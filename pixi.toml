@@ -1,0 +1,29 @@
+[workspace]
+name = "trainer-gui"
+version = "0.1.0"
+description = "Unified training terminal for the Modal point-cloud training scripts."
+channels = ["conda-forge"]
+platforms = ["win-64"]
+
+# Pinned to 3.11: open3d ships no wheels for Python 3.13 (your base conda), and
+# numpy<2 has no 3.13 wheels either. Everything here is local-side only — the
+# training itself runs in each script's own Modal image.
+[dependencies]
+python = "3.11.*"
+numpy = "<2"
+scipy = "*"             # kNN/cKDTree for density analysis + local normal estimation
+pyside6 = "*"           # desktop UI
+matplotlib = "*"        # metrics dashboard (plot_run_metrics.py) + viewer fallback
+python-pdal = "*"       # Pretraining tab: HeightAboveGround (SMRF -> hag_nn), LAZ I/O
+pip = "*"
+
+[pypi-dependencies]
+modal = "*"
+open3d = ">=0.18"       # 3D viewer
+laspy = { version = ">=2.5", extras = ["lazrs"] }
+plyfile = ">=1.0"
+trainer-gui = { path = ".", editable = true }
+
+[tasks]
+gui = "trainer-gui"                    # launch the desktop app
+test = "python tests/smoke_test.py"    # local pipeline checks (no Modal calls)
