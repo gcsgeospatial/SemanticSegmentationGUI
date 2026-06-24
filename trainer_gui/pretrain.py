@@ -113,8 +113,7 @@ def add_hag(in_dir: str | Path, out_dir: str | Path, *, skip_ground: bool = Fals
     in_dir, out_dir = Path(in_dir), Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    files = sorted(p for p in in_dir.iterdir()
-                   if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS)
+    files = dataset.discover_scenes(in_dir)   # accepts a folder OR a single file
     if not files:
         raise FileNotFoundError(f"No supported point-cloud files in {in_dir}")
 

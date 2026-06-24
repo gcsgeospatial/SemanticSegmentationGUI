@@ -1,4 +1,4 @@
-"""Convert user folders into the canonical dataset the refactored scripts consume.
+"""Convert user folders/files into the canonical dataset the scripts consume.
 
 Canonical layout (staged locally, then `modal volume put terminal-datasets ...`):
   <staging>/<name>/
@@ -6,13 +6,20 @@ Canonical layout (staged locally, then `modal volume put terminal-datasets ...`)
     train/<scene>.npz     # xyz f32, label i32 (-1 = ignore), [rgb u8, intensity f32 0..1,
     val/<scene>.npz       #   return_number f32]
 Inference jobs use the same npz minus `label`, under scenes/.
+
+The converter is format- and layout-agnostic. The minimal case is: point at one
+file (or one folder) that carries a classification field; everything else (a
+held-out val folder, companion label files, custom intensity normalization) is
+opt-in. When no explicit val split is given the data is split automatically:
+several files -> hold out whole scenes; a single file -> cut it into a coarse
+grid and hold out whole tiles (so train/val don't share neighbouring points).
 """
 
 from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -20,28 +27,65 @@ import numpy as np
 
 from .readers import SUPPORTED_EXTS, Cloud, read_points
 
+MIN_TILE_PTS = 256   # drop grid tiles smaller than this when tile-splitting
+
 
 @dataclass
 class LabelSpec:
     """Where ground-truth labels come from.
 
     kind="field": a named field in the cloud file itself (LAS dim, PLY prop,
-        "column N" of an ASCII/npy file).
+        "column N" of an ASCII/npy file). This is the general/default case.
     kind="file": a companion ASCII file, one label per point — the IEEE layout.
         The companion path = truth_dir / scene_name with src_suffix replaced by
         dst_suffix (e.g. "_PC3.txt" -> "_CLS.txt").
     """
-    kind: str                      # "field" | "file"
+    kind: str = "field"            # "field" | "file"
     field: str = ""                # for kind="field"
     truth_dir: str = ""            # for kind="file"
     src_suffix: str = "_PC3.txt"
     dst_suffix: str = "_CLS.txt"
 
 
+@dataclass
+class SplitConfig:
+    """How to derive train/val when the user hasn't pre-split into two folders.
+
+    strategy="auto"     1 file -> "tile", many files -> "scene".
+    strategy="scene"    hold out whole files (needs >= 2 files).
+    strategy="tile"     cut each file into a grid, hold out whole tiles.
+    strategy="provided" caller passes an explicit val set (set via val_inputs).
+    """
+    strategy: str = "auto"
+    val_ratio: float = 0.2
+    seed: int = 42
+    tile_m: float = 0.0            # 0 = auto (≈ a 5×5 grid over the scene extent)
+
+
+@dataclass
+class SceneSpec:
+    """One output scene: a source file, optionally cropped to an XY box."""
+    src: Path
+    name: str
+    bounds: tuple | None = None    # (x0, y0, x1, y1) or None for the whole file
+
+
 def discover_scenes(folder: str | Path) -> list[Path]:
     folder = Path(folder)
+    if folder.is_file():
+        return [folder] if folder.suffix.lower() in SUPPORTED_EXTS else []
     return sorted(p for p in folder.iterdir()
                   if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS)
+
+
+def expand_inputs(inputs) -> list[Path]:
+    """Flatten a mix of file and folder paths into a sorted list of cloud files."""
+    if isinstance(inputs, (str, Path)):
+        inputs = [inputs]
+    out: list[Path] = []
+    for p in inputs:
+        out.extend(discover_scenes(p))
+    return sorted(set(out))
 
 
 def read_labels(path: Path, cloud: Cloud, spec: LabelSpec) -> np.ndarray:
@@ -85,20 +129,81 @@ def sanitize_name(name: str) -> str:
     return s.lower()
 
 
-def convert_scene(path: Path, spec: LabelSpec | None, value_to_index: dict[int, int],
-                  out_path: Path, intensity_norm: str = "max") -> dict:
-    """Convert one source file to a canonical npz; returns per-scene stats.
+# --------------------------------------------------------------------- splitting
 
-    intensity_norm: "max" -> i/max in [0,1] (canonical-dataset default);
-    "p95" -> clip(i/p95, 0, 2), matching how the IEEE training scripts normalize
-    raw intensity, so inference on those weights sees the same feature scale.
-    """
-    cloud = read_points(path)
+def resolve_strategy(strategy: str, n_files: int) -> str:
+    if strategy in ("scene", "tile", "provided"):
+        return strategy
+    return "tile" if n_files == 1 else "scene"      # "auto"
+
+
+def _ratio_split(items: list, val_ratio: float, seed: int) -> tuple[list, list]:
+    """Shuffle `items` and split off a val fraction; both sides get >= 1."""
+    n = len(items)
+    if n < 2:
+        raise ValueError("scene-split needs >= 2 files; use tile-split or add a val folder")
+    rng = np.random.RandomState(seed)
+    idx = np.arange(n)
+    rng.shuffle(idx)
+    n_val = min(max(1, round(val_ratio * n)), n - 1)
+    val_pos = set(idx[:n_val].tolist())
+    train = [items[i] for i in range(n) if i not in val_pos]
+    val = [items[i] for i in range(n) if i in val_pos]
+    return train, val
+
+
+def density_tile_m(xyz: np.ndarray) -> float:
+    """Density-based tile size (m): target ~250k points per tile, clamped to
+    [25, 100] m and rounded to 5 — the same heuristic analysis.recommend uses,
+    so the converter's default tiling matches the per-backbone recommendation."""
+    ext = xyz[:, :2].max(0) - xyz[:, :2].min(0)
+    area = max(float(ext[0] * ext[1]), 1.0)
+    density = len(xyz) / area
+    t = float(np.sqrt(250_000 / max(density, 0.01)))
+    return float(min(max(5 * round(t / 5), 25), 100))
+
+
+def grid_cells(xyz: np.ndarray, tile_m: float) -> list[tuple]:
+    """Coarse XY grid over a cloud -> [(name, (x0,y0,x1,y1)), ...]. tile_m<=0
+    auto-sizes from point density (~250k pts/tile)."""
+    mn = xyz[:, :2].min(0)
+    mx = xyz[:, :2].max(0)
+    ext = mx - mn
+    if tile_m <= 0:
+        tile_m = density_tile_m(xyz)
+    cells = []
+    xs = np.arange(mn[0], mx[0] + tile_m, tile_m)[:-1] if ext[0] > 0 else [mn[0]]
+    ys = np.arange(mn[1], mx[1] + tile_m, tile_m)[:-1] if ext[1] > 0 else [mn[1]]
+    for i, x0 in enumerate(xs):
+        for j, y0 in enumerate(ys):
+            cells.append((f"r{i}_c{j}", (float(x0), float(y0),
+                                         float(x0) + tile_m, float(y0) + tile_m)))
+    return cells
+
+
+def _crop(cloud: Cloud, raw: np.ndarray | None, bounds: tuple):
+    x0, y0, x1, y1 = bounds
+    m = ((cloud.xyz[:, 0] >= x0) & (cloud.xyz[:, 0] < x1) &
+         (cloud.xyz[:, 1] >= y0) & (cloud.xyz[:, 1] < y1))
+    sub = Cloud(
+        xyz=cloud.xyz[m],
+        rgb=cloud.rgb[m] if cloud.rgb is not None else None,
+        intensity=cloud.intensity[m] if cloud.intensity is not None else None,
+        return_number=cloud.return_number[m] if cloud.return_number is not None else None,
+        fields={k: v[m] for k, v in cloud.fields.items()},
+    )
+    return sub, (raw[m] if raw is not None else None)
+
+
+# --------------------------------------------------------------------- conversion
+
+def _convert_one(cloud: Cloud, raw: np.ndarray | None, value_to_index: dict[int, int],
+                 out_path: Path, intensity_norm: str = "max") -> dict:
+    """Write one (already-read, already-cropped) cloud to a canonical npz."""
     out: dict[str, np.ndarray] = {"xyz": cloud.xyz.astype(np.float32)}
 
     class_counts: dict[int, int] = {}
-    if spec is not None:
-        raw = read_labels(path, cloud, spec)
+    if raw is not None:
         label = np.full(cloud.n, -1, dtype=np.int32)
         for src_val, idx in value_to_index.items():
             label[raw == src_val] = idx
@@ -137,39 +242,124 @@ def convert_scene(path: Path, spec: LabelSpec | None, value_to_index: dict[int, 
     }
 
 
-def convert_dataset(name: str, train_dir: str, val_dir: str, spec: LabelSpec,
-                    classes: list[dict], ignore_values: list[int],
-                    staging_root: Path, progress=None) -> Path:
-    """Convert both splits, write dataset_meta.json; returns the staged dataset dir.
+def convert_scene(path: Path, spec: LabelSpec | None, value_to_index: dict[int, int],
+                  out_path: Path, intensity_norm: str = "max") -> dict:
+    """Read one source file and convert the whole cloud (no cropping)."""
+    cloud = read_points(path)
+    raw = read_labels(path, cloud, spec) if spec is not None else None
+    return _convert_one(cloud, raw, value_to_index, out_path, intensity_norm)
 
+
+def _plan_and_convert(train_files: list[Path], val_files: list[Path] | None,
+                      strategy: str, split: SplitConfig, spec: LabelSpec | None,
+                      value_to_index: dict[int, int], out_root: Path,
+                      intensity_norm: str, say) -> dict:
+    """Drive conversion per strategy; returns {"train": [stats], "val": [stats]}.
+    Each big file is read at most once."""
+    stats = {"train": [], "val": []}
+
+    def emit(split_name: str, cloud: Cloud, raw, scene_name: str):
+        out_path = out_root / split_name / f"{scene_name}.npz"
+        st = _convert_one(cloud, raw, value_to_index, out_path, intensity_norm)
+        st["scene"] = out_path.name
+        stats[split_name].append(st)
+
+    if strategy == "provided":
+        for split_name, files in (("train", train_files), ("val", val_files or [])):
+            say(f"[{split_name}] {len(files)} scenes")
+            for f in files:
+                say(f"  converting {f.name} ...")
+                cloud = read_points(f)
+                raw = read_labels(f, cloud, spec) if spec is not None else None
+                emit(split_name, cloud, raw, f.stem)
+        return stats
+
+    if strategy == "scene":
+        tr, va = _ratio_split(train_files, split.val_ratio, split.seed)
+        say(f"scene-split: {len(tr)} train / {len(va)} val scenes")
+        for split_name, files in (("train", tr), ("val", va)):
+            for f in files:
+                say(f"  converting {f.name} ...")
+                cloud = read_points(f)
+                raw = read_labels(f, cloud, spec) if spec is not None else None
+                emit(split_name, cloud, raw, f.stem)
+        return stats
+
+    # strategy == "tile": grid each file, hold out whole tiles.
+    for f in train_files:
+        say(f"  tiling {f.name} ...")
+        cloud = read_points(f)
+        raw = read_labels(f, cloud, spec) if spec is not None else None
+        kept = []
+        for cname, bounds in grid_cells(cloud.xyz, split.tile_m):
+            sub, sub_raw = _crop(cloud, raw, bounds)
+            if sub.n >= MIN_TILE_PTS:
+                kept.append((cname, sub, sub_raw))
+        if len(kept) < 2:
+            raise ValueError(
+                f"{f.name}: tile-split produced {len(kept)} usable tile(s) "
+                f"(need >= 2). Use a smaller tile size, add more data, or supply "
+                f"a separate validation folder.")
+        val_pos = set(_split_indices(len(kept), split.val_ratio, split.seed))
+        n_tr = len(kept) - len(val_pos)
+        say(f"  {f.stem}: {len(kept)} tiles -> {n_tr} train / {len(val_pos)} val")
+        for k, (cname, sub, sub_raw) in enumerate(kept):
+            split_name = "val" if k in val_pos else "train"
+            emit(split_name, sub, sub_raw, f"{f.stem}_{cname}")
+    return stats
+
+
+def _split_indices(n: int, val_ratio: float, seed: int) -> list[int]:
+    rng = np.random.RandomState(seed)
+    idx = np.arange(n)
+    rng.shuffle(idx)
+    n_val = min(max(1, round(val_ratio * n)), n - 1)
+    return idx[:n_val].tolist()
+
+
+def convert_dataset(name: str, inputs, spec: LabelSpec | None,
+                    classes: list[dict], ignore_values: list[int],
+                    staging_root: Path, *, val_inputs=None,
+                    split: SplitConfig | None = None,
+                    intensity_norm: str = "max", progress=None) -> Path:
+    """Convert `inputs` (files and/or folders) into a staged canonical dataset.
+
+    inputs: a path or list of paths (files or folders) to use as the source.
+    val_inputs: optional explicit validation source -> "provided" split.
+    split: how to derive train/val when val_inputs is None (default: auto).
     classes: [{"index", "source_value", "name"}] — built by the Datasets page.
-    progress: optional callable(str) for live status lines.
     """
     from . import analysis
 
+    split = split or SplitConfig()
     name = sanitize_name(name)
     out_root = staging_root / name
     value_to_index = {int(c["source_value"]): int(c["index"]) for c in classes}
-
     say = progress or (lambda s: None)
-    splits, scene_stats = {}, {"train": [], "val": []}
-    for split, src_dir in (("train", train_dir), ("val", val_dir)):
-        files = discover_scenes(src_dir)
-        if not files:
-            raise FileNotFoundError(f"No supported point-cloud files in {src_dir}")
-        say(f"[{split}] {len(files)} scenes")
-        scenes = []
-        for path in files:
-            out_path = out_root / split / (path.stem + ".npz")
-            say(f"  converting {path.name} ...")
-            st = convert_scene(path, spec, value_to_index, out_path)
-            st["scene"] = out_path.name
-            scenes.append(out_path.name)
-            scene_stats[split].append(st)
-        splits[split] = {"scenes": scenes,
-                         "total_points": sum(s["n_points"] for s in scene_stats[split])}
 
-    # aggregate stats + per-class counts over the real (full) conversion pass
+    train_files = expand_inputs(inputs)
+    if not train_files:
+        raise FileNotFoundError(f"No supported point-cloud files in {inputs}")
+    if val_inputs:
+        strategy = "provided"
+        val_files = expand_inputs(val_inputs)
+        if not val_files:
+            raise FileNotFoundError(f"No supported point-cloud files in {val_inputs}")
+    else:
+        strategy = resolve_strategy(split.strategy, len(train_files))
+        val_files = None
+    say(f"source: {len(train_files)} file(s), split strategy = {strategy}")
+
+    scene_stats = _plan_and_convert(train_files, val_files, strategy, split, spec,
+                                    value_to_index, out_root, intensity_norm, say)
+    if not scene_stats["train"] or not scene_stats["val"]:
+        raise ValueError("Conversion produced an empty train or val split — check "
+                         "the split settings or supply an explicit val folder.")
+
+    splits = {sp: {"scenes": [s["scene"] for s in scene_stats[sp]],
+                   "total_points": sum(s["n_points"] for s in scene_stats[sp])}
+              for sp in ("train", "val")}
+
     all_stats = scene_stats["train"] + scene_stats["val"]
     total_pts = sum(s["n_points"] for s in all_stats)
     total_area = sum(s["area_m2"] for s in all_stats)
@@ -180,6 +370,12 @@ def convert_dataset(name: str, train_dir: str, val_dir: str, spec: LabelSpec,
                                for s in scene_stats["train"])
         c["val_count"] = sum(s["class_counts"].get(int(c["index"]), 0)
                              for s in scene_stats["val"])
+
+    # Several source values may be combined into one class (same index/name), so
+    # the number of classes is the count of UNIQUE indices, not table rows.
+    idx_to_name: dict[int, str] = {}
+    for c in classes:
+        idx_to_name.setdefault(int(c["index"]), c["name"])
 
     stats = {
         "mean_pts_per_m2": density,
@@ -197,13 +393,20 @@ def convert_dataset(name: str, train_dir: str, val_dir: str, spec: LabelSpec,
         "name": name,
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "source": {
-            "train_dir": str(train_dir), "val_dir": str(val_dir),
-            "label_kind": spec.kind, "label_field": spec.field,
-            "truth_dir": spec.truth_dir, "ignore_values": [int(v) for v in ignore_values],
+            "inputs": [str(p) for p in (inputs if isinstance(inputs, (list, tuple)) else [inputs])],
+            "val_inputs": [str(p) for p in (val_inputs or [])],
+            "split_strategy": strategy,
+            "val_ratio": split.val_ratio, "split_seed": split.seed,
+            "tile_m": split.tile_m,
+            "label_kind": spec.kind if spec else None,
+            "label_field": spec.field if spec else "",
+            "truth_dir": spec.truth_dir if spec else "",
+            "intensity_norm": intensity_norm,
+            "ignore_values": [int(v) for v in ignore_values],
         },
         "classes": classes,
-        "num_classes": len(classes),
-        "class_names": [c["name"] for c in sorted(classes, key=lambda c: int(c["index"]))],
+        "num_classes": len(idx_to_name),
+        "class_names": [idx_to_name[i] for i in sorted(idx_to_name)],
         "has_rgb": all(s["has_rgb"] for s in all_stats),
         "has_intensity": all(s["has_intensity"] for s in all_stats),
         "has_return_number": all(s["has_return_number"] for s in all_stats),
@@ -252,3 +455,41 @@ def convert_infer_job(job_id: str, input_dir: str, staging_root: Path, progress=
         json.dump(meta, f, indent=2)
     say(f"staged inference job -> {out_root}")
     return out_root
+
+
+# --------------------------------------------------------------------- self-check
+
+def _selfcheck():
+    """Synthesize a single labeled cloud, tile-split it, and assert the splits
+    partition the points (no leakage, none lost above the tile floor)."""
+    import tempfile
+
+    rng = np.random.RandomState(0)
+    n = 20000
+    xyz = rng.uniform(0, 100, size=(n, 3)).astype(np.float64)
+    cls = rng.randint(0, 3, size=n).astype(np.float64)
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        np.savez(td / "scene.npz", xyz=xyz, classification=cls)
+        classes = [{"index": i, "source_value": i, "name": f"c{i}"} for i in range(3)]
+        out = convert_dataset("selftest", td / "scene.npz",
+                              LabelSpec(kind="field", field="classification"),
+                              classes, [], td / "staging",
+                              split=SplitConfig(strategy="tile", tile_m=20.0))
+        meta = json.loads((out / "dataset_meta.json").read_text())
+        tr, va = meta["splits"]["train"], meta["splits"]["val"]
+        assert tr["scenes"] and va["scenes"], "both splits must be non-empty"
+        assert tr["total_points"] + va["total_points"] == n, "points must be conserved"
+        # scene-split path
+        for k in range(3):
+            np.savez(td / f"s{k}.npz", xyz=xyz, classification=cls)
+        out2 = convert_dataset("selftest2", td, LabelSpec(field="classification"),
+                               classes, [], td / "staging",
+                               split=SplitConfig(strategy="scene"))
+        m2 = json.loads((out2 / "dataset_meta.json").read_text())
+        assert m2["splits"]["train"]["scenes"] and m2["splits"]["val"]["scenes"]
+    print("dataset self-check OK")
+
+
+if __name__ == "__main__":
+    _selfcheck()

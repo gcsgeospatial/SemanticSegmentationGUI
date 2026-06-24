@@ -16,10 +16,10 @@ from pathlib import Path
 from PySide6.QtCore import QProcess
 from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import (QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox,
-                               QHBoxLayout, QLabel, QLineEdit, QListWidget, QPlainTextEdit,
+                               QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit,
                                QPushButton, QRadioButton, QVBoxLayout, QWidget)
 
-from .. import appstate, dataset, modal_cli, ui
+from .. import appstate, dataset, local_cli, modal_cli, ui
 from ..backbones import BACKBONES, infer_backbones
 from ..jobs import FuncWorker, JobRunner, LogParser
 
@@ -38,6 +38,7 @@ class InferPage(QWidget):
         self._staged: Path | None = None
         self._weights_remote = ""
         self._run_id = ""
+        self._dl_dest: Path | None = None
 
         root = QVBoxLayout(self)
         title = QLabel("Inference")
@@ -120,10 +121,14 @@ class InferPage(QWidget):
 
         out_row = QHBoxLayout()
         out_col = QVBoxLayout()
-        out_col.addWidget(QLabel("Predictions from the last run  (double-click to view)"))
-        self.pred_list = QListWidget()
-        self.pred_list.itemDoubleClicked.connect(self._view_item)
-        out_col.addWidget(self.pred_list, 1)
+        out_col.addWidget(QLabel("Prediction stats (vs ground truth)"))
+        self.stats_box = QPlainTextEdit()
+        self.stats_box.setReadOnly(True)
+        self.stats_box.setMaximumHeight(150)
+        self.stats_box.setPlaceholderText(
+            "Run 'Compare to ground truth…' on a prediction cloud to compute its "
+            "overall accuracy, mIoU and per-class IoU here.")
+        out_col.addWidget(self.stats_box)
         out_row.addLayout(out_col, 1)
         btn_col = QVBoxLayout()
         self.view_btn = QPushButton("View a point cloud…")
@@ -146,6 +151,7 @@ class InferPage(QWidget):
         self.converter.error.connect(self._on_error)
         self.runner.output.connect(self._on_output)
         self.runner.finished.connect(self._on_stage_done)
+        self.runner.failed.connect(self._on_runner_failed)
         self.parser.run_id.connect(self._on_run_id)
 
         self.reload_runs()
@@ -241,7 +247,7 @@ class InferPage(QWidget):
 
         self._job_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         self._run_id = ""
-        self.pred_list.clear()
+        self.stats_box.clear()
         self.log.clear()
         self.run_btn.setEnabled(False)
         self._append(f"[1/4] Converting {input_dir} to canonical scenes (job {self._job_id})…")
@@ -250,6 +256,9 @@ class InferPage(QWidget):
 
     def _on_converted(self, staged: Path):
         self._staged = staged
+        if appstate.get_exec_mode() == "local":
+            self._start_local_infer()
+            return
         self._append(f"[2/4] Uploading scenes -> {modal_cli.DATASETS_VOLUME}:/_infer/{self._job_id} …")
         self._stage = "upload_scenes"
         prog, args = modal_cli.volume_put(modal_cli.DATASETS_VOLUME, str(staged),
@@ -275,26 +284,41 @@ class InferPage(QWidget):
         elif self._stage == "upload_weights":
             self._start_modal_run()
         elif self._stage == "run":
-            if not self._run_id:
-                self._append("\n✗ Could not detect the run id from the logs — "
-                             "check the Runs page for a *_infer run and download it there.")
-                self.run_btn.setEnabled(True)
-                return
-            dest = appstate.runs_dir() / b.key
-            dest.mkdir(parents=True, exist_ok=True)
-            self._append(f"[4/4] Downloading predictions runs/{self._run_id} -> {dest} …")
+            # Predictions now live on the shared terminal-datasets volume next to the
+            # input scenes (_infer/<job_id>/predictions), keyed on the job id we
+            # generated — no need to parse a per-backbone run id from the logs.
+            self._dl_dest = appstate.runs_dir() / "_infer" / self._job_id
+            self._dl_dest.mkdir(parents=True, exist_ok=True)
+            self._append(f"[4/4] Downloading predictions -> {self._dl_dest} …")
             self._stage = "download"
-            prog, args = modal_cli.volume_get(b.outputs_volume, f"runs/{self._run_id}", str(dest))
+            prog, args = modal_cli.volume_get(modal_cli.DATASETS_VOLUME,
+                                              f"_infer/{self._job_id}/predictions",
+                                              str(self._dl_dest))
             self.runner.start(prog, args, cwd=self.repo_root)
+        elif self._stage == "run_local":
+            # Local Docker run: predictions were written straight to the host
+            # staging dir (no download stage).
+            self.run_btn.setEnabled(True)
+            pred_dir = (self._staged / "predictions") if self._staged else None
+            if pred_dir and pred_dir.is_dir():
+                preds = [p for p in sorted(pred_dir.iterdir())
+                         if p.suffix.lower() in (".ply", ".npz")]
+                appstate.put("last_view_dir", str(pred_dir))
+                self._append(f"\n✓ Done — {len(preds)} prediction file(s) in {pred_dir}.\n"
+                             f"  'View a point cloud…' to open one, or 'Compare to ground "
+                             f"truth…' for accuracy + mIoU.")
+            else:
+                self._append(f"\n✗ No predictions folder at {pred_dir}.")
         elif self._stage == "download":
             self.run_btn.setEnabled(True)
-            pred_dir = appstate.runs_dir() / b.key / self._run_id / "predictions"
+            pred_dir = self._dl_dest / "predictions"
             if pred_dir.is_dir():
-                for p in sorted(pred_dir.iterdir()):
-                    if p.suffix.lower() in (".ply", ".npz"):
-                        self.pred_list.addItem(str(p))
-                self._append(f"\n✓ Done — {self.pred_list.count()} prediction files. "
-                             f"Double-click one to view it.")
+                preds = [p for p in sorted(pred_dir.iterdir())
+                         if p.suffix.lower() in (".ply", ".npz")]
+                appstate.put("last_view_dir", str(pred_dir))   # View dialog opens here
+                self._append(f"\n✓ Done — {len(preds)} prediction file(s) in {pred_dir}.\n"
+                             f"  'View a point cloud…' to open one, or 'Compare to ground "
+                             f"truth…' for accuracy + mIoU.")
             else:
                 self._append(f"\n✗ No predictions folder at {pred_dir}.")
 
@@ -314,9 +338,60 @@ class InferPage(QWidget):
         self._append(f"$ modal {' '.join(args)}\n")
         self.runner.start(prog, args, cwd=self.repo_root)
 
+    def _start_local_infer(self):
+        """Local (Docker) inference: the staged scenes are bind-mounted into the
+        container at /datasets/_infer/<job>, predictions land straight back in the
+        host staging dir — no upload, no download."""
+        b = self._backbone()
+        # Scenes (and where predictions get written) are self._staged on the host.
+        extra_mounts = [(str(self._staged), f"/datasets/_infer/{self._job_id}")]
+        if self.from_file_radio.isChecked():
+            wpath = Path(self.pth_edit.text().strip())
+            extra_mounts.append((str(wpath.parent), "/outputs/_local_weights"))
+            weights = f"_local_weights/{wpath.name}"
+        else:
+            # Resolve the run's weights on THIS host. A locally-trained run lands at
+            # local_runs/runs/<id> (already under the /outputs mount); a Modal run
+            # downloaded via the Runs page lives under runs/<backbone>/<id> — bind-mount
+            # whichever exists. Refuse (don't fail in-container) if neither does.
+            run_id = self._weights_remote.split("/")[1]   # runs/<id>/final_model.pth
+            local_w = appstate.local_runs_dir() / "runs" / run_id / "final_model.pth"
+            dl_w = next(iter(appstate.runs_dir().glob(f"*/{run_id}/final_model.pth")), None)
+            if local_w.exists():
+                weights = self._weights_remote
+            elif dl_w is not None:
+                extra_mounts.append((str(dl_w.parent), "/outputs/_local_weights"))
+                weights = "_local_weights/final_model.pth"
+            else:
+                self._append(f"✗ Run '{run_id}' has no local weights (looked in "
+                             f"{local_w.parent} and {appstate.runs_dir()}). Train it locally, "
+                             f"download it on the Runs page, or use the 'Local .pth file' option.")
+                self.run_btn.setEnabled(True)
+                return
+        flags = {
+            "mode": "infer",
+            "weights": weights,
+            "infer-input": self._job_id,
+            b.grid_flag: self.grid_spin.value(),
+        }
+        if b.has_chunk:
+            flags["chunk-xy"] = self.chunk_spin.value()
+        self._stage = "run_local"
+        prog, args = local_cli.run_script(b.script, flags, b, repo_root=self.repo_root,
+                                          extra_mounts=extra_mounts)
+        self._append(f"[local] Running inference in Docker ({b.label}) …")
+        self._append(f"[local] $ {local_cli.preview(prog, args)}\n")
+        if not local_cli.have_docker():
+            self._append("[local] docker not found on PATH — printed the exact command "
+                         "(design-now mode). On a Docker+GPU host the predictions land in "
+                         f"{self._staged}\\predictions.")
+            self.run_btn.setEnabled(True)
+            return
+        self.runner.start(prog, args, cwd=self.repo_root)
+
     def _on_output(self, text: str):
         self._append(text, newline=False)
-        if self._stage == "run":
+        if self._stage in ("run", "run_local"):
             self.parser.feed(text)
 
     def _on_run_id(self, run_id: str):
@@ -326,13 +401,15 @@ class InferPage(QWidget):
         self.run_btn.setEnabled(True)
         self._append(f"\n✗ Conversion error:\n{tb}")
 
+    def _on_runner_failed(self, err: str):
+        # QProcess FailedToStart fires `failed`, not `finished` — re-enable the
+        # button so a bad docker/modal exec doesn't wedge the UI.
+        self.run_btn.setEnabled(True)
+        self._append(f"\n✗ Failed to start process: {err}")
+
     # ------------------------------------------------------------- view
     def _open_viewer(self, *args: str):
         QProcess.startDetached(sys.executable, ["-m", "trainer_gui.viewer", *args], PROJECT_DIR)
-
-    def _view_item(self, item):
-        self._open_viewer(item.text())
-        self._append(f"Opened viewer for {Path(item.text()).name}")
 
     def _view_file(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -370,8 +447,27 @@ class InferPage(QWidget):
             return
         pred, gt = picked
         self._open_viewer(pred, "--gt", gt)
+        self._show_stats(pred, gt)
         self._append(f"Comparing {Path(pred).name} to {Path(gt).name} "
                      f"(yellow = predicted class differs from the ground truth).")
+
+    def _show_stats(self, pred: str, gt: str):
+        """Compute accuracy + mIoU of the prediction cloud vs ground truth and
+        list them in the stats box (alongside opening the error-map viewer)."""
+        from .. import viewer
+        self.stats_box.setPlainText("Computing accuracy + mIoU …")
+        try:
+            m = viewer.prediction_metrics(pred, gt)
+        except Exception as e:  # noqa: BLE001
+            self.stats_box.setPlainText(f"Could not compute stats:\n{e}")
+            return
+        lines = [m["scene"] or Path(pred).stem,
+                 f"accuracy : {m['accuracy']:.4f}",
+                 f"mIoU     : {m['miou']:.4f}   (over {len(m['per_class_iou'])} present classes)",
+                 f"labeled  : {m['labeled']:,} pts",
+                 "per-class IoU:"]
+        lines += [f"  class {c}: {iou:.4f}" for c, iou in sorted(m["per_class_iou"].items())]
+        self.stats_box.setPlainText("\n".join(lines))
 
     def _export_gt(self):
         """Prompt for a prediction + ground truth and write the error-map cloud

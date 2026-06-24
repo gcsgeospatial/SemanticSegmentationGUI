@@ -53,6 +53,7 @@ Usage:
     modal run modal_train_kpconvx_cold_hag.py --mode eval --weights runs/<id>/final_model.pth
 """
 
+import os
 from typing import Optional
 
 import modal
@@ -203,7 +204,8 @@ image = image.run_commands(
 
 data_volume     = modal.Volume.from_name("ieee-data",            create_if_missing=True)
 outputs_volume  = modal.Volume.from_name(f"{APP_NAME}-outputs",  create_if_missing=True)
-datasets_volume = modal.Volume.from_name("terminal-datasets",    create_if_missing=True)
+datasets_volume = modal.Volume.from_name(
+    os.environ.get("TT_DATASET_VOLUME", "terminal-datasets"), create_if_missing=True)
 
 # ============================================================================
 # Training function
@@ -217,9 +219,12 @@ datasets_volume = modal.Volume.from_name("terminal-datasets",    create_if_missi
     memory=49152,
     timeout=TIMEOUT_HOURS * 3600,
 )
-def train_kpconvx(mode: str = "train", weights: Optional[str] = None,
+def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
+                  weights: Optional[str] = None,
                   infer_input: Optional[str] = None, grid: Optional[float] = None,
-                  chunk_xy: Optional[float] = None):
+                  chunk_xy: Optional[float] = None, epochs: Optional[int] = None,
+                  batch: Optional[int] = None, steps_per_epoch: Optional[int] = None,
+                  predict_n: Optional[int] = None):
     import os, sys, time, json, csv, glob, traceback
     from datetime import datetime
     import numpy as np
@@ -234,6 +239,63 @@ def train_kpconvx(mode: str = "train", weights: Optional[str] = None,
     LABEL_LUT = np.full(256, -1, dtype=np.int32)
     for raw, mapped in LABEL_MAP.items():
         LABEL_LUT[raw] = mapped
+
+    # --- resolve run config: CLI flags override the module defaults --------------
+    # Geometry + schedule knobs the GUI sends as --grid / --chunk-xy / --epochs /
+    # --batch / --steps-per-epoch / --predict-n. Assigned as LOCALS so every
+    # nested helper (grid_subsample, the train loop, evaluate, …) picks them up
+    # via closure. --batch maps to PACK_N (tiles packed per forward).
+    GRID        = grid if grid is not None else globals()["GRID"]
+    CHUNK_XY    = chunk_xy if chunk_xy is not None else globals()["CHUNK_XY"]
+    STRIDE      = CHUNK_XY / 2.0
+    N_EPOCHS    = epochs if epochs is not None else globals()["N_EPOCHS"]
+    EPOCH_STEPS = steps_per_epoch if steps_per_epoch is not None else globals()["EPOCH_STEPS"]
+    PACK_N      = batch if batch is not None else globals()["PACK_N"]
+    N_PREDICT   = predict_n if predict_n is not None else globals()["N_PREDICT"]
+
+    # --dataset NAME selects a canonical trainer_gui dataset on the terminal-
+    # datasets volume; default (None) trains on raw IEEE Track 4. Canonical scenes
+    # carry no HAG laz, so the HAG channel falls back to the z-scene-min proxy
+    # (same as the no-GT inference path). NUM_CLASSES / CLASS_NAMES / PREP_DIR are
+    # locals so the whole function tracks the dataset's class layout. IEEE_INFER
+    # flags an IEEE-trained model (ASPRS codes).
+    NUM_CLASSES = globals()["NUM_CLASSES"]
+    CLASS_NAMES = list(globals()["CLASS_NAMES"])
+    IEEE_INFER  = True
+    ds_root = f"/datasets/{dataset}" if dataset else None
+    if ds_root:
+        meta_path = f"{ds_root}/dataset_meta.json"
+        if not os.path.exists(meta_path):
+            raise FileNotFoundError(f"{meta_path} not found — upload the dataset "
+                                    f"with the trainer_gui app first.")
+        with open(meta_path) as f:
+            ds_meta = json.load(f)
+        NUM_CLASSES = int(ds_meta["num_classes"])
+        CLASS_NAMES = list(ds_meta["class_names"])
+        PREP_DIR = f"{ds_root}/prep/kpconvx_cold_hag_grid{GRID:g}_c{int(CHUNK_XY)}"
+    elif INFER and weights:
+        # Infer must reproduce the TRAINED geometry + class layout, not the GUI's
+        # defaults — read them from the run's config next to the checkpoint.
+        cfg_dir = os.path.dirname(f"/outputs/{weights}")
+        if os.path.basename(cfg_dir) == "checkpoints":
+            cfg_dir = os.path.dirname(cfg_dir)
+        rc_path = f"{cfg_dir}/run_config.json"
+        if os.path.exists(rc_path):
+            with open(rc_path) as f:
+                rcfg = json.load(f)
+            NUM_CLASSES = int(rcfg.get("num_classes", NUM_CLASSES))
+            CLASS_NAMES = list(rcfg.get("class_names", CLASS_NAMES))
+            GRID = float(rcfg.get("grid_m", GRID)); CHUNK_XY = float(rcfg.get("chunk_xy_m", CHUNK_XY))
+            STRIDE = CHUNK_XY / 2.0
+            IEEE_INFER = rcfg.get("label_map_asprs_to_index") is not None
+        PREP_DIR = globals()["PREP_DIR"]
+    else:
+        # IEEE default: keep the canonical cache path for the trained defaults; a
+        # custom grid/chunk forks its own cache (the signature check rejects
+        # reusing tiles built at a different geometry).
+        base = globals()["PREP_DIR"]
+        PREP_DIR = base if (GRID == globals()["GRID"] and CHUNK_XY == globals()["CHUNK_XY"]) \
+            else f"{base}_grid{GRID:g}_c{int(CHUNK_XY)}"
 
     # ------------------------------------------------------------------------
     # HAG: per-point HeightAboveGround read from the Pretraining-tab .laz files
@@ -331,22 +393,47 @@ def train_kpconvx(mode: str = "train", weights: Optional[str] = None,
         lab = LABEL_LUT[np.clip(lab_raw, 0, 255)].astype(np.int32)
         return xyz, intensity, ret_num, lab
 
+    def load_canonical(npz_path):
+        """Canonical trainer_gui scene (.npz) -> (xyz, intensity, ret_num, lab).
+        xyz origin-offset like load_ieee; intensity is already GUI-normalized
+        (the p95 renorm below is skipped); no return-number channel (zeros);
+        labels are already contiguous indices (no ASPRS LUT). No HAG laz exists
+        for canonical scenes — tile_and_save uses the z-scene-min proxy."""
+        z = np.load(npz_path)
+        xyz = (z["xyz"] - np.floor(z["xyz"].min(0))).astype(np.float32)
+        if "intensity" in z.files:
+            intensity = z["intensity"].astype(np.float32)
+        elif "rgb" in z.files:
+            intensity = z["rgb"].astype(np.float32).mean(1) / 255.0
+        else:
+            intensity = np.zeros(len(xyz), np.float32)
+        ret_num = np.zeros(len(xyz), np.float32)
+        lab = z["label"].astype(np.int32) if "label" in z.files \
+            else np.full(len(xyz), -1, np.int32)
+        return xyz, intensity, ret_num, lab
+
     def tile_and_save(name, pc_path, cls_path, out_dir, chunk_xy, stride, hag_dir):
         os.makedirs(out_dir, exist_ok=True)
         t0 = time.time()
         try:
-            xyz, intensity, ret_num, lab = load_ieee(pc_path, cls_path)
-            hag = load_hag(name, hag_dir, xyz)
+            if cls_path is None:          # canonical .npz (label embedded, no HAG laz)
+                xyz, intensity, ret_num, lab = load_canonical(pc_path)
+                hag = (xyz[:, 2] - xyz[:, 2].min()).astype(np.float32)   # z-scene-min proxy
+            else:
+                xyz, intensity, ret_num, lab = load_ieee(pc_path, cls_path)
+                hag = load_hag(name, hag_dir, xyz)
         except Exception as e:
             print(f"  skip {pc_path}: {e}", flush=True); return None
-        # Robust per-scene normalisation: dividing by the max lets one hot return
-        # rescale the whole scene, so "water-grade" intensity meant different
-        # numbers in different scenes. p95 + clip keeps the scale comparable.
-        i_p95 = max(float(np.percentile(intensity, 95)), 1.0)
-        intensity_n = np.clip(intensity / i_p95, 0.0, 2.0).astype(np.float32)
+        # IEEE intensity is raw -> robust per-scene p95 normalisation (dividing by
+        # the max lets one hot return rescale the whole scene). Canonical intensity
+        # is already GUI-normalized, so pass it through (just clip).
+        if cls_path is None:
+            intensity_n = np.clip(intensity, 0.0, 2.0).astype(np.float32)
+        else:
+            i_p95 = max(float(np.percentile(intensity, 95)), 1.0)
+            intensity_n = np.clip(intensity / i_p95, 0.0, 2.0).astype(np.float32)
         print(f"    {name}: {len(xyz):,} pts loaded in {time.time()-t0:.1f}s, "
-              f"intensity p95={i_p95:.1f}, HAG {hag.min():.1f}..{hag.max():.1f}m, tiling…",
-              flush=True)
+              f"HAG {hag.min():.1f}..{hag.max():.1f}m, tiling…", flush=True)
         mins = xyz[:, :2].min(0); maxs = xyz[:, :2].max(0)
         x0s = np.arange(mins[0], maxs[0], stride)
         y0s = np.arange(mins[1], maxs[1], stride)
@@ -379,6 +466,25 @@ def train_kpconvx(mode: str = "train", weights: Optional[str] = None,
         return n_tiles
 
     def _split_scenes():
+        if ds_root:
+            # Canonical: hold out N_VAL_HOLDOUT train scenes by name for val; the
+            # dataset's val/ folder is the test set. cls_path=None flags canonical.
+            train_npz = sorted(glob.glob(f"{ds_root}/train/*.npz"))
+            if not train_npz:
+                raise FileNotFoundError(f"No canonical scenes under {ds_root}/train")
+            path_of = {os.path.splitext(os.path.basename(p))[0]: p for p in train_npz}
+            names_all = sorted(path_of)
+            rng = np.random.RandomState(HOLDOUT_SEED)
+            idx = np.arange(len(names_all)); rng.shuffle(idx)
+            n_hold = min(N_VAL_HOLDOUT, max(1, len(names_all) // 5))
+            val_names = sorted(names_all[i] for i in idx[:n_hold])
+            train_names = sorted(n for n in names_all if n not in val_names)
+            test_npz = sorted(glob.glob(f"{ds_root}/val/*.npz"))
+            return (
+                [(n, path_of[n], None) for n in train_names],
+                [(n, path_of[n], None) for n in val_names],
+                [(os.path.splitext(os.path.basename(p))[0], p, None) for p in test_npz],
+            )
         train_pc = sorted(glob.glob(f"{TRAIN_PC_DIR}/*_PC3.txt"))
         if not train_pc:
             raise FileNotFoundError(
@@ -487,7 +593,7 @@ def train_kpconvx(mode: str = "train", weights: Optional[str] = None,
         print(f"  [test] {len(test_list)} scenes", flush=True)
         tile_remaining(test_list, f"{PREP_DIR}/test", CHUNK_XY, STRIDE, HAG_TEST_DIR)
         if any_new[0]:
-            data_volume.commit()
+            (datasets_volume if ds_root else data_volume).commit()
             print("  preprocessing committed.", flush=True)
         else:
             print("  all scenes already cached.", flush=True)
@@ -537,7 +643,9 @@ def train_kpconvx(mode: str = "train", weights: Optional[str] = None,
     if INFER:
         # Inference-only: fresh *_infer run dir, weights loaded after net build.
         run_id = datetime.utcnow().strftime("%Y%m%d_%H%M%S_infer")
-        run_dir = f"/outputs/runs/{run_id}"
+        # Predictions live next to the input scenes on terminal-datasets (not the
+        # per-backbone outputs volume), so inference output is in one consistent place.
+        run_dir = f"/datasets/_infer/{infer_input}"
         os.makedirs(f"{run_dir}/predictions", exist_ok=True)
         resume_ckpt, start_epoch = None, 0
     elif resume_info:
@@ -562,13 +670,15 @@ def train_kpconvx(mode: str = "train", weights: Optional[str] = None,
             "warm_start": False,
             "feature_mode": FEATURE_MODE,
             "input_channels": INPUT_CHANNELS,
-            "comparison_target": "kpconv-pdal/train_LAS.py (deformable KPFCNN)",
-            "dataset": "IEEE GRSS 2019 DFC Track 4",
+            "comparison_target": None if ds_root
+                else "kpconv-pdal/train_LAS.py (deformable KPFCNN)",
+            "dataset": dataset or "IEEE GRSS 2019 DFC Track 4",
+            "hag_source": "z_minus_scene_min_proxy" if ds_root else "pdal_hag_nn",
             "n_epochs": N_EPOCHS, "epoch_steps": EPOCH_STEPS,
             "pack_n": PACK_N, "accum": ACCUM,
             "grid_m": GRID, "kp_radius": KP_RADIUS, "radius_scaling": RADIUS_SCALING,
             "num_classes": NUM_CLASSES, "class_names": CLASS_NAMES,
-            "label_map_asprs_to_index": LABEL_MAP,
+            "label_map_asprs_to_index": None if ds_root else LABEL_MAP,
             "chunk_xy_m": CHUNK_XY, "stride_m": STRIDE,
             "optimizer": {"type": "AdamW", "weight_decay": WEIGHT_DECAY,
                           "cyc_lr0": CYC_LR0, "cyc_lr1": CYC_LR1,
@@ -917,9 +1027,13 @@ def train_kpconvx(mode: str = "train", weights: Optional[str] = None,
               "the z-tile-min proxy (folder inference is best-effort vs HAG-prepped data).",
               flush=True)
         net.eval()
-        IDX_TO_ASPRS = np.array([2, 5, 6, 9, 17], dtype=np.int32)
-        PALETTE = np.array([[139, 90, 43], [34, 160, 34], [200, 60, 60],
-                            [40, 110, 220], [235, 225, 60]], dtype=np.int32)
+        IDX_TO_ASPRS = np.array([2, 5, 6, 9, 17], dtype=np.int32)   # IEEE models only
+        # Palette tiled to NUM_CLASSES so canonical models (any class count) don't
+        # index past a fixed 5-colour table.
+        _BASE_PAL = np.array([[139, 90, 43], [34, 160, 34], [200, 60, 60], [40, 110, 220],
+                              [235, 225, 60], [150, 80, 200], [240, 140, 40], [70, 200, 200],
+                              [220, 100, 170], [120, 120, 120]], dtype=np.int32)
+        PALETTE = np.tile(_BASE_PAL, (-(-NUM_CLASSES // len(_BASE_PAL)), 1))[:NUM_CLASSES]
 
         def _write_ply(path, pxyz, pred_idx, intensity=None):
             cols = [pxyz.astype(np.float32), PALETTE[pred_idx]]
@@ -957,10 +1071,12 @@ def train_kpconvx(mode: str = "train", weights: Optional[str] = None,
                              else np.zeros(len(xyz), np.float32)))
             pred = _predict_points(xyz, intensity_n, ret_num)
             _write_ply(f"{pred_dir}/{name}_pred.ply", xyz, pred, intensity_n)
-            np.savetxt(f"{pred_dir}/{name}_pred_CLS.txt", IDX_TO_ASPRS[pred], fmt="%d")
+            # IEEE models emit ASPRS codes; canonical models emit raw class indices.
+            np.savetxt(f"{pred_dir}/{name}_pred_CLS.txt",
+                       IDX_TO_ASPRS[pred] if IEEE_INFER else pred, fmt="%d")
             print(f"  [infer] {name}: {len(xyz):,} pts in {time.time()-t0:.1f}s", flush=True)
-        outputs_volume.commit()
-        print(f"  [infer] done — predictions in runs/{run_id}/predictions", flush=True)
+        datasets_volume.commit()
+        print(f"  [infer] done — predictions in _infer/{infer_input}/predictions", flush=True)
         return
 
     metrics_csv = f"{run_dir}/metrics.csv"
@@ -1170,7 +1286,8 @@ def train_kpconvx(mode: str = "train", weights: Optional[str] = None,
                 rep_xyz = P[first]                      # one representative coord per voxel
                 # Reproject voxel predictions onto the raw scene cloud + raw GT.
                 try:
-                    raw_xyz, _, _, raw_lab = load_ieee(pc_path, cls_path)
+                    raw_xyz, _, _, raw_lab = (load_canonical(pc_path) if cls_path is None
+                                              else load_ieee(pc_path, cls_path))
                 except Exception as ex:
                     print(f"  [{label}] skip {name}: raw reload failed: {ex}", flush=True)
                     n_skipped_scenes += 1; continue
@@ -1263,7 +1380,9 @@ def train_kpconvx(mode: str = "train", weights: Optional[str] = None,
         net.eval()
         pred_dir = f"{run_dir}/predictions"
         os.makedirs(pred_dir, exist_ok=True)
-        scenes = [] if EVAL_ONLY else sorted(glob.glob(f"{PRED_PC_DIR}/*_PC3.txt"))[:N_PREDICT]
+        # IEEE-only demo (ASPRS palette + Test-Track4 layout); canonical datasets
+        # use the dedicated --mode infer path instead.
+        scenes = [] if (EVAL_ONLY or ds_root) else sorted(glob.glob(f"{PRED_PC_DIR}/*_PC3.txt"))[:N_PREDICT]
         print(f"  [predict] labeling {len(scenes)} Test-Track4 scene(s) -> {pred_dir}", flush=True)
         for pc_path in scenes:
             name = os.path.basename(pc_path).replace("_PC3.txt", "")
@@ -1279,10 +1398,14 @@ def train_kpconvx(mode: str = "train", weights: Optional[str] = None,
 
 
 @app.local_entrypoint()
-def main(mode: str = "train", weights: Optional[str] = None,
+def main(dataset: Optional[str] = None, mode: str = "train", weights: Optional[str] = None,
          infer_input: Optional[str] = None, grid: Optional[float] = None,
-         chunk_xy: Optional[float] = None):
-    what = {"eval": "eval-only re-score", "infer": f"infer({weights})"}.get(mode, "train")
+         chunk_xy: Optional[float] = None, epochs: Optional[int] = None,
+         batch: Optional[int] = None, steps_per_epoch: Optional[int] = None,
+         predict_n: Optional[int] = None):
+    what = {"eval": "eval-only re-score", "infer": f"infer({weights})"}.get(
+        mode, f"train({dataset or 'IEEE Track 4'})")
     print(f"Launching {APP_NAME} [{what}] on {GPU_TYPE} for up to {TIMEOUT_HOURS}h.")
-    train_kpconvx.remote(mode=mode, weights=weights, infer_input=infer_input,
-                         grid=grid, chunk_xy=chunk_xy)
+    train_kpconvx.remote(dataset=dataset, mode=mode, weights=weights, infer_input=infer_input,
+                         grid=grid, chunk_xy=chunk_xy, epochs=epochs, batch=batch,
+                         steps_per_epoch=steps_per_epoch, predict_n=predict_n)

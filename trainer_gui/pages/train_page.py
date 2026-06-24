@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDoubleS
                                QPlainTextEdit, QPushButton, QSpinBox, QTableWidget,
                                QTableWidgetItem, QVBoxLayout, QWidget)
 
-from .. import analysis, appstate, modal_cli, prep, ui
+from .. import analysis, appstate, local_cli, modal_cli, prep, ui
 from ..backbones import BACKBONES, GPU_CHOICES
 from ..jobs import FuncWorker, JobRunner, LogParser
 
@@ -25,6 +25,7 @@ class TrainPage(QWidget):
         self.log_runner = JobRunner(self)   # for re-attaching to detached runs
         self.prep_worker = FuncWorker(self)  # local tiling/subsampling
         self.prep_uploader = JobRunner(self)
+        self.verify_worker = FuncWorker(self)  # `modal volume ls` presence check
         self.parser = LogParser(self)
         self._param_widgets: dict[str, QWidget] = {}
         self._meta: dict | None = None
@@ -46,7 +47,16 @@ class TrainPage(QWidget):
         form = QFormLayout(form_box)
         self.dataset_combo = QComboBox()
         self.dataset_combo.currentIndexChanged.connect(self._on_dataset_change)
-        form.addRow("Dataset", self.dataset_combo)
+        ds_row = QHBoxLayout()
+        ds_row.addWidget(self.dataset_combo, 1)
+        self.verify_btn = QPushButton("Check on Modal")
+        self.verify_btn.clicked.connect(self._verify_dataset)
+        ds_row.addWidget(self.verify_btn)
+        form.addRow("Dataset", _wrap(ds_row))
+        self.ds_status = QLabel("")
+        self.ds_status.setWordWrap(True)
+        self.ds_status.setStyleSheet("color: #6a6a6a;")
+        form.addRow("", self.ds_status)
         self.backbone_combo = QComboBox()  # populated per-dataset in _reload_backbones
         self.backbone_combo.currentIndexChanged.connect(self._rebuild_params)
         form.addRow("Model", self.backbone_combo)
@@ -58,6 +68,7 @@ class TrainPage(QWidget):
         self.detach_chk = QCheckBox("Detached (survives closing the app)")
         self.detach_chk.setChecked(True)
         self.smoke_chk = QCheckBox("Smoke run (2 epochs × 50 steps on A10G)")
+        self.smoke_chk.toggled.connect(self._apply_smoke)
         opts_row.addWidget(self.detach_chk)
         opts_row.addWidget(self.smoke_chk)
         opts_row.addStretch()
@@ -115,12 +126,16 @@ class TrainPage(QWidget):
 
         self.runner.output.connect(self._on_output)
         self.runner.finished.connect(self._on_finished)
+        self.runner.failed.connect(self._on_runner_failed)
         self.log_runner.output.connect(self._on_output)
         self.prep_worker.output.connect(self._append)
         self.prep_worker.done.connect(self._on_prepped)
         self.prep_worker.error.connect(self._on_prep_error)
         self.prep_uploader.output.connect(lambda s: self._append(s, newline=False))
         self.prep_uploader.finished.connect(self._on_prep_uploaded)
+        self.verify_worker.done.connect(self._on_verified)
+        self.verify_worker.error.connect(lambda tb: self._set_ds_status(
+            "Could not reach Modal — is the CLI authenticated? (modal token new)", "#b25f00"))
         self.parser.epoch.connect(self._on_epoch)
         self.parser.run_id.connect(self._on_run_id)
 
@@ -149,7 +164,65 @@ class TrainPage(QWidget):
         if meta_path and os.path.exists(meta_path):
             with open(meta_path, "r", encoding="utf-8") as f:
                 self._meta = json.load(f)
+        # Show what we know locally; the actual Modal volume is only confirmed by
+        # the "Check on Modal" button (the local flag can be stale).
+        if not name:
+            self._set_ds_status("")
+        elif info.get("builtin"):
+            self._set_ds_status("Built-in dataset (lives on the ieee-data volume).")
+        elif info.get("uploaded"):
+            self._set_ds_status("Marked uploaded locally — click “Check on Modal” to confirm.")
+        else:
+            self._set_ds_status("Not uploaded yet — upload it on the Datasets page first.",
+                                "#b25f00")
+        self.verify_btn.setEnabled(bool(name) and not info.get("builtin"))
         self._reload_backbones()
+
+    def _set_ds_status(self, text: str, color: str = "#6a6a6a"):
+        self.ds_status.setStyleSheet(f"color: {color};")
+        self.ds_status.setText(text)
+
+    def _verify_dataset(self):
+        """Actually list the dataset's Modal volume so the user can confirm the
+        upload is present rather than trusting the local 'uploaded' flag."""
+        name = self.dataset_combo.currentText()
+        info = appstate.known_datasets().get(name, {})
+        if not name or info.get("builtin"):
+            return
+        if self.verify_worker.running:
+            return
+        vol = info.get("volume", name)
+        self.verify_btn.setEnabled(False)
+        self._set_ds_status(f"Checking volume “{vol}” on Modal …")
+        self.verify_worker.start(_check_dataset_present, vol, name)
+
+    def _on_verified(self, res: dict):
+        self.verify_btn.setEnabled(True)
+        vol, n = res["volume"], res["scenes"]
+        if res["has_meta"]:
+            self._set_ds_status(
+                f"✓ Present on Modal volume “{vol}”: dataset_meta.json"
+                + (f" + {n} train scene(s)." if res["has_train"] else
+                   " but no train/ folder — re-upload on the Datasets page."),
+                "#2e7d32" if res["has_train"] else "#b25f00")
+        else:
+            self._set_ds_status(
+                f"✗ Not found on Modal volume “{vol}” — upload it on the Datasets page "
+                f"before training.", "#b25f00")
+
+    def _apply_smoke(self):
+        """Reflect the smoke override in the form so it's visible, not silent:
+        lock epochs=2 / steps=50 / GPU=A10G while the box is checked."""
+        on = self.smoke_chk.isChecked()
+        self.gpu_combo.setEnabled(not on)
+        if on:
+            self.gpu_combo.setCurrentText("A10G")
+        for flag, val in (("epochs", 2), ("steps-per-epoch", 50)):
+            w = self._param_widgets.get(flag)
+            if w is not None:
+                if on:
+                    w.setValue(val)
+                w.setEnabled(not on)
 
     def _reload_backbones(self):
         """Populate the model dropdown. Built-in IEEE datasets restrict it to the
@@ -200,6 +273,7 @@ class TrainPage(QWidget):
             self.warn_label.setText("\n".join("⚠ " + w for w in warns))
         else:
             self.warn_label.setText("")
+        self._apply_smoke()   # re-lock epochs/steps if a smoke run is selected
 
     # ------------------------------------------------------------- launch
     def _launch(self):
@@ -237,7 +311,10 @@ class TrainPage(QWidget):
         # Optional local prep: tile/subsample here and upload the cache so the
         # GPU container finds everything already preprocessed and skips it.
         # Built-ins already have their prep on the ieee-data volume — skip it.
-        if self.prep_chk.isChecked() and not info.get("builtin"):
+        # Local mode skips prep+upload entirely: the staged dataset IS the data,
+        # bind-mounted straight into the container at /datasets.
+        if (appstate.get_exec_mode() == "modal" and self.prep_chk.isChecked()
+                and not info.get("builtin")):
             staged = appstate.known_datasets().get(name, {}).get("staged_dir", "")
             if not prep.supports_local_prep(b.key):
                 self._append(f"[prep] {b.label} has no local prep path — the script "
@@ -250,22 +327,24 @@ class TrainPage(QWidget):
                 self.prep_worker.start(prep.prep_dataset, b.key, staged, dict(flags))
                 return
 
-        self._start_modal_run()
+        self._start_run()
 
     def _on_prepped(self, prep_dir):
         p = self._pending
         if p is None:
             return
         tag = prep_dir.name
-        remote = f"/{p['dataset']}/prep/{tag}"
-        self._append(f"[prep] Uploading cache -> {modal_cli.DATASETS_VOLUME}:{remote} …")
-        prog, args = modal_cli.volume_put(modal_cli.DATASETS_VOLUME, str(prep_dir), remote)
-        self.prep_uploader.start(prog, args, cwd=self.repo_root)
+        vol = p["dataset"]              # per-dataset volume named after the dataset
+        remote = f"/{vol}/prep/{tag}"
+        self._append(f"[prep] Uploading cache -> {vol}:{remote} …")
+        prog, args = modal_cli.volume_put(vol, str(prep_dir), remote)
+        self.prep_uploader.start(prog, args, cwd=self.repo_root,
+                                 pre=modal_cli.volume_create(vol))
 
     def _on_prep_error(self, tb: str):
         self._append(f"\n[prep] Local prep failed — falling back to remote "
                      f"preprocessing.\n{tb}")
-        self._start_modal_run()
+        self._start_run()
 
     def _on_prep_uploaded(self, code: int):
         if code != 0:
@@ -273,17 +352,69 @@ class TrainPage(QWidget):
                          f"preprocess remotely instead.")
         else:
             self._append("[prep] ✓ Cache uploaded — remote preprocessing will be skipped.")
-        self._start_modal_run()
+        self._start_run()
 
-    def _start_modal_run(self):
+    def _start_run(self):
+        """Dispatch the pending launch to Modal (cloud) or Docker (local)."""
         p, self._pending = self._pending, None
         if p is None:
             self.launch_btn.setEnabled(True)
             return
+        if appstate.get_exec_mode() == "local":
+            self._start_local_run(p)
+        else:
+            self._start_modal_run(p)
+
+    def _start_modal_run(self, p):
         prog, args = modal_cli.run_script(p["backbone"].script, p["flags"],
                                           detach=self.detach_chk.isChecked())
-        self._append(f"\n$ modal {' '.join(args)}   [TT_GPU={p['gpu']}]\n")
-        self.runner.start(prog, args, cwd=self.repo_root, extra_env={"TT_GPU": p["gpu"]})
+        extra_env = {"TT_GPU": p["gpu"]}
+        # User datasets live in their own volume (= dataset name); tell the script
+        # to mount it at /datasets. Built-ins (no "dataset" flag) leave it unset, so
+        # the script falls back to terminal-datasets (also used by inference).
+        ds_vol = p["flags"].get("dataset")
+        if ds_vol:
+            extra_env["TT_DATASET_VOLUME"] = ds_vol
+        self._append(f"\n$ modal {' '.join(args)}   [TT_GPU={p['gpu']}"
+                     f"{', TT_DATASET_VOLUME=' + ds_vol if ds_vol else ''}]\n")
+        self.runner.start(prog, args, cwd=self.repo_root, extra_env=extra_env)
+
+    def _start_local_run(self, p):
+        b, flags, gpu, name = p["backbone"], p["flags"], p["gpu"], p["dataset"]
+        info = appstate.known_datasets().get(name, {})
+        extra_mounts = []
+        if info.get("builtin"):
+            # Built-ins read raw data from /data/IEEE — only the user can supply it.
+            if not appstate.local_config().get("data_root"):
+                self._append("[local] ⚠ Built-in IEEE training reads /data/IEEE — set "
+                             "local_config['data_root'] (host → /data) or the run will fail.")
+        else:
+            # Mount the dataset's real staged dir at /datasets/<name> so local training
+            # works wherever it was converted (independent of datasets_root).
+            staged = info.get("staged_dir", "")
+            if staged and os.path.isdir(staged):
+                extra_mounts.append((staged, f"/datasets/{name}"))
+            else:
+                self._append(f"[local] ⚠ No local staged copy of '{name}' on this machine — "
+                             f"the container won't find /datasets/{name}.")
+        prog, args = local_cli.run_script(b.script, flags, b, repo_root=self.repo_root,
+                                          gpu=gpu, extra_mounts=extra_mounts)
+        self._append(f"\n[local] $ {local_cli.preview(prog, args)}\n")
+        if not local_cli.have_docker():
+            self._append(
+                "[local] docker not found on PATH — printed the exact command instead of "
+                "running it (design-now mode). On a Docker+GPU host, build the images with "
+                "docker/build_all.ps1, then launch: training writes to "
+                f"{appstate.local_runs_dir()}\\runs\\<id> (no upload/download).")
+            self.launch_btn.setEnabled(True)
+            return
+        self.runner.start(prog, args, cwd=self.repo_root)
+
+    def _on_runner_failed(self, err: str):
+        # QProcess FailedToStart fires `failed`, not `finished`, so re-enable the
+        # button here (otherwise a bad docker/modal exec wedges the UI).
+        self.launch_btn.setEnabled(True)
+        self._append(f"\n✗ Failed to start process: {err}")
 
     def _reattach(self):
         b = self._backbone()
@@ -345,3 +476,25 @@ def _wrap(layout) -> QWidget:
     layout.setContentsMargins(0, 0, 0, 0)
     w.setLayout(layout)
     return w
+
+
+def _entry_name(entry: dict) -> str:
+    """Basename of a `modal volume ls --json` entry (key name varies by CLI ver)."""
+    for k in ("path", "Filename", "filename", "name", "Name"):
+        v = entry.get(k)
+        if v:
+            return str(v).rstrip("/").rsplit("/", 1)[-1]
+    return ""
+
+
+def _check_dataset_present(volume: str, name: str, progress=None) -> dict:
+    """List the dataset's Modal volume to confirm the upload is really there.
+    The training script reads <volume>:/<name>/dataset_meta.json + /train, so
+    those are what we look for. Runs in a worker thread (blocking subprocess)."""
+    root = modal_cli.list_volume_entries(volume, f"/{name}")
+    names = {_entry_name(e) for e in root}
+    train = modal_cli.list_volume_entries(volume, f"/{name}/train") if "train" in names else []
+    return {"volume": volume, "name": name,
+            "has_meta": "dataset_meta.json" in names,
+            "has_train": "train" in names,
+            "scenes": sum(1 for e in train if _entry_name(e).endswith(".npz"))}

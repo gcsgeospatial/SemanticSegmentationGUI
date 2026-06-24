@@ -83,7 +83,7 @@ import modal
 # ============================================================================
 APP_NAME      = "ptv3-ieee-hag"
 GPU_TYPE      = os.environ.get("TT_GPU", "A100")
-N_EPOCHS      = 50            # PTv3 outdoor recipe (Wu et al., CVPR 2024): ~50
+N_EPOCHS      = 100            # PTv3 outdoor recipe (Wu et al., CVPR 2024): ~50
                              # epochs x 500 steps. Override per-run with --epochs;
                              # for a cheap end-to-end check pass --epochs 2.
 BATCH_SIZE    = 4
@@ -102,7 +102,9 @@ GRID_SIZE     = 0.5            # voxel grid (m). PTv3's 0.05 m outdoor default i
                                # positional-encoding conv with empty kernels (no
                                # point falls within a few voxels of another).
                                # 0.5 m ≈ the actual point spacing. Override --grid.
-USE_FLASH_ATTN = True
+USE_FLASH_ATTN = False  # ponytail: flash serialized-attn patch-gather OOBs mid-train
+                        # (the "device-side assert" crash). Off + patch_size 128 is the
+                        # documented Pointcept fix. Re-enable w/ patch 128 if you want speed.
 HOLDOUT_SEED   = 42
 N_VAL_HOLDOUT  = 10            # held-out train scenes for val (matches KPConvX cold)
 
@@ -146,11 +148,12 @@ RARE_FREQ_FRAC   = 0.5
 RARE_TILE_PROB   = 0.25    # P(draw the next train tile from a rare-class tile)
 
 # Periodic held-out validation + checkpoint/resume cadence.
-VAL_EVERY        = 10      # held-out val pass every N epochs (no weight updates)
-VAL_SUBSET       = 200     # tiles in the periodic val pass (seeded random subset)
+VAL_EVERY        = 10      # FULL voted eval over the combined eval set every N
+                          # epochs (no weight updates). Heavier than the old
+                          # subset val pass — raise this if it costs too much.
 CHECKPOINT_GAP   = 3       # checkpoint (model + optimizer) frequency, epochs
 RESUME           = False   # force-resume the latest matching run (see AUTO_RESUME)
-AUTO_RESUME      = True    # auto-continue an unfinished run (no DONE marker) on
+AUTO_RESUME      = False    # auto-continue an unfinished run (no DONE marker) on
                           # relaunch / Modal auto-retry, so an intermittent crash
                           # never loses the run — only epochs since last checkpoint
 
@@ -226,7 +229,8 @@ image = image.run_commands("touch /opt/ptv3/__init__.py")
 
 data_volume     = modal.Volume.from_name("ieee-data",           create_if_missing=True)
 outputs_volume  = modal.Volume.from_name(f"{APP_NAME}-outputs", create_if_missing=True)
-datasets_volume = modal.Volume.from_name("terminal-datasets",   create_if_missing=True)
+datasets_volume = modal.Volume.from_name(
+    os.environ.get("TT_DATASET_VOLUME", "terminal-datasets"), create_if_missing=True)
 
 
 # ============================================================================
@@ -362,12 +366,27 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
             else np.full(len(xyz), -1, np.int64)
         return xyz, rgb, lab
 
+    def _loadtxt_fast(path, delimiter=None):
+        """pandas' C parser reads big IEEE .txt scenes ~20-50x faster than
+        np.loadtxt — the eval-time raw-reload bottleneck (each multi-million-point
+        scene took minutes under loadtxt). Falls back to loadtxt if pandas is
+        unavailable or the parse fails. delimiter=None -> whitespace-separated."""
+        try:
+            import pandas as pd
+            if delimiter is None:
+                df = pd.read_csv(path, header=None, sep=r"\s+", engine="python")
+            else:
+                df = pd.read_csv(path, header=None, sep=delimiter)
+            return df.to_numpy()
+        except Exception:
+            return np.loadtxt(path, delimiter=delimiter)
+
     def _ieee_xyz_rgb(pc_path):
         """IEEE PC3.txt -> (xyz, rgb) where rgb carries per-scene p95-normalized
         intensity as grayscale (the one cue that separates water; same robust
         normalization as the KPConvX cold script). Intensity rides the 3 color
         channels so the model's in_channels=6 (coord+color) is unchanged."""
-        pc = np.loadtxt(pc_path, delimiter=",")                 # float64 (full precision)
+        pc = _loadtxt_fast(pc_path, ",")                        # float64 (full precision)
         # Subtract a per-scene origin before the float32 cast: projected (UTM)
         # coords otherwise quantize to ~0.25-0.5 m on the northing axis (float32
         # has ~7 sig digits). The offset is deterministic (floor of the per-scene
@@ -384,7 +403,7 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
         """Labeled IEEE scene -> (xyz, rgb, lab) with ASPRS codes mapped to
         contiguous indices (unmapped/ignored -> -1)."""
         xyz, rgb = _ieee_xyz_rgb(pc_path)
-        lab_raw = np.loadtxt(cls_path, dtype=np.int64).reshape(-1)
+        lab_raw = _loadtxt_fast(cls_path).reshape(-1).astype(np.int64)
         if len(lab_raw) != len(xyz):
             raise ValueError(f"point/label mismatch in {pc_path}: "
                              f"{len(xyz)} pts vs {len(lab_raw)} labels")
@@ -548,11 +567,11 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
             enc_depths=(2, 2, 2, 6, 2),
             enc_channels=(32, 64, 128, 256, 512),
             enc_num_head=(2, 4, 8, 16, 32),
-            enc_patch_size=(1024, 1024, 1024, 1024, 1024),
+            enc_patch_size=(128, 128, 128, 128, 128),   # 1024 overflowed the flash pad-gather
             dec_depths=(2, 2, 2, 2),
             dec_channels=(64, 64, 128, 256),
             dec_num_head=(4, 4, 8, 16),
-            dec_patch_size=(1024, 1024, 1024, 1024),
+            dec_patch_size=(128, 128, 128, 128),
             drop_path=DROP_PATH,
             enable_flash=use_flash,
             cls_mode=False,
@@ -660,7 +679,10 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
             raise FileNotFoundError(f"No scenes under {DATASETS_ROOT}/_infer/{infer_input}/scenes")
 
         run_id = datetime.utcnow().strftime("%Y%m%d_%H%M%S_infer")
-        run_dir = f"/outputs/runs/{run_id}"
+        # Predictions live next to the input scenes on the shared terminal-datasets
+        # volume (not the per-backbone outputs volume), so inference output lands in
+        # one consistent place no matter which model produced it.
+        run_dir = f"{DATASETS_ROOT}/_infer/{infer_input}"
         pred_dir = f"{run_dir}/predictions"
         os.makedirs(pred_dir, exist_ok=True)
         with open(f"{run_dir}/run_config.json", "w") as f:
@@ -679,8 +701,8 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
             xyz, pred, inten = predict_scene(pc_path)
             _write_ply(f"{pred_dir}/{name}_pred.ply", xyz, pred, palette, inten)
             print(f"  [infer] {name}: {len(xyz):,} pts in {time.time()-t0:.1f}s", flush=True)
-        outputs_volume.commit()
-        print(f"  [infer] done — predictions in runs/{run_id}/predictions", flush=True)
+        datasets_volume.commit()
+        print(f"  [infer] done — predictions in _infer/{infer_input}/predictions", flush=True)
         return
 
     # ==========================================================================
@@ -1041,137 +1063,15 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                 "gpu_mem_mb",
             ])
 
-    # --- Periodic held-out validation (eval mode, no_grad — weights untouched).
-    # Appends to val_metrics.csv + commits, so the train/val gap is watchable
-    # mid-run:  modal volume get <app>-outputs runs/<id>/val_metrics.csv --------
-    val_csv = f"{run_dir}/val_metrics.csv"
-    if not os.path.exists(val_csv):
-        with open(val_csv, "w", newline="") as f:
-            csv.writer(f).writerow(
-                ["epoch", "val_acc", "val_miou"] +
-                [f"iou_{_name(c)}" for c in range(NUM_CLASSES)])
-    _rs = np.random.RandomState(0)
-    val_subset = ([synth_test_tiles[i] for i in sorted(_rs.choice(
-        len(synth_test_tiles), min(VAL_SUBSET, len(synth_test_tiles)), replace=False))]
-        if synth_test_tiles else [])
-
-    def quick_val(ep):
-        backbone.eval(); head.eval()
-        inter = np.zeros(NUM_CLASSES, np.int64)
-        union = np.zeros(NUM_CLASSES, np.int64)
-        correct = total = 0
-        t0 = time.time()
-        with torch.no_grad():
-            for tile in val_subset:
-                try:
-                    batch, lbl = to_ptv3_batch([tile], training=False)
-                    point = backbone(batch)
-                    fe = point["feat"] if isinstance(point, dict) else point.feat
-                    pred = head(fe).argmax(-1)
-                except RuntimeError as e:
-                    if "out of memory" in str(e).lower():
-                        torch.cuda.empty_cache(); continue
-                    raise
-                v = lbl >= 0
-                correct += int((pred[v] == lbl[v]).sum()); total += int(v.sum())
-                for c in range(NUM_CLASSES):
-                    inter[c] += int(((pred == c) & (lbl == c)).sum())
-                    union[c] += int((((pred == c) | (lbl == c)) & v).sum())
-        with np.errstate(invalid="ignore"):
-            ious = inter / np.maximum(union, 1)
-        acc = correct / max(total, 1); miou = float(ious.mean())
-        with open(val_csv, "a", newline="") as f:
-            csv.writer(f).writerow([ep, f"{acc:.4f}", f"{miou:.4f}"] +
-                                   [f"{x:.4f}" for x in ious])
-        print(f"  [val @ ep {ep:3d}] acc={acc:.4f} mIoU={miou:.4f}  ({time.time()-t0:.0f}s)",
-              flush=True)
-        outputs_volume.commit()
-        backbone.train(); head.train()
-
-    LOG_EVERY = 20  # intra-epoch heartbeat
-    print(f"  starting at epoch {start_epoch}, up to {N_EPOCHS}, "
-          f"{STEPS} steps/epoch (batch {BATCH_SIZE})", flush=True)
-    t_run = time.time()
-    for ep in range(start_epoch, N_EPOCHS):
-        cur_lr = lr_at(ep)
-        for g in optim.param_groups:
-            g["lr"] = cur_lr
-        backbone.train(); head.train()
-        ep_loss = ep_correct = ep_total = 0
-        ep_inter = np.zeros(NUM_CLASSES, dtype=np.int64)
-        ep_union = np.zeros(NUM_CLASSES, dtype=np.int64)
-        t_ep = time.time(); t_chunk = t_ep; n_steps = 0; last_log_step = 0
-        print(f"  ep {ep:3d} starting (lr={cur_lr:.2e})…", flush=True)
-        for step in range(STEPS):
-            picks = [pick_train_tile() for _ in range(BATCH_SIZE)]
-            try:
-                batch, label = to_ptv3_batch(picks, training=True)
-                point = backbone(batch)
-                feat = point["feat"] if isinstance(point, dict) else point.feat
-                logits = head(feat)
-                loss = seg_loss(logits, label)
-                optim.zero_grad(); loss.backward()
-                torch.nn.utils.clip_grad_norm_(
-                    list(backbone.parameters()) + list(head.parameters()), GRAD_CLIP)
-                optim.step()
-                ep_loss += loss.item(); n_steps += 1
-                if n_steps % LOG_EVERY == 0:
-                    dt = time.time() - t_chunk
-                    print(f"    ep {ep:3d} step {n_steps:4d}: "
-                          f"loss={ep_loss/n_steps:.4f} "
-                          f"{(n_steps-last_log_step)/max(dt,1e-6):.2f} it/s", flush=True)
-                    t_chunk = time.time(); last_log_step = n_steps
-                pred = logits.argmax(-1)
-                m = label >= 0
-                ep_correct += (pred[m] == label[m]).sum().item()
-                ep_total   += int(m.sum())
-                for c in range(NUM_CLASSES):
-                    ep_inter[c] += ((pred == c) & (label == c)).sum().item()
-                    ep_union[c] += (((pred == c) | (label == c)) & m).sum().item()
-            except RuntimeError as e:
-                if "out of memory" in str(e).lower():
-                    torch.cuda.empty_cache(); continue
-                raise
-        sec_per_iter = (time.time() - t_ep) / max(n_steps, 1)
-        sec_per_epoch = time.time() - t_ep
-        train_acc = ep_correct / max(ep_total, 1)
-        with np.errstate(invalid="ignore"):
-            train_iou = float(np.mean(ep_inter / np.maximum(ep_union, 1)))
-        gpu_mem = torch.cuda.max_memory_allocated() / 1e6
-        with open(metrics_csv, "a", newline="") as f:
-            csv.writer(f).writerow([
-                ep, ep_loss / max(n_steps, 1), "", f"{train_acc:.4f}", "",
-                f"{train_iou:.4f}", "", f"{cur_lr:.6e}", f"{sec_per_iter:.4f}",
-                f"{sec_per_epoch:.2f}", f"{gpu_mem:.1f}",
-            ])
-        print(f"  ep {ep:3d}: loss={ep_loss/max(n_steps,1):.4f} "
-              f"acc={train_acc:.4f} miou={train_iou:.4f} lr={cur_lr:.2e} "
-              f"s/iter={sec_per_iter:.3f} s/ep={sec_per_epoch:.1f}", flush=True)
-        if (ep + 1) % CHECKPOINT_GAP == 0 or ep == N_EPOCHS - 1:
-            torch.save({"backbone": backbone.state_dict(), "head": head.state_dict(),
-                        "optim": optim.state_dict(), "epoch": ep},
-                       f"{run_dir}/checkpoints/ep{ep:03d}.pth")
-            # keep only the 2 newest checkpoints (~0.5 GB each with optimizer)
-            for old in sorted(glob.glob(f"{run_dir}/checkpoints/ep*.pth"))[:-2]:
-                try:
-                    os.remove(old)
-                except OSError:
-                    pass
-            outputs_volume.commit()
-        if (ep + 1) % VAL_EVERY == 0 or ep == N_EPOCHS - 1:
-            quick_val(ep)
-
-    torch.save({"backbone": backbone.state_dict(), "head": head.state_dict(),
-                "epoch": N_EPOCHS - 1}, f"{run_dir}/final_model.pth")
-
-    # --- Test ---------------------------------------------------------------
-    backbone.eval(); head.eval()
+    # --- Raw-scene loaders + ONE combined eval set ---------------------------
+    # val (train-holdout scenes) and test (the dedicated test split) are scored
+    # together as a single evaluation set. Each item carries its own tile dir so
+    # evaluate() votes per scene regardless of which split it came from.
     def _raw_loader(split, name):
         """Closure -> (xyz, rgb, lab) for the ORIGINAL raw scene, so the voted
-        voxel predictions can be reprojected onto raw points + raw GT (the
-        protocol KPConvX/RandLA score on). `name` is a parameter, so each closure
-        binds its own scene (no loop late-binding bug). HAG isn't needed here —
-        raw scoring only uses raw xyz + raw GT."""
+        voxel predictions can be reprojected onto raw points + raw GT. `name` is a
+        parameter, so each closure binds its own scene (no loop late-binding bug).
+        HAG isn't needed here — raw scoring only uses raw xyz + raw GT."""
         if ds_root:
             sub = "train" if split == "val" else "val"   # val holdout = train scenes
             return lambda: load_canonical(f"{ds_root}/{sub}/{name}.npz")
@@ -1181,7 +1081,15 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
         return lambda: load_ieee(f"{TEST_PC_DIR}/{name}_PC3.txt",
                                  f"{TEST_CLS_DIR}/{name}_CLS.txt")
 
-    def evaluate(scene_items, split_dir, label):
+    eval_items = (
+        [(n, _raw_loader("val", n), f"{PREP_DIR}/train") for n in sorted(hold)] +
+        [(n, _raw_loader("test", n), f"{PREP_DIR}/test")
+         for n in sorted({_scene_of(p) for p in real_test_tiles})]
+    )
+    print(f"  eval set: {len(eval_items)} scenes "
+          f"({len(hold)} holdout + {len(eval_items) - len(hold)} test)", flush=True)
+
+    def evaluate(scene_items, label):
         """Per-SCENE overlap voting scored on the ORIGINAL raw points — the
         official protocol KPConvX/RandLA use, so all three are directly
         comparable. For each scene: forward its overlapping tiles (stride
@@ -1202,7 +1110,7 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
         n_scenes = n_skipped_tiles = n_skipped_scenes = 0
         t_test = time.time()
         with torch.no_grad():
-            for name, load_raw in scene_items:
+            for name, load_raw, split_dir in scene_items:
                 tiles = sorted(glob.glob(f"{split_dir}/{name}_x*.npz"))
                 if not tiles:
                     n_skipped_scenes += 1; continue
@@ -1305,20 +1213,117 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
               f"skipped(tiles={n_skipped_tiles},scenes={n_skipped_scenes})", flush=True)
         return m
 
-    print("  evaluating on train-holdout val + test split…", flush=True)
-    val_items  = [(n, _raw_loader("val",  n)) for n in sorted(hold)]
-    test_items = [(n, _raw_loader("test", n))
-                  for n in sorted({_scene_of(p) for p in real_test_tiles})]
-    test_metrics = {
-        "val":  evaluate(val_items,  f"{PREP_DIR}/train", "val"),
-        "test": evaluate(test_items, f"{PREP_DIR}/test",  "test"),
-        "val_scenes":  [n for n, _ in val_items],
-        "test_scenes": [n for n, _ in test_items],
-    }
-    with open(f"{run_dir}/test_metrics.json", "w") as f:
-        json.dump(test_metrics, f, indent=2)
+    # --- Periodic evaluation: the REAL voted eval (not a cheap proxy) over the
+    # whole combined eval set every VAL_EVERY epochs, appended to val_metrics.csv
+    # so the curve is watchable mid-run. NOTE: this is far heavier than the old
+    # quick_val — it forwards every overlapping tile of every eval scene. Raise
+    # VAL_EVERY if it costs too much wall-clock. ------------------------------
+    val_csv = f"{run_dir}/val_metrics.csv"
+    if not os.path.exists(val_csv):
+        with open(val_csv, "w", newline="") as f:
+            csv.writer(f).writerow(
+                ["epoch", "val_acc", "val_miou"] +
+                [f"iou_{_name(c)}" for c in range(NUM_CLASSES)])
+
+    def run_eval(ep, write_json=False):
+        backbone.eval(); head.eval()
+        m = evaluate(eval_items, f"eval@ep{ep}")
+        ious = [m["per_class_iou"][_name(c)] for c in range(NUM_CLASSES)]
+        with open(val_csv, "a", newline="") as f:
+            csv.writer(f).writerow([ep, f"{m['overall_acc']:.4f}",
+                                    f"{m['overall_mIoU']:.4f}"] + [f"{x:.4f}" for x in ious])
+        if write_json:
+            # val + test are one combined set now; write the same metrics under
+            # both keys so the trainer_gui (which reads test_metrics["val"] and
+            # ["test"]) keeps rendering without changes.
+            with open(f"{run_dir}/test_metrics.json", "w") as fj:
+                json.dump({"val": m, "test": m,
+                           "eval_scenes": [n for n, _, _ in eval_items]}, fj, indent=2)
+        outputs_volume.commit()
+        backbone.train(); head.train()
+        return m
+
+    LOG_EVERY = 20  # intra-epoch heartbeat
+    print(f"  starting at epoch {start_epoch}, up to {N_EPOCHS}, "
+          f"{STEPS} steps/epoch (batch {BATCH_SIZE})", flush=True)
+    t_run = time.time()
+    for ep in range(start_epoch, N_EPOCHS):
+        cur_lr = lr_at(ep)
+        for g in optim.param_groups:
+            g["lr"] = cur_lr
+        backbone.train(); head.train()
+        ep_loss = ep_correct = ep_total = 0
+        ep_inter = np.zeros(NUM_CLASSES, dtype=np.int64)
+        ep_union = np.zeros(NUM_CLASSES, dtype=np.int64)
+        t_ep = time.time(); t_chunk = t_ep; n_steps = 0; last_log_step = 0
+        print(f"  ep {ep:3d} starting (lr={cur_lr:.2e})…", flush=True)
+        for step in range(STEPS):
+            picks = [pick_train_tile() for _ in range(BATCH_SIZE)]
+            try:
+                batch, label = to_ptv3_batch(picks, training=True)
+                point = backbone(batch)
+                feat = point["feat"] if isinstance(point, dict) else point.feat
+                logits = head(feat)
+                loss = seg_loss(logits, label)
+                optim.zero_grad(); loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    list(backbone.parameters()) + list(head.parameters()), GRAD_CLIP)
+                optim.step()
+                ep_loss += loss.item(); n_steps += 1
+                if n_steps % LOG_EVERY == 0:
+                    dt = time.time() - t_chunk
+                    print(f"    ep {ep:3d} step {n_steps:4d}: "
+                          f"loss={ep_loss/n_steps:.4f} "
+                          f"{(n_steps-last_log_step)/max(dt,1e-6):.2f} it/s", flush=True)
+                    t_chunk = time.time(); last_log_step = n_steps
+                pred = logits.argmax(-1)
+                m = label >= 0
+                ep_correct += (pred[m] == label[m]).sum().item()
+                ep_total   += int(m.sum())
+                for c in range(NUM_CLASSES):
+                    ep_inter[c] += ((pred == c) & (label == c)).sum().item()
+                    ep_union[c] += (((pred == c) | (label == c)) & m).sum().item()
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower():
+                    torch.cuda.empty_cache(); continue
+                raise
+        sec_per_iter = (time.time() - t_ep) / max(n_steps, 1)
+        sec_per_epoch = time.time() - t_ep
+        train_acc = ep_correct / max(ep_total, 1)
+        with np.errstate(invalid="ignore"):
+            train_iou = float(np.mean(ep_inter / np.maximum(ep_union, 1)))
+        gpu_mem = torch.cuda.max_memory_allocated() / 1e6
+        with open(metrics_csv, "a", newline="") as f:
+            csv.writer(f).writerow([
+                ep, ep_loss / max(n_steps, 1), "", f"{train_acc:.4f}", "",
+                f"{train_iou:.4f}", "", f"{cur_lr:.6e}", f"{sec_per_iter:.4f}",
+                f"{sec_per_epoch:.2f}", f"{gpu_mem:.1f}",
+            ])
+        print(f"  ep {ep:3d}: loss={ep_loss/max(n_steps,1):.4f} "
+              f"acc={train_acc:.4f} miou={train_iou:.4f} lr={cur_lr:.2e} "
+              f"s/iter={sec_per_iter:.3f} s/ep={sec_per_epoch:.1f}", flush=True)
+        if (ep + 1) % CHECKPOINT_GAP == 0 or ep == N_EPOCHS - 1:
+            torch.save({"backbone": backbone.state_dict(), "head": head.state_dict(),
+                        "optim": optim.state_dict(), "epoch": ep},
+                       f"{run_dir}/checkpoints/ep{ep:03d}.pth")
+            # keep only the 2 newest checkpoints (~0.5 GB each with optimizer)
+            for old in sorted(glob.glob(f"{run_dir}/checkpoints/ep*.pth"))[:-2]:
+                try:
+                    os.remove(old)
+                except OSError:
+                    pass
+            outputs_volume.commit()
+        if (ep + 1) % VAL_EVERY == 0 and ep != N_EPOCHS - 1:
+            run_eval(ep)               # last epoch handled by the final eval below
+
+    torch.save({"backbone": backbone.state_dict(), "head": head.state_dict(),
+                "epoch": N_EPOCHS - 1}, f"{run_dir}/final_model.pth")
+
+    # --- Final evaluation: the real voted eval over the combined eval set,
+    # written to test_metrics.json (the same number run_eval logs periodically). -
+    print("  final evaluation over the combined eval set…", flush=True)
+    run_eval(N_EPOCHS - 1, write_json=True)
     print(f"  total wall-clock {(time.time() - t_run)/3600:.2f} h")
-    outputs_volume.commit()
 
     # ------------------------------------------------------------------------
     # Prediction demo: canonical -> first N_PREDICT val scenes (PLY + npz);

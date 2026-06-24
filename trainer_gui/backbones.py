@@ -72,47 +72,7 @@ def _common(epochs_default: int, batch_default: int, steps_default: int = 500,
 
 BACKBONES: dict[str, Backbone] = {b.key: b for b in [
     Backbone(
-        key="ptv3_warm", label="PTv3 (warm — Sonata)", script="modal_train_ptv3_warm.py",
-        app_name="ptv3-warm-ieee", warm=True, ready=True,
-        grid_clamp=(0.05, 0.6),
-        params=[ParamSpec("grid", "Grid size (m)", "float", 0.30, 0.02, 3.0,
-                          step=0.05, decimals=2, recommend_key="grid")]
-               + _common(100, 4),
-    ),
-    Backbone(
-        key="randlanet_warm", label="RandLA-Net (warm)", script="modal_train_randlanet_warm.py",
-        app_name="randlanet-warm-ieee", warm=True, ready=True,
-        grid_clamp=(0.06, 0.5),
-        params=[ParamSpec("sub-grid", "Sub-grid size (m)", "float", 0.30, 0.02, 2.0,
-                          step=0.05, decimals=2, recommend_key="grid"),
-                ParamSpec("num-points", "Points / sample", "int", 45056, 4096, 131072)]
-               + _common(100, 6, chunk=False),   # RandLA samples spheres, no tiling
-    ),
-    Backbone(
-        key="octformer_warm", label="OctFormer (warm)", script="modal_train_octformer_warm.py",
-        app_name="octformer-warm-ieee", warm=True, ready=True,
-        grid_kind="octree_depth", grid_clamp=(9, 12),
-        params=[ParamSpec("octree-depth", "Octree depth", "int", 11, 8, 13,
-                          recommend_key="octree_depth")]
-               + _common(100, 4, steps_default=300),
-    ),
-    Backbone(
-        key="kpconvx_warm", label="KPConvX-L (warm)", script="modal_train_kpconvx_warm.py",
-        app_name="kpconvx-warm-ieee", warm=True, ready=True,
-        # in_sub_size wants ~1.1x the native point spacing (not 3x like voxel
-        # backbones) — the conv radius is 2.1 grid units on top of it.
-        grid_clamp=(0.05, 1.5), grid_mult=1.1,
-        params=[ParamSpec("grid", "Base sub-grid / in_sub_size (m)", "float", 0.8, 0.02, 3.0,
-                          step=0.05, decimals=2, recommend_key="grid"),
-                ParamSpec("epochs", "Epochs", "int", 100, 1, 1000),
-                ParamSpec("batch", "Grad-accum batch", "int", 2, 1, 16, recommend_key="batch"),
-                ParamSpec("steps-per-epoch", "Optimizer steps / epoch", "int", 300, 10, 5000),
-                ParamSpec("chunk-xy", "Tile size (m)", "float", 30.0, 10.0, 200.0,
-                          step=5.0, decimals=0, recommend_key="chunk_xy"),
-                ParamSpec("predict-n", "Scenes to predict after training", "int", 1, 0, 50)],
-    ),
-    Backbone(
-        key="ptv3", label="PTv3 (cold)", script="modal_train_ptv3.py",
+        key="ptv3", label="PTv3", script="modal_train_ptv3.py",
         app_name="ptv3-ieee", warm=False, ready=True, folder_infer=True,
         grid_clamp=(0.05, 0.6),
         params=[ParamSpec("grid", "Grid size (m)", "float", 0.05, 0.02, 3.0,
@@ -120,7 +80,7 @@ BACKBONES: dict[str, Backbone] = {b.key: b for b in [
                + _common(250, 4),
     ),
     Backbone(
-        key="randlanet", label="RandLA-Net (cold)", script="modal_train_randlanet.py",
+        key="randlanet", label="RandLA-Net", script="modal_train_randlanet.py",
         app_name="randlanet-cold-ieee", warm=False, ready=True, folder_infer=True,
         grid_clamp=(0.06, 0.5),
         params=[ParamSpec("sub-grid", "Sub-grid size (m)", "float", 0.12, 0.02, 2.0,
@@ -129,16 +89,8 @@ BACKBONES: dict[str, Backbone] = {b.key: b for b in [
                + _common(250, 6, chunk=False),
     ),
     Backbone(
-        key="octformer", label="OctFormer (cold)", script="modal_train_octformer.py",
-        app_name="octformer-stpls3d", warm=False, ready=True,
-        grid_kind="octree_depth", grid_clamp=(9, 12),
-        params=[ParamSpec("octree-depth", "Octree depth", "int", 11, 8, 13,
-                          recommend_key="octree_depth")]
-               + _common(250, 4, steps_default=300),
-    ),
-    Backbone(
-        key="kpconvx_cold", label="KPConvX-L (cold)", script="modal_train_kpconvx_cold.py",
-        app_name="kpconvx-cold-ieee", warm=False, folder_infer=True,
+        key="kpconvx_cold", label="KPConvX-L", script="modal_train_kpconvx_cold.py",
+        app_name="kpconvx-cold-ieee", warm=False, ready=True, folder_infer=True,
         grid_clamp=(0.5, 3.0),
         params=[ParamSpec("grid", "Grid size (m)", "float", 2.0, 0.1, 5.0,
                           step=0.1, decimals=2, recommend_key="grid")]
@@ -146,7 +98,7 @@ BACKBONES: dict[str, Backbone] = {b.key: b for b in [
     ),
     # --- HAG variants (real PDAL HeightAboveGround as an extra input channel) ---
     Backbone(
-        key="ptv3_hag", label="PTv3 (cold + HAG)", script="modal_train_ptv3_hag.py",
+        key="ptv3_hag", label="PTv3 + HAG", script="modal_train_ptv3_hag.py",
         app_name="ptv3-ieee-hag", warm=False, ready=True, folder_infer=True,
         grid_clamp=(0.05, 0.6),
         params=[ParamSpec("grid", "Grid size (m)", "float", 0.05, 0.02, 3.0,
@@ -154,7 +106,7 @@ BACKBONES: dict[str, Backbone] = {b.key: b for b in [
                + _common(250, 4),
     ),
     Backbone(
-        key="randlanet_hag", label="RandLA-Net (cold + HAG)",
+        key="randlanet_hag", label="RandLA-Net + HAG",
         script="modal_train_randlanet_hag.py",
         app_name="randlanet-cold-ieee-hag", warm=False, ready=True, folder_infer=True,
         grid_clamp=(0.06, 0.5),
@@ -163,13 +115,13 @@ BACKBONES: dict[str, Backbone] = {b.key: b for b in [
                 ParamSpec("num-points", "Points / sample", "int", 45056, 4096, 131072)]
                + _common(250, 6, chunk=False),
     ),
-    # KPConvX (cold) stays ready=False (its train_kpconvx has no --dataset path),
-    # but both KPConvX scripts now accept --mode infer --infer-input, so they're
-    # folder-inferable. Folder inference uses the z-tile-min HAG proxy.
+    # Both KPConvX scripts now have a --dataset training path (canonical scenes;
+    # the HAG variant uses the z-scene-min HAG proxy since canonical data has no
+    # HAG laz) plus --mode infer --infer-input for folder inference.
     Backbone(
-        key="kpconvx_cold_hag", label="KPConvX-L (cold + HAG)",
+        key="kpconvx_cold_hag", label="KPConvX-L + HAG",
         script="modal_train_kpconvx_cold_hag.py",
-        app_name="kpconvx-cold-ieee-hag", warm=False, folder_infer=True,
+        app_name="kpconvx-cold-ieee-hag", warm=False, ready=True, folder_infer=True,
         grid_clamp=(0.5, 3.0),
         params=[ParamSpec("grid", "Grid size (m)", "float", 2.0, 0.1, 5.0,
                           step=0.1, decimals=2, recommend_key="grid")]

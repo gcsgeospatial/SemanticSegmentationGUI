@@ -31,6 +31,47 @@ def runs_dir() -> Path:
     return d
 
 
+def local_runs_dir() -> Path:
+    """Where local (Docker) training writes runs/<id>/... — bind-mounted /outputs."""
+    d = app_dir() / "local_runs"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+# ---- execution mode: "modal" (cloud) | "local" (Docker on a GPU host) --------
+
+def get_exec_mode() -> str:
+    return "local" if get("exec_mode") == "local" else "modal"
+
+
+def set_exec_mode(mode: str) -> None:
+    put("exec_mode", "local" if mode == "local" else "modal")
+
+
+# Defaults for the local backend. Roots default to the dirs the GUI already
+# uses (so a converted dataset / inference job is immediately reachable); every
+# value is overridable from state.json["local_config"] for I/O modularity.
+_DEFAULT_LOCAL_CONFIG = {
+    "images": {},          # backbone.key -> docker image tag (default trainer-local-<key>)
+    "datasets_root": "",   # host -> /datasets (default: staging_dir())
+    "outputs_root": "",    # host -> /outputs  (default: local_runs_dir())
+    "data_root": "",       # host -> /data     (built-in IEEE raw data; optional)
+    "gpus": "all",         # docker --gpus value ("all" | "0" | "" to disable)
+    "extra_args": [],      # extra `docker run` args
+}
+
+
+def local_config() -> dict:
+    cfg = {**_DEFAULT_LOCAL_CONFIG, **get("local_config", {})}
+    cfg["datasets_root"] = cfg["datasets_root"] or str(staging_dir())
+    cfg["outputs_root"] = cfg["outputs_root"] or str(local_runs_dir())
+    return cfg
+
+
+def set_local_config(cfg: dict) -> None:
+    put("local_config", cfg)
+
+
 _STATE_PATH = None  # resolved lazily so tests can monkeypatch APPDATA
 
 
@@ -72,13 +113,13 @@ def put(key: str, value: Any) -> None:
 BUILTIN_DATASETS = {
     "IEEE": {
         "builtin": True, "uploaded": True, "meta_path": "",
-        "backbones": ["ptv3", "randlanet"],
+        "backbones": ["ptv3", "randlanet", "kpconvx_cold"],
         "note": "Raw IEEE GRSS 2019 Track 4 (ieee-data volume) — the scripts' "
                 "default. 5 classes: Ground/Trees/Building/Water/Bridge.",
     },
     "IEEE HAG": {
         "builtin": True, "uploaded": True, "meta_path": "",
-        "backbones": ["ptv3_hag", "randlanet_hag"],
+        "backbones": ["ptv3_hag", "randlanet_hag", "kpconvx_cold_hag"],
         "note": "Raw IEEE Track 4 + real per-point HeightAboveGround "
                 "(ieee-data:/IEEE/HAG) — trains the HAG model variants.",
     },

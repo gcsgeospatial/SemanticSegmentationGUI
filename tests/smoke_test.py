@@ -10,6 +10,7 @@ training-log parsing, viewer loading.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sys
 import tempfile
@@ -92,9 +93,9 @@ def main():
         classes = [{"index": 0, "source_value": 2, "name": "Ground"},
                    {"index": 1, "source_value": 5, "name": "Veg"},
                    {"index": 2, "source_value": 6, "name": "Building"}]
-        staged = dataset.convert_dataset("laz_demo", str(laz_root / "train"),
-                                         str(laz_root / "val"), spec, classes, [0],
-                                         tmp / "staging", progress=print)
+        staged = dataset.convert_dataset("laz_demo", str(laz_root / "train"), spec, classes,
+                                         [0], tmp / "staging",
+                                         val_inputs=[str(laz_root / "val")], progress=print)
         z = np.load(staged / "train" / "scene0.npz")
         check("laz npz: keys", {"xyz", "label", "rgb", "intensity"}.issubset(z.files))
         check("laz npz: xyz f32 (N,3)", z["xyz"].dtype == np.float32 and z["xyz"].shape[1] == 3)
@@ -108,12 +109,12 @@ def main():
         check("meta: class names ordered", meta["class_names"] == ["Ground", "Veg", "Building"])
         check("meta: counts populated", meta["classes"][0]["train_count"] > 0)
         check("meta: recommendations for all backbones",
-              "ptv3_warm" in meta["recommendations"] and "kpconvx_cold" in meta["recommendations"])
-        grid = meta["recommendations"]["ptv3_warm"]["grid"]
+              "ptv3" in meta["recommendations"] and "kpconvx_cold" in meta["recommendations"])
+        grid = meta["recommendations"]["ptv3"]["grid"]
         # 20k pts over ~100x100m -> 2 pts/m² -> spacing .7m -> 3x = 2.1 clamped to 0.6
         check(f"meta: ptv3 grid clamped to band (got {grid})", 0.05 <= grid <= 0.6)
-        check("meta: octformer got a depth",
-              9 <= meta["recommendations"]["octformer_warm"]["octree_depth"] <= 12)
+        check("meta: kpconvx grid clamped to its band",
+              0.5 <= meta["recommendations"]["kpconvx_cold"]["grid"] <= 3.0)
 
         # ---------------- PLY dataset with field labels
         ply_root = tmp / "ply_src"
@@ -126,9 +127,9 @@ def main():
         spec_ply = LabelSpec(kind="field", field="label")
         classes_ply = [{"index": i, "source_value": v, "name": f"c{v}"}
                        for i, v in enumerate([1, 2, 3])]
-        staged_ply = dataset.convert_dataset("ply_demo", str(ply_root / "train"),
-                                             str(ply_root / "val"), spec_ply, classes_ply,
-                                             [], tmp / "staging")
+        staged_ply = dataset.convert_dataset("ply_demo", str(ply_root / "train"), spec_ply,
+                                             classes_ply, [], tmp / "staging",
+                                             val_inputs=[str(ply_root / "val")])
         zp = np.load(staged_ply / "train" / "tile0.npz")
         check("ply npz: rgb present u8", zp["rgb"].dtype == np.uint8)
         check("ply npz: all labels mapped", set(np.unique(zp["label"])) == {0, 1, 2})
@@ -151,9 +152,9 @@ def main():
         check("ascii: companion labels scanned", set(counts_txt) == {0, 2, 6})
         classes_txt = [{"index": 0, "source_value": 2, "name": "Ground"},
                        {"index": 1, "source_value": 6, "name": "Building"}]
-        staged_txt = dataset.convert_dataset("txt_demo", str(txt_root / "train"),
-                                             str(txt_root / "val"), spec_txt, classes_txt,
-                                             [0], tmp / "staging")
+        staged_txt = dataset.convert_dataset("txt_demo", str(txt_root / "train"), spec_txt,
+                                             classes_txt, [0], tmp / "staging",
+                                             val_inputs=[str(txt_root / "val")])
         zt = np.load(staged_txt / "train" / "JAX_train0_PC3.npz")
         check("ascii npz: intensity + return_number captured",
               "intensity" in zt.files and "return_number" in zt.files)
@@ -172,7 +173,8 @@ def main():
         kd = appstate.known_datasets()
         check("appstate: IEEE + IEEE HAG are built-in known datasets",
               kd.get("IEEE", {}).get("builtin") is True
-              and kd.get("IEEE HAG", {}).get("backbones") == ["ptv3_hag", "randlanet_hag"])
+              and kd.get("IEEE HAG", {}).get("backbones")
+                  == ["ptv3_hag", "randlanet_hag", "kpconvx_cold_hag"])
         check("appstate: built-in dataset backbones all exist + are trainable",
               all(k in BACKBONES and BACKBONES[k].ready
                   for ds in ("IEEE", "IEEE HAG") for k in kd[ds]["backbones"]))
@@ -196,13 +198,23 @@ def main():
               and not BACKBONES["randlanet"].has_chunk)
         check("backbones: ptv3 uses --grid and has --chunk-xy",
               BACKBONES["ptv3"].grid_flag == "grid" and BACKBONES["ptv3"].has_chunk)
-        check("backbones: kpconvx is folder-inferable but not canonical-trainable",
-              BACKBONES["kpconvx_cold"].folder_infer and not BACKBONES["kpconvx_cold"].ready
-              and BACKBONES["kpconvx_cold_hag"].folder_infer)
+        check("backbones: kpconvx is folder-inferable and canonical-trainable",
+              BACKBONES["kpconvx_cold"].folder_infer and BACKBONES["kpconvx_cold"].ready
+              and BACKBONES["kpconvx_cold_hag"].folder_infer
+              and BACKBONES["kpconvx_cold_hag"].ready)
         check("backbones: IEEE outputs volumes (not stale stpls3d)",
               BACKBONES["ptv3"].outputs_volume == "ptv3-ieee-outputs"
               and BACKBONES["randlanet"].outputs_volume == "randlanet-cold-ieee-outputs"
               and BACKBONES["ptv3_hag"].outputs_volume == "ptv3-ieee-hag-outputs")
+
+        # Train page's Modal-presence check parses `modal volume ls --json` entries
+        # whose basename key varies by CLI version — lock the parser.
+        from trainer_gui.pages.train_page import _entry_name
+        check("train: _entry_name reads path/Filename/name across CLI shapes",
+              _entry_name({"path": "/ds/dataset_meta.json"}) == "dataset_meta.json"
+              and _entry_name({"Filename": "train/"}) == "train"
+              and _entry_name({"name": "a.npz"}) == "a.npz"
+              and _entry_name({}) == "")
 
         # ---------------- plots: read val curves, build figures, average runs
         from trainer_gui import plots
@@ -457,6 +469,102 @@ def main():
         from trainer_gui.viewer import _ieee_key
         check("viewer: _ieee_key lists all 5 classes (Water + Bridge included)",
               [n for n, _ in _ieee_key()] == ["Ground", "Trees", "Building", "Water", "Bridge"])
+
+        # ================= LOCAL (Docker) backend =================
+        import importlib
+        import typing
+
+        import _modal_shim
+        import local_run
+        from trainer_gui import local_cli
+        from trainer_gui.backbones import BACKBONES as BB
+
+        # the modal shim must import every training script (no torch / no cloud)
+        # and expose its @app.local_entrypoint main + the recorded Image recipe.
+        SCRIPTS = ["modal_train_ptv3", "modal_train_ptv3_hag", "modal_train_randlanet",
+                   "modal_train_randlanet_hag", "modal_train_kpconvx_cold",
+                   "modal_train_kpconvx_cold_hag"]
+        shim_ok, recipe_ok = True, True
+        for nm in SCRIPTS:
+            _modal_shim.install()
+            for m in list(sys.modules):
+                if m.startswith("modal_train_"):
+                    sys.modules.pop(m, None)
+            try:
+                mod = importlib.import_module(nm)
+            except Exception:  # noqa: BLE001
+                shim_ok = False
+                continue
+            app = _modal_shim.App.last
+            img = (app.image if app else None) or getattr(mod, "image", None)
+            if app is None or getattr(app, "entrypoint", None) is None:
+                shim_ok = False
+            if img is None or not getattr(img, "steps", None):
+                recipe_ok = False
+        check("local: modal shim imports all 6 train scripts + finds main", shim_ok)
+        check("local: every script records an Image recipe for Dockerfile gen", recipe_ok)
+
+        # local_run: kebab `--flag value` -> typed kwargs from main()'s signature
+        lf = local_run._parse_flags(["--dataset", "X", "--grid", "0.05",
+                                     "--epochs", "250", "--smoke"])
+        check("local_run: --flag value parsed, bare flag -> True",
+              lf == {"dataset": "X", "grid": "0.05", "epochs": "250", "smoke": True})
+        check("local_run: coerces via annotation (Optional[int]/[float]/[str])",
+              local_run._coerce("250", typing.Optional[int]) == 250
+              and local_run._coerce("0.05", typing.Optional[float]) == 0.05
+              and local_run._coerce("0.05", typing.Optional[str]) == "0.05")
+
+        # gen_dockerfiles: recipe -> a buildable Dockerfile (cuda base, ctx, quoting)
+        import tools.gen_dockerfiles as gen
+        df, contexts = gen.build_dockerfile("ptv3", "modal_train_ptv3.py")
+        check("gen: ptv3 Dockerfile uses a CUDA devel base + python bootstrap",
+              "FROM nvidia/cuda:" in df and "-devel-ubuntu22.04" in df
+              and "ln -sf /usr/bin/python3 /usr/bin/python" in df)
+        check("gen: Dockerfile pins a heredoc-capable frontend on line 1",
+              df.splitlines()[0] == "# syntax=docker/dockerfile:1")
+        check("gen: shell-unsafe pip version specs are quoted",
+              "'numpy<2.0'" in df and "'pandas<3'" in df)
+        check("gen: model repo COPY uses a build-context matching build_all",
+              "COPY --from=ptv3src . /opt/ptv3" in df and "ptv3src" in contexts)
+        dfr, _ = gen.build_dockerfile("randlanet", "modal_train_randlanet.py")
+        check("gen: multi-line run command emitted as a RUN heredoc",
+              "RUN <<'TT_EOT'" in dfr and "build_ext --inplace" in dfr)
+
+        # local_cli + appstate exec mode/config, isolated to a throwaway APPDATA
+        from trainer_gui import appstate
+        _old_appdata = os.environ.get("APPDATA")
+        os.environ["APPDATA"] = str(tmp / "appdata_local")
+        try:
+            check("appstate: exec mode defaults to modal", appstate.get_exec_mode() == "modal")
+            appstate.set_exec_mode("local")
+            check("appstate: exec mode persists to local", appstate.get_exec_mode() == "local")
+            cfg = appstate.local_config()
+            check("appstate: local_config fills datasets/outputs roots + gpus",
+                  bool(cfg["datasets_root"]) and bool(cfg["outputs_root"])
+                  and isinstance(cfg["images"], dict) and cfg["gpus"] == "all")
+            appstate.set_local_config({**cfg, "images": {"ptv3": "myimg:1"}, "gpus": "0"})
+            check("appstate: local_config overrides round-trip",
+                  appstate.local_config()["images"]["ptv3"] == "myimg:1"
+                  and appstate.local_config()["gpus"] == "0")
+
+            prog, args = local_cli.run_script(
+                "modal_train_ptv3.py", {"dataset": "myds", "grid": 0.05, "epochs": 250},
+                BB["ptv3"], repo_root="/repo", gpu="A100")
+            joined = " ".join(args)
+            check("local_cli: docker run with gpus + workspace/datasets/outputs mounts",
+                  args[0] == "run" and "--gpus" in args and "/repo:/workspace" in args
+                  and ":/datasets" in joined and ":/outputs" in joined)
+            check("local_cli: invokes local_run on the right script with the flags",
+                  "local_run.py" in args and "modal_train_ptv3.py" in args
+                  and "--dataset" in args and "myds" in args and "--grid" in args)
+            check("local_cli: image tag override respected (else trainer-local-<key>)",
+                  local_cli.image_for(BB["ptv3"]) == "myimg:1"
+                  and local_cli.image_for(BB["randlanet"]) == "trainer-local-randlanet")
+        finally:
+            if _old_appdata is None:
+                os.environ.pop("APPDATA", None)
+            else:
+                os.environ["APPDATA"] = _old_appdata
 
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

@@ -210,14 +210,9 @@ def _read_gt(gt_path: Path, scene: str) -> np.ndarray:
     return asprs_to_index(np.loadtxt(str(gt_path)).astype(np.int64).reshape(-1))
 
 
-def compare_clouds(pred_path: Path, gt_path: Path, intensity_path: Path | None = None):
-    """Error map for a prediction (.ply class-coloured, or .npz with pred/label)
-    against ground truth. Correct points are shaded by intensity (so structure
-    stays visible), wrong points are YELLOW.
-    gt_path: a folder (matched by scene name) or a single file — a class-coloured
-    .ply, an .npz, or an IEEE <scene>_CLS.txt.
-    intensity_path: optional cloud to read intensity from; otherwise it's taken
-    from the prediction npz, or auto-found from a sibling scene. -> (xyz, colors, key)."""
+def _load_pred(pred_path: Path):
+    """(xyz, pred_classes, intensity|None, scene) from a prediction .ply
+    (class-coloured) or .npz (with pred/label + xyz)."""
     from .palette import class_from_rgb
     from .readers import read_points
 
@@ -241,6 +236,41 @@ def compare_clouds(pred_path: Path, gt_path: Path, intensity_path: Path | None =
     scene = pred_path.stem
     for suffix in ("_pred", "_PC3", "_CLS", "_gt"):
         scene = scene.replace(suffix, "")
+    return xyz, pred, inten, scene
+
+
+def prediction_metrics(pred_path, gt_path) -> dict:
+    """Overall accuracy + mIoU + per-class IoU of a prediction cloud against
+    ground truth, scored on points that carry a GT label. mIoU averages only the
+    classes present in GT or prediction (absent classes don't drag it to zero)."""
+    pred_path, gt_path = Path(pred_path), Path(gt_path)
+    _, pred, _, scene = _load_pred(pred_path)
+    gt = _read_gt(gt_path, scene)
+    n = min(len(pred), len(gt))
+    pred, gt = pred[:n], gt[:n]
+    has = gt >= 0
+    labeled = int(has.sum())
+    acc = float((pred[has] == gt[has]).sum()) / max(labeled, 1)
+    present = sorted({int(c) for c in np.unique(pred[has])} | {int(c) for c in np.unique(gt[has])})
+    ious = {}
+    for c in present:
+        inter = int(((pred == c) & (gt == c) & has).sum())
+        union = int((((pred == c) | (gt == c)) & has).sum())
+        ious[c] = inter / union if union else 0.0
+    miou = float(np.mean(list(ious.values()))) if ious else 0.0
+    return {"scene": scene, "accuracy": acc, "miou": miou,
+            "labeled": labeled, "per_class_iou": ious}
+
+
+def compare_clouds(pred_path: Path, gt_path: Path, intensity_path: Path | None = None):
+    """Error map for a prediction (.ply class-coloured, or .npz with pred/label)
+    against ground truth. Correct points are shaded by intensity (so structure
+    stays visible), wrong points are YELLOW.
+    gt_path: a folder (matched by scene name) or a single file — a class-coloured
+    .ply, an .npz, or an IEEE <scene>_CLS.txt.
+    intensity_path: optional cloud to read intensity from; otherwise it's taken
+    from the prediction npz, or auto-found from a sibling scene. -> (xyz, colors, key)."""
+    xyz, pred, inten, scene = _load_pred(pred_path)
     if inten is None and intensity_path is not None:
         inten = _load_intensity(Path(intensity_path))
     if inten is None:

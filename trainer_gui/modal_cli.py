@@ -7,6 +7,7 @@ JobRunner. The `modal` executable is resolved from PATH.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 
@@ -15,6 +16,12 @@ DATASETS_VOLUME = "terminal-datasets"
 
 def modal_exe() -> str:
     return shutil.which("modal") or "modal"
+
+
+def volume_create(volume: str) -> tuple[str, list[str]]:
+    # Idempotent in intent: errors (non-zero) if the volume already exists, so
+    # callers run it as JobRunner's `pre` step and ignore the exit code.
+    return modal_exe(), ["volume", "create", volume]
 
 
 def volume_put(volume: str, local_path: str, remote_path: str) -> tuple[str, list[str]]:
@@ -52,9 +59,12 @@ def app_logs(app_name: str) -> tuple[str, list[str]]:
 def list_volume_entries(volume: str, remote_path: str = "/", timeout: int = 60) -> list[dict]:
     """Blocking `modal volume ls --json`; returns [] if the path doesn't exist."""
     prog, args = volume_ls(volume, remote_path)
+    # Force UTF-8 in the child: modal emits ✓/box chars and crashes encoding them
+    # under Windows' default cp1252 (same hazard as JobRunner).
+    env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
     try:
         out = subprocess.run([prog] + args, capture_output=True, text=True,
-                             timeout=timeout, encoding="utf-8", errors="replace")
+                             timeout=timeout, encoding="utf-8", errors="replace", env=env)
     except (OSError, subprocess.TimeoutExpired):
         return []
     if out.returncode != 0:

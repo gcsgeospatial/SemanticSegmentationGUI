@@ -65,19 +65,40 @@ class JobRunner(QObject):
         return self.proc is not None and self.proc.state() != QProcess.NotRunning
 
     def start(self, program: str, args: list[str], cwd: str = "",
-              extra_env: dict | None = None):
+              extra_env: dict | None = None, pre: tuple | None = None):
+        """Run `program args`. If `pre=(program, args)` is given it runs first and
+        its exit code is IGNORED (used for idempotent `modal volume create`, which
+        errors when the volume already exists), then the main command runs and its
+        code is the one `finished` reports."""
         if self.running:
             raise RuntimeError("JobRunner already has a live process")
+        self._cwd = cwd
+        self._extra_env = extra_env
+        self._main = (program, list(args))
+        if pre is not None:
+            self._stage = "pre"
+            self._launch(pre[0], list(pre[1]))
+        else:
+            self._stage = "main"
+            self._launch(program, list(args))
+
+    def _launch(self, program: str, args: list[str]):
         env = QProcessEnvironment.systemEnvironment()
-        env.insert("PYTHONUTF8", "1")        # Modal prints ✓ — avoid cp1252 crashes
+        # Modal prints ✓ and box-drawing chars; on Windows the child's stdout
+        # defaults to cp1252 and crashes encoding them (silently aborting e.g. a
+        # `volume put`). Force UTF-8 two ways — PYTHONUTF8 enables UTF-8 mode,
+        # PYTHONIOENCODING pins the stream encoding even for libs (rich/click)
+        # that read it directly.
+        env.insert("PYTHONUTF8", "1")
+        env.insert("PYTHONIOENCODING", "utf-8")
         env.insert("PYTHONUNBUFFERED", "1")  # line-by-line streaming
-        for k, v in (extra_env or {}).items():
+        for k, v in (self._extra_env or {}).items():
             env.insert(k, str(v))
         self.proc = QProcess(self)
         self.proc.setProcessEnvironment(env)
         self.proc.setProcessChannelMode(QProcess.MergedChannels)
-        if cwd:
-            self.proc.setWorkingDirectory(cwd)
+        if self._cwd:
+            self.proc.setWorkingDirectory(self._cwd)
         self.proc.readyReadStandardOutput.connect(self._on_output)
         self.proc.finished.connect(self._on_finished)
         self.proc.errorOccurred.connect(
@@ -93,6 +114,10 @@ class JobRunner(QObject):
         self.output.emit(data)
 
     def _on_finished(self, code, _status):
+        if self._stage == "pre":      # ignore create's exit; run the real command
+            self._stage = "main"
+            self._launch(*self._main)
+            return
         self.finished.emit(int(code))
         self.proc = None
 

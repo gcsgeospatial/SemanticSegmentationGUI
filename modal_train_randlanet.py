@@ -179,7 +179,8 @@ image = image.run_commands(
 
 data_volume     = modal.Volume.from_name("ieee-data",            create_if_missing=True)
 outputs_volume  = modal.Volume.from_name(f"{APP_NAME}-outputs",  create_if_missing=True)
-datasets_volume = modal.Volume.from_name("terminal-datasets",    create_if_missing=True)
+datasets_volume = modal.Volume.from_name(
+    os.environ.get("TT_DATASET_VOLUME", "terminal-datasets"), create_if_missing=True)
 
 
 # ============================================================================
@@ -771,7 +772,10 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
             raise FileNotFoundError(f"No scenes under {DATASETS_ROOT}/_infer/{infer_input}/scenes")
 
         run_id = datetime.utcnow().strftime("%Y%m%d_%H%M%S_infer")
-        run_dir = f"/outputs/runs/{run_id}"
+        # Predictions live next to the input scenes on the shared terminal-datasets
+        # volume (not the per-backbone outputs volume), so inference output lands in
+        # one consistent place no matter which model produced it.
+        run_dir = f"{DATASETS_ROOT}/_infer/{infer_input}"
         pred_dir = f"{run_dir}/predictions"
         os.makedirs(pred_dir, exist_ok=True)
         with open(f"{run_dir}/run_config.json", "w") as f:
@@ -790,8 +794,8 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
             xyz, pred, inten = predict_scene(pc_path)
             _write_ply(f"{pred_dir}/{name}_pred.ply", xyz, pred, palette, inten)
             print(f"  [infer] {name}: {len(xyz):,} pts in {time.time()-t0:.1f}s", flush=True)
-        outputs_volume.commit()
-        print(f"  [infer] done — predictions in runs/{run_id}/predictions", flush=True)
+        datasets_volume.commit()
+        print(f"  [infer] done — predictions in _infer/{infer_input}/predictions", flush=True)
         return
 
     # ==========================================================================
