@@ -90,6 +90,30 @@ def set_local_config(cfg: dict) -> None:
     put("local_config", cfg)
 
 
+# ---- which backbones to show in local mode (hide images your driver can't run) --
+
+def enabled_backbones():
+    """Backbone keys enabled for local mode, or None = all. Lets you hide a
+    backbone whose Docker image you can't run (e.g. a cu124 image on an older
+    driver) or simply don't use. Stored explicitly once the user picks."""
+    val = get("local_config", {}).get("enabled_backbones")
+    return None if val is None else set(val)
+
+
+def set_enabled_backbones(keys) -> None:
+    cfg = {**get("local_config", {}), "enabled_backbones": list(keys)}
+    put("local_config", cfg)
+
+
+def backbone_enabled(key: str) -> bool:
+    """True if this backbone should appear. Only filters in local mode; an unset
+    selection means all are enabled."""
+    if get_exec_mode() != "local":
+        return True
+    en = enabled_backbones()
+    return en is None or key in en
+
+
 _STATE_PATH = None  # resolved lazily so tests can monkeypatch APPDATA
 
 

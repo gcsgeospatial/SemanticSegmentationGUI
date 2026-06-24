@@ -114,6 +114,8 @@ class MainWindow(QWidget):
         self.train_page = TrainPage(REPO_ROOT)
         self.plotting_page = PlottingPage(REPO_ROOT)
         self.infer_page = InferPage(REPO_ROOT)
+        # Local backbone selection (Train page checkboxes) also filters Inference.
+        self.train_page.models_changed.connect(self.infer_page.reload_backbones)
         # Each page scrolls vertically instead of being crammed into the window.
         for page in (self.datasets_page, self.train_page,
                      self.plotting_page, self.infer_page):

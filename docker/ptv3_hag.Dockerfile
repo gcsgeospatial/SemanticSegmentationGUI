@@ -6,7 +6,7 @@
 FROM nvidia/cuda:12.4.0-devel-ubuntu22.04
 ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      python3 python3-pip git wget build-essential cmake ninja-build libgl1 libglib2.0-0 \
+      python3 python3-pip python3-dev git wget build-essential cmake ninja-build libgl1 libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 RUN ln -sf /usr/bin/python3 /usr/bin/python
 RUN python -m pip install --no-cache-dir --upgrade pip

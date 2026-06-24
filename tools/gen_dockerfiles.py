@@ -101,9 +101,11 @@ def build_dockerfile(key, script):
     for kind, p in steps:
         if kind == "apt":
             apt_pkgs += p
-    # ubuntu 22.04 already ships python 3.10 (a symlink gives us `python`;
-    # python-is-python3 lives in `universe`, which may be off on the CUDA base).
-    boot = ["python3", "python3-pip"] + apt_pkgs
+    # ubuntu 22.04 already ships python 3.10. python3-dev gives Python.h — the
+    # KPConv/RandLA C++ extensions #include it at build_ext time and fail without
+    # it (Modal's debian_slim bundled the headers; the CUDA base doesn't). The
+    # symlink below gives us `python` (python-is-python3 lives in `universe`).
+    boot = ["python3", "python3-pip", "python3-dev"] + apt_pkgs
 
     contexts = {}   # ctx name -> host src
     out = [

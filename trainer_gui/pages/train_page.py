@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDoubleSpinBox,
                                QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel,
@@ -18,6 +18,8 @@ from ..jobs import FuncWorker, JobRunner, LogParser
 
 
 class TrainPage(QWidget):
+    models_changed = Signal()   # local backbone selection changed -> refresh other pages
+
     def __init__(self, repo_root: str):
         super().__init__()
         self.repo_root = repo_root
@@ -98,6 +100,8 @@ class TrainPage(QWidget):
         # Config column (scrolls when squeezed so the log can take the room).
         config_col = QVBoxLayout()
         config_col.addWidget(form_box)
+        self._models_box = self._make_models_box()   # local-mode only (see apply_exec_mode)
+        config_col.addWidget(self._models_box)
         config_col.addWidget(self.params_box)
         config_col.addWidget(self.warn_label)
         config_col.addLayout(run_row)
@@ -149,6 +153,9 @@ class TrainPage(QWidget):
         self.verify_btn.setVisible(not local)                # Check on Modal volume
         self.smoke_chk.setText("Smoke run (2 epochs × 50 steps)" if local
                                else "Smoke run (2 epochs × 50 steps on A10G)")
+        self._models_box.setVisible(local)
+        if local:
+            self._sync_model_checks()
         self.sub.setText(
             "Pick a dataset and a model. Parameters are pre-filled from the dataset's "
             "density analysis — edit anything before launching. "
@@ -156,6 +163,47 @@ class TrainPage(QWidget):
                if local else
                "Runs execute on Modal; detached runs keep going if you close this app."))
         self.reload_datasets()
+
+    # ---------------------------------------------------- local model selection
+    def _make_models_box(self):
+        """Checkbox per backbone — untick the ones you don't want loaded locally
+        (e.g. a cu124 image an older driver can't run). Local mode only."""
+        box = QGroupBox("Local models — which backbones to show")
+        lay = QVBoxLayout(box)
+        hint = QLabel("Untick a backbone to hide it everywhere in local mode (e.g. an "
+                      "image your GPU driver is too old to run). Build/pull only the ones "
+                      "you keep.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #6a6a6a;")
+        lay.addWidget(hint)
+        self._model_checks: dict[str, QCheckBox] = {}
+        cols = QHBoxLayout()
+        col = QVBoxLayout()
+        for n, (key, b) in enumerate(BACKBONES.items()):
+            chk = QCheckBox(b.label)
+            chk.toggled.connect(self._on_models_changed)
+            self._model_checks[key] = chk
+            col.addWidget(chk)
+            if n == (len(BACKBONES) - 1) // 2:   # split into two columns
+                cols.addLayout(col)
+                col = QVBoxLayout()
+        cols.addLayout(col)
+        cols.addStretch()
+        lay.addLayout(cols)
+        return box
+
+    def _sync_model_checks(self):
+        en = appstate.enabled_backbones()        # None = all enabled
+        for key, chk in self._model_checks.items():
+            chk.blockSignals(True)
+            chk.setChecked(en is None or key in en)
+            chk.blockSignals(False)
+
+    def _on_models_changed(self):
+        keys = [k for k, chk in self._model_checks.items() if chk.isChecked()]
+        appstate.set_enabled_backbones(keys)
+        self._reload_backbones()
+        self.models_changed.emit()              # let the Inference page refresh too
 
     # ------------------------------------------------------------- datasets
     def reload_datasets(self):
@@ -249,6 +297,8 @@ class TrainPage(QWidget):
         self.backbone_combo.clear()
         for key, b in BACKBONES.items():
             if allowed and key not in allowed:
+                continue
+            if not appstate.backbone_enabled(key):   # hidden in local mode by the user
                 continue
             self.backbone_combo.addItem(
                 b.label + ("" if b.ready else "  (script not wired yet)"), key)

@@ -593,6 +593,19 @@ def main():
             check("local_cli: missing local-only image blocks with a build hint",
                   ok_local is False and "build_all" in msg_local
                   and not local_cli.is_pullable(BB["randlanet"]))
+
+            # backbone selection: unset = all; an explicit list filters in local mode only.
+            check("appstate: backbones all enabled by default (unset)",
+                  appstate.enabled_backbones() is None
+                  and appstate.backbone_enabled("ptv3_hag"))
+            appstate.set_enabled_backbones(["ptv3", "randlanet", "kpconvx_cold"])
+            check("appstate: explicit selection hides the others in local mode",
+                  appstate.backbone_enabled("randlanet")
+                  and not appstate.backbone_enabled("ptv3_hag"))
+            appstate.set_exec_mode("modal")
+            check("appstate: selection does NOT filter in modal mode",
+                  appstate.backbone_enabled("ptv3_hag"))
+            appstate.set_exec_mode("local")
         finally:
             if _old_appdata is None:
                 os.environ.pop("APPDATA", None)

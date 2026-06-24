@@ -73,9 +73,8 @@ class InferPage(QWidget):
         self.pth_row_w = _wrap(pth_row)
         wf.addRow("File", self.pth_row_w)
         self.backbone_combo = QComboBox()
-        for key, b in infer_backbones().items():
-            self.backbone_combo.addItem(b.label, key)
         self.backbone_combo.currentIndexChanged.connect(self._sync_controls)
+        # populated at the end of __init__ (reload_backbones needs grid_spin etc.)
         wf.addRow("Model architecture", self.backbone_combo)
 
         ibox = QGroupBox("Input")
@@ -153,18 +152,33 @@ class InferPage(QWidget):
         self.runner.failed.connect(self._on_runner_failed)
         self.parser.run_id.connect(self._on_run_id)
 
+        self.reload_backbones()
         self.reload_runs()
         self._on_source_toggle()
-        self._sync_controls()
         self.apply_exec_mode(appstate.get_exec_mode() == "local")
 
     def apply_exec_mode(self, local: bool):
-        """Reword copy for the backend. Inference has no Modal-only controls
-        (just weights + a folder), so there's nothing to hide."""
+        """Reword copy for the backend + apply the local backbone filter. Inference
+        has no other Modal-only controls (just weights + a folder)."""
         self.sub.setText(
             "Label new point clouds with an already-trained model. Pick the weights "
             "(a finished run, or a local .pth), point at a folder of clouds, and run"
             + (" — inference runs locally in Docker." if local else " on Modal."))
+        self.reload_backbones()
+
+    def reload_backbones(self):
+        """Populate the model dropdown, honoring the local-mode backbone filter."""
+        prev = self.backbone_combo.currentData()
+        self.backbone_combo.blockSignals(True)
+        self.backbone_combo.clear()
+        for key, b in infer_backbones().items():
+            if appstate.backbone_enabled(key):
+                self.backbone_combo.addItem(b.label, key)
+        i = self.backbone_combo.findData(prev)
+        if i >= 0:
+            self.backbone_combo.setCurrentIndex(i)
+        self.backbone_combo.blockSignals(False)
+        self._sync_controls()
 
     # ------------------------------------------------------------- inputs
     def reload_runs(self):
@@ -202,6 +216,8 @@ class InferPage(QWidget):
         """Auto-fill grid + tile size from the selected script's own defaults
         (RandLA uses sub-grid; KPConvX a 2 m grid / 100 m tiles), and disable
         tile size for RandLA (it samples spheres, so tiling is meaningless)."""
+        if self.backbone_combo.currentData() is None:   # all backbones unticked
+            return
         b = self._backbone()
         gp = next((p for p in b.params if p.recommend_key == "grid"), None)
         if gp:
