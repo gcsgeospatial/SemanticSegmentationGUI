@@ -126,8 +126,11 @@ class MainWindow(QWidget):
         mode = self.mode_combo.currentData()
         appstate.set_exec_mode(mode)
         self._apply_mode_tag(mode)
-        # Built-in datasets are hidden in local mode — refresh the Train picker now.
-        self.train_page.reload_datasets()
+        # Re-scheme every page for the chosen backend (hide Modal-only controls,
+        # drop built-ins, reword copy).
+        local = mode == "local"
+        for page in (self.datasets_page, self.train_page, self.infer_page):
+            page.apply_exec_mode(local)
 
     def _apply_mode_tag(self, mode: str):
         self.tag.setText("point-cloud training — local (Docker)" if mode == "local"

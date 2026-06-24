@@ -68,6 +68,7 @@ def set_exec_mode(mode: str) -> None:
 # value is overridable from state.json["local_config"] for I/O modularity.
 _DEFAULT_LOCAL_CONFIG = {
     "images": {},          # backbone.key -> docker image tag (default trainer-local-<key>)
+    "registry": "",        # registry prefix, e.g. "ghcr.io/you" -> pull instead of build
     "datasets_root": "",   # host -> /datasets (default: staging_dir())
     "outputs_root": "",    # host -> /outputs  (default: local_runs_dir())
     "data_root": "",       # host -> /data     (built-in IEEE raw data; optional)
@@ -80,6 +81,8 @@ def local_config() -> dict:
     cfg = {**_DEFAULT_LOCAL_CONFIG, **get("local_config", {})}
     cfg["datasets_root"] = cfg["datasets_root"] or str(staging_dir())
     cfg["outputs_root"] = cfg["outputs_root"] or str(local_runs_dir())
+    # TT_REGISTRY lets you set the registry once in the environment (no JSON edit).
+    cfg["registry"] = cfg["registry"] or os.environ.get("TT_REGISTRY", "")
     return cfg
 
 

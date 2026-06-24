@@ -577,6 +577,22 @@ def main():
             check("local_cli: image tag override respected (else trainer-local-<key>)",
                   local_cli.image_for(BB["ptv3"]) == "myimg:1"
                   and local_cli.image_for(BB["randlanet"]) == "trainer-local-randlanet")
+
+            # registry distribution: a configured registry makes the default tag
+            # pullable (build once, pull anywhere); local-only tags must be built.
+            appstate.set_local_config({**appstate.local_config(), "images": {},
+                                       "registry": "ghcr.io/acme"})
+            check("local_cli: registry prefixes the default image tag + marks it pullable",
+                  local_cli.image_for(BB["randlanet"]) == "ghcr.io/acme/trainer-local-randlanet"
+                  and local_cli.is_pullable(BB["randlanet"]))
+            ok_pull, _ = local_cli.image_preflight(BB["randlanet"])   # absent but pullable
+            check("local_cli: missing-but-pullable image is allowed to run (docker auto-pulls)",
+                  ok_pull is True)
+            appstate.set_local_config({**appstate.local_config(), "registry": ""})
+            ok_local, msg_local = local_cli.image_preflight(BB["randlanet"])  # absent, local-only
+            check("local_cli: missing local-only image blocks with a build hint",
+                  ok_local is False and "build_all" in msg_local
+                  and not local_cli.is_pullable(BB["randlanet"]))
         finally:
             if _old_appdata is None:
                 os.environ.pop("APPDATA", None)

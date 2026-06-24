@@ -36,15 +36,13 @@ class TrainPage(QWidget):
         title = QLabel("Train")
         title.setObjectName("pageTitle")
         root.addWidget(title)
-        sub = QLabel("Pick a dataset and a model. Parameters are pre-filled from the dataset's "
-                     "density analysis — edit anything before launching. Runs execute on Modal; "
-                     "detached runs keep going if you close this app.")
-        sub.setWordWrap(True)
-        sub.setObjectName("pageSub")
-        root.addWidget(sub)
+        self.sub = QLabel()
+        self.sub.setWordWrap(True)
+        self.sub.setObjectName("pageSub")
+        root.addWidget(self.sub)
 
         form_box = QGroupBox("Job")
-        form = QFormLayout(form_box)
+        form = self.form = QFormLayout(form_box)
         self.dataset_combo = QComboBox()
         self.dataset_combo.currentIndexChanged.connect(self._on_dataset_change)
         ds_row = QHBoxLayout()
@@ -139,8 +137,25 @@ class TrainPage(QWidget):
         self.parser.epoch.connect(self._on_epoch)
         self.parser.run_id.connect(self._on_run_id)
 
-        self.reload_datasets()
+        self.apply_exec_mode(appstate.get_exec_mode() == "local")
         self._rebuild_params()
+
+    def apply_exec_mode(self, local: bool):
+        """Hide Modal-only controls + reword copy for the local (Docker) backend."""
+        self.form.setRowVisible(self.gpu_combo, not local)   # GPU type is a Modal pick
+        self.form.setRowVisible(self.prep_chk, not local)    # prep+upload is Modal-only
+        self.detach_chk.setVisible(not local)                # Modal detach
+        self.attach_btn.setVisible(not local)                # modal app logs
+        self.verify_btn.setVisible(not local)                # Check on Modal volume
+        self.smoke_chk.setText("Smoke run (2 epochs × 50 steps)" if local
+                               else "Smoke run (2 epochs × 50 steps on A10G)")
+        self.sub.setText(
+            "Pick a dataset and a model. Parameters are pre-filled from the dataset's "
+            "density analysis — edit anything before launching. "
+            + ("Runs execute locally in Docker on your GPU."
+               if local else
+               "Runs execute on Modal; detached runs keep going if you close this app."))
+        self.reload_datasets()
 
     # ------------------------------------------------------------- datasets
     def reload_datasets(self):
@@ -406,6 +421,12 @@ class TrainPage(QWidget):
                 "running it (design-now mode). On a Docker+GPU host, build the images with "
                 "docker/build_all script, then launch: training writes to "
                 f"{appstate.local_runs_dir().as_posix()}/runs/<id> (no upload/download).")
+            self.launch_btn.setEnabled(True)
+            return
+        ok, msg = local_cli.image_preflight(b)
+        if msg:
+            self._append(msg)
+        if not ok:
             self.launch_btn.setEnabled(True)
             return
         self.runner.start(prog, args, cwd=self.repo_root)

@@ -1,0 +1,92 @@
+name: build-local-images
+
+# Build the per-backbone Docker images on GitHub's CPU runners (no GPU needed —
+# the CUDA torch/spconv are prebuilt pip wheels, the KPConv/RandLA C++ ops are
+# CPU compiles, and pykeops compiles CUDA at RUNTIME, not build) and push them to
+# GHCR. Other machines then `docker pull ghcr.io/<owner>/trainer-local-<key>`
+# (set TT_REGISTRY=ghcr.io/<owner>) instead of building anything.
+#
+# The model source is cloned from its upstream repo, PINNED to the exact commit
+# the scripts were validated against (the local clones on the dev box sit at these
+# same SHAs, unmodified). To move to a newer upstream, bump the `sha` below.
+# Nothing to configure before the first run — just commit this file and trigger it
+# from the Actions tab.
+
+on:
+  workflow_dispatch:        # manual only — run it from the Actions tab
+
+permissions:
+  contents: read
+  packages: write           # lets GITHUB_TOKEN push to GHCR (no PAT needed)
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false      # one backbone failing shouldn't cancel the others
+      matrix:
+        include:
+          - key: ptv3
+            ctx: ptv3src
+            url: 'https://github.com/Pointcept/PointTransformerV3'
+            sha: '3229e9b7de1770c8ad17c316f8e349982de509f8'
+            subdir: ''
+          - key: ptv3_hag
+            ctx: ptv3src
+            url: 'https://github.com/Pointcept/PointTransformerV3'
+            sha: '3229e9b7de1770c8ad17c316f8e349982de509f8'
+            subdir: ''
+          - key: randlanet
+            ctx: randlanetsrc
+            url: 'https://github.com/tsunghan-wu/RandLA-Net-pytorch'
+            sha: '75adeacdb796db07e69ba990c36409c5d3ee886b'
+            subdir: ''
+          - key: randlanet_hag
+            ctx: randlanetsrc
+            url: 'https://github.com/tsunghan-wu/RandLA-Net-pytorch'
+            sha: '75adeacdb796db07e69ba990c36409c5d3ee886b'
+            subdir: ''
+          - key: kpconvx_cold
+            ctx: kpconvxsrc
+            url: 'https://github.com/apple/ml-kpconvx'
+            sha: '54e644a9f3bddd4c344a58193897a44582b0fea4'
+            subdir: '/Standalone/KPConvX'
+          - key: kpconvx_cold_hag
+            ctx: kpconvxsrc
+            url: 'https://github.com/apple/ml-kpconvx'
+            sha: '54e644a9f3bddd4c344a58193897a44582b0fea4'
+            subdir: '/Standalone/KPConvX'
+    steps:
+      - name: Checkout this repo (Dockerfiles)
+        uses: actions/checkout@v4
+
+      - name: Reclaim disk space (CUDA images are multi-GB)
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+                      /usr/local/share/boost /opt/hostedtoolcache
+          df -h /
+
+      - name: Fetch the model source (pinned commit)
+        run: |
+          git clone "${{ matrix.url }}" model-src
+          git -C model-src checkout --quiet "${{ matrix.sha }}"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & push ${{ matrix.key }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/${{ matrix.key }}.Dockerfile
+          build-contexts: ${{ matrix.ctx }}=model-src${{ matrix.subdir }}
+          tags: ghcr.io/${{ github.repository_owner }}/trainer-local-${{ matrix.key }}:latest
+          push: true
+          provenance: false

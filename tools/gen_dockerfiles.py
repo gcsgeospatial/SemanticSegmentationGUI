@@ -188,7 +188,46 @@ def main():
     sh += builds
     with open(os.path.join(docker_dir, "build_all.sh"), "w", encoding="utf-8", newline="\n") as f:
         f.write("\n".join(sh) + "\n")
-    print("wrote docker/build_all.ps1 + docker/build_all.sh")
+
+    # Registry distribution: push the built images once, pull them on machines
+    # that won't build (they need no model repos — the code is baked into each
+    # image). TT_REGISTRY (e.g. ghcr.io/<you>) is the single knob, shared with the
+    # GUI's local_config['registry'].
+    def _write(fname, lines, crlf=False):
+        nl = "\r\n" if crlf else "\n"
+        with open(os.path.join(docker_dir, fname), "w", encoding="utf-8", newline=nl) as f:
+            f.write("\n".join(lines) + "\n")
+
+    sh_keys = " ".join(SCRIPTS)
+    ps_keys = ",".join(f'"{k}"' for k in SCRIPTS)
+    push_note = ("Tag + push the locally-built trainer-local-* images to a registry so other "
+                 "machines can pull them (no model repos needed — the code is baked in).")
+    pull_note = "Pull the trainer-local-* images on a machine that won't build them."
+    sh_guard = ': "${TT_REGISTRY:?set TT_REGISTRY=ghcr.io/<your-user-or-org> (docker login first)}"'
+    ps_guard = ('if (-not $env:TT_REGISTRY) { throw '
+                '"set $env:TT_REGISTRY=ghcr.io/<your-user-or-org> (docker login first)" }')
+
+    _write("push_all.sh", [
+        "#!/usr/bin/env bash", "# " + push_note,
+        "# Usage:  TT_REGISTRY=ghcr.io/<you> bash docker/push_all.sh   (after: docker login <registry>)",
+        "set -euo pipefail", sh_guard, f"for key in {sh_keys}; do",
+        '  docker tag "trainer-local-$key" "$TT_REGISTRY/trainer-local-$key:latest"',
+        '  docker push "$TT_REGISTRY/trainer-local-$key:latest"', "done",
+        'echo "pushed to $TT_REGISTRY — set TT_REGISTRY (or local_config[\'registry\']) there too."'])
+    _write("pull_all.sh", [
+        "#!/usr/bin/env bash", "# " + pull_note,
+        "# Usage:  TT_REGISTRY=ghcr.io/<you> bash docker/pull_all.sh",
+        "set -euo pipefail", sh_guard, f"for key in {sh_keys}; do",
+        '  docker pull "$TT_REGISTRY/trainer-local-$key:latest"', "done"])
+    _write("push_all.ps1", [
+        "# " + push_note, ps_guard, f"foreach ($key in @({ps_keys})) {{",
+        '  docker tag "trainer-local-$key" "$env:TT_REGISTRY/trainer-local-$key:latest"',
+        '  docker push "$env:TT_REGISTRY/trainer-local-$key:latest"', "}"], crlf=True)
+    _write("pull_all.ps1", [
+        "# " + pull_note, ps_guard, f"foreach ($key in @({ps_keys})) {{",
+        '  docker pull "$env:TT_REGISTRY/trainer-local-$key:latest"', "}"], crlf=True)
+
+    print("wrote docker/build_all + push_all + pull_all (.ps1 + .sh)")
 
 
 if __name__ == "__main__":

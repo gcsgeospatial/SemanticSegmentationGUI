@@ -44,11 +44,10 @@ class InferPage(QWidget):
         title = QLabel("Inference")
         title.setObjectName("pageTitle")
         root.addWidget(title)
-        sub = QLabel("Label new point clouds with an already-trained model. Pick the weights "
-                     "(a finished run, or a local .pth), point at a folder of clouds, and run.")
-        sub.setWordWrap(True)
-        sub.setObjectName("pageSub")
-        root.addWidget(sub)
+        self.sub = QLabel()
+        self.sub.setWordWrap(True)
+        self.sub.setObjectName("pageSub")
+        root.addWidget(self.sub)
 
         wbox = QGroupBox("Weights")
         wf = QFormLayout(wbox)
@@ -157,6 +156,15 @@ class InferPage(QWidget):
         self.reload_runs()
         self._on_source_toggle()
         self._sync_controls()
+        self.apply_exec_mode(appstate.get_exec_mode() == "local")
+
+    def apply_exec_mode(self, local: bool):
+        """Reword copy for the backend. Inference has no Modal-only controls
+        (just weights + a folder), so there's nothing to hide."""
+        self.sub.setText(
+            "Label new point clouds with an already-trained model. Pick the weights "
+            "(a finished run, or a local .pth), point at a folder of clouds, and run"
+            + (" — inference runs locally in Docker." if local else " on Modal."))
 
     # ------------------------------------------------------------- inputs
     def reload_runs(self):
@@ -385,6 +393,12 @@ class InferPage(QWidget):
             self._append("[local] docker not found on PATH — printed the exact command "
                          "(design-now mode). On a Docker+GPU host the predictions land in "
                          f"{self._staged.as_posix()}/predictions.")
+            self.run_btn.setEnabled(True)
+            return
+        ok, msg = local_cli.image_preflight(b)
+        if msg:
+            self._append(msg)
+        if not ok:
             self.run_btn.setEnabled(True)
             return
         self.runner.start(prog, args, cwd=self.repo_root)

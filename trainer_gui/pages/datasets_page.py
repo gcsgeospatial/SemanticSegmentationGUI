@@ -47,13 +47,10 @@ class DatasetsPage(QWidget):
         title = QLabel("Datasets")
         title.setObjectName("pageTitle")
         root.addWidget(title)
-        sub = QLabel("Build a trainable dataset, step by step: point at point clouds "
-                     "(las/laz, ply, txt/csv, pcd, npy/npz), optionally add Height-Above-Ground, "
-                     "name the classes, split train/val (tiled by point density automatically), "
-                     "then convert locally and upload to a per-dataset Modal volume.")
-        sub.setWordWrap(True)
-        sub.setObjectName("pageSub")
-        root.addWidget(sub)
+        self.sub = QLabel()
+        self.sub.setWordWrap(True)
+        self.sub.setObjectName("pageSub")
+        root.addWidget(self.sub)
 
         # ---- the workflow: a plain top-to-bottom stack (the whole page scrolls),
         # so each section keeps its natural height and the collapsible Advanced
@@ -97,6 +94,21 @@ class DatasetsPage(QWidget):
         self.uploader.output.connect(lambda s: self._append(s, newline=False))
         self.uploader.finished.connect(self._on_upload_done)
         self.uploader.failed.connect(self._on_upload_failed)
+        self.apply_exec_mode(appstate.get_exec_mode() == "local")
+
+    def apply_exec_mode(self, local: bool):
+        """Local mode never uploads to Modal — hide the upload buttons, drop the
+        built-ins from the saved list, and reword the workflow copy."""
+        self.upload_btn.setVisible(not local)
+        self.upload_saved_btn.setVisible(not local)
+        self.sub.setText(
+            "Build a trainable dataset, step by step: point at point clouds "
+            "(las/laz, ply, txt/csv, pcd, npy/npz), optionally add Height-Above-Ground, "
+            "name the classes, split train/val (tiled by point density automatically), "
+            + ("then convert — it's staged on disk and ready to train in Docker."
+               if local else
+               "then convert locally and upload to a per-dataset Modal volume."))
+        self._reload_known()
 
     # ============================================================= 1. New dataset
     def _new_dataset_box(self) -> QWidget:
@@ -571,8 +583,12 @@ class DatasetsPage(QWidget):
             "uploaded": False,
         })
         self._reload_known()
-        self._append(f"\n✓ Converted -> {staged}\nClick 'Upload to Modal' to push it to its "
-                     f"per-dataset volume.")
+        if appstate.get_exec_mode() == "local":
+            self._append(f"\n✓ Converted -> {staged}\nReady — pick '{staged.name}' on the Train "
+                         f"page (it's bind-mounted into the container at /datasets/{staged.name}).")
+        else:
+            self._append(f"\n✓ Converted -> {staged}\nClick 'Upload to Modal' to push it to its "
+                         f"per-dataset volume.")
 
     def _upload(self):
         if not (self._staged_dir and self._staged_dir.exists()):
@@ -657,8 +673,9 @@ class DatasetsPage(QWidget):
 
     # ------------------------------------------------------------- known list
     def _reload_known(self):
+        # selectable_datasets() drops built-ins in local mode (no /data pipeline).
         self.known_list.clear()
-        for name in sorted(appstate.known_datasets()):
+        for name in sorted(appstate.selectable_datasets()):
             self.known_list.addItem(name)
 
     def _show_known(self):
@@ -671,10 +688,14 @@ class DatasetsPage(QWidget):
             return
         staged = info.get("staged_dir", "")
         on_disk = bool(staged) and os.path.isdir(staged)
-        status = ("uploaded ✓ (re-upload to refresh)" if info.get("uploaded")
-                  else "not uploaded — click “Upload selected to Modal”")
-        if not on_disk:
-            status += "  ·  local copy missing (upload will ask where it is)"
+        if appstate.get_exec_mode() == "local":
+            status = ("staged on disk ✓ — ready to train" if on_disk
+                      else "local copy missing — re-convert it on this machine")
+        else:
+            status = ("uploaded ✓ (re-upload to refresh)" if info.get("uploaded")
+                      else "not uploaded — click “Upload selected to Modal”")
+            if not on_disk:
+                status += "  ·  local copy missing (upload will ask where it is)"
         meta_path = info.get("meta_path", "")
         if meta_path and os.path.exists(meta_path):
             import json
