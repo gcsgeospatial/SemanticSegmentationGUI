@@ -147,7 +147,7 @@ class TrainPage(QWidget):
         current = self.dataset_combo.currentText()
         self.dataset_combo.blockSignals(True)
         self.dataset_combo.clear()
-        for name in sorted(appstate.known_datasets()):
+        for name in sorted(appstate.selectable_datasets()):
             self.dataset_combo.addItem(name)
         self.dataset_combo.blockSignals(False)
         if current:

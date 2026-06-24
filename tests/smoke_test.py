@@ -546,8 +546,15 @@ def main():
         os.environ["APPDATA"] = str(tmp / "appdata_local")
         try:
             check("appstate: exec mode defaults to modal", appstate.get_exec_mode() == "modal")
+            check("appstate: modal mode offers built-in datasets",
+                  "IEEE" in appstate.selectable_datasets()
+                  and "IEEE HAG" in appstate.selectable_datasets())
             appstate.set_exec_mode("local")
             check("appstate: exec mode persists to local", appstate.get_exec_mode() == "local")
+            check("appstate: local mode hides built-in datasets (known_datasets still has them)",
+                  "IEEE" not in appstate.selectable_datasets()
+                  and "IEEE HAG" not in appstate.selectable_datasets()
+                  and "IEEE" in appstate.known_datasets())
             cfg = appstate.local_config()
             check("appstate: local_config fills datasets/outputs roots + gpus",
                   bool(cfg["datasets_root"]) and bool(cfg["outputs_root"])

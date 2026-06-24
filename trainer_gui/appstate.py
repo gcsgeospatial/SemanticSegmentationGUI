@@ -146,6 +146,16 @@ def known_datasets() -> dict:
     return {**get("datasets", {}), **BUILTIN_DATASETS}
 
 
+def selectable_datasets() -> dict:
+    """Datasets offered for a job. Built-ins read raw IEEE data from a remote
+    /data volume the local backend doesn't provision, so they're hidden in local
+    mode — convert your own dataset on the Datasets page instead."""
+    ds = known_datasets()
+    if get_exec_mode() == "local":
+        return {k: v for k, v in ds.items() if not v.get("builtin")}
+    return ds
+
+
 def remember_dataset(name: str, info: dict) -> None:
     ds = known_datasets()
     ds[name] = info
