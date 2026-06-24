@@ -8,7 +8,8 @@ and view the predicted point cloud — all in one place.
 
 The env is pinned to Python 3.11 because Open3D ships no wheels for 3.13
 (which is what a current base conda gives you). [pixi](https://pixi.sh) handles
-all of it:
+all of it on **Windows and Linux** (`win-64` + `linux-64`) — the commands are
+identical on both (the block below is PowerShell; use any shell):
 
 ```powershell
 cd trainer_gui

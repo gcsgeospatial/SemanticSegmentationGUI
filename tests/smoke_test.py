@@ -530,6 +530,16 @@ def main():
         check("gen: multi-line run command emitted as a RUN heredoc",
               "RUN <<'TT_EOT'" in dfr and "build_ext --inplace" in dfr)
 
+        # cross-platform app dir: APPDATA overrides everywhere; else native per-OS
+        check("appstate: _app_base honors APPDATA on every platform",
+              appstate._app_base("linux", {"APPDATA": "/x"}) == Path("/x")
+              and appstate._app_base("win32", {"APPDATA": "/x"}) == Path("/x"))
+        check("appstate: _app_base uses XDG/.config on Linux, Library on macOS, LOCALAPPDATA on win",
+              appstate._app_base("linux", {"XDG_CONFIG_HOME": "/cfg"}) == Path("/cfg")
+              and appstate._app_base("linux", {}) == Path.home() / ".config"
+              and appstate._app_base("darwin", {}) == Path.home() / "Library" / "Application Support"
+              and appstate._app_base("win32", {"LOCALAPPDATA": "/la"}) == Path("/la"))
+
         # local_cli + appstate exec mode/config, isolated to a throwaway APPDATA
         from trainer_gui import appstate
         _old_appdata = os.environ.get("APPDATA")

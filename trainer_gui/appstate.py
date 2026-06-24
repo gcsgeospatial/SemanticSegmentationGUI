@@ -1,20 +1,35 @@
 """Persisted app state (known datasets, last-used params, run history).
 
-Stored as JSON under %APPDATA%/trainer_gui/. Staging and downloaded run
-artifacts also live there so the repo stays clean.
+Stored as JSON in the per-OS app dir (%APPDATA% on Windows, $XDG_CONFIG_HOME or
+~/.config on Linux, ~/Library/Application Support on macOS). Staging and
+downloaded run artifacts also live there so the repo stays clean.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
 
+def _app_base(platform: str, environ) -> Path:
+    """Native per-OS base dir for app data. APPDATA is honored on EVERY platform
+    so it stays a single override knob (tests set it); otherwise pick the native
+    location for the OS."""
+    if environ.get("APPDATA"):
+        return Path(environ["APPDATA"])
+    home = Path.home()
+    if platform == "win32":
+        return Path(environ.get("LOCALAPPDATA") or home)
+    if platform == "darwin":
+        return home / "Library" / "Application Support"
+    return Path(environ.get("XDG_CONFIG_HOME") or (home / ".config"))
+
+
 def app_dir() -> Path:
-    base = os.environ.get("APPDATA") or str(Path.home())
-    d = Path(base) / "trainer_gui"
+    d = _app_base(sys.platform, os.environ) / "trainer_gui"
     d.mkdir(parents=True, exist_ok=True)
     return d
 

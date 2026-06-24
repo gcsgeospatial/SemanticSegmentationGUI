@@ -3,7 +3,7 @@ name = "trainer-gui"
 version = "0.1.0"
 description = "Unified training terminal for the Modal point-cloud training scripts."
 channels = ["conda-forge"]
-platforms = ["win-64"]
+platforms = ["win-64", "linux-64"]
 
 # Pinned to 3.11: open3d ships no wheels for Python 3.13 (your base conda), and
 # numpy<2 has no 3.13 wheels either. Everything here is local-side only — the

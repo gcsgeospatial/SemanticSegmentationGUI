@@ -384,7 +384,7 @@ class InferPage(QWidget):
         if not local_cli.have_docker():
             self._append("[local] docker not found on PATH — printed the exact command "
                          "(design-now mode). On a Docker+GPU host the predictions land in "
-                         f"{self._staged}\\predictions.")
+                         f"{self._staged.as_posix()}/predictions.")
             self.run_btn.setEnabled(True)
             return
         self.runner.start(prog, args, cwd=self.repo_root)

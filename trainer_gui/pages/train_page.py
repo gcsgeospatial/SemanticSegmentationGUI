@@ -404,8 +404,8 @@ class TrainPage(QWidget):
             self._append(
                 "[local] docker not found on PATH — printed the exact command instead of "
                 "running it (design-now mode). On a Docker+GPU host, build the images with "
-                "docker/build_all.ps1, then launch: training writes to "
-                f"{appstate.local_runs_dir()}\\runs\\<id> (no upload/download).")
+                "docker/build_all script, then launch: training writes to "
+                f"{appstate.local_runs_dir().as_posix()}/runs/<id> (no upload/download).")
             self.launch_btn.setEnabled(True)
             return
         self.runner.start(prog, args, cwd=self.repo_root)
