@@ -68,7 +68,6 @@ def _common(epochs_default: int, batch_default: int, steps_default: int = 500,
     if chunk:
         specs.append(ParamSpec("chunk-xy", "Tile size (m)", "float", chunk_default, 10.0, 200.0,
                                step=5.0, decimals=0, recommend_key="chunk_xy"))
-    specs.append(ParamSpec("predict-n", "Scenes to predict after training", "int", 1, 0, 50))
     return specs
 
 

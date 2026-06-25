@@ -1,9 +1,9 @@
 """Datasets page — the full dataset workflow in one place, top to bottom:
 
   1. New dataset       point at a file/folder, name it, say where labels live
-  2. Pre-process       (optional) add Height-Above-Ground with PDAL
-  3. Classes           scan label values, name them, mark ignored, check density
-  4. Split & tiling     train/val split; data is tiled by point density by default
+  2. Classes           scan label values, name them, mark ignored, check density
+  3. Split & tiling     train/val split; data is tiled by point density by default
+  4. Pre-process       (optional) add Height-Above-Ground with PDAL
   5. Convert + Upload  write the canonical npz locally, then push to a Modal volume
 
 Tiling is on by default (size auto-derived from point density); the standalone
@@ -56,10 +56,10 @@ class DatasetsPage(QWidget):
         # so each section keeps its natural height and the collapsible Advanced
         # section grows/shrinks instead of being pinned to a fixed-height slot ----
         root.addWidget(self._new_dataset_box())   # 1
-        root.addWidget(self._prep_box())          # 2  (after New dataset)
-        root.addWidget(self._classes_box())       # 3
-        root.addWidget(self._split_box())         # 4
-        root.addWidget(self._advanced_box())      # 4b
+        root.addWidget(self._classes_box())       # 2
+        root.addWidget(self._split_box())         # 3
+        root.addWidget(self._advanced_box())      # 3b
+        root.addWidget(self._prep_box())          # 4  (HAG — optional, below split)
         root.addLayout(self._go_layout())         # 5
 
         # ---- saved datasets: bottom layer ----
@@ -134,9 +134,9 @@ class DatasetsPage(QWidget):
         form.addRow("Output folder", out_row)
         return box
 
-    # ============================================================= 2. Pre-process
+    # ============================================================= 4. Pre-process
     def _prep_box(self) -> QWidget:
-        box = QGroupBox("2 · Pre-process raw clouds (optional) — add Height-Above-Ground (PDAL)")
+        box = QGroupBox("4 · Pre-process raw clouds (optional) — add Height-Above-Ground (PDAL)")
         form = QFormLayout(box)
         self.hag_in = QLineEdit()
         self.hag_in.setPlaceholderText("a file, or a folder of clouds")
@@ -149,10 +149,6 @@ class DatasetsPage(QWidget):
         flbtn.clicked.connect(self._pick_hag_file)
         hag_in_row.addWidget(flbtn)
         form.addRow("Input folder or file", _wrap(hag_in_row))
-        self.hag_out, out_row = self._dir_row(lambda: self._pick_into(self.hag_out, "HAG output folder"))
-        form.addRow("Output folder", out_row)
-        self.skip_ground = QCheckBox("ground already classified (skip SMRF)")
-        form.addRow("", self.skip_ground)
         self.hag_filter = QComboBox()
         self.hag_filter.addItems(list(pretrain.HAG_FILTERS))
         form.addRow("HAG filter", self.hag_filter)
@@ -172,7 +168,7 @@ class DatasetsPage(QWidget):
 
     # ============================================================= 3. Classes
     def _classes_box(self) -> QWidget:
-        box = QGroupBox("3 · Classes — uncheck 'Train' to ignore a value; rows that share a "
+        box = QGroupBox("2 · Classes — uncheck 'Train' to ignore a value; rows that share a "
                         "Class name are merged into one class")
         cl = QVBoxLayout(box)
         btn_row = QHBoxLayout()
@@ -204,7 +200,7 @@ class DatasetsPage(QWidget):
 
     # ============================================================= 4. Split & tiling
     def _split_box(self) -> QWidget:
-        box = QGroupBox("4 · Split & tiling")
+        box = QGroupBox("3 · Split & tiling")
         form = QFormLayout(box)
         self.split_combo = QComboBox()
         self.split_combo.addItems([
@@ -393,24 +389,21 @@ class DatasetsPage(QWidget):
     # ------------------------------------------------------------- pre-process (HAG)
     def _run_hag(self):
         in_dir = self.hag_in.text().strip()
-        out_dir = self.hag_out.text().strip()
         if not os.path.exists(in_dir):
             self._append("HAG: choose an input file or folder of point clouds.")
-            return
-        if not out_dir:
-            self._append("HAG: choose an output folder.")
             return
         if self.worker.running:
             self._append("A local job is already running — wait for it to finish.")
             return
-        skip = self.skip_ground.isChecked()
+        # No output field: HAG writes to a sibling "<name>_hag" folder under the
+        # staging/output root and auto-feeds it in as the dataset input.
+        out_dir = str(self._output_root() / f"{Path(in_dir).stem}_hag")
         flt = self.hag_filter.currentText()
         self.hag_btn.setEnabled(False)
-        self._append(f"Adding HAG ({flt}{'' if skip else ', SMRF ground'}) …")
+        self._append(f"Adding HAG ({flt}, SMRF ground) …")
 
         def job(progress):
-            return pretrain.add_hag(in_dir, out_dir, skip_ground=skip,
-                                    hag_filter=flt, progress=progress)
+            return pretrain.add_hag(in_dir, out_dir, hag_filter=flt, progress=progress)
 
         self._done_cb = self._on_hag_done
         self.worker.start(job)

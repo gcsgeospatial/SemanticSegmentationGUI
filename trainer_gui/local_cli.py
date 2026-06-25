@@ -1,17 +1,19 @@
 """Builders for the LOCAL (Docker) execution path — the mirror of modal_cli.
 
-Each modal_train_*.py runs unmodified inside its backbone's Docker image (built
-by tools/gen_dockerfiles.py) via local_run.py, with host dirs bind-mounted to
-the paths the scripts already hardcode:
+Each backbone's local_train_*.py runs DIRECTLY inside its Docker image (built by
+tools/gen_dockerfiles.py) — no modal, no shim — with host dirs bind-mounted to
+the paths the trainer reads:
 
-    /workspace  <- repo root (the scripts + local_run.py + _modal_shim.py)
+    /workspace  <- repo root (the local_train_*.py scripts; run from here)
     /datasets   <- staging root (canonical datasets + _infer/<job> live here)
-    /outputs    <- local runs dir (training writes runs/<id>/..., weights read here)
+    /outputs    <- the chosen output folder (training writes runs/<id>/..., weights read here)
     /data       <- raw IEEE data (only the built-in no-`--dataset` path needs it)
 
 No upload/download: the data is already on the host, and predictions/checkpoints
 land straight back in the bind-mounted host dirs. Returns (program, args) for
 JobRunner — exactly like modal_cli — so the GUI dispatch is backend-agnostic.
+The modal_train_*.py scripts are now thin shells that subprocess these same
+local_train_*.py inside a Modal container, so local and cloud run one codebase.
 """
 
 from __future__ import annotations
@@ -80,10 +82,10 @@ def image_preflight(backbone) -> tuple[bool, str]:
                    f"local_config['registry']) and `docker pull` it — then run again.")
 
 
-def _mounts(cfg: dict, repo_root: str, extra_mounts) -> list[str]:
+def _mounts(cfg: dict, repo_root: str, extra_mounts, outputs_root: str = "") -> list[str]:
     m = ["-v", f"{repo_root}:/workspace",
          "-v", f"{cfg['datasets_root']}:/datasets",
-         "-v", f"{cfg['outputs_root']}:/outputs"]
+         "-v", f"{outputs_root or cfg['outputs_root']}:/outputs"]
     if cfg.get("data_root"):
         m += ["-v", f"{cfg['data_root']}:/data"]
     for host, container in (extra_mounts or []):
@@ -92,21 +94,25 @@ def _mounts(cfg: dict, repo_root: str, extra_mounts) -> list[str]:
 
 
 def run_script(script: str, flags: dict, backbone, *, repo_root: str,
-               gpu: str = "", extra_mounts=None) -> tuple[str, list[str]]:
-    """`docker run --rm --gpus all -v ... <image> python local_run.py script --flags`.
+               gpu: str = "", extra_mounts=None,
+               outputs_root: str = "") -> tuple[str, list[str]]:
+    """`docker run --rm --gpus all -v ... <image> python local_train_<key>.py --flags`.
 
-    `flags` are the same kebab-case flags modal_cli.run_script takes; `extra_mounts`
-    is a list of (host, container) bind pairs (e.g. a local .pth into /outputs).
+    `script` (the modal_train_*.py name) is accepted for call-site parity with
+    modal_cli but unused: locally we run the decoupled local_train_<key>.py
+    directly. `flags` are the same kebab-case flags; `extra_mounts` is a list of
+    (host, container) bind pairs (e.g. a local .pth into /outputs). `outputs_root`
+    overrides the host dir bound to /outputs (the user-picked output folder).
     """
     cfg = appstate.local_config()
     args = ["run", "--rm", "-w", "/workspace"]
     if cfg.get("gpus"):
         args += ["--gpus", str(cfg["gpus"])]
-    args += _mounts(cfg, repo_root, extra_mounts)
+    args += _mounts(cfg, repo_root, extra_mounts, outputs_root=outputs_root)
     if gpu:
         args += ["-e", f"TT_GPU={gpu}"]          # cosmetic locally; keeps log parity
     args += list(cfg.get("extra_args", []))
-    args += [image_for(backbone), "python", "local_run.py", script]
+    args += [image_for(backbone), "python", f"local_train_{backbone.key}.py"]
     for key, val in flags.items():
         if val is None:
             continue

@@ -493,10 +493,8 @@ def main():
 
         # ================= LOCAL (Docker) backend =================
         import importlib
-        import typing
 
         import _modal_shim
-        import local_run
         from trainer_gui import local_cli
         from trainer_gui.backbones import BACKBONES as BB
 
@@ -531,15 +529,35 @@ def main():
               not hasattr(sys.modules["modal"], "__file__")
               and sys.modules["modal"].Volume is not None)
 
-        # local_run: kebab `--flag value` -> typed kwargs from main()'s signature
-        lf = local_run._parse_flags(["--dataset", "X", "--grid", "0.05",
-                                     "--epochs", "250", "--smoke"])
-        check("local_run: --flag value parsed, bare flag -> True",
-              lf == {"dataset": "X", "grid": "0.05", "epochs": "250", "smoke": True})
-        check("local_run: coerces via annotation (Optional[int]/[float]/[str])",
-              local_run._coerce("250", typing.Optional[int]) == 250
-              and local_run._coerce("0.05", typing.Optional[float]) == 0.05
-              and local_run._coerce("0.05", typing.Optional[str]) == "0.05")
+        # decoupling: every local_train_X.py imports with NO modal (torch lives in
+        # the body) and exposes its train fn with no-op Volume stand-ins.
+        LOCAL = ["local_train_ptv3", "local_train_ptv3_hag", "local_train_randlanet",
+                 "local_train_randlanet_hag", "local_train_kpconvx_cold",
+                 "local_train_kpconvx_cold_hag"]
+        local_ok = True
+        for nm in LOCAL:
+            try:
+                lm = importlib.import_module(nm)
+            except Exception:  # noqa: BLE001
+                local_ok = False
+                continue
+            fn = next((getattr(lm, n) for n in dir(lm) if n.startswith("train_")), None)
+            if fn is None or type(lm.outputs_volume).__name__ != "_NoVol":
+                local_ok = False
+        check("local: all 6 local_train_*.py import + expose train fn + no-op volumes", local_ok)
+        with open(importlib.import_module("local_train_ptv3").__file__, encoding="utf-8") as f:
+            _lt_src = f.read()
+        check("local: local_train_ptv3.py has no 'import modal' (source is decoupled)",
+              "import modal" not in _lt_src and "_NoVol" in _lt_src)
+        # inversion: the modal wrapper bakes its local script in + shells out to it.
+        _modal_shim.install()
+        for m in list(sys.modules):
+            if m.startswith("modal_train_"):
+                sys.modules.pop(m, None)
+        importlib.import_module("modal_train_ptv3")
+        _steps = _modal_shim.App.last.image.steps
+        check("local: modal wrapper bakes its local_train script into the image",
+              any(k == "copy_file" and "local_train_ptv3.py" in p["src"] for k, p in _steps))
 
         # gen_dockerfiles: recipe -> a buildable Dockerfile (cuda base, ctx, quoting)
         import tools.gen_dockerfiles as gen
@@ -553,6 +571,8 @@ def main():
               "'numpy<2.0'" in df and "'pandas<3'" in df)
         check("gen: model repo COPY uses a build-context matching build_all",
               "COPY --from=ptv3src . /opt/ptv3" in df and "ptv3src" in contexts)
+        check("gen: local_train script is NOT baked (bind-mounted at /workspace locally)",
+              "local_train" not in df)
         dfr, _ = gen.build_dockerfile("randlanet", "modal_train_randlanet.py")
         check("gen: multi-line run command emitted as a RUN heredoc",
               "RUN <<'TT_EOT'" in dfr and "build_ext --inplace" in dfr)
@@ -607,9 +627,14 @@ def main():
             check("local_cli: docker run with gpus + workspace/datasets/outputs mounts",
                   args[0] == "run" and "--gpus" in args and "/repo:/workspace" in args
                   and ":/datasets" in joined and ":/outputs" in joined)
-            check("local_cli: invokes local_run on the right script with the flags",
-                  "local_run.py" in args and "modal_train_ptv3.py" in args
+            check("local_cli: invokes the decoupled local_train_<key>.py with the flags",
+                  "local_train_ptv3.py" in args and "local_run.py" not in args
                   and "--dataset" in args and "myds" in args and "--grid" in args)
+            _, args_o = local_cli.run_script(
+                "modal_train_ptv3.py", {"dataset": "d"}, BB["ptv3"],
+                repo_root="/repo", outputs_root="/myout")
+            check("local_cli: outputs_root override binds the chosen folder to /outputs",
+                  "/myout:/outputs" in " ".join(args_o))
             check("local_cli: image tag override respected (else trainer-local-<key>)",
                   local_cli.image_for(BB["ptv3"]) == "myimg:1"
                   and local_cli.image_for(BB["randlanet"]) == "trainer-local-randlanet")

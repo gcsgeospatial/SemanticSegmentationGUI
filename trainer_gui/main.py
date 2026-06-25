@@ -48,7 +48,7 @@ QSplitter::handle:vertical { height: 8px; margin: 1px 60px; }
 QSplitter::handle:horizontal { width: 8px; margin: 60px 1px; }
 """
 
-PAGES = ["Datasets", "Train", "Plotting", "Inference"]
+PAGES = ["Datasets", "Train", "Inference", "Plotting"]
 
 
 class MainWindow(QWidget):
@@ -118,7 +118,7 @@ class MainWindow(QWidget):
         self.train_page.models_changed.connect(self.infer_page.reload_backbones)
         # Each page scrolls vertically instead of being crammed into the window.
         for page in (self.datasets_page, self.train_page,
-                     self.plotting_page, self.infer_page):
+                     self.infer_page, self.plotting_page):
             self.stack.addWidget(ui.scroll_v(page))
 
         self.nav.setCurrentRow(0)
@@ -139,13 +139,13 @@ class MainWindow(QWidget):
                          else "point-cloud training on Modal")
 
     def _go(self, row: int):
-        # PAGES = [Datasets, Train, Plotting, Inference]
+        # PAGES = [Datasets, Train, Inference, Plotting]
         if row == 1:
             self.train_page.reload_datasets()
         elif row == 2:
-            self.plotting_page._rescan()
-        elif row == 3:
             self.infer_page.reload_runs()
+        elif row == 3:
+            self.plotting_page._rescan()
         self.stack.setCurrentIndex(row)
 
     # Window size/position persists across sessions (stored in appstate JSON).

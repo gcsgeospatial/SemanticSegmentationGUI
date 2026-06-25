@@ -8,9 +8,9 @@ import os
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDoubleSpinBox,
-                               QFormLayout, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView,
-                               QLabel, QLineEdit, QPlainTextEdit, QPushButton, QSpinBox,
-                               QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
+                               QFileDialog, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout,
+                               QHeaderView, QLabel, QLineEdit, QPlainTextEdit, QPushButton,
+                               QSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
 from .. import analysis, appstate, local_cli, modal_cli, prep, ui
 from ..backbones import BACKBONES, GPU_CHOICES
@@ -82,6 +82,18 @@ class TrainPage(QWidget):
                                   "spent on preprocessing)")
         self.prep_chk.setChecked(True)
         form.addRow("", self.prep_chk)
+        # Local mode: where runs/<id>/... land on the host (bind-mounted to /outputs).
+        # Nothing is uploaded — the checkpoints/metrics are written straight here.
+        self.out_edit = QLineEdit()
+        self.out_edit.setText(appstate.get("local_train_out", ""))
+        self.out_edit.setPlaceholderText(f"default: {appstate.local_runs_dir().as_posix()}")
+        out_row = QHBoxLayout()
+        out_row.addWidget(self.out_edit)
+        out_btn = QPushButton("Browse…")
+        out_btn.clicked.connect(self._pick_out)
+        out_row.addWidget(out_btn)
+        self.out_row_w = _wrap(out_row)
+        form.addRow("Output folder", self.out_row_w)
 
         self.params_box = QGroupBox("Parameters (recommended values pre-filled)")
         self.params_form = QFormLayout(self.params_box)
@@ -157,6 +169,7 @@ class TrainPage(QWidget):
         """Hide Modal-only controls + reword copy for the local (Docker) backend."""
         self.form.setRowVisible(self.gpu_combo, not local)   # GPU type is a Modal pick
         self.form.setRowVisible(self.prep_chk, not local)    # prep+upload is Modal-only
+        self.form.setRowVisible(self.out_row_w, local)       # output folder is a local pick
         self.detach_chk.setVisible(not local)                # Modal detach
         self.attach_btn.setVisible(not local)                # modal app logs
         self.verify_btn.setVisible(not local)                # Check on Modal volume
@@ -210,7 +223,7 @@ class TrainPage(QWidget):
         for r, (key, b) in enumerate(BACKBONES.items()):
             chk = QCheckBox(b.label)
             chk.toggled.connect(self._on_models_changed)
-            rec = QLabel(f"{b.rec_gpu} · ≥{b.min_vram_gb} GB")
+            rec = QLabel(f"{b.rec_gpu} ({b.min_vram_gb} GB)")
             rec.setStyleSheet("color: #6a6a6a;")
             rec.setToolTip("Rough recommended GPU + minimum VRAM for training this "
                            "backbone — a starting point to tune to your data/tiles.")
@@ -391,6 +404,13 @@ class TrainPage(QWidget):
     def _set_ds_status(self, text: str, color: str = "#6a6a6a"):
         self.ds_status.setStyleSheet(f"color: {color};")
         self.ds_status.setText(text)
+
+    def _pick_out(self):
+        d = QFileDialog.getExistingDirectory(
+            self, "Output folder for training runs (runs/<id>/… land here)",
+            self.out_edit.text() or str(appstate.local_runs_dir()))
+        if d:
+            self.out_edit.setText(d)
 
     def _verify_dataset(self):
         """Actually list the dataset's Modal volume so the user can confirm the
@@ -594,6 +614,12 @@ class TrainPage(QWidget):
     def _start_local_run(self, p):
         b, flags, gpu, name = p["backbone"], p["flags"], p["gpu"], p["dataset"]
         info = appstate.known_datasets().get(name, {})
+        # Output folder (bind-mounted to /outputs): the user-picked dir, else the
+        # default app local_runs dir. Created here so the bind-mount source exists;
+        # remembered for next time. Nothing is uploaded — runs land straight here.
+        out_root = self.out_edit.text().strip() or str(appstate.local_runs_dir())
+        os.makedirs(out_root, exist_ok=True)
+        appstate.put("local_train_out", self.out_edit.text().strip())
         extra_mounts = []
         if info.get("builtin"):
             # Built-ins read raw data from /data/IEEE — only the user can supply it.
@@ -610,14 +636,15 @@ class TrainPage(QWidget):
                 self._append(f"[local] ⚠ No local staged copy of '{name}' on this machine — "
                              f"the container won't find /datasets/{name}.")
         prog, args = local_cli.run_script(b.script, flags, b, repo_root=self.repo_root,
-                                          gpu=gpu, extra_mounts=extra_mounts)
+                                          gpu=gpu, extra_mounts=extra_mounts,
+                                          outputs_root=out_root)
         self._append(f"\n[local] $ {local_cli.preview(prog, args)}\n")
         if not local_cli.have_docker():
             self._append(
                 "[local] docker not found on PATH — printed the exact command instead of "
                 "running it (design-now mode). On a Docker+GPU host, build the images with "
                 "docker/build_all script, then launch: training writes to "
-                f"{appstate.local_runs_dir().as_posix()}/runs/<id> (no upload/download).")
+                f"{out_root}/runs/<id> (no upload/download).")
             self.launch_btn.setEnabled(True)
             return
         ok, msg = local_cli.image_preflight(b)

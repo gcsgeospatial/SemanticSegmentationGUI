@@ -40,6 +40,7 @@ class InferPage(QWidget):
         self._weights_remote = ""
         self._run_id = ""
         self._dl_dest: Path | None = None
+        self._pred_dir: Path | None = None   # where local predictions land (host)
 
         root = QVBoxLayout(self)
         title = QLabel("Inference")
@@ -79,7 +80,7 @@ class InferPage(QWidget):
         wf.addRow("Model architecture", self.backbone_combo)
 
         ibox = QGroupBox("Input")
-        iform = QFormLayout(ibox)
+        iform = self.iform = QFormLayout(ibox)
         self.input_edit = QLineEdit()
         in_row = QHBoxLayout()
         in_row.addWidget(self.input_edit)
@@ -99,6 +100,18 @@ class InferPage(QWidget):
         self.chunk_spin.setDecimals(0)
         self.chunk_spin.setValue(50.0)
         iform.addRow("Tile size (m)", self.chunk_spin)
+        # Local mode: where prediction files land on the host (bind-mounted to the
+        # container's predictions dir). Empty = the app staging folder. No upload.
+        self.out_edit = QLineEdit()
+        self.out_edit.setText(appstate.get("infer_out", ""))
+        self.out_edit.setPlaceholderText("default: app staging folder")
+        out_row = QHBoxLayout()
+        out_row.addWidget(self.out_edit)
+        out_btn = QPushButton("Browse…")
+        out_btn.clicked.connect(self._pick_out)
+        out_row.addWidget(out_btn)
+        self.out_row_w = _wrap(out_row)
+        iform.addRow("Output folder (predictions)", self.out_row_w)
 
         run_row = QHBoxLayout()
         self.run_btn = QPushButton("Run inference")
@@ -173,6 +186,7 @@ class InferPage(QWidget):
             "Label new point clouds with an already-trained model. Pick the weights "
             "(a finished run, or a local .pth), point at a folder of clouds, and run"
             + (" — inference runs locally in Docker." if local else " on Modal."))
+        self.iform.setRowVisible(self.out_row_w, local)   # output folder is a local pick
         self.reload_backbones()
 
     def reload_backbones(self):
@@ -287,6 +301,13 @@ class InferPage(QWidget):
         if d:
             self.input_edit.setText(d)
 
+    def _pick_out(self):
+        d = QFileDialog.getExistingDirectory(
+            self, "Output folder for predictions",
+            self.out_edit.text() or str(appstate.staging_dir()))
+        if d:
+            self.out_edit.setText(d)
+
     def _backbone(self):
         return BACKBONES[self.backbone_combo.currentData()]
 
@@ -366,10 +387,10 @@ class InferPage(QWidget):
                                               str(self._dl_dest))
             self.runner.start(prog, args, cwd=self.repo_root)
         elif self._stage == "run_local":
-            # Local Docker run: predictions were written straight to the host
-            # staging dir (no download stage).
+            # Local Docker run: predictions were written straight to the chosen
+            # output folder on the host (no download stage).
             self.run_btn.setEnabled(True)
-            pred_dir = (self._staged / "predictions") if self._staged else None
+            pred_dir = self._pred_dir
             if pred_dir and pred_dir.is_dir():
                 preds = [p for p in sorted(pred_dir.iterdir())
                          if p.suffix.lower() in (".ply", ".npz")]
@@ -415,6 +436,17 @@ class InferPage(QWidget):
         b = self._backbone()
         # Scenes (and where predictions get written) are self._staged on the host.
         extra_mounts = [(str(self._staged), f"/datasets/_infer/{self._job_id}")]
+        # Predictions: a user-picked folder bind-mounted over the container's
+        # predictions dir (so they land straight there, no copy), else staging.
+        out = self.out_edit.text().strip()
+        appstate.put("infer_out", out)
+        if out:
+            self._pred_dir = Path(out)
+            self._pred_dir.mkdir(parents=True, exist_ok=True)
+            extra_mounts.append(
+                (str(self._pred_dir), f"/datasets/_infer/{self._job_id}/predictions"))
+        else:
+            self._pred_dir = self._staged / "predictions"
         if self.from_file_radio.isChecked():
             wpath = Path(self.pth_edit.text().strip())
             extra_mounts.append((str(wpath.parent), "/outputs/_local_weights"))
@@ -454,7 +486,7 @@ class InferPage(QWidget):
         if not local_cli.have_docker():
             self._append("[local] docker not found on PATH — printed the exact command "
                          "(design-now mode). On a Docker+GPU host the predictions land in "
-                         f"{self._staged.as_posix()}/predictions.")
+                         f"{self._pred_dir.as_posix()}.")
             self.run_btn.setEnabled(True)
             return
         ok, msg = local_cli.image_preflight(b)

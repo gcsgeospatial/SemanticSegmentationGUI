@@ -9,10 +9,11 @@ re-run this after editing a script.
 
     python tools/gen_dockerfiles.py            # writes docker/<key>.Dockerfile + build_all.ps1
 
-The trainer code itself (modal_train_*.py, local_run.py, _modal_shim.py) is NOT
-baked in — it's bind-mounted at /workspace when you `docker run` (see
-trainer_gui/local_cli.py), so editing a script needs no rebuild. Only the heavy
-deps + the model repo (add_local_dir) live in the image.
+The trainer code itself (local_train_*.py) is NOT baked in — it's bind-mounted at
+/workspace when you `docker run` (see trainer_gui/local_cli.py), so editing a
+script needs no rebuild. Only the heavy deps + the model repo (add_local_dir)
+live in the image. (The modal shells DO bake their local_train_*.py via
+add_local_file, but this generator skips that copy for the local images.)
 """
 
 from __future__ import annotations
@@ -136,6 +137,13 @@ def build_dockerfile(key, script):
         elif kind == "env":
             out.append("ENV " + " ".join(f"{k}={v}" for k, v in p.items()))
         elif kind in ("copy_dir", "copy_file"):
+            # The modal shell bakes local_train_*.py into its image, but locally
+            # that script is bind-mounted at /workspace (run_script runs it from
+            # there) — so skip baking it; only the model repo (add_local_dir) is
+            # baked. ponytail: basename match, the trainer scripts are the only
+            # copy steps we ever want to skip.
+            if os.path.basename(p["src"]).startswith("local_train_"):
+                continue
             ctx = _ctx_name(p["dst"])
             contexts[ctx] = p["src"]
             out.append(f"COPY --from={ctx} . {p['dst']}")
