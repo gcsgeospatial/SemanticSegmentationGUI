@@ -503,6 +503,12 @@ def main():
                 recipe_ok = False
         check("local: modal shim imports all 6 train scripts + finds main", shim_ok)
         check("local: every script records an Image recipe for Dockerfile gen", recipe_ok)
+        # the shim's catch-all __getattr__ must RAISE on dunders, else inspect.getmodule
+        # reads modal.__file__ as a function and torch's import blows up (endswith bug).
+        _modal_shim.install()
+        check("local: shim raises on dunder lookups (inspect.getmodule-safe)",
+              not hasattr(sys.modules["modal"], "__file__")
+              and sys.modules["modal"].Volume is not None)
 
         # local_run: kebab `--flag value` -> typed kwargs from main()'s signature
         lf = local_run._parse_flags(["--dataset", "X", "--grid", "0.05",

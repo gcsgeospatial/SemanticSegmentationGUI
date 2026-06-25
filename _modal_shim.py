@@ -216,6 +216,13 @@ def _build_module() -> types.ModuleType:
     # Anything else (`modal.<x>`) -> a permissive no-op, so an unforeseen symbol
     # in one of the variant scripts can't break module import.
     def __getattr__(name):            # PEP 562 module-level getattr
+        # Dunders MUST raise, not return a no-op. inspect.getmodule() scans every
+        # sys.modules entry and reads `.__file__` (torch does this at import time in
+        # register_debug_prims); a function there makes inspect call
+        # `<func>.endswith(...)` -> AttributeError. The real symbols the scripts use
+        # are all set explicitly above, so only junk lookups reach here.
+        if name.startswith("__") and name.endswith("__"):
+            raise AttributeError(name)
         return _noop_factory
     m.__getattr__ = __getattr__
     return m
