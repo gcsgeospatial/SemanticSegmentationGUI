@@ -206,6 +206,9 @@ def main():
               BACKBONES["ptv3"].outputs_volume == "ptv3-ieee-outputs"
               and BACKBONES["randlanet"].outputs_volume == "randlanet-cold-ieee-outputs"
               and BACKBONES["ptv3_hag"].outputs_volume == "ptv3-ieee-hag-outputs")
+        check("backbones: each carries a recommended GPU + min VRAM (Train specs bar)",
+              all(b.rec_gpu and b.min_vram_gb > 0 for b in BACKBONES.values())
+              and BACKBONES["kpconvx_cold"].min_vram_gb >= BACKBONES["randlanet"].min_vram_gb)
 
         # Train page's Modal-presence check parses `modal volume ls --json` entries
         # whose basename key varies by CLI version — lock the parser.
@@ -470,6 +473,24 @@ def main():
         check("viewer: _ieee_key lists all 5 classes (Water + Bridge included)",
               [n for n, _ in _ieee_key()] == ["Ground", "Trees", "Building", "Water", "Bridge"])
 
+        # chosen-dataset palette (Inference menu): a prediction coloured with the
+        # shared categorical palette is labelled with the picked class names, and a
+        # raw RGB cloud gets no spurious legend.
+        from trainer_gui.palette import palette_for
+        from trainer_gui.viewer import _key_for_names, _load
+        names3, pal3 = ["A", "B", "C"], palette_for(3)
+        kc = _key_for_names(pal3[np.array([0, 1, 2, 1, 0])], names3)   # palette-coloured
+        check("viewer: _key_for_names labels a chosen-palette cloud with all class names",
+              [n for n, _ in kc] == names3 and np.allclose(kc[0][1], pal3[0] / 255.0))
+        check("viewer: _key_for_names gives no key for a non-palette (raw RGB) cloud",
+              _key_for_names(np.array([[1, 2, 3], [4, 5, 6]], np.uint8), names3) == [])
+        nn = tmp / "pred_nonames.npz"
+        np.savez_compressed(nn, xyz=make_xyz(5).astype(np.float32),
+                            pred=np.array([0, 1, 2, 1, 0], np.int32))   # no class_names
+        _, _, k_nn = _load(nn, ["X", "Y", "Z"])
+        check("viewer: _load applies chosen class names to an npz lacking class_names",
+              [n for n, _ in k_nn] == ["X", "Y", "Z"])
+
         # ================= LOCAL (Docker) backend =================
         import importlib
         import typing
@@ -561,11 +582,20 @@ def main():
                   "IEEE" not in appstate.selectable_datasets()
                   and "IEEE HAG" not in appstate.selectable_datasets()
                   and "IEEE" in appstate.known_datasets())
+            # Registry defaults to our GHCR org when never set (pulling works out
+            # of the box); TT_REGISTRY/env or an explicit value override it.
+            _saved_reg = os.environ.pop("TT_REGISTRY", None)
+            check("appstate: registry defaults to ghcr.io/gcsgeospatial when unset",
+                  appstate.local_config()["registry"] == "ghcr.io/gcsgeospatial")
+            if _saved_reg is not None:
+                os.environ["TT_REGISTRY"] = _saved_reg
             cfg = appstate.local_config()
             check("appstate: local_config fills datasets/outputs roots + gpus",
                   bool(cfg["datasets_root"]) and bool(cfg["outputs_root"])
                   and isinstance(cfg["images"], dict) and cfg["gpus"] == "all")
-            appstate.set_local_config({**cfg, "images": {"ptv3": "myimg:1"}, "gpus": "0"})
+            # registry="" here = opt out of the default, so the bare local tag shows.
+            appstate.set_local_config({**cfg, "images": {"ptv3": "myimg:1"},
+                                       "gpus": "0", "registry": ""})
             check("appstate: local_config overrides round-trip",
                   appstate.local_config()["images"]["ptv3"] == "myimg:1"
                   and appstate.local_config()["gpus"] == "0")
@@ -594,6 +624,19 @@ def main():
             ok_pull, _ = local_cli.image_preflight(BB["randlanet"])   # absent but pullable
             check("local_cli: missing-but-pullable image is allowed to run (docker auto-pulls)",
                   ok_pull is True)
+
+            # GUI image manager: pull() targets the same tag image_for/run use, and
+            # all_statuses reports one row per backbone with the manager's contract
+            # (works whether or not docker is installed on this box).
+            pprog, pargs = local_cli.pull(BB["randlanet"])
+            check("local_cli: pull() = `docker pull <image_for tag>`",
+                  pargs == ["pull", local_cli.image_for(BB["randlanet"])])
+            st = local_cli.all_statuses()
+            check("local_cli: all_statuses has one contract-shaped row per backbone",
+                  len(st) == len(BB)
+                  and all({"key", "label", "tag", "present", "pullable", "docker"} <= set(s)
+                          for s in st)
+                  and {s["key"] for s in st} == set(BB))
             appstate.set_local_config({**appstate.local_config(), "registry": ""})
             ok_local, msg_local = local_cli.image_preflight(BB["randlanet"])  # absent, local-only
             check("local_cli: missing local-only image blocks with a build hint",

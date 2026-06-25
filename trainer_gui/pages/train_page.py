@@ -8,9 +8,9 @@ import os
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDoubleSpinBox,
-                               QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel,
-                               QPlainTextEdit, QPushButton, QSpinBox, QTableWidget,
-                               QTableWidgetItem, QVBoxLayout, QWidget)
+                               QFormLayout, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView,
+                               QLabel, QLineEdit, QPlainTextEdit, QPushButton, QSpinBox,
+                               QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
 from .. import analysis, appstate, local_cli, modal_cli, prep, ui
 from ..backbones import BACKBONES, GPU_CHOICES
@@ -28,6 +28,11 @@ class TrainPage(QWidget):
         self.prep_worker = FuncWorker(self)  # local tiling/subsampling
         self.prep_uploader = JobRunner(self)
         self.verify_worker = FuncWorker(self)  # `modal volume ls` presence check
+        self.pull_runner = JobRunner(self)     # docker pull, streamed to the log
+        self.status_worker = FuncWorker(self)  # off-thread image-presence check
+        self._pull_queue: list[str] = []       # backbone keys waiting to pull
+        self._pulling_key: str | None = None
+        self._last_statuses: dict = {}         # key -> status dict from all_statuses
         self.parser = LogParser(self)
         self._param_widgets: dict[str, QWidget] = {}
         self._meta: dict | None = None
@@ -138,6 +143,10 @@ class TrainPage(QWidget):
         self.verify_worker.done.connect(self._on_verified)
         self.verify_worker.error.connect(lambda tb: self._set_ds_status(
             "Could not reach Modal — is the CLI authenticated? (modal token new)", "#b25f00"))
+        self.pull_runner.output.connect(lambda s: self._append(s, newline=False))
+        self.pull_runner.finished.connect(self._on_pull_finished)
+        self.pull_runner.failed.connect(self._on_pull_failed)
+        self.status_worker.done.connect(self._apply_statuses)
         self.parser.epoch.connect(self._on_epoch)
         self.parser.run_id.connect(self._on_run_id)
 
@@ -156,6 +165,8 @@ class TrainPage(QWidget):
         self._models_box.setVisible(local)
         if local:
             self._sync_model_checks()
+            self.registry_edit.setText(appstate.local_config().get("registry", ""))
+            self.refresh_images()
         self.sub.setText(
             "Pick a dataset and a model. Parameters are pre-filled from the dataset's "
             "density analysis — edit anything before launching. "
@@ -166,30 +177,65 @@ class TrainPage(QWidget):
 
     # ---------------------------------------------------- local model selection
     def _make_models_box(self):
-        """Checkbox per backbone — untick the ones you don't want loaded locally
-        (e.g. a cu124 image an older driver can't run). Local mode only."""
-        box = QGroupBox("Local models — which backbones to show")
+        """Backbones to run + their Docker images (local mode only). One row per
+        backbone: tick the ones you'll run (the tick shows the backbone everywhere),
+        see its rough recommended GPU/VRAM, whether the image is present, and pull
+        the missing ones. A registry must be set for pulling — otherwise images are
+        local builds only. Ticks + registry persist (appstate), so you can pull,
+        refresh and run across restarts."""
+        box = QGroupBox("Backbones to run")
         lay = QVBoxLayout(box)
-        hint = QLabel("Untick a backbone to hide it everywhere in local mode (e.g. an "
-                      "image your GPU driver is too old to run). Build/pull only the ones "
-                      "you keep.")
+        hint = QLabel("Tick the backbones you'll run locally (untick to hide one "
+                      "everywhere). Recommended GPU/VRAM are rough starting points — "
+                      "tune to your data. Set a registry to pull prebuilt images, pull "
+                      "the missing ones, then Refresh and launch.")
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #6a6a6a;")
         lay.addWidget(hint)
+
+        reg_row = QHBoxLayout()
+        reg_row.addWidget(QLabel("Registry"))
+        self.registry_edit = QLineEdit()
+        self.registry_edit.setPlaceholderText("e.g. ghcr.io/gcsgeospatial  (clear = local builds only)")
+        self.registry_edit.setText(appstate.local_config().get("registry", ""))
+        self.registry_edit.editingFinished.connect(self._on_registry_change)
+        reg_row.addWidget(self.registry_edit, 1)
+        lay.addLayout(reg_row)
+
+        grid = QGridLayout()
+        grid.setColumnStretch(2, 1)   # let the status column take the slack
         self._model_checks: dict[str, QCheckBox] = {}
-        cols = QHBoxLayout()
-        col = QVBoxLayout()
-        for n, (key, b) in enumerate(BACKBONES.items()):
+        self._img_status: dict[str, QLabel] = {}
+        self._pull_btns: dict[str, QPushButton] = {}
+        for r, (key, b) in enumerate(BACKBONES.items()):
             chk = QCheckBox(b.label)
             chk.toggled.connect(self._on_models_changed)
+            rec = QLabel(f"{b.rec_gpu} · ≥{b.min_vram_gb} GB")
+            rec.setStyleSheet("color: #6a6a6a;")
+            rec.setToolTip("Rough recommended GPU + minimum VRAM for training this "
+                           "backbone — a starting point to tune to your data/tiles.")
+            status = QLabel("…")
+            status.setStyleSheet("color: #6a6a6a;")
+            btn = QPushButton("Pull")
+            btn.clicked.connect(lambda _=False, k=key: self._pull_one(k))
             self._model_checks[key] = chk
-            col.addWidget(chk)
-            if n == (len(BACKBONES) - 1) // 2:   # split into two columns
-                cols.addLayout(col)
-                col = QVBoxLayout()
-        cols.addLayout(col)
-        cols.addStretch()
-        lay.addLayout(cols)
+            self._img_status[key] = status
+            self._pull_btns[key] = btn
+            grid.addWidget(chk, r, 0)
+            grid.addWidget(rec, r, 1)
+            grid.addWidget(status, r, 2)
+            grid.addWidget(btn, r, 3)
+        lay.addLayout(grid)
+
+        foot = QHBoxLayout()
+        self.refresh_btn = QPushButton("Refresh status")
+        self.refresh_btn.clicked.connect(self.refresh_images)
+        self.pull_missing_btn = QPushButton("Pull checked && missing")
+        self.pull_missing_btn.clicked.connect(self._pull_missing)
+        foot.addWidget(self.refresh_btn)
+        foot.addWidget(self.pull_missing_btn)
+        foot.addStretch()
+        lay.addLayout(foot)
         return box
 
     def _sync_model_checks(self):
@@ -204,6 +250,107 @@ class TrainPage(QWidget):
         appstate.set_enabled_backbones(keys)
         self._reload_backbones()
         self.models_changed.emit()              # let the Inference page refresh too
+
+    # ------------------------------------------------- Docker image manager
+    def _on_registry_change(self):
+        cfg = {**appstate.get("local_config", {}), "registry": self.registry_edit.text().strip()}
+        appstate.set_local_config(cfg)
+        self.refresh_images()                   # pullability changed with the registry
+
+    def refresh_images(self):
+        """Re-check every backbone image's presence off the GUI thread."""
+        if self.status_worker.running:
+            return
+        for lbl in self._img_status.values():
+            lbl.setText("checking…")
+            lbl.setStyleSheet("color: #6a6a6a;")
+        self.status_worker.start(local_cli.all_statuses)
+
+    def _apply_statuses(self, statuses: list):
+        self._last_statuses = {s["key"]: s for s in statuses}
+        pulling = self.pull_runner.running
+        for s in statuses:
+            lbl, btn = self._img_status.get(s["key"]), self._pull_btns.get(s["key"])
+            if lbl is None:
+                continue
+            if not s["docker"]:
+                lbl.setText("docker not found"); lbl.setStyleSheet("color: #6a6a6a;")
+                btn.setEnabled(False)
+            elif s["present"]:
+                lbl.setText("✓ present"); lbl.setStyleSheet("color: #2e7d32;")
+                btn.setEnabled(False)
+            elif s["pullable"]:
+                lbl.setText("✗ not pulled"); lbl.setStyleSheet("color: #b25f00;")
+                btn.setEnabled(not pulling)
+            else:
+                lbl.setText("✗ build it (set a registry to pull)")
+                lbl.setStyleSheet("color: #b25f00;"); btn.setEnabled(False)
+
+    def _pullable_missing(self, key: str) -> bool:
+        s = self._last_statuses.get(key)
+        return bool(s and s["docker"] and s["pullable"] and not s["present"])
+
+    def _pull_one(self, key: str):
+        if self._pullable_missing(key):
+            self._enqueue_pull([key])
+
+    def _pull_missing(self):
+        keys = [k for k, chk in self._model_checks.items()
+                if chk.isChecked() and self._pullable_missing(k)]
+        if not keys:
+            self._append("[local] Nothing to pull — checked images are present or not "
+                         "pullable (set a registry, and `docker login` if private).")
+            return
+        self._enqueue_pull(keys)
+
+    def _enqueue_pull(self, keys: list):
+        self._pull_queue += [k for k in keys if k not in self._pull_queue]
+        self._set_pull_enabled(False)
+        if not self.pull_runner.running:
+            self._pull_next()
+
+    def _pull_next(self):
+        if not self._pull_queue:
+            self._pulling_key = None
+            self._set_pull_enabled(True)
+            self.refresh_images()
+            return
+        self._pulling_key = self._pull_queue.pop(0)
+        b = BACKBONES[self._pulling_key]
+        prog, args = local_cli.pull(b)
+        self._append(f"\n[local] $ {local_cli.preview(prog, args)}\n")
+        self.pull_runner.start(prog, args, cwd=self.repo_root)
+
+    def _on_pull_finished(self, code: int):
+        key = self._pulling_key
+        b = BACKBONES.get(key) if key else None
+        if b and code == 0:
+            self._append(f"[local] ✓ pulled {b.label}.")
+            lbl = self._img_status.get(key)
+            if lbl:
+                lbl.setText("✓ present"); lbl.setStyleSheet("color: #2e7d32;")
+        elif b:
+            self._append(f"[local] ✗ pull failed for {b.label} (exit {code}). "
+                         f"Run `docker login` first if the registry is private.")
+        self._pull_next()
+
+    def _on_pull_failed(self, err: str):
+        # QProcess FailedToStart fires `failed`, not `finished` — drain the queue
+        # and re-enable the buttons so a bad docker exec doesn't wedge the panel.
+        b = BACKBONES.get(self._pulling_key) if self._pulling_key else None
+        self._append(f"\n[local] ✗ couldn't start docker pull"
+                     f"{' for ' + b.label if b else ''}: {err}")
+        self._pull_queue.clear()
+        self._pull_next()
+
+    def _set_pull_enabled(self, on: bool):
+        self.refresh_btn.setEnabled(on)
+        self.pull_missing_btn.setEnabled(on)
+        if on and self._last_statuses:
+            self._apply_statuses(list(self._last_statuses.values()))  # restore per-row state
+        else:
+            for btn in self._pull_btns.values():
+                btn.setEnabled(False)
 
     # ------------------------------------------------------------- datasets
     def reload_datasets(self):

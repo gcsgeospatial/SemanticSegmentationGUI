@@ -63,6 +63,12 @@ def set_exec_mode(mode: str) -> None:
     put("exec_mode", "local" if mode == "local" else "modal")
 
 
+# The org we publish the trainer-local-* images under, on GitHub Container
+# Registry. Used as the registry when the user hasn't set one — so the GUI pulls
+# from it out of the box. Override via local_config['registry'] or TT_REGISTRY;
+# clear it to "" explicitly for local-build-only (no pulling).
+DEFAULT_REGISTRY = "ghcr.io/gcsgeospatial"
+
 # Defaults for the local backend. Roots default to the dirs the GUI already
 # uses (so a converted dataset / inference job is immediately reachable); every
 # value is overridable from state.json["local_config"] for I/O modularity.
@@ -78,11 +84,18 @@ _DEFAULT_LOCAL_CONFIG = {
 
 
 def local_config() -> dict:
-    cfg = {**_DEFAULT_LOCAL_CONFIG, **get("local_config", {})}
+    saved = get("local_config", {})
+    cfg = {**_DEFAULT_LOCAL_CONFIG, **saved}
     cfg["datasets_root"] = cfg["datasets_root"] or str(staging_dir())
     cfg["outputs_root"] = cfg["outputs_root"] or str(local_runs_dir())
-    # TT_REGISTRY lets you set the registry once in the environment (no JSON edit).
-    cfg["registry"] = cfg["registry"] or os.environ.get("TT_REGISTRY", "")
+    # Registry precedence: a saved value (even "") wins; else TT_REGISTRY (set it
+    # once in the env, no JSON edit); else our DEFAULT_REGISTRY so pulling works
+    # out of the box. "registry" absent from saved = never set -> use the default;
+    # present-and-empty = the user opted out (local builds only), so leave it.
+    if "registry" not in saved:
+        cfg["registry"] = os.environ.get("TT_REGISTRY", "") or DEFAULT_REGISTRY
+    else:
+        cfg["registry"] = cfg["registry"] or os.environ.get("TT_REGISTRY", "")
     return cfg
 
 

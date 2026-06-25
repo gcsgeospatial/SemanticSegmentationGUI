@@ -193,8 +193,9 @@ def main():
 
     # Registry distribution: push the built images once, pull them on machines
     # that won't build (they need no model repos — the code is baked into each
-    # image). TT_REGISTRY (e.g. ghcr.io/<you>) is the single knob, shared with the
-    # GUI's local_config['registry'].
+    # image). TT_REGISTRY is the single knob, shared with the GUI's
+    # local_config['registry']; it defaults to our gcsgeospatial GHCR org.
+    default_reg = "ghcr.io/gcsgeospatial"
     def _write(fname, lines, crlf=False):
         nl = "\r\n" if crlf else "\n"
         with open(os.path.join(docker_dir, fname), "w", encoding="utf-8", newline=nl) as f:
@@ -205,20 +206,21 @@ def main():
     push_note = ("Tag + push the locally-built trainer-local-* images to a registry so other "
                  "machines can pull them (no model repos needed — the code is baked in).")
     pull_note = "Pull the trainer-local-* images on a machine that won't build them."
-    sh_guard = ': "${TT_REGISTRY:?set TT_REGISTRY=ghcr.io/<your-user-or-org> (docker login first)}"'
-    ps_guard = ('if (-not $env:TT_REGISTRY) { throw '
-                '"set $env:TT_REGISTRY=ghcr.io/<your-user-or-org> (docker login first)" }')
+    # Default TT_REGISTRY to our org if unset (`:=` / -not) — `docker login` first
+    # if the packages are private.
+    sh_guard = f': "${{TT_REGISTRY:={default_reg}}}"'
+    ps_guard = f'if (-not $env:TT_REGISTRY) {{ $env:TT_REGISTRY = "{default_reg}" }}'
 
     _write("push_all.sh", [
         "#!/usr/bin/env bash", "# " + push_note,
-        "# Usage:  TT_REGISTRY=ghcr.io/<you> bash docker/push_all.sh   (after: docker login <registry>)",
+        f"# Usage:  bash docker/push_all.sh   (TT_REGISTRY={default_reg} by default; docker login first)",
         "set -euo pipefail", sh_guard, f"for key in {sh_keys}; do",
         '  docker tag "trainer-local-$key" "$TT_REGISTRY/trainer-local-$key:latest"',
         '  docker push "$TT_REGISTRY/trainer-local-$key:latest"', "done",
         'echo "pushed to $TT_REGISTRY — set TT_REGISTRY (or local_config[\'registry\']) there too."'])
     _write("pull_all.sh", [
         "#!/usr/bin/env bash", "# " + pull_note,
-        "# Usage:  TT_REGISTRY=ghcr.io/<you> bash docker/pull_all.sh",
+        f"# Usage:  bash docker/pull_all.sh   (TT_REGISTRY={default_reg} by default)",
         "set -euo pipefail", sh_guard, f"for key in {sh_keys}; do",
         '  docker pull "$TT_REGISTRY/trainer-local-$key:latest"', "done"])
     _write("push_all.ps1", [

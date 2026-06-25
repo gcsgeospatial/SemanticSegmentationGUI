@@ -114,6 +114,42 @@ def run_script(script: str, flags: dict, backbone, *, repo_root: str,
     return docker_exe(), args
 
 
+def pull(backbone) -> tuple[str, list[str]]:
+    """`docker pull <tag>` for a backbone's image. Reuses image_for so the pulled
+    tag is exactly the one `docker run` (and image_available) will look for."""
+    return docker_exe(), ["pull", image_for(backbone)]
+
+
+def present_images() -> set[str]:
+    """`repo:tag` of every image present locally, from ONE `docker images` call —
+    the bulk path for the GUI's status refresh (image_available is per-image and
+    each can block to its timeout if the daemon is down)."""
+    try:
+        r = subprocess.run([docker_exe(), "images", "--format", "{{.Repository}}:{{.Tag}}"],
+                           capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired):
+        return set()
+    return set(r.stdout.split()) if r.returncode == 0 else set()
+
+
+def all_statuses(progress=None) -> list[dict]:
+    """Per-backbone image status for the GUI image manager (one dict each):
+    {key,label,tag,present,pullable,docker}. Runs in a FuncWorker thread (one
+    `docker images` call), so a slow/down daemon never freezes the window. When
+    docker is absent every row is reported missing+un-pullable. `progress` is the
+    FuncWorker hook (unused here)."""
+    from .backbones import BACKBONES
+    if not have_docker():
+        return [{"key": k, "label": b.label, "tag": image_for(b),
+                 "present": False, "pullable": False, "docker": False}
+                for k, b in BACKBONES.items()]
+    here = present_images()
+    return [{"key": k, "label": b.label, "tag": image_for(b),
+             "present": image_for(b) in here or f"{image_for(b)}:latest" in here,
+             "pullable": is_pullable(b), "docker": True}
+            for k, b in BACKBONES.items()]
+
+
 def preview(program: str, args: list[str]) -> str:
     """One-line shell preview for the log (the exact command JobRunner will run)."""
     return program + " " + " ".join(args)

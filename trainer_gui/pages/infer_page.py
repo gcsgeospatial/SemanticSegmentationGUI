@@ -8,6 +8,7 @@ The run is a chain of stages handled by one JobRunner:
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from datetime import datetime
@@ -129,6 +130,14 @@ class InferPage(QWidget):
         out_col.addWidget(self.stats_box)
         out_row.addLayout(out_col, 1)
         btn_col = QVBoxLayout()
+        btn_col.addWidget(QLabel("Class palette (legend)"))
+        self.palette_combo = QComboBox()
+        self.palette_combo.setToolTip(
+            "Colour the viewer's legend with a dataset's class names. Auto = use the "
+            "names embedded in the file, else IEEE. Colours come from the shared "
+            "categorical palette the training scripts bake into predictions.")
+        self.palette_combo.currentIndexChanged.connect(self._on_palette_change)
+        btn_col.addWidget(self.palette_combo)
         self.view_btn = QPushButton("View a point cloud…")
         self.view_btn.clicked.connect(self._view_file)
         self.compare_btn = QPushButton("Compare to ground truth…")
@@ -180,8 +189,45 @@ class InferPage(QWidget):
         self.backbone_combo.blockSignals(False)
         self._sync_controls()
 
+    # ------------------------------------------------------- class palette
+    def reload_palettes(self):
+        """Offer 'Auto' + every known dataset whose class names we can resolve
+        (built-ins, or a converted dataset with a readable dataset_meta.json)."""
+        self.palette_combo.blockSignals(True)
+        self.palette_combo.clear()
+        self.palette_combo.addItem("Auto (from file / IEEE)", None)
+        for nm, info in sorted(appstate.known_datasets().items()):
+            if info.get("builtin") or os.path.exists(info.get("meta_path", "") or ""):
+                self.palette_combo.addItem(nm, nm)
+        want = appstate.get("infer_palette") or None
+        i = self.palette_combo.findData(want)
+        self.palette_combo.setCurrentIndex(i if i >= 0 else 0)
+        self.palette_combo.blockSignals(False)
+
+    def _on_palette_change(self):
+        appstate.put("infer_palette", self.palette_combo.currentData() or "")
+
+    def _selected_class_names(self) -> list | None:
+        """Class names for the chosen dataset's palette, or None for 'Auto'."""
+        name = self.palette_combo.currentData()
+        if not name:
+            return None
+        info = appstate.known_datasets().get(name, {})
+        if info.get("builtin"):
+            from ..palette import IEEE_CLASS_NAMES
+            return IEEE_CLASS_NAMES
+        mp = info.get("meta_path", "")
+        if mp and os.path.exists(mp):
+            try:
+                with open(mp, "r", encoding="utf-8") as f:
+                    return json.load(f).get("class_names")
+            except (OSError, json.JSONDecodeError):
+                return None
+        return None
+
     # ------------------------------------------------------------- inputs
     def reload_runs(self):
+        self.reload_palettes()
         self.run_combo.blockSignals(True)
         self.run_combo.clear()
         seen = set()
@@ -448,8 +494,11 @@ class InferPage(QWidget):
         if not path:
             return
         appstate.put("last_view_dir", str(Path(path).parent))
-        self._open_viewer(path)
-        self._append(f"Opened viewer for {Path(path).name}")
+        names = self._selected_class_names()
+        extra = ["--class-names", ",".join(names)] if names else []
+        self._open_viewer(path, *extra)
+        self._append(f"Opened viewer for {Path(path).name}"
+                     + (f"  ({self.palette_combo.currentText()} palette)" if names else ""))
 
     def _pick_pred_gt(self):
         """Prompt for a prediction cloud then its ground-truth labels.

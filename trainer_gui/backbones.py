@@ -35,6 +35,8 @@ class Backbone:
     grid_kind: str = "grid"            # "grid" | "octree_depth" — drives recommendation math
     grid_clamp: tuple = (0.05, 1.0)    # clamp band for the recommended grid (m)
     grid_mult: float = 3.0             # recommended grid = grid_mult x mean point spacing
+    rec_gpu: str = "A100"              # rough recommended GPU for training (tune to your data)
+    min_vram_gb: int = 16             # rough min VRAM (GB) for local training (tune)
     params: list = field(default_factory=list)
 
     @property
@@ -74,6 +76,7 @@ BACKBONES: dict[str, Backbone] = {b.key: b for b in [
     Backbone(
         key="ptv3", label="PTv3", script="modal_train_ptv3.py",
         app_name="ptv3-ieee", warm=False, ready=True, folder_infer=True,
+        rec_gpu="A100", min_vram_gb=16,
         grid_clamp=(0.05, 0.6),
         params=[ParamSpec("grid", "Grid size (m)", "float", 0.05, 0.02, 3.0,
                           step=0.05, decimals=2, recommend_key="grid")]
@@ -82,6 +85,7 @@ BACKBONES: dict[str, Backbone] = {b.key: b for b in [
     Backbone(
         key="randlanet", label="RandLA-Net", script="modal_train_randlanet.py",
         app_name="randlanet-cold-ieee", warm=False, ready=True, folder_infer=True,
+        rec_gpu="A10G", min_vram_gb=8,
         grid_clamp=(0.06, 0.5),
         params=[ParamSpec("sub-grid", "Sub-grid size (m)", "float", 0.12, 0.02, 2.0,
                           step=0.05, decimals=2, recommend_key="grid"),
@@ -91,6 +95,7 @@ BACKBONES: dict[str, Backbone] = {b.key: b for b in [
     Backbone(
         key="kpconvx_cold", label="KPConvX-L", script="modal_train_kpconvx_cold.py",
         app_name="kpconvx-cold-ieee", warm=False, ready=True, folder_infer=True,
+        rec_gpu="A100-80GB", min_vram_gb=24,
         grid_clamp=(0.5, 3.0),
         params=[ParamSpec("grid", "Grid size (m)", "float", 2.0, 0.1, 5.0,
                           step=0.1, decimals=2, recommend_key="grid")]
@@ -100,6 +105,7 @@ BACKBONES: dict[str, Backbone] = {b.key: b for b in [
     Backbone(
         key="ptv3_hag", label="PTv3 + HAG", script="modal_train_ptv3_hag.py",
         app_name="ptv3-ieee-hag", warm=False, ready=True, folder_infer=True,
+        rec_gpu="A100", min_vram_gb=16,
         grid_clamp=(0.05, 0.6),
         params=[ParamSpec("grid", "Grid size (m)", "float", 0.05, 0.02, 3.0,
                           step=0.05, decimals=2, recommend_key="grid")]
@@ -109,6 +115,7 @@ BACKBONES: dict[str, Backbone] = {b.key: b for b in [
         key="randlanet_hag", label="RandLA-Net + HAG",
         script="modal_train_randlanet_hag.py",
         app_name="randlanet-cold-ieee-hag", warm=False, ready=True, folder_infer=True,
+        rec_gpu="A10G", min_vram_gb=8,
         grid_clamp=(0.06, 0.5),
         params=[ParamSpec("sub-grid", "Sub-grid size (m)", "float", 0.12, 0.02, 2.0,
                           step=0.05, decimals=2, recommend_key="grid"),
@@ -122,6 +129,7 @@ BACKBONES: dict[str, Backbone] = {b.key: b for b in [
         key="kpconvx_cold_hag", label="KPConvX-L + HAG",
         script="modal_train_kpconvx_cold_hag.py",
         app_name="kpconvx-cold-ieee-hag", warm=False, ready=True, folder_infer=True,
+        rec_gpu="A100-80GB", min_vram_gb=24,
         grid_clamp=(0.5, 3.0),
         params=[ParamSpec("grid", "Grid size (m)", "float", 2.0, 0.1, 5.0,
                           step=0.1, decimals=2, recommend_key="grid")]

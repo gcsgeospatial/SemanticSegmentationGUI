@@ -45,6 +45,22 @@ def _key_from_rgb(rgb_u8: np.ndarray) -> list[tuple[str, tuple]]:
     return _ieee_key() if np.any(class_from_rgb(rgb_u8) >= 0) else []
 
 
+def _key_for_names(rgb_u8: np.ndarray, names: list) -> list[tuple[str, tuple]]:
+    """Colour key for a prediction coloured with palette_for(len(names)) — the exact
+    palette the training scripts bake into prediction PLYs. Returns the full class
+    list (like the IEEE key) when any point matches that palette, so a chosen
+    dataset's scheme labels even a non-IEEE prediction; [] if nothing matches (a raw
+    RGB scene), so plain clouds get no spurious legend."""
+    from .palette import palette_for
+    pal = palette_for(len(names))
+    matched = any(
+        np.any((rgb_u8[:, 0] == c[0]) & (rgb_u8[:, 1] == c[1]) & (rgb_u8[:, 2] == c[2]))
+        for c in pal)
+    if not matched:
+        return []
+    return [(names[i], tuple((pal[i] / 255.0).tolist())) for i in range(len(names))]
+
+
 def _npz_class(z) -> tuple[np.ndarray, str] | tuple[None, None]:
     """An npz's per-point class array + its key name: prediction (`pred`) or
     ground-truth/dataset (`label`), whichever is present. -1 stays -1 (ignore)."""
@@ -54,35 +70,40 @@ def _npz_class(z) -> tuple[np.ndarray, str] | tuple[None, None]:
     return None, None
 
 
-def _load(path: Path):
-    """One file -> (xyz float64 (N,3), rgb01 (N,3)|None, key)."""
+def _load(path: Path, names: list | None = None):
+    """One file -> (xyz float64 (N,3), rgb01 (N,3)|None, key). `names` is a chosen
+    dataset's class names (a palette pick): used for the legend, and for npz
+    predictions whose file carries no class_names; the file's own class_names win."""
     if path.suffix.lower() == ".npz":
         z = np.load(str(path), allow_pickle=False)
         cls, _ = _npz_class(z)
         if cls is not None and "xyz" in z:
             from .palette import IEEE_CLASS_NAMES, palette_for
             xyz = np.asarray(z["xyz"], np.float64)
-            names = [str(n) for n in z["class_names"]] if "class_names" in z else IEEE_CLASS_NAMES
-            pal = palette_for(max(int(cls.max()) + 1, len(names))).astype(np.float64) / 255.0
+            names_used = ([str(n) for n in z["class_names"]] if "class_names" in z
+                          else (names or IEEE_CLASS_NAMES))
+            pal = palette_for(max(int(cls.max()) + 1, len(names_used))).astype(np.float64) / 255.0
             colors = np.full((len(xyz), 3), GREY)          # -1/ignore -> grey
             ok = cls >= 0
             colors[ok] = pal[np.clip(cls[ok], 0, len(pal) - 1)]
-            key = [(names[i] if i < len(names) else f"class_{i}", tuple(pal[i].tolist()))
+            key = [(names_used[i] if i < len(names_used) else f"class_{i}", tuple(pal[i].tolist()))
                    for i in sorted(set(cls[ok].tolist()))]
             return xyz, colors, key
     from .readers import read_points
     cloud = read_points(path)
     if cloud.rgb is not None:
-        return cloud.xyz, cloud.rgb.astype(np.float64) / 255.0, _key_from_rgb(cloud.rgb)
+        key = _key_for_names(cloud.rgb, names) if names else _key_from_rgb(cloud.rgb)
+        return cloud.xyz, cloud.rgb.astype(np.float64) / 255.0, key
     if cloud.intensity is not None:          # no class colours -> shade by intensity
         v = _intensity_value(cloud.intensity)
         return cloud.xyz, np.stack([v, v, v], axis=1), []
     return cloud.xyz, None, []
 
 
-def _load_folder(folder: Path):
+def _load_folder(folder: Path, names: list | None = None):
     """Every cloud in a folder, centred and tiled into a grid so they're all
-    visible at once -> (xyz, rgb01|None, key)."""
+    visible at once -> (xyz, rgb01|None, key). `names` = a chosen dataset's class
+    names for the legend (see _load)."""
     from .readers import SUPPORTED_EXTS, read_points
     files = sorted(p for p in folder.iterdir() if p.suffix.lower() == ".ply")
     if not files:
@@ -120,7 +141,11 @@ def _load_folder(folder: Path):
             rgbs.append(np.full((len(cz), 3), 0.6))
     xyz = np.vstack(xs)
     rgb = np.vstack(rgbs) if any_rgb else None
-    key = _key_from_rgb((rgb * 255).round().astype(np.uint8)) if rgb is not None else []
+    if rgb is not None:
+        rgb_u8 = (rgb * 255).round().astype(np.uint8)
+        key = _key_for_names(rgb_u8, names) if names else _key_from_rgb(rgb_u8)
+    else:
+        key = []
     print(f"  {len(clouds)} clouds tiled in a {ncol}-wide grid")
     return xyz, rgb, key
 
@@ -393,6 +418,10 @@ def main(argv=None) -> int:
                     help="with --gt: cloud to read per-point intensity from, used to "
                          "shade the correct points (default: the prediction's own "
                          "intensity, or a sibling scene found by name)")
+    ap.add_argument("--class-names", default=None,
+                    help="comma-separated class names (a dataset's palette) for the "
+                         "colour legend, and to label predictions whose file carries no "
+                         "class names; colours come from the shared categorical palette")
     ap.add_argument("--max-points", type=int, default=8_000_000,
                     help="random subsample cap for display")
     ap.add_argument("--save", default=None,
@@ -400,16 +429,18 @@ def main(argv=None) -> int:
                          "the --gt error map) to this .ply and exit, instead of opening a window")
     args = ap.parse_args(argv)
 
+    names = ([s.strip() for s in args.class_names.split(",") if s.strip()]
+             if args.class_names else None)
     path = Path(args.path)
     if args.gt:
         xyz, rgb, key = compare_clouds(path, Path(args.gt),
                                        Path(args.intensity) if args.intensity else None)
         title = f"{path.stem} vs ground truth"
     elif path.is_dir():
-        xyz, rgb, key = _load_folder(path)
+        xyz, rgb, key = _load_folder(path, names)
         title = path.name
     else:
-        xyz, rgb, key = _load(path)
+        xyz, rgb, key = _load(path, names)
         title = path.name
     if args.save:
         _save_ply(Path(args.save), xyz, rgb)
