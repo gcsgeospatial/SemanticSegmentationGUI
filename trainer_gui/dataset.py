@@ -74,8 +74,17 @@ def discover_scenes(folder: str | Path) -> list[Path]:
     folder = Path(folder)
     if folder.is_file():
         return [folder] if folder.suffix.lower() in SUPPORTED_EXTS else []
-    return sorted(p for p in folder.iterdir()
-                  if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS)
+    top = sorted(p for p in folder.iterdir()
+                 if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS)
+    if top:
+        return top
+    # A converted/tiled dataset has no clouds at the top level — its scenes live
+    # under train/ and val/ (the canonical npz layout). Look there so HAG, Scan
+    # and Analyze accept a tiled dataset folder, not just a flat folder of clouds.
+    sub = [p for split in ("train", "val") if (folder / split).is_dir()
+           for p in sorted((folder / split).iterdir())
+           if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS]
+    return sub
 
 
 def expand_inputs(inputs) -> list[Path]:
@@ -376,6 +385,21 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
     idx_to_name: dict[int, str] = {}
     for c in classes:
         idx_to_name.setdefault(int(c["index"]), c["name"])
+
+    # Collapse combined classes into ONE entry per index (counts are keyed by
+    # index, so every combined row already carries the full total — take it once
+    # and gather the source values). This is what the rare-class warnings and the
+    # UI read, so a combined class shows added-together, not duplicated.
+    by_index: dict[int, dict] = {}
+    for c in classes:
+        i = int(c["index"])
+        e = by_index.get(i)
+        if e is None:
+            by_index[i] = {"index": i, "name": c["name"], "source_values": [int(c["source_value"])],
+                           "train_count": int(c["train_count"]), "val_count": int(c["val_count"])}
+        else:
+            e["source_values"].append(int(c["source_value"]))
+    classes = [by_index[i] for i in sorted(by_index)]
 
     stats = {
         "mean_pts_per_m2": density,

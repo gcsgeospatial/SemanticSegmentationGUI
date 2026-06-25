@@ -362,7 +362,8 @@ def _show(xyz, rgb, key, title, max_points):
 
     try:
         import open3d as o3d
-    except ImportError:
+    except Exception as e:   # not just ImportError: a libstdc++/GL load failure too
+        print(f"  (open3d unavailable: {e} — falling back to the matplotlib viewer)")
         o3d = None
 
     if o3d is not None:
@@ -389,8 +390,17 @@ def _show(xyz, rgb, key, title, max_points):
 
 
 def _show_mpl(xyz, rgb, key, title):
-    import matplotlib.patches as mpatches
-    import matplotlib.pyplot as plt
+    try:
+        import matplotlib.patches as mpatches
+        import matplotlib.pyplot as plt
+    except Exception as e:   # e.g. libstdc++ CXXABI mismatch on Linux
+        print(f"\n⚠ No 3D viewer available — open3d couldn't load and matplotlib "
+              f"failed too ({e}).\n  The colour key above tells you how each class "
+              f"is coloured; the prediction file is at the path in the title. On "
+              f"Linux this is usually a libstdc++ mismatch — launch via `pixi run "
+              f"gui` (or `pixi run python -m trainer_gui.viewer …`) so the env's "
+              f"libstdc++ is used.")
+        return
 
     if len(xyz) > 150_000:
         keep = np.random.default_rng(0).choice(len(xyz), 150_000, replace=False)

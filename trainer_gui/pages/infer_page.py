@@ -151,6 +151,11 @@ class InferPage(QWidget):
             "categorical palette the training scripts bake into predictions.")
         self.palette_combo.currentIndexChanged.connect(self._on_palette_change)
         btn_col.addWidget(self.palette_combo)
+        # Live swatch legend: how each class is coloured in the 3D viewer, for the
+        # selected palette (the exact colours the training scripts bake in).
+        self.legend_label = QLabel()
+        self.legend_label.setToolTip("How each class is coloured in the 3D viewer.")
+        btn_col.addWidget(self.legend_label)
         self.view_btn = QPushButton("View a point cloud…")
         self.view_btn.clicked.connect(self._view_file)
         self.compare_btn = QPushButton("Compare to ground truth…")
@@ -217,9 +222,24 @@ class InferPage(QWidget):
         i = self.palette_combo.findData(want)
         self.palette_combo.setCurrentIndex(i if i >= 0 else 0)
         self.palette_combo.blockSignals(False)
+        self._refresh_legend()
+
+    def _refresh_legend(self):
+        """Show a colour swatch per class for the selected palette — the exact
+        colours the 3D viewer paints (palette_for(), shared with the training
+        scripts). 'Auto' has no chosen names, so fall back to the IEEE default."""
+        from ..palette import IEEE_CLASS_NAMES, palette_for
+        names = self._selected_class_names() or IEEE_CLASS_NAMES
+        pal = palette_for(len(names))
+        rows = "".join(
+            f'<tr><td><span style="font-size:15px; color:#{r:02x}{g:02x}{b:02x}">'
+            f'■</span></td><td>&nbsp;{name}</td></tr>'
+            for name, (r, g, b) in zip(names, pal.tolist()))
+        self.legend_label.setText(f"<table cellspacing='2'>{rows}</table>")
 
     def _on_palette_change(self):
         appstate.put("infer_palette", self.palette_combo.currentData() or "")
+        self._refresh_legend()
 
     def _selected_class_names(self) -> list | None:
         """Class names for the chosen dataset's palette, or None for 'Auto'."""

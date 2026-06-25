@@ -83,7 +83,13 @@ def warnings_for(meta: dict) -> list[str]:
     if not meta.get("has_rgb", False) and not meta.get("has_intensity", False):
         warns.append("Dataset has neither RGB nor intensity — warm-started encoders "
                      "expecting color/intensity inputs will run with degraded features.")
-    classes = meta.get("classes", [])
+    # Dedupe by class index: a combined class can appear once per source value in
+    # older metas (same index, each carrying the full count), which would inflate
+    # the total and warn about the class twice. Keep one entry per index.
+    seen: dict = {}
+    for c in meta.get("classes", []):
+        seen.setdefault(c.get("index", c.get("name")), c)
+    classes = list(seen.values())
     total = sum(int(c.get("train_count", 0)) for c in classes) or 1
     for c in classes:
         share = int(c.get("train_count", 0)) / total

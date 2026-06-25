@@ -17,10 +17,9 @@ import os
 from pathlib import Path
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
                                QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel,
-                               QLineEdit, QListWidget, QPlainTextEdit, QPushButton, QSpinBox,
+                               QLineEdit, QListWidget, QMessageBox, QProgressBar, QPushButton, QSpinBox,
                                QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
 from .. import analysis, appstate, dataset, modal_cli, pretrain, ui
@@ -158,6 +157,13 @@ class DatasetsPage(QWidget):
         row.addWidget(self.hag_btn)
         row.addStretch()
         form.addRow("", _wrap(row))
+        # Loading bar for the (slow) HAG run — busy/indeterminate, shown only while
+        # it runs, sitting right beneath the Add HAG button.
+        self.hag_busy = QProgressBar()
+        self.hag_busy.setRange(0, 0)
+        self.hag_busy.setTextVisible(False)
+        self.hag_busy.setVisible(False)
+        form.addRow("", self.hag_busy)
         if not pretrain.pdal_available():
             self.hag_btn.setEnabled(False)
             warn = QLabel("PDAL not found — install python-pdal to enable this step.")
@@ -272,18 +278,29 @@ class DatasetsPage(QWidget):
         self.upload_btn.clicked.connect(self._upload)
         go_row.addWidget(self.upload_btn)
         go_row.addStretch()
-        self.log = QPlainTextEdit()
-        self.log.setReadOnly(True)
-        self.log.setObjectName("log")
-        self.log.setMinimumHeight(140)
-        self.log.setPlaceholderText("Conversion + upload progress appears here…")
+        # Replaced the scrolling console with a loading bar + one-line status: a
+        # busy/indeterminate bar shown only while an operation runs, plus the
+        # latest message. Errors pop up a dialog (see _on_worker_error).
+        self.busy = QProgressBar()
+        self.busy.setRange(0, 0)
+        self.busy.setTextVisible(False)
+        self.busy.setVisible(False)
+        self.status = QLabel("")
+        self.status.setWordWrap(True)
+        self.status.setStyleSheet("color: #5b6273;")
         lay = QVBoxLayout()
         lay.addLayout(go_row)
-        lay.addWidget(self.log, 1)
+        lay.addWidget(self.busy)
+        lay.addWidget(self.status)
         return lay
+
+    def _busy_off(self):
+        self.busy.setVisible(False)
+        self.hag_busy.setVisible(False)
 
     # ------------------------------------------------------------- widgets
     def _dispatch_done(self, result):
+        self._busy_off()
         cb, self._done_cb = self._done_cb, None
         if cb:
             cb(result)
@@ -400,6 +417,7 @@ class DatasetsPage(QWidget):
         out_dir = str(self._output_root() / f"{Path(in_dir).stem}_hag")
         flt = self.hag_filter.currentText()
         self.hag_btn.setEnabled(False)
+        self.hag_busy.setVisible(True)
         self._append(f"Adding HAG ({flt}, SMRF ground) …")
 
         def job(progress):
@@ -426,6 +444,7 @@ class DatasetsPage(QWidget):
         spec = self._spec()
         self._append("Scanning label values…")
         self.scan_btn.setEnabled(False)
+        self.busy.setVisible(True)
 
         def job(progress):
             files = dataset.expand_inputs(in_path)
@@ -466,6 +485,7 @@ class DatasetsPage(QWidget):
             self._append("Choose an input file or folder first.")
             return
         self.analyze_btn.setEnabled(False)
+        self.busy.setVisible(True)
         self._append("Analyzing density…")
 
         def job(progress):
@@ -508,8 +528,25 @@ class DatasetsPage(QWidget):
             self.class_table.setItem(r, 3, QTableWidgetItem(name))
             chk = self.class_table.cellWidget(r, 0).findChild(QCheckBox)
             chk.setChecked(True)            # combining implies training on it
+        self._refresh_group_counts()        # show the merged classes added together
         vals = ", ".join(self.class_table.item(r, 1).text() for r in rows)
         self._append(f"Combined source values [{vals}] into one class '{name}'.")
+
+    def _refresh_group_counts(self):
+        """Display each row's 'Points seen' as the total over all rows sharing its
+        class name, so combined classes read as one added-together class. Col 2 is
+        display-only — conversion recounts class totals from the actual data."""
+        totals: dict[str, int] = {}
+        for r in range(self.class_table.rowCount()):
+            val = int(self.class_table.item(r, 1).text())
+            name = self.class_table.item(r, 3).text().strip() or f"class_{val}"
+            totals[name] = totals.get(name, 0) + self._label_values.get(val, 0)
+        for r in range(self.class_table.rowCount()):
+            val = int(self.class_table.item(r, 1).text())
+            name = self.class_table.item(r, 3).text().strip() or f"class_{val}"
+            cell = self.class_table.item(r, 2)
+            if cell:
+                cell.setText(f"{totals[name]:,}")
 
     def _classes_from_table(self):
         """Rows sharing a Class name collapse to one class index (combine); each
@@ -554,7 +591,7 @@ class DatasetsPage(QWidget):
         out_root = self._output_root()
         self.convert_btn.setEnabled(False)
         self.upload_btn.setEnabled(False)
-        self.log.clear()
+        self.busy.setVisible(True)
         self._append(f"Converting '{name}' ({len(classes)} classes, split={split.strategy}, "
                      f"ignored values: {ignored}) -> {out_root}…")
 
@@ -627,18 +664,21 @@ class DatasetsPage(QWidget):
         name = staged.name
         self.upload_btn.setEnabled(False)
         self.upload_saved_btn.setEnabled(False)
+        self.busy.setVisible(True)
         self._append(f"\nCreating + uploading volume '{name}' (-> /{name}) …")
         prog, args = modal_cli.volume_put(name, str(staged), f"/{name}")
         self.uploader.start(prog, args, cwd=self.repo_root,
                             pre=modal_cli.volume_create(name))
 
     def _on_upload_failed(self, err: str):
+        self._busy_off()
         self.upload_btn.setEnabled(True)
         self.upload_saved_btn.setEnabled(True)
-        self._append(f"\n✗ Upload process failed to run: {err}. Is the Modal CLI on PATH "
+        self._append(f"✗ Upload process failed to run: {err}. Is the Modal CLI on PATH "
                      f"and authenticated? (modal token new)")
 
     def _on_upload_done(self, code: int):
+        self._busy_off()
         self.upload_btn.setEnabled(True)
         self.upload_saved_btn.setEnabled(True)
         staged = self._uploading
@@ -658,11 +698,13 @@ class DatasetsPage(QWidget):
 
     def _on_worker_error(self, tb: str):
         self._done_cb = None
+        self._busy_off()
         self.scan_btn.setEnabled(True)
         self.analyze_btn.setEnabled(True)
         self.convert_btn.setEnabled(True)
         self.hag_btn.setEnabled(pretrain.pdal_available())
-        self._append(f"\n✗ Error:\n{tb}")
+        self.status.setText("✗ Error — see the dialog for details.")
+        QMessageBox.critical(self, "Dataset error", tb)
 
     # ------------------------------------------------------------- known list
     def _reload_known(self):
@@ -706,9 +748,11 @@ class DatasetsPage(QWidget):
 
     # ------------------------------------------------------------- helpers
     def _append(self, text: str, newline: bool = True):
-        self.log.moveCursor(QTextCursor.End)
-        self.log.insertPlainText(text + ("\n" if newline else ""))
-        self.log.moveCursor(QTextCursor.End)
+        # The console is gone — show the latest message on one line (whitespace +
+        # newlines collapsed) in the status label beside the loading bar.
+        msg = " ".join(text.split())
+        if msg:
+            self.status.setText(msg)
 
 
 def _wrap(layout) -> QWidget:
