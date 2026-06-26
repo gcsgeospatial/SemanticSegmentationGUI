@@ -18,7 +18,12 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_ROOT))
+# train scripts moved under scripts/{local,modal,helper}; keep the bare module
+# names importable (import_module("local_train_ptv3"), _modal_shim, …).
+for _d in ("scripts/local", "scripts/modal", "scripts/helper"):
+    sys.path.insert(0, str(_ROOT / _d))
 
 from trainer_gui import analysis, dataset  # noqa: E402
 from trainer_gui.dataset import LabelSpec  # noqa: E402
@@ -627,8 +632,8 @@ def main():
             check("local_cli: docker run with gpus + workspace/datasets/outputs mounts",
                   args[0] == "run" and "--gpus" in args and "/repo:/workspace" in args
                   and ":/datasets" in joined and ":/outputs" in joined)
-            check("local_cli: invokes the decoupled local_train_<key>.py with the flags",
-                  "local_train_ptv3.py" in args and "local_run.py" not in args
+            check("local_cli: invokes the decoupled scripts/local/local_train_<key>.py with the flags",
+                  "scripts/local/local_train_ptv3.py" in args and "local_run.py" not in args
                   and "--dataset" in args and "myds" in args and "--grid" in args)
             _, args_o = local_cli.run_script(
                 "modal_train_ptv3.py", {"dataset": "d"}, BB["ptv3"],

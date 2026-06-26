@@ -1,6 +1,20 @@
 """
 Modal training script for RandLA-Net (PyTorch) on IEEE GRSS 2019 Track 4 —
-COLD-START variant.
+COLD-START + HAG variant.
+
+This is the HAG twin of modal_train_randlanet.py. Identical in every way except
+it appends a real PDAL HeightAboveGround feature (computed by the trainer_gui
+Pretraining tab: SMRF ground-classify -> hag_nn) as an extra input channel:
+IN_DIM 5 -> 6 ([xyz, intensity, return_number, HAG]); fc0 is rebuilt at 6->8.
+HAG is read per point from /data/IEEE/HAG/{Train,Validate}/<scene>_PC3.laz and
+paired to the raw _PC3.txt points. Run it head-to-head against
+modal_train_randlanet.py to measure HAG's contribution.
+
+Prereq: upload the HAGTEST output (Pretraining tab) to the ieee-data volume:
+    modal volume put ieee-data "C:/Users/OrionHoch/Desktop/HAGTEST/Train"    /IEEE/HAG/Train
+    modal volume put ieee-data "C:/Users/OrionHoch/Desktop/HAGTEST/Validate" /IEEE/HAG/Validate
+The --dataset (canonical trainer_gui) path has no HAG laz, so it falls back to a
+z-scene-min proxy for the 6th channel (keeps IN_DIM fixed at 6).
 
 Random initialization — no pretrained weights. Architecture and features are
 identical to the warm sibling (modal_train_randlanet_warm.py), making
@@ -54,7 +68,7 @@ from typing import Optional
 # ============================================================================
 # Configuration
 # ============================================================================
-APP_NAME      = "randlanet-cold-ieee"
+APP_NAME      = "randlanet-cold-ieee-hag"
 GPU_TYPE      = os.environ.get("TT_GPU", "A10G")   # RandLA is light, A10G handles it
 N_EPOCHS      = 100              # was 5 (smoke test); 250-300 for a full run
 BATCH_SIZE    = 6
@@ -64,7 +78,7 @@ TIMEOUT_HOURS = int(os.environ.get("TT_TIMEOUT_HOURS", "24"))
 NUM_CLASSES   = 5                # IEEE Track 4: Ground, Trees, Building, Water, Bridge
 NUM_POINTS    = 45056            # 4096*11, RandLA SemKITTI default
 SUB_GRID_SIZE = 0.30             # 30 cm — IEEE LiDAR is sparser (~2 pts/m²) than KITTI
-IN_DIM        = 5                # [x, y, z, intensity, return_number]
+IN_DIM        = 6                # [x, y, z, intensity, return_number, HAG]
 N_VAL_HOLDOUT = 10               # number of train scenes held out for val
 HOLDOUT_SEED  = 42
 
@@ -100,7 +114,11 @@ TRAIN_PC_DIR   = f"{DATA_ROOT}/Train-Track4/Track4"
 TRAIN_CLS_DIR  = f"{DATA_ROOT}/Train-Track4-Truth/Track4-Truth"
 TEST_PC_DIR    = f"{DATA_ROOT}/Validate-Track4/Track4"
 TEST_CLS_DIR   = f"{DATA_ROOT}/Validate-Track4-Truth"
-PREP_DIR       = f"{DATA_ROOT}/prep/randlanet_grid30_p95_origin"   # p95 intensity norm
+# Per-point HeightAboveGround from the Pretraining tab (HAGTEST upload). Train +
+# val-holdout scenes -> HAG/Train; the test split (Validate-Track4) -> HAG/Validate.
+HAG_TRAIN_DIR  = f"{DATA_ROOT}/HAG/Train"
+HAG_TEST_DIR   = f"{DATA_ROOT}/HAG/Validate"
+PREP_DIR       = f"{DATA_ROOT}/prep/randlanet_hag_grid30_p95_origin"   # p95 intensity norm + HAG
 
 # ASPRS LAS code -> contiguous 0..4 IEEE class index. Class 0 (Unclassified)
 # maps to -1 and is ignored by the CE loss.
@@ -134,8 +152,10 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     from datetime import datetime
     import numpy as np
     import torch
+    import laspy
     import torch.nn as nn
     import torch.optim as optim
+    from scipy.spatial import cKDTree
     from torch.utils.data import DataLoader, Dataset
 
     # --- resolve config: CLI args override the module defaults ---------------
@@ -158,7 +178,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         NUM_CLASSES = int(ds_meta["num_classes"])
         CLASS_NAMES = list(ds_meta["class_names"])
         # No "warm" in the name: the cold sibling shares this cache (identical prep).
-        PREP_DIR = f"{ds_root}/prep/randlanet_grid{int(round(SUB_GRID_SIZE * 100))}_p95"
+        PREP_DIR = f"{ds_root}/prep/randlanet_hag_grid{int(round(SUB_GRID_SIZE * 100))}_p95"
     else:
         PREP_DIR = globals()["PREP_DIR"]
 
@@ -286,6 +306,40 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     for raw, mapped in LABEL_MAP.items():
         LABEL_LUT[raw] = mapped
 
+    # --- HAG: per-point HeightAboveGround from the Pretraining-tab .laz files,
+    # paired to the raw scene points. PDAL preserves point order, so index-pair
+    # when counts match (sample-verified); else nearest-neighbor on xyz. --------
+    def _read_hag_laz(laz_path):
+        las = laspy.read(laz_path)
+        names = list(las.point_format.dimension_names)
+        hname = next((n for n in names if n.lower() in ("heightaboveground", "hag")), None)
+        if hname is None:
+            raise KeyError(f"{laz_path}: no HeightAboveGround dim (have {names})")
+        hag = np.asarray(las[hname], dtype=np.float32)
+        laz_xyz = np.column_stack([las.x, las.y, las.z])   # float64: absolute UTM
+        return hag, laz_xyz                                 # needs full precision for pairing
+
+    def load_hag(name, hag_dir, xyz_ref):
+        laz_path = f"{hag_dir}/{name}_PC3.laz"
+        if not os.path.exists(laz_path):
+            raise FileNotFoundError(
+                f"HAG file missing: {laz_path}. Upload the Pretraining-tab output:\n"
+                f'  modal volume put ieee-data "<HAGTEST>/Train" /IEEE/HAG/Train\n'
+                f'  modal volume put ieee-data "<HAGTEST>/Validate" /IEEE/HAG/Validate')
+        hag, laz_xyz = _read_hag_laz(laz_path)
+        # xyz_ref is offset to a per-scene origin (precision fix) while the laz
+        # carries absolute coords; subtract each array's own per-axis min so the
+        # index-pair guard and NN fallback compare in a common full-precision frame.
+        ref0 = xyz_ref.astype(np.float64) - xyz_ref.min(0)
+        laz0 = laz_xyz - laz_xyz.min(0)
+        if len(hag) == len(xyz_ref):
+            k = min(2048, len(hag))
+            s = np.random.RandomState(0).choice(len(hag), k, replace=False)
+            if np.allclose(laz0[s], ref0[s], atol=0.05):
+                return hag
+        nn = cKDTree(laz0).query(ref0)[1]
+        return hag[nn].astype(np.float32)
+
     def load_ieee(pc_path, cls_path):
         # PC3.txt: x, y, z, intensity, returnNumber  (CSV)
         # CLS.txt: one ASPRS class code per line
@@ -326,10 +380,10 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
             return load_canonical(pc_path)
         return load_ieee(pc_path, cls_path)
 
-    def grid_subsample(xyz, intensity, ret_num, lab, grid):
+    def grid_subsample(xyz, intensity, ret_num, hag, lab, grid):
         keys = np.floor(xyz / grid).astype(np.int64)
         _, uniq = np.unique(keys, axis=0, return_index=True)
-        return xyz[uniq], intensity[uniq], ret_num[uniq], lab[uniq]
+        return xyz[uniq], intensity[uniq], ret_num[uniq], hag[uniq], lab[uniq]
 
     def _split_scenes():
         """Deterministic train/val split; returns (name, pc_path, cls_path) lists."""
@@ -343,6 +397,8 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
             idx = np.arange(len(names_all))
             rng.shuffle(idx)
             n_hold = min(N_VAL_HOLDOUT, max(1, len(names_all) // 5))
+            if len(names_all) >= 6:            # H3: avoid the 1-scene val-mIoU lottery
+                n_hold = max(n_hold, 3)
             val_names = sorted(names_all[i] for i in idx[:n_hold])
             train = [(n, p, None) for n, p in zip(names_all, train_npz) if n not in val_names]
             val   = [(n, p, None) for n, p in zip(names_all, train_npz) if n in val_names]
@@ -378,7 +434,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         # means the cache is stale/leaky and must not be silently reused.
         return {
             "format_version": 1,
-            "pipeline": "randlanet",
+            "pipeline": "randlanet_hag",
             "dataset": dataset or "IEEE_Track4",
             "sub_grid_size": SUB_GRID_SIZE,
             "num_classes": NUM_CLASSES,
@@ -386,15 +442,18 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
             "n_val_holdout": N_VAL_HOLDOUT,
             "label_map": (None if ds_root
                           else {str(k): v for k, v in sorted(LABEL_MAP.items())}),
-            "feature_recipe": "xyz,intensity,return_number",
+            "feature_recipe": "xyz,intensity,return_number,hag",
+            "hag_source": ("z_minus_scene_min_proxy" if ds_root else "pdal_hag_nn"),
+            "hag_train_dir": (None if ds_root else HAG_TRAIN_DIR),
+            "hag_test_dir": (None if ds_root else HAG_TEST_DIR),
         }
 
     def _validate_cache(lists):
         """Refuse to reuse a cache built with different settings (grid, split
-        seed, label map, dataset, feature recipe …) instead of silently mixing
-        incompatible data. Migrate a pre-validation cache by stamping .done
-        markers for already-saved scenes. Returns True if the signature file was
-        newly written (so the caller commits the volume)."""
+        seed, label map, dataset, feature recipe, HAG source …) instead of
+        silently mixing incompatible data. Migrate a pre-validation cache by
+        stamping .done markers for already-saved scenes. Returns True if the
+        signature file was newly written (so the caller commits the volume)."""
         meta_path = f"{PREP_DIR}/cache_meta.json"
         cur = _cache_signature()
         if os.path.exists(meta_path):
@@ -433,6 +492,9 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                                    ("test", test_list)])
         for split, items in (("train", train_list), ("val", val_list),
                              ("test", test_list)):
+            # train + val-holdout scenes are Train-Track4 -> HAG/Train; test is
+            # Validate-Track4 -> HAG/Validate. Canonical --dataset has no HAG laz.
+            hag_dir = HAG_TEST_DIR if split == "test" else HAG_TRAIN_DIR
             print(f"  [{split}] {len(items)} scenes", flush=True)
             for i, (name, pc_path, cls_path) in enumerate(items):
                 out = f"{PREP_DIR}/{split}/{name}.npz"
@@ -442,8 +504,11 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                 try:
                     xyz, intensity, ret_num, lab = load_scene(pc_path, cls_path)
                     n_in = len(xyz)
-                    xyz, intensity, ret_num, lab = grid_subsample(
-                        xyz, intensity, ret_num, lab, SUB_GRID_SIZE)
+                    # Real HAG for IEEE; z-scene-min proxy for canonical datasets.
+                    hag = ((xyz[:, 2] - xyz[:, 2].min()).astype(np.float32)
+                           if ds_root else load_hag(name, hag_dir, xyz))
+                    xyz, intensity, ret_num, hag, lab = grid_subsample(
+                        xyz, intensity, ret_num, hag, lab, SUB_GRID_SIZE)
                 except Exception as e:
                     print(f"  skip {pc_path}: {e}", flush=True); continue
                 np.savez_compressed(
@@ -451,6 +516,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                     xyz=xyz.astype(np.float32),
                     intensity=intensity.astype(np.float32),
                     ret_num=ret_num.astype(np.float32),
+                    hag=hag.astype(np.float32),
                     lab=lab.astype(np.int32))
                 open(out + ".done", "w").close()      # mark complete after a clean write
                 any_new = True
@@ -482,8 +548,8 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         return flat
 
     def collate_fn(batch):
-        # Items are (pc, extra_feats(2ch), label, point_idx, cloud_idx); the
-        # network input is [xyz, intensity, return_number] = IN_DIM channels.
+        # Items are (pc, extra_feats(3ch), label, point_idx, cloud_idx); the
+        # network input is [xyz, intensity, return_number, HAG] = IN_DIM channels.
         pcs, feats, lbs, idxs, cinds = zip(*batch)
         pcs  = np.stack(pcs);  feats = np.stack(feats); lbs = np.stack(lbs)
         idxs = np.stack(idxs); cinds = np.stack(cinds)
@@ -518,15 +584,18 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         @staticmethod
         def _load(f):
             z = np.load(f)
-            return (z["xyz"], z["intensity"], z["ret_num"], z["lab"])
+            # HAG-prepped tiles carry "hag"; tolerate legacy caches via z-min proxy.
+            hag = (z["hag"] if "hag" in z.files
+                   else (z["xyz"][:, 2] - z["xyz"][:, 2].min()).astype(np.float32))
+            return (z["xyz"], z["intensity"], z["ret_num"], hag, z["lab"])
 
         def set_rare_classes(self, rare_classes):
             self.rare_idx = [np.where(np.isin(lab, rare_classes))[0]
-                             for _, _, _, lab in self.scenes]
+                             for _, _, _, _, lab in self.scenes]
             self.rare_scenes = [i for i, r in enumerate(self.rare_idx) if len(r)]
 
         def sample_sphere(self, cloud_idx, center_idx, augment=False, rng=np.random):
-            xyz, intensity, ret_num, lab = self.scenes[cloud_idx]
+            xyz, intensity, ret_num, hag, lab = self.scenes[cloud_idx]
             center = xyz[center_idx:center_idx + 1]
             d2 = np.sum((xyz - center) ** 2, axis=1)
             sel = np.argpartition(d2, min(cfg.num_points, len(xyz) - 1))[:cfg.num_points]
@@ -542,7 +611,8 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                 if rng.rand() < 0.5:
                     pc[:, 0] *= -1.0
                 pc = pc * np.float32(rng.uniform(0.9, 1.1))
-            feat2 = np.stack([intensity[sel], ret_num[sel]], axis=1).astype(np.float32)
+            feat2 = np.stack([intensity[sel], ret_num[sel], hag[sel]],
+                             axis=1).astype(np.float32)   # 3 extra ch -> IN_DIM=6
             lb = lab[sel].astype(np.int64)
             return pc.astype(np.float32), feat2, lb, sel.astype(np.int32), \
                    np.array([cloud_idx], dtype=np.int32)
@@ -580,9 +650,6 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         reps = -(-num_classes // len(BASE_PALETTE))
         return np.tile(BASE_PALETTE, (reps, 1))[:num_classes]
 
-    def _write_cls(path, pred_idx):
-        np.savetxt(path, IDX_TO_ASPRS[pred_idx], fmt="%d")
-
     def _write_ply(path, xyz, pred_idx, palette, intensity=None):
         cols = [xyz.astype(np.float32), palette[pred_idx]]
         props = ("property float x\nproperty float y\nproperty float z\n"
@@ -618,6 +685,11 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                 itn0 = np.clip(itn0 / i_p95, 0.0, 2.0).astype(np.float32)
                 ret0 = pc[:, 4].astype(np.float32) if pc.shape[1] >= 5 \
                     else np.zeros(len(xyz0), np.float32)
+            # Predict scenes (IEEE Test-Track4 / canonical infer npz) have no HAG
+            # laz -> z-scene-min proxy for the 6th channel (best-effort demo).
+            hag0 = (z["hag"].astype(np.float32)
+                    if pc_path.endswith(".npz") and "hag" in z.files
+                    else (xyz0[:, 2] - xyz0[:, 2].min()).astype(np.float32))
             keys = np.floor(xyz0 / SUB_GRID_SIZE).astype(np.int64)
             _, uniq = np.unique(keys, axis=0, return_index=True)
             sub_xyz = xyz0[uniq]
@@ -625,6 +697,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
             sub_sorted = sub_xyz[order]
             sub_itn = itn0[uniq][order]
             sub_ret = ret0[uniq][order]
+            sub_hag = hag0[uniq][order]
             sub_pred = np.full(len(sub_xyz), -1, np.int64)
             N = cfg.num_points
             with torch.no_grad():
@@ -633,7 +706,8 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                     if real < 64:
                         continue
                     block = sub_sorted[s:s + N]
-                    f2 = np.stack([sub_itn[s:s + N], sub_ret[s:s + N]], axis=1)
+                    f2 = np.stack([sub_itn[s:s + N], sub_ret[s:s + N],
+                                   sub_hag[s:s + N]], axis=1)
                     orig = order[s:s + real].astype(np.int64)   # indices into sub_xyz
                     if real < N:                         # pad the final short block
                         pad = np.random.choice(real, N - real)
@@ -641,7 +715,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                         f2 = np.concatenate([f2, f2[pad]], axis=0)
                         orig = np.concatenate([orig, np.full(N - real, -1, np.int64)])
                     # RandLA-Net's first-N subsampling requires randomized point
-                    # order (training spheres shuffle); shuffle, unshuffle on scatter.
+                    # order (see evaluate()); shuffle, then unshuffle on scatter.
                     perm = np.random.permutation(N)
                     block, f2, orig = block[perm], f2[perm], orig[perm]
                     pc_c = (block - block.mean(0, keepdims=True)).astype(np.float32)
@@ -694,7 +768,8 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                 f"use weights trained by this script version")
         net.load_state_dict(sd)
         net.eval()
-        print(f"  [infer] loaded {weights} ({num_classes} classes: {class_names})", flush=True)
+        print(f"  [infer] loaded {weights} ({num_classes} classes: {class_names}; "
+              f"final_model = best-val epoch {ckpt.get('epoch', '?')})", flush=True)
 
         scenes = sorted(glob.glob(f"{DATASETS_ROOT}/_infer/{infer_input}/scenes/*.npz"))
         if not scenes:
@@ -736,7 +811,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     print("=" * 70)
     train_list, val_list, test_list = ensure_prep()
     tag = dataset or "ieee"
-    run_id = datetime.utcnow().strftime(f"%Y%m%d_%H%M%S_{tag}_randlanet_cold")
+    run_id = datetime.utcnow().strftime(f"%Y%m%d_%H%M%S_{tag}_randlanet_cold_hag")
     run_dir = f"/outputs/runs/{run_id}"
     os.makedirs(f"{run_dir}/checkpoints", exist_ok=True)
     with open(f"{run_dir}/run_config.json", "w") as f:
@@ -747,7 +822,8 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
             "n_epochs": N_EPOCHS,
             "batch_size": BATCH_SIZE, "num_points": NUM_POINTS,
             "sub_grid_size": SUB_GRID_SIZE, "in_dim": IN_DIM,
-            "features": ["x", "y", "z", "intensity", "return_number"],
+            "features": ["x", "y", "z", "intensity", "return_number", "HAG"],
+            "hag_source": "PDAL hag_nn (trainer_gui Pretraining tab)",
             "steps_per_epoch": STEPS,
             "class_balance": {"weighting": CLASS_WEIGHTING, "beta": WEIGHT_BETA,
                               "weight_scheme": "inv_sqrt_freq" if WEIGHT_BETA == 0.5
@@ -781,7 +857,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     # rare classes. Rare = train frequency < RARE_FREQ_THRESH.
     print("  scanning train scenes for class balance…", flush=True)
     class_counts = np.zeros(NUM_CLASSES, dtype=np.int64)
-    for _, _, _, lab in train_ds.scenes:
+    for _, _, _, _, lab in train_ds.scenes:
         v = lab[lab >= 0]
         if v.size:
             class_counts += np.bincount(v, minlength=NUM_CLASSES)
@@ -832,21 +908,11 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
             batch[k] = [t.to(device) for t in batch[k]]
         return batch
 
-    # ------------------------------------------------------------------------
-    # Periodic held-out validation (eval mode, no_grad — weights untouched).
-    # Same seeded spheres every pass, so rows are comparable across epochs.
-    # Watch mid-run: modal volume get <app>-outputs runs/<id>/val_metrics.csv
-    # ------------------------------------------------------------------------
     # --- Periodic + final evaluation: the REAL full-coverage eval (not a cheap
-    # subset proxy) on the held-out val set every VAL_EVERY epochs, appended to
-    # val_metrics.csv so the val curve uses the SAME protocol the final test does.
-    # NOTE: far heavier than the old quick_val — every val scene is fully covered
-    # and reprojected to raw points. Raise VAL_EVERY if it costs too much. -------
-    val_csv = f"{run_dir}/val_metrics.csv"
-    with open(val_csv, "w", newline="") as f:
-        csv.writer(f).writerow(["epoch", "val_acc", "val_miou"] +
-                               [f"iou_{n}" for n in CLASS_NAMES])
-
+    # subset proxy) over the held-out val set every VAL_EVERY epochs, appended to
+    # val_metrics.csv so the val curve is the SAME protocol the final test reports
+    # (full-coverage blocks, reprojected to raw points, scored on raw GT). Heavier
+    # than the old quick_val — raise VAL_EVERY if it costs too much. ------------
     def evaluate(ds, name2src, label):
         """Full-coverage eval scored on the ORIGINAL raw points (official
         protocol). Each scene's 0.30 m subsampled points are predicted once via
@@ -861,7 +927,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         n_scenes = n_skipped = 0
         N = cfg.num_points
         with torch.no_grad():
-            for i, (xyz, intensity, ret_num, lab) in enumerate(ds.scenes):
+            for i, (xyz, intensity, ret_num, hag, lab) in enumerate(ds.scenes):
                 order = np.lexsort((xyz[:, 1], xyz[:, 0]))   # rough spatial locality
                 pred = np.full(len(xyz), -1, np.int64)
                 pend_items, pend_blocks = [], []
@@ -884,7 +950,8 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                     if real < 64:
                         continue
                     pts_blk = xyz[blk]
-                    f2 = np.stack([intensity[blk], ret_num[blk]], axis=1).astype(np.float32)
+                    f2 = np.stack([intensity[blk], ret_num[blk], hag[blk]],
+                                  axis=1).astype(np.float32)
                     orig = blk.astype(np.int64)
                     if real < N:                         # pad the final short block
                         pad = np.random.choice(real, N - real)
@@ -893,9 +960,9 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                         orig = np.concatenate([orig, np.full(N - real, -1, np.int64)])
                     # RandLA-Net subsamples by taking the FIRST points at each
                     # layer (tf_map), so the input MUST be shuffled — training
-                    # spheres are (sample_sphere). The lexsort-ordered block
-                    # collapses the multi-scale subsampling onto one corner and
-                    # wrecks predictions. Shuffle, then track originals.
+                    # spheres are (sample_sphere). Feeding the lexsort-ordered
+                    # block collapses the multi-scale subsampling onto one corner
+                    # and wrecks predictions. Shuffle, then track originals.
                     perm = np.random.permutation(N)
                     pts_blk, f2, orig = pts_blk[perm], f2[perm], orig[perm]
                     pc_c = (pts_blk - pts_blk.mean(0, keepdims=True)).astype(np.float32)
@@ -958,6 +1025,13 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
 
     val_src = {n: (p, c) for n, p, c in val_list}
 
+    val_csv = f"{run_dir}/val_metrics.csv"
+    with open(val_csv, "w", newline="") as f:
+        csv.writer(f).writerow(["epoch", "val_acc", "val_miou"] +
+                               [f"iou_{n}" for n in CLASS_NAMES])
+
+    import os as _os, sys as _sys   # scripts/helper is a sibling dir (flat /root in Modal)
+    _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "helper"))
     from train_common import BestCheckpoint
     best = BestCheckpoint(run_dir)
 
@@ -1044,8 +1118,6 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         if (ep + 1) % VAL_EVERY == 0 and ep != N_EPOCHS - 1:
             run_eval(ep)               # last epoch handled by the final eval below
 
-    # --- Final evaluation: the real full-coverage eval over val + test, written
-    # to test_metrics.json (the same val number run_eval logs periodically). ----
     print("  final evaluation (val + test)…", flush=True)
     run_eval(N_EPOCHS - 1, write_json=True)
     best.finalize(lambda p: torch.save(
@@ -1056,7 +1128,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
 
 def main():
     import argparse
-    ap = argparse.ArgumentParser(description='Local randlanet trainer/inferencer (no modal).')
+    ap = argparse.ArgumentParser(description='Local randlanet_hag trainer/inferencer (no modal).')
     ap.add_argument('--dataset', default=None)
     ap.add_argument('--sub-grid', type=float, default=None)
     ap.add_argument('--num-points', type=int, default=None)

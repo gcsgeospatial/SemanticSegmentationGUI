@@ -10,9 +10,9 @@ from PySide6.QtCore import QByteArray, Qt
 from PySide6.QtWidgets import (QApplication, QComboBox, QHBoxLayout, QLabel, QListWidget,
                                QListWidgetItem, QMessageBox, QStackedWidget, QVBoxLayout, QWidget)
 
-# Repo root = the project dir holding the modal_train_*.py scripts (one level up
-# from this trainer_gui/ package). modal runs are launched with cwd=REPO_ROOT, so
-# this must be where `modal run modal_train_*.py` can find the script.
+# Repo root = the project dir holding scripts/ (one level up from this trainer_gui/
+# package). modal runs are launched with cwd=REPO_ROOT, so this must be where
+# `modal run scripts/modal/modal_train_*.py` can find the script.
 #   .../<repo>/trainer_gui/main.py  -> parents[0]=trainer_gui pkg, parents[1]=<repo>
 REPO_ROOT = str(Path(__file__).resolve().parents[1])
 

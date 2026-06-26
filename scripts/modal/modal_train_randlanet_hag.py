@@ -1,6 +1,20 @@
 """
 Modal training script for RandLA-Net (PyTorch) on IEEE GRSS 2019 Track 4 —
-COLD-START variant.
+COLD-START + HAG variant.
+
+This is the HAG twin of modal_train_randlanet.py. Identical in every way except
+it appends a real PDAL HeightAboveGround feature (computed by the trainer_gui
+Pretraining tab: SMRF ground-classify -> hag_nn) as an extra input channel:
+IN_DIM 5 -> 6 ([xyz, intensity, return_number, HAG]); fc0 is rebuilt at 6->8.
+HAG is read per point from /data/IEEE/HAG/{Train,Validate}/<scene>_PC3.laz and
+paired to the raw _PC3.txt points. Run it head-to-head against
+modal_train_randlanet.py to measure HAG's contribution.
+
+Prereq: upload the HAGTEST output (Pretraining tab) to the ieee-data volume:
+    modal volume put ieee-data "C:/Users/OrionHoch/Desktop/HAGTEST/Train"    /IEEE/HAG/Train
+    modal volume put ieee-data "C:/Users/OrionHoch/Desktop/HAGTEST/Validate" /IEEE/HAG/Validate
+The --dataset (canonical trainer_gui) path has no HAG laz, so it falls back to a
+z-scene-min proxy for the 6th channel (keeps IN_DIM fixed at 6).
 
 Random initialization — no pretrained weights. Architecture and features are
 identical to the warm sibling (modal_train_randlanet_warm.py), making
@@ -55,7 +69,7 @@ import modal
 # ============================================================================
 # Configuration
 # ============================================================================
-APP_NAME      = "randlanet-cold-ieee"
+APP_NAME      = "randlanet-cold-ieee-hag"
 GPU_TYPE      = os.environ.get("TT_GPU", "A10G")   # RandLA is light, A10G handles it
 N_EPOCHS      = 100              # was 5 (smoke test); 250-300 for a full run
 BATCH_SIZE    = 6
@@ -65,7 +79,7 @@ TIMEOUT_HOURS = int(os.environ.get("TT_TIMEOUT_HOURS", "24"))
 NUM_CLASSES   = 5                # IEEE Track 4: Ground, Trees, Building, Water, Bridge
 NUM_POINTS    = 45056            # 4096*11, RandLA SemKITTI default
 SUB_GRID_SIZE = 0.30             # 30 cm — IEEE LiDAR is sparser (~2 pts/m²) than KITTI
-IN_DIM        = 5                # [x, y, z, intensity, return_number]
+IN_DIM        = 6                # [x, y, z, intensity, return_number, HAG]
 N_VAL_HOLDOUT = 10               # number of train scenes held out for val
 HOLDOUT_SEED  = 42
 
@@ -101,7 +115,11 @@ TRAIN_PC_DIR   = f"{DATA_ROOT}/Train-Track4/Track4"
 TRAIN_CLS_DIR  = f"{DATA_ROOT}/Train-Track4-Truth/Track4-Truth"
 TEST_PC_DIR    = f"{DATA_ROOT}/Validate-Track4/Track4"
 TEST_CLS_DIR   = f"{DATA_ROOT}/Validate-Track4-Truth"
-PREP_DIR       = f"{DATA_ROOT}/prep/randlanet_grid30_p95_origin"   # p95 intensity norm
+# Per-point HeightAboveGround from the Pretraining tab (HAGTEST upload). Train +
+# val-holdout scenes -> HAG/Train; the test split (Validate-Track4) -> HAG/Validate.
+HAG_TRAIN_DIR  = f"{DATA_ROOT}/HAG/Train"
+HAG_TEST_DIR   = f"{DATA_ROOT}/HAG/Validate"
+PREP_DIR       = f"{DATA_ROOT}/prep/randlanet_hag_grid30_p95_origin"   # p95 intensity norm + HAG
 
 # ASPRS LAS code -> contiguous 0..4 IEEE class index. Class 0 (Unclassified)
 # maps to -1 and is ignored by the CE loss.
@@ -131,6 +149,8 @@ image = (
         "matplotlib",
         "Cython",
         "pandas<3",
+        "laspy",
+        "lazrs",          # LAZ backend so laspy can read the HAG .laz scenes
         index_url="https://download.pytorch.org/whl/cu121",
         extra_index_url="https://pypi.org/simple",
     )
@@ -176,8 +196,8 @@ image = image.run_commands(
     "      /opt/randlanet/utils/cpp_wrappers/cpp_subsampling/__init__.py",
 )
 
-image = image.add_local_file("local_train_randlanet.py", "/root/local_train_randlanet.py")
-image = image.add_local_file("train_common.py", "/root/train_common.py")
+image = image.add_local_file("scripts/local/local_train_randlanet_hag.py", "/root/local_train_randlanet_hag.py")
+image = image.add_local_file("scripts/helper/train_common.py", "/root/train_common.py")
 
 data_volume     = modal.Volume.from_name("ieee-data",            create_if_missing=True)
 outputs_volume  = modal.Volume.from_name(f"{APP_NAME}-outputs",  create_if_missing=True)
@@ -203,13 +223,13 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                     mode: str = "train", weights: Optional[str] = None,
                     infer_input: Optional[str] = None):
     """Modal shell: provision the GPU container + volumes, then run the LOCAL
-    trainer. All training/inference logic lives in local_train_randlanet.py — this only
+    trainer. All training/inference logic lives in local_train_randlanet_hag.py — this only
     shells out to it, so local and cloud run byte-identical code."""
     import subprocess
     import sys
     import threading
 
-    cmd = [sys.executable, "/root/local_train_randlanet.py"]
+    cmd = [sys.executable, "/root/local_train_randlanet_hag.py"]
     for _flag, _val in (
         ("--dataset", dataset),
         ("--sub-grid", sub_grid),

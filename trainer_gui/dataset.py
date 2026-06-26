@@ -207,8 +207,14 @@ def _crop(cloud: Cloud, raw: np.ndarray | None, bounds: tuple):
 # --------------------------------------------------------------------- conversion
 
 def _convert_one(cloud: Cloud, raw: np.ndarray | None, value_to_index: dict[int, int],
-                 out_path: Path, intensity_norm: str = "max") -> dict:
-    """Write one (already-read, already-cropped) cloud to a canonical npz."""
+                 out_path: Path, intensity_norm: str = "max",
+                 compute_hag: bool = False) -> dict:
+    """Write one (already-read, already-cropped) cloud to a canonical npz.
+
+    compute_hag (inference only): also store a per-point real HeightAboveGround
+    ("hag", SMRF->hag_nn) aligned to xyz, for running *_hag weights trained on real
+    HAG. Silently skipped (the infer loaders fall back to a z-min proxy) when PDAL
+    can't produce an aligned result."""
     out: dict[str, np.ndarray] = {"xyz": cloud.xyz.astype(np.float32)}
 
     class_counts: dict[int, int] = {}
@@ -233,6 +239,11 @@ def _convert_one(cloud: Cloud, raw: np.ndarray | None, value_to_index: dict[int,
             out["intensity"] = (cloud.intensity / raw_imax).astype(np.float32)
     if cloud.return_number is not None:
         out["return_number"] = cloud.return_number.astype(np.float32)
+    if compute_hag:
+        from . import pretrain
+        h = pretrain.hag_for_cloud(cloud)
+        if h is not None and len(h) == cloud.n:
+            out["hag"] = h.astype(np.float32)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(out_path, **out)
@@ -252,11 +263,13 @@ def _convert_one(cloud: Cloud, raw: np.ndarray | None, value_to_index: dict[int,
 
 
 def convert_scene(path: Path, spec: LabelSpec | None, value_to_index: dict[int, int],
-                  out_path: Path, intensity_norm: str = "max") -> dict:
+                  out_path: Path, intensity_norm: str = "max",
+                  compute_hag: bool = False) -> dict:
     """Read one source file and convert the whole cloud (no cropping)."""
     cloud = read_points(path)
     raw = read_labels(path, cloud, spec) if spec is not None else None
-    return _convert_one(cloud, raw, value_to_index, out_path, intensity_norm)
+    return _convert_one(cloud, raw, value_to_index, out_path, intensity_norm,
+                        compute_hag=compute_hag)
 
 
 def _plan_and_convert(train_files: list[Path], val_files: list[Path] | None,
@@ -446,14 +459,26 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
 
 
 def convert_infer_job(job_id: str, input_dir: str, staging_root: Path, progress=None,
-                      intensity_norm: str = "p95") -> Path:
+                      intensity_norm: str = "p95", hag: bool = False) -> Path:
     """Label-less conversion for inference-only jobs -> <staging>/_infer/<job_id>/.
 
-    Defaults to p95 intensity normalization to match the IEEE training scripts
-    (the weights you run inference with). ponytail: assumes IEEE-style weights;
-    pass intensity_norm="max" for models trained on a canonical --dataset.
+    intensity_norm MUST match what the weights were trained with (max -> [0,1] for
+    canonical --dataset runs; p95 -> [0,2] for the IEEE scripts) — a mismatch feeds
+    the net out-of-distribution intensity and tanks accuracy for every checkpoint.
+    `hag=True` (for *_hag weights trained on real PDAL HeightAboveGround) computes a
+    per-point "hag" channel via SMRF->hag_nn when PDAL is available, so inference
+    reproduces the trained feature instead of a z-min proxy; falls back to the proxy
+    (with a warning) when PDAL is missing.
     """
     say = progress or (lambda s: None)
+    if hag:
+        from . import pretrain
+        if pretrain.pdal_available():
+            say("  computing real PDAL HeightAboveGround (SMRF -> hag_nn) per scene …")
+        else:
+            say("  ⚠ HAG requested but PDAL isn't installed here — using a z-min proxy "
+                "(degraded for a model trained on real HAG).")
+            hag = False
     out_root = staging_root / "_infer" / job_id
     files = discover_scenes(input_dir)
     if not files:
@@ -462,7 +487,8 @@ def convert_infer_job(job_id: str, input_dir: str, staging_root: Path, progress=
     for path in files:
         out_path = out_root / "scenes" / (path.stem + ".npz")
         say(f"  converting {path.name} ...")
-        st = convert_scene(path, None, {}, out_path, intensity_norm=intensity_norm)
+        st = convert_scene(path, None, {}, out_path, intensity_norm=intensity_norm,
+                           compute_hag=hag)
         st["scene"] = out_path.name
         st["source_file"] = str(path)
         scenes.append(out_path.name)

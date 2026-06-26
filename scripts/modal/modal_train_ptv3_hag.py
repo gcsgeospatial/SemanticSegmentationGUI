@@ -1,11 +1,26 @@
 """
-Modal training script for PointTransformerV3 on IEEE GRSS 2019 DFC Track 4.
+Modal training script for PointTransformerV3 on IEEE GRSS 2019 DFC Track 4 —
+HAG variant.
+
+This is the HAG twin of modal_train_ptv3.py. Identical in every way except it
+appends a real PDAL HeightAboveGround feature (computed by the trainer_gui
+Pretraining tab: SMRF ground-classify -> hag_nn) as an extra input channel:
+in_channels 6 -> 7 ([xyz, rgb(=intensity grayscale), HAG]). HAG is read per
+point from /data/IEEE/HAG/{Train,Validate}/<scene>_PC3.laz and paired to the
+raw _PC3.txt points. Run it head-to-head against modal_train_ptv3.py to measure
+HAG's contribution.
 
 The default (no --dataset) path trains on the same raw IEEE Track 4 airborne
 LiDAR — and uses the same ASPRS->index label map, per-scene p95 intensity
 normalization, and scene holdout — as modal_train_kpconvx_cold.py, so PTv3 can
 be compared head-to-head against KPConvX/KPConv on identical data. (It was
 previously wired to STPLS3D; switched 2026-06-15.)
+
+Prereq: upload the HAGTEST output (Pretraining tab) to the ieee-data volume:
+    modal volume put ieee-data "C:/Users/OrionHoch/Desktop/HAGTEST/Train"    /IEEE/HAG/Train
+    modal volume put ieee-data "C:/Users/OrionHoch/Desktop/HAGTEST/Validate" /IEEE/HAG/Validate
+The --dataset (canonical trainer_gui) path has no HAG laz, so it falls back to a
+z-scene-min proxy for the 7th channel (keeps in_channels fixed at 7).
 
 Uses the standalone PTv3 model.py from testSem/PointTransformerV3 directly
 (no full Pointcept install). The fast path uses FlashAttention; if the GPU
@@ -66,9 +81,11 @@ import modal
 # ============================================================================
 # Configuration
 # ============================================================================
-APP_NAME      = "ptv3-ieee"
+APP_NAME      = "ptv3-ieee-hag"
 GPU_TYPE      = os.environ.get("TT_GPU", "A100")
-N_EPOCHS      = 100             # smoke test; PTv3 outdoor recipe trains ~50 epochs
+N_EPOCHS      = 100            # PTv3 outdoor recipe (Wu et al., CVPR 2024): ~50
+                             # epochs x 500 steps. Override per-run with --epochs;
+                             # for a cheap end-to-end check pass --epochs 2.
 BATCH_SIZE    = 4
 TIMEOUT_HOURS = int(os.environ.get("TT_TIMEOUT_HOURS", "24"))
 
@@ -85,7 +102,9 @@ GRID_SIZE     = 0.5            # voxel grid (m). PTv3's 0.05 m outdoor default i
                                # positional-encoding conv with empty kernels (no
                                # point falls within a few voxels of another).
                                # 0.5 m ≈ the actual point spacing. Override --grid.
-USE_FLASH_ATTN = False   # PTv3 runs on standard attention; no flash-attn dep
+USE_FLASH_ATTN = False  # ponytail: flash serialized-attn patch-gather OOBs mid-train
+                        # (the "device-side assert" crash). Off + patch_size 128 is the
+                        # documented Pointcept fix. Re-enable w/ patch 128 if you want speed.
 HOLDOUT_SEED   = 42
 N_VAL_HOLDOUT  = 10            # held-out train scenes for val (matches KPConvX cold)
 
@@ -129,27 +148,25 @@ RARE_FREQ_FRAC   = 0.5
 RARE_TILE_PROB   = 0.25    # P(draw the next train tile from a rare-class tile)
 
 # Periodic held-out validation + checkpoint/resume cadence.
-VAL_EVERY        = 10      # held-out val pass every N epochs (no weight updates)
-VAL_SUBSET       = 200     # tiles in the periodic val pass (seeded random subset)
+VAL_EVERY        = 10      # FULL voted eval over the combined eval set every N
+                          # epochs (no weight updates). Heavier than the old
+                          # subset val pass — raise this if it costs too much.
 CHECKPOINT_GAP   = 3       # checkpoint (model + optimizer) frequency, epochs
-RESUME           = True   # force-resume the latest matching run (see AUTO_RESUME)
+RESUME           = False   # force-resume the latest matching run (see AUTO_RESUME)
 AUTO_RESUME      = False    # auto-continue an unfinished run (no DONE marker) on
                           # relaunch / Modal auto-retry, so an intermittent crash
                           # never loses the run — only epochs since last checkpoint
-DEBUG_CUDA       = False   # ONE-OFF diagnostic: CUDA_LAUNCH_BLOCKING + dump the
-                          # offending batch's stats + no retries (set True to debug).
-STEM_KERNEL      = 5       # PTv3's faithful 5x5x5 stem. (Shrinking it to 3 was a
-                          # failed workaround for the cu124 spconv conv-backward
-                          # device-assert; that bug is fixed properly by moving to
-                          # the spconv-cu118 build, so the original stem is restored.
-                          # Set 3 only if a large-kernel spconv issue ever recurs.)
 
 DATA_ROOT      = "/data/IEEE"
 TRAIN_PC_DIR   = f"{DATA_ROOT}/Train-Track4/Track4"            # *_PC3.txt (x,y,z,intensity,ret)
 TRAIN_CLS_DIR  = f"{DATA_ROOT}/Train-Track4-Truth/Track4-Truth"  # *_CLS.txt (ASPRS codes)
 TEST_PC_DIR    = f"{DATA_ROOT}/Validate-Track4/Track4"
 TEST_CLS_DIR   = f"{DATA_ROOT}/Validate-Track4-Truth"
-PREP_DIR       = f"{DATA_ROOT}/prep/ptv3_ieee_grid05_origin"
+# Per-point HeightAboveGround from the Pretraining tab (HAGTEST upload). Train +
+# val-holdout scenes -> HAG/Train; the test split (Validate-Track4) -> HAG/Validate.
+HAG_TRAIN_DIR  = f"{DATA_ROOT}/HAG/Train"
+HAG_TEST_DIR   = f"{DATA_ROOT}/HAG/Validate"
+PREP_DIR       = f"{DATA_ROOT}/prep/ptv3_ieee_hag_grid05_origin"
 
 DATASETS_ROOT = "/datasets"   # terminal-datasets volume (trainer_gui canonical datasets)
 
@@ -162,14 +179,9 @@ app = modal.App(APP_NAME)
 image = (
     modal.Image.debian_slim(python_version="3.10")
     .apt_install("git", "wget", "build-essential", "cmake", "ninja-build", "libgl1", "libglib2.0-0")
-    # Canonical PTv3/Pointcept stack: torch 2.1 + CUDA 11.8 + spconv-cu118. The
-    # cu124 build's sparse-conv backward device-asserted on valid input and its
-    # implicit-GEMM couldn't NVRTC-compile (missing cumm headers); spconv-cu118 is
-    # the mature, battle-tested build PTv3 is actually developed against. No
-    # flash-attn — PTv3 runs fine on standard attention (USE_FLASH_ATTN=False).
     .pip_install(
-        "torch==2.1.0",
-        "torchvision==0.16.0",
+        "torch==2.5.0",
+        "torchvision==0.20.0",
         "numpy<2.0",
         "scipy",
         "scikit-learn",
@@ -180,14 +192,27 @@ image = (
         "einops",
         "timm",
         "pandas<3",
-        index_url="https://download.pytorch.org/whl/cu118",
+        "laspy",
+        "lazrs",          # LAZ backend so laspy can read the HAG .laz scenes
+        index_url="https://download.pytorch.org/whl/cu124",
         extra_index_url="https://pypi.org/simple",
     )
     .pip_install(
-        "spconv-cu118",
+        "spconv-cu124",
         "torch-scatter",
         "torch-cluster",
-        find_links="https://data.pyg.org/whl/torch-2.1.0+cu118.html",
+        find_links="https://data.pyg.org/whl/torch-2.5.0+cu124.html",
+    )
+    .run_commands(
+        # FlashAttention: install the prebuilt wheel matching this image exactly
+        # (torch 2.5 / cu12 / cp310 / cxx11abiFALSE — PyTorch's pip wheels use the
+        # pre-cxx11 ABI). Plain `pip install flash-attn` compiles from source and
+        # reliably fails on debian_slim here; the matched wheel installs in
+        # seconds. build_model still probes `import flash_attn` and falls back to
+        # standard attention if it's ever absent.
+        "pip install --no-deps "
+        "https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/"
+        "flash_attn-2.7.4.post1+cu12torch2.5cxx11abiFALSE-cp310-cp310-linux_x86_64.whl",
     )
     .env({"PYTHONUNBUFFERED": "1"})
 )
@@ -202,8 +227,8 @@ image = image.add_local_dir(
 # a package; we add /opt (its parent) to sys.path at runtime.
 image = image.run_commands("touch /opt/ptv3/__init__.py")
 
-image = image.add_local_file("local_train_ptv3.py", "/root/local_train_ptv3.py")
-image = image.add_local_file("train_common.py", "/root/train_common.py")
+image = image.add_local_file("scripts/local/local_train_ptv3_hag.py", "/root/local_train_ptv3_hag.py")
+image = image.add_local_file("scripts/helper/train_common.py", "/root/train_common.py")
 
 data_volume     = modal.Volume.from_name("ieee-data",           create_if_missing=True)
 outputs_volume  = modal.Volume.from_name(f"{APP_NAME}-outputs", create_if_missing=True)
@@ -226,8 +251,7 @@ datasets_volume = modal.Volume.from_name(
     # side assert from spconv, which poisons the context and cannot be caught
     # in-process). Each retry auto-resumes from the latest checkpoint, so an
     # intermittent crash costs only the epochs since the last checkpoint.
-    retries=modal.Retries(max_retries=0 if DEBUG_CUDA else 10,
-                          backoff_coefficient=1.0, initial_delay=5.0),
+    retries=modal.Retries(max_retries=10, backoff_coefficient=1.0, initial_delay=5.0),
 )
 def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                epochs: Optional[int] = None, batch: Optional[int] = None,
@@ -235,13 +259,13 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                mode: str = "train", weights: Optional[str] = None,
                infer_input: Optional[str] = None):
     """Modal shell: provision the GPU container + volumes, then run the LOCAL
-    trainer. All training/inference logic lives in local_train_ptv3.py — this only
+    trainer. All training/inference logic lives in local_train_ptv3_hag.py — this only
     shells out to it, so local and cloud run byte-identical code."""
     import subprocess
     import sys
     import threading
 
-    cmd = [sys.executable, "/root/local_train_ptv3.py"]
+    cmd = [sys.executable, "/root/local_train_ptv3_hag.py"]
     for _flag, _val in (
         ("--dataset", dataset),
         ("--grid", grid),

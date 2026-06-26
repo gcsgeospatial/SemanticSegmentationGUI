@@ -201,8 +201,8 @@ image = image.run_commands(
     "      /opt/kpconvx/cpp_wrappers/cpp_neighbors/__init__.py",
 )
 
-image = image.add_local_file("local_train_kpconvx_cold_hag.py", "/root/local_train_kpconvx_cold_hag.py")
-image = image.add_local_file("train_common.py", "/root/train_common.py")
+image = image.add_local_file("scripts/local/local_train_kpconvx_cold_hag.py", "/root/local_train_kpconvx_cold_hag.py")
+image = image.add_local_file("scripts/helper/train_common.py", "/root/train_common.py")
 
 data_volume     = modal.Volume.from_name("ieee-data",            create_if_missing=True)
 outputs_volume  = modal.Volume.from_name(f"{APP_NAME}-outputs",  create_if_missing=True)

@@ -170,6 +170,34 @@ def add_hag(in_dir: str | Path, out_dir: str | Path, *, skip_ground: bool = Fals
     return summary
 
 
+def hag_for_cloud(cloud) -> "np.ndarray | None":
+    """Per-point HeightAboveGround (SMRF -> hag_nn) aligned 1:1 to cloud.xyz, for
+    INFERENCE (the twin of add_hag's per-file laz output — same stages, kept in RAM).
+
+    Returns float32 of length cloud.n, or None if PDAL is unavailable or the
+    pipeline drops/reorders points (the caller then falls back to a z-min proxy, so
+    a missing/odd PDAL is never worse than today's behaviour). smrf+hag_nn are
+    point-wise filters that preserve input order; the length + first/last-X guard
+    rejects the pathological case where they don't."""
+    if not pdal_available():
+        return None
+    import pdal
+    try:
+        arr_in = _structured_from_cloud(cloud)
+        stages = [{"type": "filters.smrf"}, {"type": "filters.hag_nn"}]
+        pipe = pdal.Pipeline(json.dumps(stages), arrays=[arr_in])
+        pipe.execute()
+        arr = pipe.arrays[0]
+        if len(arr) != cloud.n or "HeightAboveGround" not in (arr.dtype.names or ()):
+            return None
+        ax = np.asarray(arr["X"], np.float64)
+        if not (np.isclose(ax[0], cloud.xyz[0, 0]) and np.isclose(ax[-1], cloud.xyz[-1, 0])):
+            return None   # PDAL reordered the points -> can't pair, fall back to proxy
+        return np.asarray(arr["HeightAboveGround"], np.float32)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 # ---------------------------------------------------------------- Stage B: tile
 
 def tile_for_model(in_dir: str | Path, out_dir: str | Path, backbone_key: str,

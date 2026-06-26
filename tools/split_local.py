@@ -54,6 +54,9 @@ def _base_type(annot):
 def _entry_params(stem: str):
     """Import the script under the modal shim and read its @app.local_entrypoint
     signature — the source of truth for the flags both new files must mirror."""
+    import os
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                    "scripts", "helper"))   # _modal_shim moved here
     import _modal_shim
     _modal_shim.install()
     for m in list(sys.modules):

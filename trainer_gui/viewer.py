@@ -277,6 +277,7 @@ def prediction_metrics(pred_path, gt_path) -> dict:
     labeled = int(has.sum())
     acc = float((pred[has] == gt[has]).sum()) / max(labeled, 1)
     present = sorted({int(c) for c in np.unique(pred[has])} | {int(c) for c in np.unique(gt[has])})
+    present = [c for c in present if c >= 0]   # drop the undecodable (-1) class from mIoU
     ious = {}
     for c in present:
         inter = int(((pred == c) & (gt == c) & has).sum())

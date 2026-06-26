@@ -4,7 +4,7 @@ Each backbone's local_train_*.py runs DIRECTLY inside its Docker image (built by
 tools/gen_dockerfiles.py) — no modal, no shim — with host dirs bind-mounted to
 the paths the trainer reads:
 
-    /workspace  <- repo root (the local_train_*.py scripts; run from here)
+    /workspace  <- repo root (runs scripts/local/local_train_*.py from here)
     /datasets   <- staging root (canonical datasets + _infer/<job> live here)
     /outputs    <- the chosen output folder (training writes runs/<id>/..., weights read here)
     /data       <- raw IEEE data (only the built-in no-`--dataset` path needs it)
@@ -20,8 +20,15 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+from pathlib import Path
 
 from . import appstate
+
+
+def _posix(p: str) -> str:
+    """Host path with forward slashes for `docker -v` (C:\\x -> C:/x; posix is
+    unchanged) — matters when a Windows GUI drives a remote Linux daemon (L7)."""
+    return Path(p).as_posix()
 
 
 def docker_exe() -> str:
@@ -65,13 +72,36 @@ def is_pullable(backbone) -> bool:
     return "/" in tag and ("." in head or ":" in head)   # host has a dot or port
 
 
+def effective_image(backbone, here: "set[str] | None" = None) -> str:
+    """The tag `docker run` should actually use. An explicit override always wins;
+    otherwise prefer a locally-built bare `trainer-local-<key>` image when one is
+    present, even if a registry prefix is configured — so a host that ran
+    build_all.sh uses ITS image instead of (failing to) pull the registry tag (M3).
+    Falls back to the configured tag when no local build exists."""
+    cfg = appstate.local_config()
+    if cfg["images"].get(backbone.key):
+        return image_for(backbone)            # explicit override wins
+    tag = image_for(backbone)
+    bare = f"trainer-local-{backbone.key}"
+    if tag != bare:                           # a registry prefix is in play
+        here = present_images() if here is None else here
+        if bare in here or f"{bare}:latest" in here:
+            return bare
+    return tag
+
+
 def image_preflight(backbone) -> tuple[bool, str]:
     """(proceed, message) for the image. proceed=False blocks the launch; a
     non-empty message is shown either way — an FYI when docker will auto-pull, an
-    error+how-to-fix when there's nothing to build or pull. Distinguishes a
-    not-built local image from a registry tag, so the user gets the right hint
-    instead of docker's cryptic 'pull access denied'."""
-    if image_available(backbone):
+    error+how-to-fix when there's nothing to build or pull. Prefers a locally-built
+    image over the registry tag (M3), so a host that built its own image isn't sent
+    to pull (and fail on) a registry tag it never pushed."""
+    here = present_images()
+    img = effective_image(backbone, here)
+    if img in here or f"{img}:latest" in here:
+        if img != image_for(backbone):
+            return True, (f"[local] using locally-built '{img}' "
+                          f"(not pulling '{image_for(backbone)}').")
         return True, ""
     tag = image_for(backbone)
     if is_pullable(backbone):
@@ -82,21 +112,38 @@ def image_preflight(backbone) -> tuple[bool, str]:
                    f"local_config['registry']) and `docker pull` it — then run again.")
 
 
+def gpu_preflight() -> tuple[bool, str]:
+    """(proceed, message) for GPU availability. The trainers are CUDA-only (every
+    script calls .cuda()), so block when GPUs are disabled in local_config, and warn
+    when no NVIDIA stack is detectable — otherwise docker fails with a cryptic
+    'could not select device driver' (M4). There is no CPU inference path."""
+    cfg = appstate.local_config()
+    if not cfg.get("gpus"):
+        return False, ("[local] GPUs are disabled (local_config['gpus']=''), but these "
+                       "models require CUDA. Set gpus='all' (or a device id) and install "
+                       "the NVIDIA Container Toolkit, then run again.")
+    if shutil.which("nvidia-smi") is None:
+        return True, ("[local] ⚠ no 'nvidia-smi' on PATH — if this host lacks an NVIDIA GPU "
+                      "+ Container Toolkit the run will fail ('could not select device "
+                      "driver'). These models are CUDA-only (no CPU fallback).")
+    return True, ""
+
+
 def _mounts(cfg: dict, repo_root: str, extra_mounts, outputs_root: str = "") -> list[str]:
-    m = ["-v", f"{repo_root}:/workspace",
-         "-v", f"{cfg['datasets_root']}:/datasets",
-         "-v", f"{outputs_root or cfg['outputs_root']}:/outputs"]
+    m = ["-v", f"{_posix(repo_root)}:/workspace",
+         "-v", f"{_posix(cfg['datasets_root'])}:/datasets",
+         "-v", f"{_posix(outputs_root or cfg['outputs_root'])}:/outputs"]
     if cfg.get("data_root"):
-        m += ["-v", f"{cfg['data_root']}:/data"]
+        m += ["-v", f"{_posix(cfg['data_root'])}:/data"]
     for host, container in (extra_mounts or []):
-        m += ["-v", f"{host}:{container}"]
+        m += ["-v", f"{_posix(host)}:{container}"]
     return m
 
 
 def run_script(script: str, flags: dict, backbone, *, repo_root: str,
                gpu: str = "", extra_mounts=None,
                outputs_root: str = "") -> tuple[str, list[str]]:
-    """`docker run --rm --gpus all -v ... <image> python local_train_<key>.py --flags`.
+    """`docker run --rm --gpus all -v ... <image> python scripts/local/local_train_<key>.py --flags`.
 
     `script` (the modal_train_*.py name) is accepted for call-site parity with
     modal_cli but unused: locally we run the decoupled local_train_<key>.py
@@ -112,7 +159,7 @@ def run_script(script: str, flags: dict, backbone, *, repo_root: str,
     if gpu:
         args += ["-e", f"TT_GPU={gpu}"]          # cosmetic locally; keeps log parity
     args += list(cfg.get("extra_args", []))
-    args += [image_for(backbone), "python", f"local_train_{backbone.key}.py"]
+    args += [effective_image(backbone), "python", f"scripts/local/local_train_{backbone.key}.py"]
     for key, val in flags.items():
         if val is None:
             continue
@@ -150,8 +197,12 @@ def all_statuses(progress=None) -> list[dict]:
                  "present": False, "pullable": False, "docker": False}
                 for k, b in BACKBONES.items()]
     here = present_images()
+
+    def _present(b):   # M3: a locally-built bare image counts as present too
+        return any(t in here or f"{t}:latest" in here
+                   for t in (image_for(b), f"trainer-local-{b.key}"))
     return [{"key": k, "label": b.label, "tag": image_for(b),
-             "present": image_for(b) in here or f"{image_for(b)}:latest" in here,
+             "present": _present(b),
              "pullable": is_pullable(b), "docker": True}
             for k, b in BACKBONES.items()]
 

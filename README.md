@@ -82,19 +82,27 @@ trainer-gui          # or: python -m trainer_gui
 
 | Model | Script | Status |
 |---|---|---|
-| PTv3 (warm, Sonata) | `modal_train_ptv3_warm.py` | ready |
-| RandLA-Net (warm, SemKITTI) | `modal_train_randlanet_warm.py` | ready |
-| OctFormer (warm, ScanNet) | `modal_train_octformer_warm.py` | ready |
-| KPConvX-L (warm, S3DIS) | `modal_train_kpconvx_warm.py` | ready |
-| PTv3 (cold) | `modal_train_ptv3.py` | ready |
-| RandLA-Net (cold) | `modal_train_randlanet.py` | ready |
-| OctFormer (cold) | `modal_train_octformer.py` | ready |
-| KPConvX-L (cold) | `modal_train_kpconvx_cold.py` | CLI-only (research comparison script, intentionally untouched) |
+| PTv3 (cold) | `scripts/modal/modal_train_ptv3.py` | ready |
+| PTv3 + HAG | `scripts/modal/modal_train_ptv3_hag.py` | ready |
+| RandLA-Net (cold) | `scripts/modal/modal_train_randlanet.py` | ready |
+| RandLA-Net + HAG | `scripts/modal/modal_train_randlanet_hag.py` | ready |
+| KPConvX-L (cold) | `scripts/modal/modal_train_kpconvx_cold.py` | ready |
+| KPConvX-L + HAG | `scripts/modal/modal_train_kpconvx_cold_hag.py` | ready |
 
-Every script still runs standalone exactly as before — `modal run
-modal_train_X.py` with no flags reproduces the original IEEE/STPLS3D behavior.
-The GUI just passes `--dataset/--grid/--epochs/...` flags and sets `TT_GPU` /
-`TT_TIMEOUT_HOURS` env vars.
+Every script still runs standalone — `modal run scripts/modal/modal_train_X.py`
+with no flags reproduces the original IEEE behavior. The GUI just passes
+`--dataset/--grid/--epochs/...` flags and sets `TT_GPU` / `TT_TIMEOUT_HOURS`.
+
+## Repo layout
+
+```
+scripts/modal/   thin Modal entrypoints (`modal run …`; bake + subprocess the local twin)
+scripts/local/   the actual trainers/inferencers (run directly in Docker, no modal)
+scripts/helper/  shared bits: train_common.py, _modal_shim.py, make_groundtruth_ply.py
+trainer_gui/     the PySide6 desktop app (the pip-installed package)
+docker/          generated Dockerfiles + build/pull/push scripts
+tools/           gen_dockerfiles.py (+ the one-shot split_local.py)
+```
 
 ## Canonical dataset format
 

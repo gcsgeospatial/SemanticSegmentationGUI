@@ -35,13 +35,17 @@ IEEE_CLASS_NAMES = ["Ground", "Trees", "Building", "Water", "Bridge"]
 IEEE_ASPRS = [2, 5, 6, 9, 17]
 
 
-def class_from_rgb(rgb: np.ndarray) -> np.ndarray:
-    """Recover IEEE class indices from a prediction PLY's colors (-1 if a point's
-    color is not an exact IEEE_PALETTE match). The training scripts color each
-    point IEEE_PALETTE[class], so this losslessly inverts that."""
+def class_from_rgb(rgb: np.ndarray, num_classes: int | None = None) -> np.ndarray:
+    """Recover class indices from a class-coloured PLY's colors (-1 where a point's
+    color isn't an exact palette match). The training scripts colour each point
+    palette_for(num_classes)[class]; matching against the FULL categorical palette
+    (the default) losslessly inverts that for any class count up to len(_EXTENDED),
+    so >5-class predictions decode correctly (not all -1 like an IEEE-only match).
+    Pass num_classes to restrict the match to exactly that many colours."""
     rgb = np.asarray(rgb)
+    pal = _EXTENDED if not num_classes else palette_for(num_classes)
     out = np.full(len(rgb), -1, np.int64)
-    for i, p in enumerate(IEEE_PALETTE):
+    for i, p in enumerate(pal):
         out[(rgb[:, 0] == p[0]) & (rgb[:, 1] == p[1]) & (rgb[:, 2] == p[2])] = i
     return out
 

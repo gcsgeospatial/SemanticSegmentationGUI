@@ -73,7 +73,7 @@ def _common(epochs_default: int, batch_default: int, steps_default: int = 500,
 
 BACKBONES: dict[str, Backbone] = {b.key: b for b in [
     Backbone(
-        key="ptv3", label="PTv3", script="modal_train_ptv3.py",
+        key="ptv3", label="PTv3", script="scripts/modal/modal_train_ptv3.py",
         app_name="ptv3-ieee", warm=False, ready=True, folder_infer=True,
         rec_gpu="A100", min_vram_gb=16,
         grid_clamp=(0.05, 0.6),
@@ -82,7 +82,7 @@ BACKBONES: dict[str, Backbone] = {b.key: b for b in [
                + _common(250, 4),
     ),
     Backbone(
-        key="randlanet", label="RandLA-Net", script="modal_train_randlanet.py",
+        key="randlanet", label="RandLA-Net", script="scripts/modal/modal_train_randlanet.py",
         app_name="randlanet-cold-ieee", warm=False, ready=True, folder_infer=True,
         rec_gpu="A10G", min_vram_gb=8,
         grid_clamp=(0.06, 0.5),
@@ -92,7 +92,7 @@ BACKBONES: dict[str, Backbone] = {b.key: b for b in [
                + _common(250, 6, chunk=False),
     ),
     Backbone(
-        key="kpconvx_cold", label="KPConvX-L", script="modal_train_kpconvx_cold.py",
+        key="kpconvx_cold", label="KPConvX-L", script="scripts/modal/modal_train_kpconvx_cold.py",
         app_name="kpconvx-cold-ieee", warm=False, ready=True, folder_infer=True,
         rec_gpu="A100-80GB", min_vram_gb=24,
         grid_clamp=(0.5, 3.0),
@@ -102,7 +102,7 @@ BACKBONES: dict[str, Backbone] = {b.key: b for b in [
     ),
     # --- HAG variants (real PDAL HeightAboveGround as an extra input channel) ---
     Backbone(
-        key="ptv3_hag", label="PTv3 + HAG", script="modal_train_ptv3_hag.py",
+        key="ptv3_hag", label="PTv3 + HAG", script="scripts/modal/modal_train_ptv3_hag.py",
         app_name="ptv3-ieee-hag", warm=False, ready=True, folder_infer=True,
         rec_gpu="A100", min_vram_gb=16,
         grid_clamp=(0.05, 0.6),
@@ -112,7 +112,7 @@ BACKBONES: dict[str, Backbone] = {b.key: b for b in [
     ),
     Backbone(
         key="randlanet_hag", label="RandLA-Net + HAG",
-        script="modal_train_randlanet_hag.py",
+        script="scripts/modal/modal_train_randlanet_hag.py",
         app_name="randlanet-cold-ieee-hag", warm=False, ready=True, folder_infer=True,
         rec_gpu="A10G", min_vram_gb=8,
         grid_clamp=(0.06, 0.5),
@@ -126,7 +126,7 @@ BACKBONES: dict[str, Backbone] = {b.key: b for b in [
     # HAG laz) plus --mode infer --infer-input for folder inference.
     Backbone(
         key="kpconvx_cold_hag", label="KPConvX-L + HAG",
-        script="modal_train_kpconvx_cold_hag.py",
+        script="scripts/modal/modal_train_kpconvx_cold_hag.py",
         app_name="kpconvx-cold-ieee-hag", warm=False, ready=True, folder_infer=True,
         rec_gpu="A100-80GB", min_vram_gb=24,
         grid_clamp=(0.5, 3.0),

@@ -542,9 +542,14 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
             # Tile into CHUNK_XY windows, voxel-downsample tracking the inverse
             # map, scatter per-voxel predictions back, NN-fill stragglers.
             xyz, rgb, _ = load_scene(scene_path)
-            # No HAG laz for the predict scenes (IEEE Test-Track4 / canonical val)
-            # -> z-scene-min proxy for the 7th channel (best-effort demo only).
+            # Real per-point HAG when convert_infer_job wrote it (run trained on PDAL
+            # HAG); else the z-scene-min proxy (canonical/legacy parity). The scene
+            # npz stores xyz unreordered, so z["hag"] aligns 1:1 with load_scene's xyz.
             hag = (xyz[:, 2] - xyz[:, 2].min()).astype(np.float32)
+            if scene_path.endswith(".npz"):
+                _z = np.load(scene_path)
+                if "hag" in _z.files and len(_z["hag"]) == len(xyz):
+                    hag = _z["hag"].astype(np.float32)
             pred = np.full(len(xyz), -1, np.int64)
             mins, maxs = xyz[:, :2].min(0), xyz[:, :2].max(0)
             with torch.no_grad():
@@ -606,7 +611,8 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
         backbone.load_state_dict(bsd)
         head.load_state_dict(hsd)
         backbone.eval(); head.eval()
-        print(f"  [infer] loaded {weights} ({num_classes} classes)", flush=True)
+        print(f"  [infer] loaded {weights} ({num_classes} classes; "
+              f"final_model = best-val epoch {ckpt.get('epoch', '?')})", flush=True)
 
         scenes = sorted(glob.glob(f"{DATASETS_ROOT}/_infer/{infer_input}/scenes/*.npz"))
         if not scenes:
@@ -704,7 +710,8 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                 "class_names": CLASS_NAMES,
                 "in_channels": 7,
                 "features": ["x", "y", "z", "rgb_r", "rgb_g", "rgb_b", "HAG"],
-                "hag_source": "PDAL hag_nn (trainer_gui Pretraining tab)",
+                "hag_source": "z_minus_scene_min_proxy" if dataset
+                    else "PDAL hag_nn (trainer_gui Pretraining tab)",
                 "chunk_xy": CHUNK_XY, "stride": STRIDE,
                 "steps_per_epoch": STEPS,
                 "flash_attn": USE_FLASH_ATTN,
@@ -759,6 +766,8 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
     idx = np.arange(len(scene_names))
     rng.shuffle(idx)
     n_hold = min(N_VAL_HOLDOUT, max(1, len(scene_names) // 5))
+    if len(scene_names) >= 6:                  # H3: avoid the 1-scene val-mIoU lottery
+        n_hold = max(n_hold, 3)
     hold = {scene_names[i] for i in idx[:n_hold]}
     synth_train_tiles = [f for f in all_train_tiles if _scene_of(f) not in hold]
     synth_test_tiles  = [f for f in all_train_tiles if _scene_of(f) in hold]
@@ -1159,6 +1168,8 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                 ["epoch", "val_acc", "val_miou"] +
                 [f"iou_{_name(c)}" for c in range(NUM_CLASSES)])
 
+    import os as _os, sys as _sys   # scripts/helper is a sibling dir (flat /root in Modal)
+    _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "helper"))
     from train_common import BestCheckpoint
     best = BestCheckpoint(run_dir)
 

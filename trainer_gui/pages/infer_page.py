@@ -33,6 +33,7 @@ class InferPage(QWidget):
         super().__init__()
         self.repo_root = repo_root
         self.converter = FuncWorker(self)
+        self.preflight = FuncWorker(self)   # Modal weights existence check (H4)
         self.runner = JobRunner(self)
         self.parser = LogParser(self)
         self._stage = ""
@@ -94,7 +95,19 @@ class InferPage(QWidget):
         self.grid_spin.setSingleStep(0.05)
         self.grid_spin.setDecimals(2)
         self.grid_spin.setValue(0.30)
-        iform.addRow("Grid size (m) — match the training run", self.grid_spin)
+        iform.addRow("Grid size (m) — auto-filled from the run", self.grid_spin)
+        # Intensity normalization MUST match what the weights were trained with:
+        # canonical --dataset runs default to max ([0,1]); the IEEE scripts use p95
+        # ([0,2]). convert_infer_job is told which, so the net sees in-distribution
+        # intensity — a mismatch silently wrecks accuracy for EVERY checkpoint.
+        self.inorm_combo = QComboBox()
+        self.inorm_combo.addItem("p95 → [0,2]  (IEEE training scripts)", "p95")
+        self.inorm_combo.addItem("max → [0,1]  (canonical --dataset default)", "max")
+        j = self.inorm_combo.findData(appstate.get("infer_inorm", "p95"))
+        self.inorm_combo.setCurrentIndex(j if j >= 0 else 0)
+        self.inorm_combo.currentIndexChanged.connect(
+            lambda: appstate.put("infer_inorm", self.inorm_combo.currentData()))
+        iform.addRow("Intensity norm — match the training run", self.inorm_combo)
         self.chunk_spin = QDoubleSpinBox()
         self.chunk_spin.setRange(10.0, 200.0)
         self.chunk_spin.setSingleStep(5.0)
@@ -179,6 +192,9 @@ class InferPage(QWidget):
         self.converter.output.connect(self._append)
         self.converter.done.connect(self._on_converted)
         self.converter.error.connect(self._on_error)
+        self.preflight.output.connect(self._append)
+        self.preflight.done.connect(self._on_preflight)
+        self.preflight.error.connect(self._on_preflight_error)
         self.runner.output.connect(self._on_output)
         self.runner.finished.connect(self._on_stage_done)
         self.runner.failed.connect(self._on_runner_failed)
@@ -322,7 +338,50 @@ class InferPage(QWidget):
         if isinstance(h, dict) and h.get("backbone") in BACKBONES:
             i = self.backbone_combo.findData(h["backbone"])
             if i >= 0:
-                self.backbone_combo.setCurrentIndex(i)
+                self.backbone_combo.setCurrentIndex(i)   # fires _sync_controls -> defaults
+        self._prefill_geometry_from_run()
+
+    def _run_config(self, run_id: str, backbone: str | None) -> dict:
+        """The picked run's run_config.json from wherever it landed on THIS host
+        (local training, or a Modal run downloaded via the Runs page). {} if none."""
+        cands = [appstate.local_runs_dir() / "runs" / run_id / "run_config.json"]
+        if backbone:
+            cands.append(appstate.runs_dir() / backbone / run_id / "run_config.json")
+        cands += list(appstate.runs_dir().glob(f"*/{run_id}/run_config.json"))
+        for p in cands:
+            if p.exists():
+                try:
+                    with open(p, encoding="utf-8") as f:
+                        return json.load(f)
+                except (OSError, json.JSONDecodeError):
+                    return {}
+        return {}
+
+    def _prefill_geometry_from_run(self):
+        """H1: override the backbone-DEFAULT grid/tile with the picked run's TRAINED
+        geometry, so inference voxelizes exactly as training did (PTv3/RandLA infer
+        at whatever --grid the GUI sends; a default ≠ the trained grid is a silent
+        10× mismatch that wrecks predictions). Runs AFTER _sync_controls, which sets
+        the defaults this overrides. No-op for a Modal run not downloaded locally."""
+        h = self.run_combo.currentData()
+        if isinstance(h, dict):
+            run_id, bkey = h.get("run_id", ""), h.get("backbone")
+        else:
+            parts = self.run_combo.currentText().split()
+            run_id, bkey = (parts[0] if parts else ""), self.backbone_combo.currentData()
+        if not run_id:
+            return
+        cfg = self._run_config(run_id, bkey)
+        if not cfg:
+            return
+        # key name varies by backbone family: PTv3 grid_size/chunk_xy,
+        # KPConvX grid_m/chunk_xy_m, RandLA sub_grid_size (no tile).
+        grid = cfg.get("grid_size", cfg.get("grid_m", cfg.get("sub_grid_size")))
+        if grid is not None:
+            self.grid_spin.setValue(float(grid))
+        chunk = cfg.get("chunk_xy", cfg.get("chunk_xy_m"))
+        if chunk is not None and self.chunk_spin.isEnabled():
+            self.chunk_spin.setValue(float(chunk))
 
     def _on_source_toggle(self):
         from_run = self.from_run_radio.isChecked()
@@ -374,9 +433,15 @@ class InferPage(QWidget):
         if not os.path.isdir(input_dir):
             self._append("Choose an input folder first.")
             return
+        modal = appstate.get_exec_mode() != "local"
+        weights_run_id = ""          # set on the from-a-run path; drives the H4 preflight
         if self.from_run_radio.isChecked():
             h = self.run_combo.currentData()
-            run_id = h["run_id"] if isinstance(h, dict) else self.run_combo.currentText().split()[0]
+            if isinstance(h, dict):
+                run_id = h["run_id"]
+            else:
+                parts = self.run_combo.currentText().split()   # H4/M6: empty combo -> no crash
+                run_id = parts[0] if parts else ""
             if not run_id:
                 self._append("Pick or type a run id.")
                 return
@@ -387,6 +452,7 @@ class InferPage(QWidget):
                              f"predictions on the Runs page instead.")
                 return
             self._weights_remote = f"runs/{run_id}/final_model.pth"
+            weights_run_id = run_id
         else:
             if not os.path.isfile(self.pth_edit.text().strip()):
                 self._append("Choose a .pth file.")
@@ -398,9 +464,73 @@ class InferPage(QWidget):
         self.stats_box.clear()
         self.log.clear()
         self.run_btn.setEnabled(False)
-        self._append(f"[1/4] Converting {input_dir} to canonical scenes (job {self._job_id})…")
+        # H4: on Modal, a run is added to history at train START, so a crashed/
+        # unfinished run shows in the picker with no final_model.pth. Confirm the
+        # weights exist on the outputs volume BEFORE converting + uploading + paying
+        # for a GPU spin-up. Runs in a worker (network call) so the UI never freezes.
+        if modal and weights_run_id:
+            self._pending_input = input_dir
+            self._pending_run_id = weights_run_id
+            self._append(f"[0/4] Checking weights on Modal "
+                         f"({self._backbone().outputs_volume}) …")
+            self.preflight.start(_check_weights_present,
+                                 self._backbone().outputs_volume, weights_run_id)
+            return
+        self._start_conversion(input_dir)
+
+    def _start_conversion(self, input_dir: str):
+        norm = self.inorm_combo.currentData() or "p95"
+        want_hag = self._run_wants_real_hag()
+        if want_hag:
+            from .. import pretrain
+            if pretrain.pdal_available():
+                self._append("[1/4] Run trained on real PDAL HAG — computing it for the "
+                             "input scenes (matches training).")
+            else:
+                self._append("⚠ This run trained on real PDAL HAG, but PDAL isn't installed "
+                             "here — inference will use a z-min proxy (degraded results).")
+        self._append(f"[1/4] Converting {input_dir} to canonical scenes (job {self._job_id}; "
+                     f"intensity={norm})…")
         self.converter.start(dataset.convert_infer_job, self._job_id, input_dir,
-                             appstate.staging_dir())
+                             appstate.staging_dir(), intensity_norm=norm, hag=want_hag)
+
+    def _run_wants_real_hag(self) -> bool:
+        """True if the picked run trained on real PDAL HAG, so convert_infer_job
+        reproduces it instead of a z-min proxy. Only *_hag backbones use HAG; a local
+        .pth (or a Modal run not downloaded locally) has no readable run_config, so
+        this defaults off — the proxy, i.e. today's behaviour."""
+        if not self.from_run_radio.isChecked():
+            return False
+        h = self.run_combo.currentData()
+        if isinstance(h, dict):
+            run_id, bkey = h.get("run_id", ""), h.get("backbone")
+        else:
+            parts = self.run_combo.currentText().split()
+            run_id, bkey = (parts[0] if parts else ""), self.backbone_combo.currentData()
+        if not run_id or not (bkey and str(bkey).endswith("hag")):
+            return False
+        s = str(self._run_config(run_id, bkey).get("hag_source", "")).lower()
+        return ("pdal" in s or "hag_nn" in s) and "proxy" not in s and "z_minus" not in s
+
+    def _on_preflight(self, present):
+        """Result of the H4 Modal weights check: True=found, False=dir exists but no
+        final_model.pth (block), None=couldn't list (proceed; in-container backstop)."""
+        if present is False:
+            self._append(f"✗ Run '{self._pending_run_id}' has no final_model.pth on the "
+                         f"outputs volume — it likely crashed before a best epoch or hasn't "
+                         f"finished. Pick a completed run, or use the 'Local .pth file' option.")
+            self.run_btn.setEnabled(True)
+            return
+        if present is None:
+            self._append("[0/4] (couldn't verify weights on Modal — proceeding; the run "
+                         "will fail in-container if they're truly missing.)")
+        self._start_conversion(self._pending_input)
+
+    def _on_preflight_error(self, tb: str):
+        # A failed CHECK shouldn't block a launch — fall through to the in-container
+        # backstop rather than stranding the user on a transient modal/CLI error.
+        self._append(f"[0/4] (weights check errored, proceeding anyway)\n{tb}")
+        self._start_conversion(self._pending_input)
 
     def _on_converted(self, staged: Path):
         self._staged = staged
@@ -446,29 +576,29 @@ class InferPage(QWidget):
         elif self._stage == "run_local":
             # Local Docker run: predictions were written straight to the chosen
             # output folder on the host (no download stage).
-            self.run_btn.setEnabled(True)
-            pred_dir = self._pred_dir
-            if pred_dir and pred_dir.is_dir():
-                preds = [p for p in sorted(pred_dir.iterdir())
-                         if p.suffix.lower() in (".ply", ".npz")]
-                appstate.put("last_view_dir", str(pred_dir))
-                self._append(f"\n✓ Done — {len(preds)} prediction file(s) in {pred_dir}.\n"
-                             f"  'View a point cloud…' to open one, or 'Compare to ground "
-                             f"truth…' for accuracy + mIoU.")
-            else:
-                self._append(f"\n✗ No predictions folder at {pred_dir}.")
+            self._report_predictions(self._pred_dir)
         elif self._stage == "download":
-            self.run_btn.setEnabled(True)
-            pred_dir = self._dl_dest / "predictions"
-            if pred_dir.is_dir():
-                preds = [p for p in sorted(pred_dir.iterdir())
-                         if p.suffix.lower() in (".ply", ".npz")]
-                appstate.put("last_view_dir", str(pred_dir))   # View dialog opens here
-                self._append(f"\n✓ Done — {len(preds)} prediction file(s) in {pred_dir}.\n"
-                             f"  'View a point cloud…' to open one, or 'Compare to ground "
-                             f"truth…' for accuracy + mIoU.")
-            else:
-                self._append(f"\n✗ No predictions folder at {pred_dir}.")
+            self._report_predictions(self._dl_dest / "predictions")
+
+    def _report_predictions(self, pred_dir):
+        """Final-stage report — green ONLY when predictions actually landed (L5): a
+        stage can exit 0 yet write nothing, and a green '0 prediction file(s)' reads
+        as success when it isn't."""
+        self.run_btn.setEnabled(True)
+        pred_dir = Path(pred_dir) if pred_dir else None
+        if not (pred_dir and pred_dir.is_dir()):
+            self._append(f"\n✗ No predictions folder at {pred_dir}.")
+            return
+        preds = [p for p in sorted(pred_dir.iterdir())
+                 if p.suffix.lower() in (".ply", ".npz")]
+        if not preds:
+            self._append(f"\n✗ Produced no prediction files in {pred_dir} — check the log "
+                         f"above for errors.")
+            return
+        appstate.put("last_view_dir", str(pred_dir))
+        self._append(f"\n✓ Done — {len(preds)} prediction file(s) in {pred_dir}.\n"
+                     f"  'View a point cloud…' to open one, or 'Compare to ground "
+                     f"truth…' for accuracy + mIoU.")
 
     def _start_modal_run(self):
         b = self._backbone()
@@ -544,6 +674,12 @@ class InferPage(QWidget):
             self._append("[local] docker not found on PATH — printed the exact command "
                          "(design-now mode). On a Docker+GPU host the predictions land in "
                          f"{self._pred_dir.as_posix()}.")
+            self.run_btn.setEnabled(True)
+            return
+        gok, gmsg = local_cli.gpu_preflight()   # M4: CUDA-only — fail clearly, not cryptically
+        if gmsg:
+            self._append(gmsg)
+        if not gok:
             self.run_btn.setEnabled(True)
             return
         ok, msg = local_cli.image_preflight(b)
@@ -712,6 +848,26 @@ class PaletteDialog(QDialog):
 
     def colors(self) -> list:
         return [list(c) for c in self._colors]
+
+
+def _entry_name(entry: dict) -> str:
+    """Basename of a `modal volume ls --json` entry (key name varies by CLI ver)."""
+    for k in ("path", "Filename", "filename", "name", "Name"):
+        v = entry.get(k)
+        if v:
+            return str(v).rstrip("/").rsplit("/", 1)[-1]
+    return ""
+
+
+def _check_weights_present(volume: str, run_id: str, progress=None):
+    """H4: does runs/<run_id>/final_model.pth exist on the Modal outputs volume?
+    True=yes, False=the dir lists but lacks it (block the launch), None=empty/
+    unreachable listing (couldn't tell — caller proceeds to the in-container check).
+    Blocking `modal volume ls`; runs in a FuncWorker thread."""
+    entries = modal_cli.list_volume_entries(volume, f"/runs/{run_id}")
+    if not entries:
+        return None
+    return any(_entry_name(e) == "final_model.pth" for e in entries)
 
 
 def _wrap(layout) -> QWidget:
