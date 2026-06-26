@@ -148,7 +148,6 @@ TRAIN_PC_DIR   = f"{DATA_ROOT}/Train-Track4/Track4"            # *_PC3.txt (x,y,
 TRAIN_CLS_DIR  = f"{DATA_ROOT}/Train-Track4-Truth/Track4-Truth"  # *_CLS.txt (ASPRS codes)
 TEST_PC_DIR    = f"{DATA_ROOT}/Validate-Track4/Track4"
 TEST_CLS_DIR   = f"{DATA_ROOT}/Validate-Track4-Truth"
-PRED_PC_DIR    = f"{DATA_ROOT}/Test-Track4/Test-Track4"        # no GT — for the predict demo
 PREP_DIR       = f"{DATA_ROOT}/prep/ptv3_ieee_grid05_origin"
 
 DATASETS_ROOT = "/datasets"   # terminal-datasets volume (trainer_gui canonical datasets)
@@ -197,7 +196,6 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
     STEPS       = steps_per_epoch if steps_per_epoch is not None else 500
     CHUNK_XY    = chunk_xy if chunk_xy is not None else 50.0
     STRIDE      = CHUNK_XY / 2.0
-    N_PREDICT   = 1
     NUM_CLASSES = globals()["NUM_CLASSES"]
     CLASS_NAMES = None
 
@@ -936,148 +934,11 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                 "gpu_mem_mb",
             ])
 
-    # --- Periodic held-out validation (eval mode, no_grad — weights untouched).
-    # Appends to val_metrics.csv + commits, so the train/val gap is watchable
-    # mid-run:  modal volume get <app>-outputs runs/<id>/val_metrics.csv --------
-    val_csv = f"{run_dir}/val_metrics.csv"
-    if not os.path.exists(val_csv):
-        with open(val_csv, "w", newline="") as f:
-            csv.writer(f).writerow(
-                ["epoch", "val_acc", "val_miou"] +
-                [f"iou_{_name(c)}" for c in range(NUM_CLASSES)])
-    _rs = np.random.RandomState(0)
-    val_subset = ([synth_test_tiles[i] for i in sorted(_rs.choice(
-        len(synth_test_tiles), min(VAL_SUBSET, len(synth_test_tiles)), replace=False))]
-        if synth_test_tiles else [])
-
-    def quick_val(ep):
-        backbone.eval(); head.eval()
-        inter = np.zeros(NUM_CLASSES, np.int64)
-        union = np.zeros(NUM_CLASSES, np.int64)
-        correct = total = 0
-        t0 = time.time()
-        with torch.no_grad():
-            for tile in val_subset:
-                try:
-                    batch, lbl = to_ptv3_batch([tile], training=False)
-                    point = backbone(batch)
-                    fe = point["feat"] if isinstance(point, dict) else point.feat
-                    pred = head(fe).argmax(-1)
-                except RuntimeError as e:
-                    if "out of memory" in str(e).lower():
-                        torch.cuda.empty_cache(); continue
-                    raise
-                v = lbl >= 0
-                correct += int((pred[v] == lbl[v]).sum()); total += int(v.sum())
-                for c in range(NUM_CLASSES):
-                    inter[c] += int(((pred == c) & (lbl == c)).sum())
-                    union[c] += int((((pred == c) | (lbl == c)) & v).sum())
-        with np.errstate(invalid="ignore"):
-            ious = inter / np.maximum(union, 1)
-        acc = correct / max(total, 1); miou = float(ious.mean())
-        with open(val_csv, "a", newline="") as f:
-            csv.writer(f).writerow([ep, f"{acc:.4f}", f"{miou:.4f}"] +
-                                   [f"{x:.4f}" for x in ious])
-        print(f"  [val @ ep {ep:3d}] acc={acc:.4f} mIoU={miou:.4f}  ({time.time()-t0:.0f}s)",
-              flush=True)
-        outputs_volume.commit()
-        backbone.train(); head.train()
-
-    LOG_EVERY = 20  # intra-epoch heartbeat
-    print(f"  starting at epoch {start_epoch}, up to {N_EPOCHS}, "
-          f"{STEPS} steps/epoch (batch {BATCH_SIZE})", flush=True)
-    t_run = time.time()
-    for ep in range(start_epoch, N_EPOCHS):
-        cur_lr = lr_at(ep)
-        for g in optim.param_groups:
-            g["lr"] = cur_lr
-        backbone.train(); head.train()
-        ep_loss = ep_correct = ep_total = 0
-        ep_inter = np.zeros(NUM_CLASSES, dtype=np.int64)
-        ep_union = np.zeros(NUM_CLASSES, dtype=np.int64)
-        t_ep = time.time(); t_chunk = t_ep; n_steps = 0; last_log_step = 0
-        print(f"  ep {ep:3d} starting (lr={cur_lr:.2e})…", flush=True)
-        for step in range(STEPS):
-            picks = [pick_train_tile() for _ in range(BATCH_SIZE)]
-            _dbg = None
-            try:
-                batch, label = to_ptv3_batch(picks, training=True)
-                if DEBUG_CUDA:
-                    # Snapshot the batch on CPU BEFORE the forward (GPU still
-                    # healthy). If the step then asserts, this is the culprit.
-                    gc, co = batch["grid_coord"], batch["coord"]
-                    _dbg = {"picks": [os.path.basename(p) for p in picks],
-                            "n_pts": int(co.shape[0]), "offset": batch["offset"].tolist(),
-                            "grid_min": gc.min(0).values.tolist(),
-                            "grid_max": gc.max(0).values.tolist(),
-                            "grid_unique": int(torch.unique(gc, dim=0).shape[0]),
-                            "coord_min": [round(float(x), 2) for x in co.min(0).values.tolist()],
-                            "coord_max": [round(float(x), 2) for x in co.max(0).values.tolist()],
-                            "coord_finite": bool(torch.isfinite(co).all().item()),
-                            "lab_min": int(label.min().item()), "lab_max": int(label.max().item())}
-                point = backbone(batch)
-                feat = point["feat"] if isinstance(point, dict) else point.feat
-                logits = head(feat)
-                loss = seg_loss(logits, label)
-                optim.zero_grad(); loss.backward()
-                torch.nn.utils.clip_grad_norm_(
-                    list(backbone.parameters()) + list(head.parameters()), GRAD_CLIP)
-                optim.step()
-                ep_loss += loss.item(); n_steps += 1
-                if n_steps % LOG_EVERY == 0:
-                    dt = time.time() - t_chunk
-                    print(f"    ep {ep:3d} step {n_steps:4d}: "
-                          f"loss={ep_loss/n_steps:.4f} "
-                          f"{(n_steps-last_log_step)/max(dt,1e-6):.2f} it/s", flush=True)
-                    t_chunk = time.time(); last_log_step = n_steps
-                pred = logits.argmax(-1)
-                m = label >= 0
-                ep_correct += (pred[m] == label[m]).sum().item()
-                ep_total   += int(m.sum())
-                for c in range(NUM_CLASSES):
-                    ep_inter[c] += ((pred == c) & (label == c)).sum().item()
-                    ep_union[c] += (((pred == c) | (label == c)) & m).sum().item()
-            except RuntimeError as e:
-                if "out of memory" in str(e).lower():
-                    torch.cuda.empty_cache(); continue
-                if _dbg is not None:
-                    print(f"  [debug] CRASH at ep {ep} step {step} — offending batch:\n"
-                          f"          {json.dumps(_dbg)}", flush=True)
-                raise
-        sec_per_iter = (time.time() - t_ep) / max(n_steps, 1)
-        sec_per_epoch = time.time() - t_ep
-        train_acc = ep_correct / max(ep_total, 1)
-        with np.errstate(invalid="ignore"):
-            train_iou = float(np.mean(ep_inter / np.maximum(ep_union, 1)))
-        gpu_mem = torch.cuda.max_memory_allocated() / 1e6
-        with open(metrics_csv, "a", newline="") as f:
-            csv.writer(f).writerow([
-                ep, ep_loss / max(n_steps, 1), "", f"{train_acc:.4f}", "",
-                f"{train_iou:.4f}", "", f"{cur_lr:.6e}", f"{sec_per_iter:.4f}",
-                f"{sec_per_epoch:.2f}", f"{gpu_mem:.1f}",
-            ])
-        print(f"  ep {ep:3d}: loss={ep_loss/max(n_steps,1):.4f} "
-              f"acc={train_acc:.4f} miou={train_iou:.4f} lr={cur_lr:.2e} "
-              f"s/iter={sec_per_iter:.3f} s/ep={sec_per_epoch:.1f}", flush=True)
-        if (ep + 1) % CHECKPOINT_GAP == 0 or ep == N_EPOCHS - 1:
-            torch.save({"backbone": backbone.state_dict(), "head": head.state_dict(),
-                        "optim": optim.state_dict(), "epoch": ep},
-                       f"{run_dir}/checkpoints/ep{ep:03d}.pth")
-            # keep only the 2 newest checkpoints (~0.5 GB each with optimizer)
-            for old in sorted(glob.glob(f"{run_dir}/checkpoints/ep*.pth"))[:-2]:
-                try:
-                    os.remove(old)
-                except OSError:
-                    pass
-            outputs_volume.commit()
-        if (ep + 1) % VAL_EVERY == 0 or ep == N_EPOCHS - 1:
-            quick_val(ep)
-
-    torch.save({"backbone": backbone.state_dict(), "head": head.state_dict(),
-                "epoch": N_EPOCHS - 1}, f"{run_dir}/final_model.pth")
-
-    # --- Test ---------------------------------------------------------------
-    backbone.eval(); head.eval()
+    # --- Periodic + final evaluation: the REAL voted eval (not a cheap proxy)
+    # over the combined holdout+test eval set every VAL_EVERY epochs, appended to
+    # val_metrics.csv so the val curve is the SAME number the final test reports.
+    # NOTE: far heavier than the old quick_val — it forwards every overlapping
+    # tile of every eval scene. Raise VAL_EVERY if it costs too much. -----------
     def _raw_loader(split, name):
         """Closure -> (xyz, rgb, lab) for the ORIGINAL raw scene, so the voted
         voxel predictions can be reprojected onto raw points + raw GT (the
@@ -1092,20 +953,20 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
         return lambda: load_ieee(f"{TEST_PC_DIR}/{name}_PC3.txt",
                                  f"{TEST_CLS_DIR}/{name}_CLS.txt")
 
-    def evaluate(scene_items, split_dir, label):
-        """Per-SCENE overlap voting scored on the ORIGINAL raw points — the
-        official protocol KPConvX/RandLA use, so all three are directly
-        comparable. For each scene: forward its overlapping tiles (stride
-        CHUNK_XY/2, each point in up to 4 tiles), sum center-tapered softmax
-        votes per GRID voxel, argmax, then NN-propagate each voxel's prediction
-        to the raw cloud and score against raw GT.
+    eval_items = (
+        [(n, _raw_loader("val", n), f"{PREP_DIR}/train") for n in sorted(hold)] +
+        [(n, _raw_loader("test", n), f"{PREP_DIR}/test")
+         for n in sorted({_scene_of(p) for p in real_test_tiles})]
+    )
+    print(f"  eval set: {len(eval_items)} scenes "
+          f"({len(hold)} holdout + {len(eval_items) - len(hold)} test)", flush=True)
 
-        Fixes vs the old eval: (1) voting is per-scene, so voxel keys from
-        different scenes can never collide (the old eval concatenated every
-        scene onto one global voxel grid — silently corrupting any dataset whose
-        scenes share a coordinate frame); (2) scoring is on raw points, not on
-        GRID voxels (the old eval scored at voxel resolution against an arbitrary
-        first-point voxel label), so the number means the same thing as KPConvX's."""
+    def evaluate(scene_items, label):
+        """Per-SCENE overlap voting scored on the ORIGINAL raw points (the
+        protocol KPConvX/RandLA use). Per scene: forward its overlapping tiles
+        (stride CHUNK_XY/2, each point in up to 4 tiles), sum center-tapered
+        softmax votes per GRID voxel, argmax, then NN-propagate each voxel's
+        prediction to the raw cloud and score against raw GT."""
         t_inter = np.zeros(NUM_CLASSES, dtype=np.int64)
         t_union = np.zeros(NUM_CLASSES, dtype=np.int64)
         t_gt    = np.zeros(NUM_CLASSES, dtype=np.int64)
@@ -1113,7 +974,7 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
         n_scenes = n_skipped_tiles = n_skipped_scenes = 0
         t_test = time.time()
         with torch.no_grad():
-            for name, load_raw in scene_items:
+            for name, load_raw, split_dir in scene_items:
                 tiles = sorted(glob.glob(f"{split_dir}/{name}_x*.npz"))
                 if not tiles:
                     n_skipped_scenes += 1; continue
@@ -1214,62 +1075,133 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
               f"skipped(tiles={n_skipped_tiles},scenes={n_skipped_scenes})", flush=True)
         return m
 
-    print("  evaluating on train-holdout val + test split…", flush=True)
-    val_items  = [(n, _raw_loader("val",  n)) for n in sorted(hold)]
-    test_items = [(n, _raw_loader("test", n))
-                  for n in sorted({_scene_of(p) for p in real_test_tiles})]
-    test_metrics = {
-        "val":  evaluate(val_items,  f"{PREP_DIR}/train", "val"),
-        "test": evaluate(test_items, f"{PREP_DIR}/test",  "test"),
-        "val_scenes":  [n for n, _ in val_items],
-        "test_scenes": [n for n, _ in test_items],
-    }
-    with open(f"{run_dir}/test_metrics.json", "w") as f:
-        json.dump(test_metrics, f, indent=2)
+    val_csv = f"{run_dir}/val_metrics.csv"
+    if not os.path.exists(val_csv):
+        with open(val_csv, "w", newline="") as f:
+            csv.writer(f).writerow(
+                ["epoch", "val_acc", "val_miou"] +
+                [f"iou_{_name(c)}" for c in range(NUM_CLASSES)])
+
+    from train_common import BestCheckpoint
+    best = BestCheckpoint(run_dir)
+
+    def run_eval(ep, write_json=False):
+        backbone.eval(); head.eval()
+        m = evaluate(eval_items, f"eval@ep{ep}")
+        ious = [m["per_class_iou"][_name(c)] for c in range(NUM_CLASSES)]
+        with open(val_csv, "a", newline="") as f:
+            csv.writer(f).writerow([ep, f"{m['overall_acc']:.4f}",
+                                    f"{m['overall_mIoU']:.4f}"] + [f"{x:.4f}" for x in ious])
+        if best.update(m["overall_mIoU"]):
+            torch.save({"backbone": backbone.state_dict(),
+                        "head": head.state_dict(), "epoch": ep}, best.final)
+        if write_json:
+            with open(f"{run_dir}/test_metrics.json", "w") as fj:
+                json.dump({"val": m, "test": m,
+                           "eval_scenes": [n for n, _, _ in eval_items]}, fj, indent=2)
+        outputs_volume.commit()
+        backbone.train(); head.train()
+        return m
+
+    LOG_EVERY = 20  # intra-epoch heartbeat
+    print(f"  starting at epoch {start_epoch}, up to {N_EPOCHS}, "
+          f"{STEPS} steps/epoch (batch {BATCH_SIZE})", flush=True)
+    t_run = time.time()
+    for ep in range(start_epoch, N_EPOCHS):
+        cur_lr = lr_at(ep)
+        for g in optim.param_groups:
+            g["lr"] = cur_lr
+        backbone.train(); head.train()
+        ep_loss = ep_correct = ep_total = 0
+        ep_inter = np.zeros(NUM_CLASSES, dtype=np.int64)
+        ep_union = np.zeros(NUM_CLASSES, dtype=np.int64)
+        t_ep = time.time(); t_chunk = t_ep; n_steps = 0; last_log_step = 0
+        print(f"  ep {ep:3d} starting (lr={cur_lr:.2e})…", flush=True)
+        for step in range(STEPS):
+            picks = [pick_train_tile() for _ in range(BATCH_SIZE)]
+            _dbg = None
+            try:
+                batch, label = to_ptv3_batch(picks, training=True)
+                if DEBUG_CUDA:
+                    # Snapshot the batch on CPU BEFORE the forward (GPU still
+                    # healthy). If the step then asserts, this is the culprit.
+                    gc, co = batch["grid_coord"], batch["coord"]
+                    _dbg = {"picks": [os.path.basename(p) for p in picks],
+                            "n_pts": int(co.shape[0]), "offset": batch["offset"].tolist(),
+                            "grid_min": gc.min(0).values.tolist(),
+                            "grid_max": gc.max(0).values.tolist(),
+                            "grid_unique": int(torch.unique(gc, dim=0).shape[0]),
+                            "coord_min": [round(float(x), 2) for x in co.min(0).values.tolist()],
+                            "coord_max": [round(float(x), 2) for x in co.max(0).values.tolist()],
+                            "coord_finite": bool(torch.isfinite(co).all().item()),
+                            "lab_min": int(label.min().item()), "lab_max": int(label.max().item())}
+                point = backbone(batch)
+                feat = point["feat"] if isinstance(point, dict) else point.feat
+                logits = head(feat)
+                loss = seg_loss(logits, label)
+                optim.zero_grad(); loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    list(backbone.parameters()) + list(head.parameters()), GRAD_CLIP)
+                optim.step()
+                ep_loss += loss.item(); n_steps += 1
+                if n_steps % LOG_EVERY == 0:
+                    dt = time.time() - t_chunk
+                    print(f"    ep {ep:3d} step {n_steps:4d}: "
+                          f"loss={ep_loss/n_steps:.4f} "
+                          f"{(n_steps-last_log_step)/max(dt,1e-6):.2f} it/s", flush=True)
+                    t_chunk = time.time(); last_log_step = n_steps
+                pred = logits.argmax(-1)
+                m = label >= 0
+                ep_correct += (pred[m] == label[m]).sum().item()
+                ep_total   += int(m.sum())
+                for c in range(NUM_CLASSES):
+                    ep_inter[c] += ((pred == c) & (label == c)).sum().item()
+                    ep_union[c] += (((pred == c) | (label == c)) & m).sum().item()
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower():
+                    torch.cuda.empty_cache(); continue
+                if _dbg is not None:
+                    print(f"  [debug] CRASH at ep {ep} step {step} — offending batch:\n"
+                          f"          {json.dumps(_dbg)}", flush=True)
+                raise
+        sec_per_iter = (time.time() - t_ep) / max(n_steps, 1)
+        sec_per_epoch = time.time() - t_ep
+        train_acc = ep_correct / max(ep_total, 1)
+        with np.errstate(invalid="ignore"):
+            train_iou = float(np.mean(ep_inter / np.maximum(ep_union, 1)))
+        gpu_mem = torch.cuda.max_memory_allocated() / 1e6
+        with open(metrics_csv, "a", newline="") as f:
+            csv.writer(f).writerow([
+                ep, ep_loss / max(n_steps, 1), "", f"{train_acc:.4f}", "",
+                f"{train_iou:.4f}", "", f"{cur_lr:.6e}", f"{sec_per_iter:.4f}",
+                f"{sec_per_epoch:.2f}", f"{gpu_mem:.1f}",
+            ])
+        print(f"  ep {ep:3d}: loss={ep_loss/max(n_steps,1):.4f} "
+              f"acc={train_acc:.4f} miou={train_iou:.4f} lr={cur_lr:.2e} "
+              f"s/iter={sec_per_iter:.3f} s/ep={sec_per_epoch:.1f}", flush=True)
+        if (ep + 1) % CHECKPOINT_GAP == 0 or ep == N_EPOCHS - 1:
+            torch.save({"backbone": backbone.state_dict(), "head": head.state_dict(),
+                        "optim": optim.state_dict(), "epoch": ep},
+                       f"{run_dir}/checkpoints/ep{ep:03d}.pth")
+            # keep only the 2 newest checkpoints (~0.5 GB each with optimizer)
+            for old in sorted(glob.glob(f"{run_dir}/checkpoints/ep*.pth"))[:-2]:
+                try:
+                    os.remove(old)
+                except OSError:
+                    pass
+            outputs_volume.commit()
+        if (ep + 1) % VAL_EVERY == 0 and ep != N_EPOCHS - 1:
+            run_eval(ep)               # last epoch handled by the final eval below
+
+    # --- Final evaluation: the real voted eval over the combined eval set,
+    # written to test_metrics.json (the same number run_eval logs periodically). -
+    print("  final evaluation over the combined eval set…", flush=True)
+    run_eval(N_EPOCHS - 1, write_json=True)
+    best.finalize(lambda p: torch.save(
+        {"backbone": backbone.state_dict(), "head": head.state_dict(),
+         "epoch": N_EPOCHS - 1}, p))
     print(f"  total wall-clock {(time.time() - t_run)/3600:.2f} h")
     outputs_volume.commit()
-
-    # ------------------------------------------------------------------------
-    # Prediction demo: canonical -> first N_PREDICT val scenes (PLY + npz);
-    # IEEE default -> first N_PREDICT Test-Track4 scenes (no GT), written as an
-    # ASPRS-coded *_pred_CLS.txt (like the KPConvX cold script) + a colored PLY.
-    # Best-effort.
-    # ------------------------------------------------------------------------
-    try:
-        backbone.eval(); head.eval()
-        pred_dir = f"{run_dir}/predictions"
-        os.makedirs(pred_dir, exist_ok=True)
-        predict_scene = make_predict_scene(backbone, head, NUM_CLASSES)
-        palette = _palette(NUM_CLASSES)
-        if ds_root:
-            scenes = sorted(glob.glob(f"{ds_root}/val/*.npz"))[:N_PREDICT]
-            print(f"  [predict] labeling {len(scenes)} scene(s) -> {pred_dir}", flush=True)
-            for pc_path in scenes:
-                name = os.path.splitext(os.path.basename(pc_path))[0]
-                t0 = time.time()
-                xyz, pred, inten = predict_scene(pc_path)
-                _write_ply(f"{pred_dir}/{name}_pred.ply", xyz, pred, palette, inten)
-                np.savez_compressed(f"{pred_dir}/{name}_pred.npz",
-                                    xyz=xyz.astype(np.float32), pred=pred.astype(np.int32),
-                                    intensity=inten.astype(np.float32),
-                                    class_names=np.array(CLASS_NAMES))
-                print(f"  [predict] {name}: {len(xyz):,} pts in {time.time()-t0:.1f}s", flush=True)
-        else:
-            IDX_TO_ASPRS = np.array([2, 5, 6, 9, 17], dtype=np.int32)  # index -> ASPRS code
-            scenes = sorted(glob.glob(f"{PRED_PC_DIR}/*_PC3.txt"))[:N_PREDICT]
-            print(f"  [predict] labeling {len(scenes)} Test-Track4 scene(s) -> {pred_dir}",
-                  flush=True)
-            for pc_path in scenes:
-                name = os.path.basename(pc_path).replace("_PC3.txt", "")
-                t0 = time.time()
-                xyz, pred, inten = predict_scene(pc_path)
-                np.savetxt(f"{pred_dir}/{name}_pred_CLS.txt", IDX_TO_ASPRS[pred], fmt="%d")
-                _write_ply(f"{pred_dir}/{name}_pred.ply", xyz, pred, palette, inten)
-                print(f"  [predict] {name}: {len(xyz):,} pts in {time.time()-t0:.1f}s", flush=True)
-        outputs_volume.commit()
-    except Exception as e:
-        print(f"  [predict] skipped (model is saved): {e}", flush=True)
-        traceback.print_exc()
 
     # Mark the run complete so AUTO_RESUME won't re-resume it on the next launch
     # (a crashed/retried run has no DONE and is picked back up automatically).

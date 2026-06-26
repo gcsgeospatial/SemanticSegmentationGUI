@@ -149,7 +149,6 @@ TRAIN_PC_DIR   = f"{DATA_ROOT}/Train-Track4/Track4"            # *_PC3.txt (x,y,
 TRAIN_CLS_DIR  = f"{DATA_ROOT}/Train-Track4-Truth/Track4-Truth"  # *_CLS.txt (ASPRS codes)
 TEST_PC_DIR    = f"{DATA_ROOT}/Validate-Track4/Track4"
 TEST_CLS_DIR   = f"{DATA_ROOT}/Validate-Track4-Truth"
-PRED_PC_DIR    = f"{DATA_ROOT}/Test-Track4/Test-Track4"        # no GT — for the predict demo
 PREP_DIR       = f"{DATA_ROOT}/prep/ptv3_ieee_grid05_origin"
 
 DATASETS_ROOT = "/datasets"   # terminal-datasets volume (trainer_gui canonical datasets)
@@ -204,6 +203,7 @@ image = image.add_local_dir(
 image = image.run_commands("touch /opt/ptv3/__init__.py")
 
 image = image.add_local_file("local_train_ptv3.py", "/root/local_train_ptv3.py")
+image = image.add_local_file("train_common.py", "/root/train_common.py")
 
 data_volume     = modal.Volume.from_name("ieee-data",           create_if_missing=True)
 outputs_volume  = modal.Volume.from_name(f"{APP_NAME}-outputs", create_if_missing=True)

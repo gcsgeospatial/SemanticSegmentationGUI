@@ -339,6 +339,39 @@ def _save_ply(path: Path, xyz, rgb):
 
 # ----------------------------------------------------------------------- display
 
+def _parse_palette(spec: str | None):
+    """'r,g,b;r,g,b;…' -> [[r,g,b], …] (one colour per class index), or None.
+    Passed by the GUI's Configure Palette so the viewer paints the user's colours."""
+    if not spec:
+        return None
+    out = [[int(x) for x in part.split(",")] for part in spec.split(";") if part.strip()]
+    return out or None
+
+
+def _recolor_to_palette(rgb01: np.ndarray, names: list, palette: list):
+    """Recolour a class-coloured cloud to a custom per-class palette and rebuild the
+    legend. Predictions are baked with palette_for(N)[class]; map each point's baked
+    colour back to its class index, then paint it `palette[index]`. Returns
+    (rgb01, key), or None when the cloud isn't palette-coloured (raw RGB scenes are
+    left untouched, so they don't get a bogus recolour or legend)."""
+    from .palette import palette_for
+    rgb_u8 = (np.clip(np.asarray(rgb01), 0, 1) * 255).round().astype(np.int64)
+    base = palette_for(len(palette))
+    out = np.array(rgb01, np.float64, copy=True)
+    matched = False
+    for bc, cc in zip(base, palette):
+        m = (rgb_u8[:, 0] == bc[0]) & (rgb_u8[:, 1] == bc[1]) & (rgb_u8[:, 2] == bc[2])
+        if m.any():
+            out[m] = np.asarray(cc, np.float64) / 255.0
+            matched = True
+    if not matched:
+        return None
+    key = [(names[i] if i < len(names) else f"class_{i}",
+            tuple((np.asarray(palette[i], np.float64) / 255.0).tolist()))
+           for i in range(len(palette))]
+    return out, key
+
+
 def _print_key(title, key):
     if key:
         print(f"{title} — colour key:")
@@ -432,6 +465,10 @@ def main(argv=None) -> int:
                     help="comma-separated class names (a dataset's palette) for the "
                          "colour legend, and to label predictions whose file carries no "
                          "class names; colours come from the shared categorical palette")
+    ap.add_argument("--palette", default=None,
+                    help="custom per-class colours 'r,g,b;r,g,b;…' (by class index) to "
+                         "recolour a class-coloured cloud and its legend (the GUI's "
+                         "Configure Palette); defaults to the baked categorical palette")
     ap.add_argument("--max-points", type=int, default=8_000_000,
                     help="random subsample cap for display")
     ap.add_argument("--save", default=None,
@@ -441,6 +478,7 @@ def main(argv=None) -> int:
 
     names = ([s.strip() for s in args.class_names.split(",") if s.strip()]
              if args.class_names else None)
+    palette = _parse_palette(args.palette)
     path = Path(args.path)
     if args.gt:
         xyz, rgb, key = compare_clouds(path, Path(args.gt),
@@ -452,6 +490,12 @@ def main(argv=None) -> int:
     else:
         xyz, rgb, key = _load(path, names)
         title = path.name
+    # Apply a custom palette (Configure Palette): recolour the class-coloured cloud
+    # to the user's colours. Not for --gt (that's a yellow/grey error map).
+    if palette and names and rgb is not None and not args.gt:
+        recolored = _recolor_to_palette(rgb, names, palette)
+        if recolored is not None:
+            rgb, key = recolored
     if args.save:
         _save_ply(Path(args.save), xyz, rgb)
         print(f"saved {len(xyz):,} points -> {args.save}")

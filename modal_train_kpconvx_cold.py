@@ -139,8 +139,6 @@ TRAIN_PC_DIR   = f"{DATA_ROOT}/Train-Track4/Track4"
 TRAIN_CLS_DIR  = f"{DATA_ROOT}/Train-Track4-Truth/Track4-Truth"
 TEST_PC_DIR    = f"{DATA_ROOT}/Validate-Track4/Track4"
 TEST_CLS_DIR   = f"{DATA_ROOT}/Validate-Track4-Truth"
-PRED_PC_DIR    = f"{DATA_ROOT}/Test-Track4/Test-Track4"
-N_PREDICT      = 1
 PREP_DIR       = f"{DATA_ROOT}/prep/kpconvx_cold_native_grid20_c100_origin"
 
 CLASS_NAMES = ["Ground", "Trees", "Building", "Water", "Bridge"]
@@ -191,6 +189,7 @@ image = image.run_commands(
 )
 
 image = image.add_local_file("local_train_kpconvx_cold.py", "/root/local_train_kpconvx_cold.py")
+image = image.add_local_file("train_common.py", "/root/train_common.py")
 
 data_volume     = modal.Volume.from_name("ieee-data",            create_if_missing=True)
 outputs_volume  = modal.Volume.from_name(f"{APP_NAME}-outputs",  create_if_missing=True)

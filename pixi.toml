@@ -24,6 +24,13 @@ laspy = { version = ">=2.5", extras = ["lazrs"] }
 plyfile = ">=1.0"
 trainer-gui = { path = ".", editable = true }
 
+[activation.env]
+# Don't scatter __pycache__/ dirs across the source tree: Python writes bytecode
+# caches whenever it imports a module, so running the GUI/viewer/tests via pixi
+# would litter them everywhere. This disables that for anything launched in the
+# env (negligible import-speed cost for a local app).
+PYTHONDONTWRITEBYTECODE = "1"
+
 [tasks]
 gui = "trainer-gui"                    # launch the desktop app
 test = "python tests/smoke_test.py"    # local pipeline checks (no Modal calls)

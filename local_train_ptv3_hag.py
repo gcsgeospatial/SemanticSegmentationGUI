@@ -161,7 +161,6 @@ TRAIN_PC_DIR   = f"{DATA_ROOT}/Train-Track4/Track4"            # *_PC3.txt (x,y,
 TRAIN_CLS_DIR  = f"{DATA_ROOT}/Train-Track4-Truth/Track4-Truth"  # *_CLS.txt (ASPRS codes)
 TEST_PC_DIR    = f"{DATA_ROOT}/Validate-Track4/Track4"
 TEST_CLS_DIR   = f"{DATA_ROOT}/Validate-Track4-Truth"
-PRED_PC_DIR    = f"{DATA_ROOT}/Test-Track4/Test-Track4"        # no GT — for the predict demo
 # Per-point HeightAboveGround from the Pretraining tab (HAGTEST upload). Train +
 # val-holdout scenes -> HAG/Train; the test split (Validate-Track4) -> HAG/Validate.
 HAG_TRAIN_DIR  = f"{DATA_ROOT}/HAG/Train"
@@ -245,7 +244,6 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
     STEPS       = steps_per_epoch if steps_per_epoch is not None else 500
     CHUNK_XY    = chunk_xy if chunk_xy is not None else 50.0
     STRIDE      = CHUNK_XY / 2.0
-    N_PREDICT   = 1
     NUM_CLASSES = globals()["NUM_CLASSES"]
     CLASS_NAMES = None
 
@@ -1161,6 +1159,9 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                 ["epoch", "val_acc", "val_miou"] +
                 [f"iou_{_name(c)}" for c in range(NUM_CLASSES)])
 
+    from train_common import BestCheckpoint
+    best = BestCheckpoint(run_dir)
+
     def run_eval(ep, write_json=False):
         backbone.eval(); head.eval()
         m = evaluate(eval_items, f"eval@ep{ep}")
@@ -1168,6 +1169,9 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
         with open(val_csv, "a", newline="") as f:
             csv.writer(f).writerow([ep, f"{m['overall_acc']:.4f}",
                                     f"{m['overall_mIoU']:.4f}"] + [f"{x:.4f}" for x in ious])
+        if best.update(m["overall_mIoU"]):
+            torch.save({"backbone": backbone.state_dict(),
+                        "head": head.state_dict(), "epoch": ep}, best.final)
         if write_json:
             # val + test are one combined set now; write the same metrics under
             # both keys so the trainer_gui (which reads test_metrics["val"] and
@@ -1252,56 +1256,14 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
         if (ep + 1) % VAL_EVERY == 0 and ep != N_EPOCHS - 1:
             run_eval(ep)               # last epoch handled by the final eval below
 
-    torch.save({"backbone": backbone.state_dict(), "head": head.state_dict(),
-                "epoch": N_EPOCHS - 1}, f"{run_dir}/final_model.pth")
-
     # --- Final evaluation: the real voted eval over the combined eval set,
     # written to test_metrics.json (the same number run_eval logs periodically). -
     print("  final evaluation over the combined eval set…", flush=True)
     run_eval(N_EPOCHS - 1, write_json=True)
+    best.finalize(lambda p: torch.save(
+        {"backbone": backbone.state_dict(), "head": head.state_dict(),
+         "epoch": N_EPOCHS - 1}, p))
     print(f"  total wall-clock {(time.time() - t_run)/3600:.2f} h")
-
-    # ------------------------------------------------------------------------
-    # Prediction demo: canonical -> first N_PREDICT val scenes (PLY + npz);
-    # IEEE default -> first N_PREDICT Test-Track4 scenes (no GT), written as an
-    # ASPRS-coded *_pred_CLS.txt (like the KPConvX cold script) + a colored PLY.
-    # Best-effort.
-    # ------------------------------------------------------------------------
-    try:
-        backbone.eval(); head.eval()
-        pred_dir = f"{run_dir}/predictions"
-        os.makedirs(pred_dir, exist_ok=True)
-        predict_scene = make_predict_scene(backbone, head, NUM_CLASSES)
-        palette = _palette(NUM_CLASSES)
-        if ds_root:
-            scenes = sorted(glob.glob(f"{ds_root}/val/*.npz"))[:N_PREDICT]
-            print(f"  [predict] labeling {len(scenes)} scene(s) -> {pred_dir}", flush=True)
-            for pc_path in scenes:
-                name = os.path.splitext(os.path.basename(pc_path))[0]
-                t0 = time.time()
-                xyz, pred, inten = predict_scene(pc_path)
-                _write_ply(f"{pred_dir}/{name}_pred.ply", xyz, pred, palette, inten)
-                np.savez_compressed(f"{pred_dir}/{name}_pred.npz",
-                                    xyz=xyz.astype(np.float32), pred=pred.astype(np.int32),
-                                    intensity=inten.astype(np.float32),
-                                    class_names=np.array(CLASS_NAMES))
-                print(f"  [predict] {name}: {len(xyz):,} pts in {time.time()-t0:.1f}s", flush=True)
-        else:
-            IDX_TO_ASPRS = np.array([2, 5, 6, 9, 17], dtype=np.int32)  # index -> ASPRS code
-            scenes = sorted(glob.glob(f"{PRED_PC_DIR}/*_PC3.txt"))[:N_PREDICT]
-            print(f"  [predict] labeling {len(scenes)} Test-Track4 scene(s) -> {pred_dir}",
-                  flush=True)
-            for pc_path in scenes:
-                name = os.path.basename(pc_path).replace("_PC3.txt", "")
-                t0 = time.time()
-                xyz, pred, inten = predict_scene(pc_path)
-                np.savetxt(f"{pred_dir}/{name}_pred_CLS.txt", IDX_TO_ASPRS[pred], fmt="%d")
-                _write_ply(f"{pred_dir}/{name}_pred.ply", xyz, pred, palette, inten)
-                print(f"  [predict] {name}: {len(xyz):,} pts in {time.time()-t0:.1f}s", flush=True)
-        outputs_volume.commit()
-    except Exception as e:
-        print(f"  [predict] skipped (model is saved): {e}", flush=True)
-        traceback.print_exc()
 
     # Mark the run complete so AUTO_RESUME won't re-resume it on the next launch
     # (a crashed/retried run has no DONE and is picked back up automatically).

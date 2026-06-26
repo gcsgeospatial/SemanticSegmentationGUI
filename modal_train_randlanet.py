@@ -101,8 +101,6 @@ TRAIN_PC_DIR   = f"{DATA_ROOT}/Train-Track4/Track4"
 TRAIN_CLS_DIR  = f"{DATA_ROOT}/Train-Track4-Truth/Track4-Truth"
 TEST_PC_DIR    = f"{DATA_ROOT}/Validate-Track4/Track4"
 TEST_CLS_DIR   = f"{DATA_ROOT}/Validate-Track4-Truth"
-PRED_PC_DIR    = f"{DATA_ROOT}/Test-Track4/Test-Track4"   # unlabeled contest test set
-N_PREDICT      = 1               # how many Test-Track4 scenes to label + save after training
 PREP_DIR       = f"{DATA_ROOT}/prep/randlanet_grid30_p95_origin"   # p95 intensity norm
 
 # ASPRS LAS code -> contiguous 0..4 IEEE class index. Class 0 (Unclassified)
@@ -179,6 +177,7 @@ image = image.run_commands(
 )
 
 image = image.add_local_file("local_train_randlanet.py", "/root/local_train_randlanet.py")
+image = image.add_local_file("train_common.py", "/root/train_common.py")
 
 data_volume     = modal.Volume.from_name("ieee-data",            create_if_missing=True)
 outputs_volume  = modal.Volume.from_name(f"{APP_NAME}-outputs",  create_if_missing=True)

@@ -100,8 +100,6 @@ TRAIN_PC_DIR   = f"{DATA_ROOT}/Train-Track4/Track4"
 TRAIN_CLS_DIR  = f"{DATA_ROOT}/Train-Track4-Truth/Track4-Truth"
 TEST_PC_DIR    = f"{DATA_ROOT}/Validate-Track4/Track4"
 TEST_CLS_DIR   = f"{DATA_ROOT}/Validate-Track4-Truth"
-PRED_PC_DIR    = f"{DATA_ROOT}/Test-Track4/Test-Track4"   # unlabeled contest test set
-N_PREDICT      = 1               # how many Test-Track4 scenes to label + save after training
 PREP_DIR       = f"{DATA_ROOT}/prep/randlanet_grid30_p95_origin"   # p95 intensity norm
 
 # ASPRS LAS code -> contiguous 0..4 IEEE class index. Class 0 (Unclassified)
@@ -146,7 +144,6 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     N_EPOCHS      = epochs if epochs is not None else globals()["N_EPOCHS"]
     BATCH_SIZE    = batch if batch is not None else globals()["BATCH_SIZE"]
     STEPS         = steps_per_epoch if steps_per_epoch is not None else 500
-    N_PREDICT     = globals()["N_PREDICT"]
     NUM_CLASSES   = globals()["NUM_CLASSES"]
     CLASS_NAMES   = globals()["CLASS_NAMES"]
 
@@ -840,117 +837,16 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     # Same seeded spheres every pass, so rows are comparable across epochs.
     # Watch mid-run: modal volume get <app>-outputs runs/<id>/val_metrics.csv
     # ------------------------------------------------------------------------
+    # --- Periodic + final evaluation: the REAL full-coverage eval (not a cheap
+    # subset proxy) on the held-out val set every VAL_EVERY epochs, appended to
+    # val_metrics.csv so the val curve uses the SAME protocol the final test does.
+    # NOTE: far heavier than the old quick_val — every val scene is fully covered
+    # and reprojected to raw points. Raise VAL_EVERY if it costs too much. -------
     val_csv = f"{run_dir}/val_metrics.csv"
     with open(val_csv, "w", newline="") as f:
         csv.writer(f).writerow(["epoch", "val_acc", "val_miou"] +
                                [f"iou_{n}" for n in CLASS_NAMES])
 
-    def quick_val(ep):
-        net.eval()
-        rng = np.random.RandomState(12345)
-        inter = np.zeros(NUM_CLASSES, np.int64)
-        union = np.zeros(NUM_CLASSES, np.int64)
-        correct = total = 0
-        t0 = time.time()
-        with torch.no_grad():
-            for _ in range(VAL_BATCHES):
-                items = []
-                for _ in range(BATCH_SIZE):
-                    ci = rng.randint(len(val_ds.scenes))
-                    pick = rng.randint(len(val_ds.scenes[ci][0]))
-                    items.append(val_ds.sample_sphere(ci, pick, augment=False, rng=rng))
-                batch = _to_device(collate_fn(items))
-                end_points = net(batch)
-                pred = end_points["logits"].transpose(1, 2).reshape(-1, NUM_CLASSES).argmax(-1)
-                lbl  = end_points["labels"].reshape(-1)
-                msk = lbl >= 0
-                correct += (pred[msk] == lbl[msk]).sum().item()
-                total   += int(msk.sum())
-                for c in range(NUM_CLASSES):
-                    inter[c] += ((pred == c) & (lbl == c) & msk).sum().item()
-                    union[c] += (((pred == c) | (lbl == c)) & msk).sum().item()
-        with np.errstate(invalid="ignore"):
-            ious = inter / np.maximum(union, 1)
-        acc = correct / max(total, 1)
-        miou = float(ious.mean())
-        with open(val_csv, "a", newline="") as f:
-            csv.writer(f).writerow([ep, f"{acc:.4f}", f"{miou:.4f}"] +
-                                   [f"{x:.4f}" for x in ious])
-        print(f"  [val @ ep {ep:3d}] acc={acc:.4f} mIoU={miou:.4f}  " +
-              "  ".join(f"{n}={x:.3f}" for n, x in zip(CLASS_NAMES, ious)) +
-              f"  ({time.time()-t0:.0f}s)", flush=True)
-        outputs_volume.commit()
-        net.train()
-
-    t_run = time.time()
-    print(f"  starting {N_EPOCHS} epochs, {cfg.train_steps} steps/epoch", flush=True)
-    LOG_EVERY = 20
-    for ep in range(N_EPOCHS):
-        net.train()
-        iou_calc = IoUCalculator(cfg)
-        ep_loss = 0.0; n_steps = 0; correct = total = 0
-        t_ep = time.time()
-        t_chunk = t_ep
-        print(f"  ep {ep:3d} starting…", flush=True)
-        for batch in train_loader:
-            for k in ("features", "labels", "input_inds", "cloud_inds"):
-                batch[k] = batch[k].to(device, non_blocking=True)
-            for k in ("xyz", "neigh_idx", "sub_idx", "interp_idx"):
-                batch[k] = [t.to(device, non_blocking=True) for t in batch[k]]
-            end_points = net(batch)
-            loss, end_points = compute_loss(end_points, NUM_CLASSES)
-            # Skip non-finite batches so one bad gradient can't poison the
-            # weights with NaN (which is unrecoverable), and clip gradients to
-            # prevent the spike in the first place (RandLA at lr=1e-2 is prone
-            # to it; the other backbones already clip).
-            if not torch.isfinite(loss):
-                opt.zero_grad(set_to_none=True)
-                continue
-            opt.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(net.parameters(), 5.0)
-            opt.step()
-            ep_loss += float(loss.item()); n_steps += 1
-            acc, end_points = compute_acc(end_points)
-            iou_calc.add_data(end_points)
-            pred = end_points["logits"].transpose(1, 2).reshape(-1, NUM_CLASSES).argmax(-1)
-            lbl  = end_points["labels"].reshape(-1)
-            m = lbl >= 0
-            correct += (pred[m] == lbl[m]).sum().item(); total += int(m.sum())
-            if n_steps % LOG_EVERY == 0:
-                dt = time.time() - t_chunk
-                print(f"    ep {ep:3d} step {n_steps:4d}: "
-                      f"loss={ep_loss/n_steps:.4f} acc={correct/max(total,1):.4f} "
-                      f"{LOG_EVERY/dt:.2f} it/s", flush=True)
-                t_chunk = time.time()
-        mean_iou, _ = iou_calc.compute_iou()
-        sched.step()
-        sec_per_iter = (time.time() - t_ep) / max(n_steps, 1)
-        sec_per_epoch = time.time() - t_ep
-        train_acc = correct / max(total, 1)
-        gpu_mem = torch.cuda.max_memory_allocated() / 1e6
-        with open(metrics_csv, "a", newline="") as f:
-            csv.writer(f).writerow([
-                ep, f"{ep_loss/max(n_steps,1):.4f}", "", f"{train_acc:.4f}", "",
-                f"{mean_iou:.4f}", "", f"{sec_per_iter:.4f}",
-                f"{sec_per_epoch:.2f}", f"{gpu_mem:.1f}",
-            ])
-        print(f"  ep {ep:3d}: loss={ep_loss/max(n_steps,1):.4f} "
-              f"acc={train_acc:.4f} miou={mean_iou:.4f} "
-              f"s/iter={sec_per_iter:.3f} s/ep={sec_per_epoch:.1f}", flush=True)
-        if (ep + 1) % 5 == 0:
-            torch.save({"model": net.state_dict(), "optim": opt.state_dict(),
-                        "epoch": ep},
-                       f"{run_dir}/checkpoints/ep{ep:03d}.pth")
-            outputs_volume.commit()
-        if (ep + 1) % VAL_EVERY == 0 or ep == N_EPOCHS - 1:
-            quick_val(ep)
-
-    torch.save({"model": net.state_dict(), "epoch": N_EPOCHS - 1},
-               f"{run_dir}/final_model.pth")
-
-    # --- Test --------------------------------------------------------------
-    net.eval()
     def evaluate(ds, name2src, label):
         """Full-coverage eval scored on the ORIGINAL raw points (official
         protocol). Each scene's 0.30 m subsampled points are predicted once via
@@ -1060,51 +956,102 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
               f"absent={m['absent_classes']}  raw_pts={total:,}  skipped={n_skipped}", flush=True)
         return m
 
-    print("  evaluating on train-holdout val + test split…", flush=True)
-    val_src  = {n: (p, c) for n, p, c in val_list}
-    test_src = {n: (p, c) for n, p, c in test_list}
-    test_metrics = {
-        "val":  evaluate(val_ds,  val_src,  "val"),
-        "test": evaluate(test_ds, test_src, "test"),
-        "val_scenes":  [n for n, _, _ in val_list],
-        "test_scenes": [n for n, _, _ in test_list],
-    }
-    with open(f"{run_dir}/test_metrics.json", "w") as f:
-        json.dump(test_metrics, f, indent=2)
+    val_src = {n: (p, c) for n, p, c in val_list}
+
+    from train_common import BestCheckpoint
+    best = BestCheckpoint(run_dir)
+
+    def run_eval(ep, write_json=False):
+        net.eval()
+        m = evaluate(val_ds, val_src, f"eval@ep{ep}")
+        ious = [m["per_class_iou"][CLASS_NAMES[c]] for c in range(NUM_CLASSES)]
+        with open(val_csv, "a", newline="") as f:
+            csv.writer(f).writerow([ep, f"{m['overall_acc']:.4f}",
+                                    f"{m['overall_mIoU']:.4f}"] + [f"{x:.4f}" for x in ious])
+        if best.update(m["overall_mIoU"]):
+            torch.save({"model": net.state_dict(), "epoch": ep}, best.final)
+        if write_json:
+            m_test = evaluate(test_ds, {n: (p, c) for n, p, c in test_list}, "test")
+            with open(f"{run_dir}/test_metrics.json", "w") as fj:
+                json.dump({"val": m, "test": m_test,
+                           "val_scenes": [n for n, _, _ in val_list],
+                           "test_scenes": [n for n, _, _ in test_list]}, fj, indent=2)
+        outputs_volume.commit()
+        net.train()
+        return m
+
+    t_run = time.time()
+    print(f"  starting {N_EPOCHS} epochs, {cfg.train_steps} steps/epoch", flush=True)
+    LOG_EVERY = 20
+    for ep in range(N_EPOCHS):
+        net.train()
+        iou_calc = IoUCalculator(cfg)
+        ep_loss = 0.0; n_steps = 0; correct = total = 0
+        t_ep = time.time()
+        t_chunk = t_ep
+        print(f"  ep {ep:3d} starting…", flush=True)
+        for batch in train_loader:
+            for k in ("features", "labels", "input_inds", "cloud_inds"):
+                batch[k] = batch[k].to(device, non_blocking=True)
+            for k in ("xyz", "neigh_idx", "sub_idx", "interp_idx"):
+                batch[k] = [t.to(device, non_blocking=True) for t in batch[k]]
+            end_points = net(batch)
+            loss, end_points = compute_loss(end_points, NUM_CLASSES)
+            # Skip non-finite batches so one bad gradient can't poison the
+            # weights with NaN (which is unrecoverable), and clip gradients to
+            # prevent the spike in the first place (RandLA at lr=1e-2 is prone
+            # to it; the other backbones already clip).
+            if not torch.isfinite(loss):
+                opt.zero_grad(set_to_none=True)
+                continue
+            opt.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(net.parameters(), 5.0)
+            opt.step()
+            ep_loss += float(loss.item()); n_steps += 1
+            acc, end_points = compute_acc(end_points)
+            iou_calc.add_data(end_points)
+            pred = end_points["logits"].transpose(1, 2).reshape(-1, NUM_CLASSES).argmax(-1)
+            lbl  = end_points["labels"].reshape(-1)
+            m = lbl >= 0
+            correct += (pred[m] == lbl[m]).sum().item(); total += int(m.sum())
+            if n_steps % LOG_EVERY == 0:
+                dt = time.time() - t_chunk
+                print(f"    ep {ep:3d} step {n_steps:4d}: "
+                      f"loss={ep_loss/n_steps:.4f} acc={correct/max(total,1):.4f} "
+                      f"{LOG_EVERY/dt:.2f} it/s", flush=True)
+                t_chunk = time.time()
+        mean_iou, _ = iou_calc.compute_iou()
+        sched.step()
+        sec_per_iter = (time.time() - t_ep) / max(n_steps, 1)
+        sec_per_epoch = time.time() - t_ep
+        train_acc = correct / max(total, 1)
+        gpu_mem = torch.cuda.max_memory_allocated() / 1e6
+        with open(metrics_csv, "a", newline="") as f:
+            csv.writer(f).writerow([
+                ep, f"{ep_loss/max(n_steps,1):.4f}", "", f"{train_acc:.4f}", "",
+                f"{mean_iou:.4f}", "", f"{sec_per_iter:.4f}",
+                f"{sec_per_epoch:.2f}", f"{gpu_mem:.1f}",
+            ])
+        print(f"  ep {ep:3d}: loss={ep_loss/max(n_steps,1):.4f} "
+              f"acc={train_acc:.4f} miou={mean_iou:.4f} "
+              f"s/iter={sec_per_iter:.3f} s/ep={sec_per_epoch:.1f}", flush=True)
+        if (ep + 1) % 5 == 0:
+            torch.save({"model": net.state_dict(), "optim": opt.state_dict(),
+                        "epoch": ep},
+                       f"{run_dir}/checkpoints/ep{ep:03d}.pth")
+            outputs_volume.commit()
+        if (ep + 1) % VAL_EVERY == 0 and ep != N_EPOCHS - 1:
+            run_eval(ep)               # last epoch handled by the final eval below
+
+    # --- Final evaluation: the real full-coverage eval over val + test, written
+    # to test_metrics.json (the same val number run_eval logs periodically). ----
+    print("  final evaluation (val + test)…", flush=True)
+    run_eval(N_EPOCHS - 1, write_json=True)
+    best.finalize(lambda p: torch.save(
+        {"model": net.state_dict(), "epoch": N_EPOCHS - 1}, p))
     print(f"  total wall-clock {(time.time() - t_run)/3600:.2f} h")
     outputs_volume.commit()
-
-    # ------------------------------------------------------------------------
-    # Inference demo: label N_PREDICT scenes (IEEE Test-Track4 in legacy mode;
-    # the dataset's val/ scenes in canonical mode). Best-effort.
-    # ------------------------------------------------------------------------
-    try:
-        net.eval()
-        pred_dir = f"{run_dir}/predictions"
-        os.makedirs(pred_dir, exist_ok=True)
-        if ds_root:
-            scenes = sorted(glob.glob(f"{ds_root}/val/*.npz"))[:N_PREDICT]
-        else:
-            scenes = sorted(glob.glob(f"{PRED_PC_DIR}/*_PC3.txt"))[:N_PREDICT]
-        predict_scene = make_predict_scene(net, NUM_CLASSES)
-        palette = _palette(NUM_CLASSES)
-        print(f"  [predict] labeling {len(scenes)} scene(s) -> {pred_dir}", flush=True)
-        for pc_path in scenes:
-            name = os.path.basename(pc_path).replace("_PC3.txt", "").replace(".npz", "")
-            t0 = time.time()
-            xyz, pred, inten = predict_scene(pc_path)
-            if not ds_root:
-                _write_cls(f"{pred_dir}/{name}_pred_CLS.txt", pred)
-            _write_ply(f"{pred_dir}/{name}_pred.ply", xyz, pred, palette, inten)
-            np.savez_compressed(f"{pred_dir}/{name}_pred.npz",
-                                xyz=xyz.astype(np.float32), pred=pred.astype(np.int32),
-                                intensity=inten.astype(np.float32),
-                                class_names=np.array(CLASS_NAMES))
-            print(f"  [predict] {name}: {len(xyz):,} pts in {time.time()-t0:.1f}s", flush=True)
-        outputs_volume.commit()
-    except Exception as e:
-        print(f"  [predict] skipped (model is saved): {e}", flush=True)
-        traceback.print_exc()
 
 
 def main():

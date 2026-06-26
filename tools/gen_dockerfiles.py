@@ -137,12 +137,13 @@ def build_dockerfile(key, script):
         elif kind == "env":
             out.append("ENV " + " ".join(f"{k}={v}" for k, v in p.items()))
         elif kind in ("copy_dir", "copy_file"):
-            # The modal shell bakes local_train_*.py into its image, but locally
-            # that script is bind-mounted at /workspace (run_script runs it from
-            # there) — so skip baking it; only the model repo (add_local_dir) is
-            # baked. ponytail: basename match, the trainer scripts are the only
-            # copy steps we ever want to skip.
-            if os.path.basename(p["src"]).startswith("local_train_"):
+            # The modal shell bakes local_train_*.py and train_common.py into its
+            # image, but locally those repo-root files are already bind-mounted at
+            # /workspace (run_script runs from there) — so skip baking them; only
+            # the model repo (add_local_dir) is baked. ponytail: basename match,
+            # the repo-root trainer files are the only copy steps we ever skip.
+            base = os.path.basename(p["src"])
+            if base.startswith("local_train_") or base == "train_common.py":
                 continue
             ctx = _ctx_name(p["dst"])
             contexts[ctx] = p["src"]

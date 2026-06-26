@@ -138,8 +138,6 @@ TRAIN_PC_DIR   = f"{DATA_ROOT}/Train-Track4/Track4"
 TRAIN_CLS_DIR  = f"{DATA_ROOT}/Train-Track4-Truth/Track4-Truth"
 TEST_PC_DIR    = f"{DATA_ROOT}/Validate-Track4/Track4"
 TEST_CLS_DIR   = f"{DATA_ROOT}/Validate-Track4-Truth"
-PRED_PC_DIR    = f"{DATA_ROOT}/Test-Track4/Test-Track4"
-N_PREDICT      = 1
 PREP_DIR       = f"{DATA_ROOT}/prep/kpconvx_cold_native_grid20_c100_origin"
 
 CLASS_NAMES = ["Ground", "Trees", "Building", "Water", "Bridge"]
@@ -191,7 +189,6 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
     N_EPOCHS    = epochs if epochs is not None else globals()["N_EPOCHS"]
     EPOCH_STEPS = steps_per_epoch if steps_per_epoch is not None else globals()["EPOCH_STEPS"]
     PACK_N      = batch if batch is not None else globals()["PACK_N"]
-    N_PREDICT   = globals()["N_PREDICT"]
 
     # --dataset NAME selects a canonical trainer_gui dataset on the terminal-
     # datasets volume; default (None) trains on raw IEEE Track 4. NUM_CLASSES /
@@ -972,48 +969,129 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
             csv.writer(f).writerow(["epoch", "val_acc", "val_miou"] +
                                    [f"iou_{n}" for n in CLASS_NAMES])
 
-    # Seeded random subset. NOT a strided slice: tiles sort scene-major with y
-    # innermost, so [::k] picks the same two y-stripes of every scene — a
-    # spatially biased (optimistic) sample. Seeded choice is representative
-    # and still identical across epochs.
-    _rs = np.random.RandomState(0)
-    val_subset = [val_tiles[i] for i in sorted(_rs.choice(
-        len(val_tiles), min(VAL_SUBSET, len(val_tiles)), replace=False))]
+    # Combined holdout-val + Validate-Track4 eval set, scored with the REAL voted
+    # eval below every VAL_EVERY epochs (each item carries its tile split_dir).
+    eval_items = ([(n, p, c, f"{PREP_DIR}/val")  for n, p, c in val_list] +
+                  [(n, p, c, f"{PREP_DIR}/test") for n, p, c in test_list])
+    print(f"  eval set: {len(eval_items)} scenes "
+          f"({len(val_list)} holdout + {len(test_list)} test)", flush=True)
 
-    def quick_val(ep):
-        net.eval()
-        inter = np.zeros(NUM_CLASSES, np.int64)
-        union = np.zeros(NUM_CLASSES, np.int64)
+    def evaluate(scene_items, label):
+        """Final eval scored on the ORIGINAL raw points (official protocol).
+        Per scene: run the model over its overlapping cached tiles (stride 50,
+        each point in up to 4 tiles), sum CENTER-WEIGHTED SOFTMAX votes per 2 m
+        voxel and take the argmax, then propagate each voxel's prediction to
+        every raw point by nearest neighbour and score against the raw GT.
+        Reprojecting to raw points removes the 2 m voxel-resolution bias and the
+        arbitrary first-duplicate voxel-GT of the old voxel scoring."""
+        t_inter = np.zeros(NUM_CLASSES, dtype=np.int64)
+        t_union = np.zeros(NUM_CLASSES, dtype=np.int64)
+        t_gt    = np.zeros(NUM_CLASSES, dtype=np.int64)
         correct = total = 0
-        t0 = time.time()
+        n_scenes = n_skipped_tiles = n_skipped_scenes = 0
+        t_test = time.time()
         with torch.no_grad():
-            for tile in val_subset:
-                s = sample_tile(tile, training=False)
-                if s is None:
-                    continue
-                cxyz, feat, lab = s
+            for name, pc_path, cls_path, split_dir in scene_items:
+                tiles = sorted(glob.glob(f"{split_dir}/{name}_x*.npz"))
+                if not tiles:
+                    n_skipped_scenes += 1; continue
+                keys_l, log_l, xyz_l = [], [], []
+                for tile in tiles:
+                    z = np.load(tile)
+                    xyz = z["xyz"]
+                    if len(xyz) < 32:
+                        continue
+                    feat = build_feat(xyz, z["intensity"], z["ret_num"])
+                    cxyz = (xyz - xyz.mean(0)).astype(np.float32)
+                    try:
+                        batch, _ = make_kp_pack([(cxyz, feat, None)])
+                        lg = net(batch).cpu().numpy().astype(np.float32)
+                    except Exception:
+                        n_skipped_tiles += 1; continue
+                    # Soft votes tapered toward the tile border (truncated context).
+                    e = np.exp(lg - lg.max(1, keepdims=True))
+                    prob = e / e.sum(1, keepdims=True)
+                    cxy = (xyz[:, :2].min(0) + xyz[:, :2].max(0)) / 2
+                    d = np.abs(xyz[:, :2] - cxy).max(1)
+                    wgt = np.clip(1.0 - d / (CHUNK_XY / 2.0), 0.05, 1.0) ** 2
+                    keys_l.append(np.floor(xyz / GRID).astype(np.int64))
+                    log_l.append((prob * wgt[:, None]).astype(np.float32))
+                    xyz_l.append(xyz.astype(np.float32))
+                if not keys_l:
+                    n_skipped_scenes += 1; continue
+                K = np.concatenate(keys_l); L = np.concatenate(log_l)
+                P = np.concatenate(xyz_l)
+                uniq, first, inv = np.unique(K, axis=0, return_index=True, return_inverse=True)
+                votes = np.zeros((len(uniq), NUM_CLASSES), np.float64)
+                np.add.at(votes, inv, L)
+                pred_u  = votes.argmax(1)
+                rep_xyz = P[first]                      # one representative coord per voxel
+                # Reproject voxel predictions onto the raw scene cloud + raw GT.
                 try:
-                    batch, _ = make_kp_pack([(cxyz, feat, None)])
-                    pred = net(batch).argmax(-1).cpu().numpy()
-                except Exception:
-                    continue
-                v = lab >= 0
-                correct += int((pred[v] == lab[v]).sum())
-                total   += int(v.sum())
+                    raw_xyz, _, _, raw_lab = (load_canonical(pc_path) if cls_path is None
+                                              else load_ieee(pc_path, cls_path))
+                except Exception as ex:
+                    print(f"  [{label}] skip {name}: raw reload failed: {ex}", flush=True)
+                    n_skipped_scenes += 1; continue
+                _, nn = cKDTree(rep_xyz).query(raw_xyz)
+                raw_pred = pred_u[nn]
+                v = raw_lab >= 0
+                rp, rl = raw_pred[v], raw_lab[v]
+                correct += int((rp == rl).sum()); total += int(v.sum())
                 for c in range(NUM_CLASSES):
-                    inter[c] += int(((pred == c) & (lab == c) & v).sum())
-                    union[c] += int((((pred == c) | (lab == c)) & v).sum())
+                    t_inter[c] += int(((rp == c) & (rl == c)).sum())
+                    t_union[c] += int(((rp == c) | (rl == c)).sum())
+                    t_gt[c]    += int((rl == c).sum())
+                n_scenes += 1
         with np.errstate(invalid="ignore"):
-            ious = inter / np.maximum(union, 1)
-        acc = correct / max(total, 1)
-        miou = float(ious.mean())
+            iou_per = t_inter / np.maximum(t_union, 1)
+        gt_counts = [int(x) for x in t_gt.tolist()]
+        present = [c for c in range(NUM_CLASSES) if gt_counts[c] > 0]
+        present_iou = [float(iou_per[c]) for c in present]
+        present_mIoU = float(np.mean(present_iou)) if present_iou else 0.0
+        m = {
+            "overall_acc": correct / max(total, 1),
+            "overall_mIoU": float(np.mean(iou_per)),
+            "present_classes_mIoU": present_mIoU,
+            "per_class_iou": {CLASS_NAMES[c]: float(iou_per[c]) for c in range(NUM_CLASSES)},
+            "per_class_gt_count": {CLASS_NAMES[c]: gt_counts[c] for c in range(NUM_CLASSES)},
+            "present_classes": [CLASS_NAMES[c] for c in present],
+            "absent_classes":  [CLASS_NAMES[c] for c in range(NUM_CLASSES) if gt_counts[c] == 0],
+            "total_test_seconds": time.time() - t_test,
+            "num_scenes": n_scenes,
+            "num_raw_points_scored": int(total),
+            "skipped_tiles": n_skipped_tiles,
+            "skipped_scenes": n_skipped_scenes,
+            "scored_on": "raw_points",
+            "voted_overlap": True,
+            "vote_weighting": "center_tapered_softmax",
+            "reprojection": "nearest_voxel_representative_to_raw",
+        }
+        print(f"  [{label}] acc={m['overall_acc']:.4f}  mIoU(5-way)={m['overall_mIoU']:.4f}  "
+              f"mIoU(present {len(present)})={m['present_classes_mIoU']:.4f}  "
+              f"absent={m['absent_classes']}  raw_pts={total:,}  "
+              f"skipped(tiles={n_skipped_tiles},scenes={n_skipped_scenes})", flush=True)
+        return m
+
+    from train_common import BestCheckpoint
+    best = BestCheckpoint(run_dir)
+
+    def run_eval(ep, write_json=False):
+        net.eval()
+        m = evaluate(eval_items, f"eval@ep{ep}")
+        ious = [m["per_class_iou"][CLASS_NAMES[c]] for c in range(NUM_CLASSES)]
         with open(val_csv, "a", newline="") as f:
-            csv.writer(f).writerow([ep, f"{acc:.4f}", f"{miou:.4f}"] +
-                                   [f"{x:.4f}" for x in ious])
-        print(f"  [val @ ep {ep:3d}] acc={acc:.4f} mIoU={miou:.4f}  " +
-              "  ".join(f"{n}={x:.3f}" for n, x in zip(CLASS_NAMES, ious)) +
-              f"  ({time.time()-t0:.0f}s)", flush=True)
+            csv.writer(f).writerow([ep, f"{m['overall_acc']:.4f}",
+                                    f"{m['overall_mIoU']:.4f}"] + [f"{x:.4f}" for x in ious])
+        if not EVAL_ONLY and best.update(m["overall_mIoU"]):
+            torch.save({"model": net.state_dict(), "epoch": ep}, best.final)
+        if write_json:
+            with open(f"{run_dir}/test_metrics.json", "w") as fj:
+                json.dump({"val": m, "test": m,
+                           "eval_scenes": [it[0] for it in eval_items]}, fj, indent=2)
         outputs_volume.commit()
+        net.train()
+        return m
 
     # ------------------------------------------------------------------------
     # Train loop — KPConvX recipe: EPOCH_STEPS optimizer steps of
@@ -1097,177 +1175,18 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
                         "epoch": ep},
                        f"{run_dir}/checkpoints/ep{ep:03d}.pth")
             outputs_volume.commit()
-        if (ep + 1) % VAL_EVERY == 0 or ep == N_EPOCHS - 1:
-            quick_val(ep)
+        if (ep + 1) % VAL_EVERY == 0 and ep != N_EPOCHS - 1:
+            run_eval(ep)               # last epoch handled by the final eval below
 
+    # --- Final evaluation: the real voted eval over the combined eval set,
+    # written to test_metrics.json (the same number run_eval logs periodically). -
+    print("  final evaluation over the combined eval set…", flush=True)
+    run_eval(N_EPOCHS - 1, write_json=True)
     if not EVAL_ONLY:
-        torch.save({"model": net.state_dict(), "epoch": N_EPOCHS - 1},
-                   f"{run_dir}/final_model.pth")
-
-    # ------------------------------------------------------------------------
-    # Test — train-holdout val + Validate-Track4 (with GT)
-    # ------------------------------------------------------------------------
-    net.eval()
-    def evaluate(scene_list, split_dir, label):
-        """Final eval scored on the ORIGINAL raw points (official protocol).
-        Per scene: run the model over its overlapping cached tiles (stride 50,
-        each point in up to 4 tiles), sum CENTER-WEIGHTED SOFTMAX votes per 2 m
-        voxel and take the argmax, then propagate each voxel's prediction to
-        every raw point by nearest neighbour and score against the raw GT.
-        Reprojecting to raw points removes the 2 m voxel-resolution bias and the
-        arbitrary first-duplicate voxel-GT of the old voxel scoring."""
-        t_inter = np.zeros(NUM_CLASSES, dtype=np.int64)
-        t_union = np.zeros(NUM_CLASSES, dtype=np.int64)
-        t_gt    = np.zeros(NUM_CLASSES, dtype=np.int64)
-        correct = total = 0
-        n_scenes = n_skipped_tiles = n_skipped_scenes = 0
-        t_test = time.time()
-        with torch.no_grad():
-            for name, pc_path, cls_path in scene_list:
-                tiles = sorted(glob.glob(f"{split_dir}/{name}_x*.npz"))
-                if not tiles:
-                    n_skipped_scenes += 1; continue
-                keys_l, log_l, xyz_l = [], [], []
-                for tile in tiles:
-                    z = np.load(tile)
-                    xyz = z["xyz"]
-                    if len(xyz) < 32:
-                        continue
-                    feat = build_feat(xyz, z["intensity"], z["ret_num"])
-                    cxyz = (xyz - xyz.mean(0)).astype(np.float32)
-                    try:
-                        batch, _ = make_kp_pack([(cxyz, feat, None)])
-                        lg = net(batch).cpu().numpy().astype(np.float32)
-                    except Exception:
-                        n_skipped_tiles += 1; continue
-                    # Soft votes tapered toward the tile border (truncated context).
-                    e = np.exp(lg - lg.max(1, keepdims=True))
-                    prob = e / e.sum(1, keepdims=True)
-                    cxy = (xyz[:, :2].min(0) + xyz[:, :2].max(0)) / 2
-                    d = np.abs(xyz[:, :2] - cxy).max(1)
-                    wgt = np.clip(1.0 - d / (CHUNK_XY / 2.0), 0.05, 1.0) ** 2
-                    keys_l.append(np.floor(xyz / GRID).astype(np.int64))
-                    log_l.append((prob * wgt[:, None]).astype(np.float32))
-                    xyz_l.append(xyz.astype(np.float32))
-                if not keys_l:
-                    n_skipped_scenes += 1; continue
-                K = np.concatenate(keys_l); L = np.concatenate(log_l)
-                P = np.concatenate(xyz_l)
-                uniq, first, inv = np.unique(K, axis=0, return_index=True, return_inverse=True)
-                votes = np.zeros((len(uniq), NUM_CLASSES), np.float64)
-                np.add.at(votes, inv, L)
-                pred_u  = votes.argmax(1)
-                rep_xyz = P[first]                      # one representative coord per voxel
-                # Reproject voxel predictions onto the raw scene cloud + raw GT.
-                try:
-                    raw_xyz, _, _, raw_lab = (load_canonical(pc_path) if cls_path is None
-                                              else load_ieee(pc_path, cls_path))
-                except Exception as ex:
-                    print(f"  [{label}] skip {name}: raw reload failed: {ex}", flush=True)
-                    n_skipped_scenes += 1; continue
-                _, nn = cKDTree(rep_xyz).query(raw_xyz)
-                raw_pred = pred_u[nn]
-                v = raw_lab >= 0
-                rp, rl = raw_pred[v], raw_lab[v]
-                correct += int((rp == rl).sum()); total += int(v.sum())
-                for c in range(NUM_CLASSES):
-                    t_inter[c] += int(((rp == c) & (rl == c)).sum())
-                    t_union[c] += int(((rp == c) | (rl == c)).sum())
-                    t_gt[c]    += int((rl == c).sum())
-                n_scenes += 1
-        with np.errstate(invalid="ignore"):
-            iou_per = t_inter / np.maximum(t_union, 1)
-        gt_counts = [int(x) for x in t_gt.tolist()]
-        present = [c for c in range(NUM_CLASSES) if gt_counts[c] > 0]
-        present_iou = [float(iou_per[c]) for c in present]
-        present_mIoU = float(np.mean(present_iou)) if present_iou else 0.0
-        m = {
-            "overall_acc": correct / max(total, 1),
-            "overall_mIoU": float(np.mean(iou_per)),
-            "present_classes_mIoU": present_mIoU,
-            "per_class_iou": {CLASS_NAMES[c]: float(iou_per[c]) for c in range(NUM_CLASSES)},
-            "per_class_gt_count": {CLASS_NAMES[c]: gt_counts[c] for c in range(NUM_CLASSES)},
-            "present_classes": [CLASS_NAMES[c] for c in present],
-            "absent_classes":  [CLASS_NAMES[c] for c in range(NUM_CLASSES) if gt_counts[c] == 0],
-            "total_test_seconds": time.time() - t_test,
-            "num_scenes": n_scenes,
-            "num_raw_points_scored": int(total),
-            "skipped_tiles": n_skipped_tiles,
-            "skipped_scenes": n_skipped_scenes,
-            "scored_on": "raw_points",
-            "voted_overlap": True,
-            "vote_weighting": "center_tapered_softmax",
-            "reprojection": "nearest_voxel_representative_to_raw",
-        }
-        print(f"  [{label}] acc={m['overall_acc']:.4f}  mIoU(5-way)={m['overall_mIoU']:.4f}  "
-              f"mIoU(present {len(present)})={m['present_classes_mIoU']:.4f}  "
-              f"absent={m['absent_classes']}  raw_pts={total:,}  "
-              f"skipped(tiles={n_skipped_tiles},scenes={n_skipped_scenes})", flush=True)
-        return m
-
-    print("  evaluating on train-holdout val + Validate-Track4 test…", flush=True)
-    test_metrics = {
-        "val":  evaluate(val_list,  f"{PREP_DIR}/val",  "val"),
-        "test": evaluate(test_list, f"{PREP_DIR}/test", "test"),
-        "val_scenes":  [n for n, _, _ in val_list],
-        "test_scenes": [n for n, _, _ in test_list],
-    }
-    with open(f"{run_dir}/test_metrics.json", "w") as f:
-        json.dump(test_metrics, f, indent=2)
+        best.finalize(lambda p: torch.save(
+            {"model": net.state_dict(), "epoch": N_EPOCHS - 1}, p))
     print(f"  total wall-clock: {(time.time() - t_run)/3600:.2f} h")
     outputs_volume.commit()
-
-    # ------------------------------------------------------------------------
-    # Inference demo: label the first N_PREDICT Test-Track4 scenes (no GT).
-    # ------------------------------------------------------------------------
-    IDX_TO_ASPRS = np.array([2, 5, 6, 9, 17], dtype=np.int32)
-    PALETTE = np.array([[139, 90, 43], [34, 160, 34], [200, 60, 60],
-                        [40, 110, 220], [235, 225, 60]], dtype=np.int32)
-
-    def _write_cls(path, pred_idx):
-        np.savetxt(path, IDX_TO_ASPRS[pred_idx], fmt="%d")
-
-    def _write_ply(path, xyz, pred_idx, intensity=None):
-        cols = [xyz.astype(np.float32), PALETTE[pred_idx]]
-        props = ("property float x\nproperty float y\nproperty float z\n"
-                 "property uchar red\nproperty uchar green\nproperty uchar blue\n")
-        fmt = ["%.3f", "%.3f", "%.3f", "%d", "%d", "%d"]
-        if intensity is not None:            # carry per-point intensity for the viewer
-            cols.append(np.asarray(intensity, np.float32).reshape(-1, 1))
-            props += "property float intensity\n"
-            fmt.append("%.5f")
-        header = "ply\nformat ascii 1.0\n" + f"element vertex {len(xyz)}\n" + props + "end_header"
-        np.savetxt(path, np.column_stack(cols), fmt=fmt, header=header, comments="")
-
-    def _predict_scene(pc_path):
-        pc = np.loadtxt(pc_path, delimiter=",")                 # float64 (full precision)
-        # Per-scene origin offset before float32 cast (precision; see load_ieee).
-        xyz = (pc[:, :3] - np.floor(pc[:, :3].min(0))).astype(np.float32)
-        intensity = pc[:, 3].astype(np.float32)
-        ret_num = pc[:, 4].astype(np.float32) if pc.shape[1] >= 5 else np.zeros(len(pc), np.float32)
-        i_p95 = max(float(np.percentile(intensity, 95)), 1.0)
-        intensity_n = np.clip(intensity / i_p95, 0.0, 2.0)
-        return xyz, _predict_points(xyz, intensity_n, ret_num), intensity_n
-
-    try:
-        net.eval()
-        pred_dir = f"{run_dir}/predictions"
-        os.makedirs(pred_dir, exist_ok=True)
-        # IEEE-only demo (ASPRS palette + Test-Track4 layout); canonical datasets
-        # use the dedicated --mode infer path instead.
-        scenes = [] if (EVAL_ONLY or ds_root) else sorted(glob.glob(f"{PRED_PC_DIR}/*_PC3.txt"))[:N_PREDICT]
-        print(f"  [predict] labeling {len(scenes)} Test-Track4 scene(s) -> {pred_dir}", flush=True)
-        for pc_path in scenes:
-            name = os.path.basename(pc_path).replace("_PC3.txt", "")
-            t0 = time.time()
-            xyz, pred, inten = _predict_scene(pc_path)
-            _write_cls(f"{pred_dir}/{name}_pred_CLS.txt", pred)
-            _write_ply(f"{pred_dir}/{name}_pred.ply", xyz, pred, inten)
-            print(f"  [predict] {name}: {len(xyz):,} pts in {time.time()-t0:.1f}s", flush=True)
-        outputs_volume.commit()
-    except Exception as e:
-        print(f"  [predict] skipped (model is saved): {e}", flush=True)
-        traceback.print_exc()
 
 
 def main():

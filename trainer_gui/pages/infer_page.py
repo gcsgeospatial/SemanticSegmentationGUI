@@ -15,10 +15,11 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QProcess
-from PySide6.QtGui import QTextCursor
-from PySide6.QtWidgets import (QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox,
-                               QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit,
-                               QPushButton, QRadioButton, QVBoxLayout, QWidget)
+from PySide6.QtGui import QColor, QTextCursor
+from PySide6.QtWidgets import (QColorDialog, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
+                               QFileDialog, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout, QLabel,
+                               QLineEdit, QPlainTextEdit, QPushButton, QRadioButton, QVBoxLayout,
+                               QWidget)
 
 from .. import appstate, dataset, local_cli, modal_cli, ui
 from ..backbones import BACKBONES, infer_backbones
@@ -146,13 +147,17 @@ class InferPage(QWidget):
         btn_col.addWidget(QLabel("Class palette (legend)"))
         self.palette_combo = QComboBox()
         self.palette_combo.setToolTip(
-            "Colour the viewer's legend with a dataset's class names. Auto = use the "
-            "names embedded in the file, else IEEE. Colours come from the shared "
-            "categorical palette the training scripts bake into predictions.")
+            "Pick the class names for the legend. Auto = names embedded in the file, "
+            "else IEEE. Use 'Configure Palette…' to set the colour of each class.")
         self.palette_combo.currentIndexChanged.connect(self._on_palette_change)
         btn_col.addWidget(self.palette_combo)
+        self.configure_palette_btn = QPushButton("Configure Palette…")
+        self.configure_palette_btn.setToolTip(
+            "Edit the colour shown for each class in the 3D viewer (saved per palette).")
+        self.configure_palette_btn.clicked.connect(self._configure_palette)
+        btn_col.addWidget(self.configure_palette_btn)
         # Live swatch legend: how each class is coloured in the 3D viewer, for the
-        # selected palette (the exact colours the training scripts bake in).
+        # selected palette (a Configure-Palette override, else the baked default).
         self.legend_label = QLabel()
         self.legend_label.setToolTip("How each class is coloured in the 3D viewer.")
         btn_col.addWidget(self.legend_label)
@@ -224,18 +229,50 @@ class InferPage(QWidget):
         self.palette_combo.blockSignals(False)
         self._refresh_legend()
 
+    def _effective_names(self) -> list:
+        """Class names labelling the palette: the selected dataset's, else IEEE."""
+        from ..palette import IEEE_CLASS_NAMES
+        return list(self._selected_class_names() or IEEE_CLASS_NAMES)
+
+    def _palette_key(self) -> str:
+        """Override-storage key for the current selection ('__auto__' for Auto)."""
+        return self.palette_combo.currentData() or "__auto__"
+
+    def _default_colors(self, n: int) -> list:
+        from ..palette import palette_for
+        return palette_for(n).tolist()
+
+    def _palette_colors(self) -> list:
+        """Effective per-class [r,g,b] for the selected palette: a saved override
+        (Configure Palette…) when it matches the class count, else the default
+        categorical palette the training scripts bake into predictions."""
+        names = self._effective_names()
+        ov = appstate.get("palette_overrides", {}).get(self._palette_key())
+        if isinstance(ov, list) and len(ov) == len(names):
+            return [[int(x) for x in c] for c in ov]
+        return self._default_colors(len(names))
+
     def _refresh_legend(self):
-        """Show a colour swatch per class for the selected palette — the exact
-        colours the 3D viewer paints (palette_for(), shared with the training
-        scripts). 'Auto' has no chosen names, so fall back to the IEEE default."""
-        from ..palette import IEEE_CLASS_NAMES, palette_for
-        names = self._selected_class_names() or IEEE_CLASS_NAMES
-        pal = palette_for(len(names))
+        """Swatch-per-class legend for the selected palette — the exact colours the
+        3D viewer paints (a Configure-Palette override, else the baked default)."""
+        names = self._effective_names()
         rows = "".join(
             f'<tr><td><span style="font-size:15px; color:#{r:02x}{g:02x}{b:02x}">'
             f'■</span></td><td>&nbsp;{name}</td></tr>'
-            for name, (r, g, b) in zip(names, pal.tolist()))
+            for name, (r, g, b) in zip(names, self._palette_colors()))
         self.legend_label.setText(f"<table cellspacing='2'>{rows}</table>")
+
+    def _configure_palette(self):
+        """Popup to edit the per-class colour for the selected palette. Saves an
+        override (per palette) and refreshes the legend; the viewer uses it too."""
+        names = self._effective_names()
+        dlg = PaletteDialog(names, self._palette_colors(),
+                            self._default_colors(len(names)), self)
+        if dlg.exec():
+            overrides = dict(appstate.get("palette_overrides", {}))
+            overrides[self._palette_key()] = dlg.colors()
+            appstate.put("palette_overrides", overrides)
+            self._refresh_legend()
 
     def _on_palette_change(self):
         appstate.put("infer_palette", self.palette_combo.currentData() or "")
@@ -546,11 +583,11 @@ class InferPage(QWidget):
         if not path:
             return
         appstate.put("last_view_dir", str(Path(path).parent))
-        names = self._selected_class_names()
-        extra = ["--class-names", ",".join(names)] if names else []
-        self._open_viewer(path, *extra)
-        self._append(f"Opened viewer for {Path(path).name}"
-                     + (f"  ({self.palette_combo.currentText()} palette)" if names else ""))
+        names = self._effective_names()
+        pal = ";".join(f"{r},{g},{b}" for r, g, b in self._palette_colors())
+        self._open_viewer(path, "--class-names", ",".join(names), "--palette", pal)
+        self._append(f"Opened viewer for {Path(path).name}  "
+                     f"({self.palette_combo.currentText()} palette)")
 
     def _pick_pred_gt(self):
         """Prompt for a prediction cloud then its ground-truth labels.
@@ -621,6 +658,60 @@ class InferPage(QWidget):
         self.log.moveCursor(QTextCursor.End)
         self.log.insertPlainText(text + ("\n" if newline else ""))
         self.log.moveCursor(QTextCursor.End)
+
+
+class PaletteDialog(QDialog):
+    """Per-class colour editor. A swatch button per class opens a colour picker;
+    `colors()` returns the chosen [[r,g,b], …] aligned to `names`."""
+
+    def __init__(self, names, colors, defaults, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Configure palette")
+        self._colors = [[int(x) for x in c] for c in colors]
+        self._defaults = [[int(x) for x in c] for c in defaults]
+        self._btns: list[QPushButton] = []
+
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel("Click a swatch to set how that class is coloured in the viewer:"))
+        grid = QGridLayout()
+        for i, name in enumerate(names):
+            grid.addWidget(QLabel(name), i, 0)
+            b = QPushButton()
+            b.setFixedSize(72, 22)
+            b.clicked.connect(lambda _=False, idx=i: self._pick(idx))
+            self._btns.append(b)
+            grid.addWidget(b, i, 1)
+        lay.addLayout(grid)
+
+        foot = QHBoxLayout()
+        reset = QPushButton("Reset to defaults")
+        reset.clicked.connect(self._reset)
+        foot.addWidget(reset)
+        foot.addStretch()
+        lay.addLayout(foot)
+
+        box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        box.accepted.connect(self.accept)
+        box.rejected.connect(self.reject)
+        lay.addWidget(box)
+        self._refresh()
+
+    def _refresh(self):
+        for b, c in zip(self._btns, self._colors):
+            b.setStyleSheet(f"background-color: rgb({c[0]},{c[1]},{c[2]}); border: 1px solid #888;")
+
+    def _pick(self, idx: int):
+        col = QColorDialog.getColor(QColor(*self._colors[idx]), self, "Pick a class colour")
+        if col.isValid():
+            self._colors[idx] = [col.red(), col.green(), col.blue()]
+            self._refresh()
+
+    def _reset(self):
+        self._colors = [list(c) for c in self._defaults]
+        self._refresh()
+
+    def colors(self) -> list:
+        return [list(c) for c in self._colors]
 
 
 def _wrap(layout) -> QWidget:
