@@ -33,9 +33,9 @@ from .readers import SUPPORTED_EXTS, read_points
 LAS_EXTS = {".las", ".laz"}
 HAG_FILTERS = ("hag_nn", "hag_delaunay")
 
-# SMRF overwrites Classification (ground->2). When the label lives in that dim we
-# ferry it here BEFORE SMRF so the converter can read the real labels back after
-# HAG. Must match datasets_page._hag_conversion_spec, which reads this dim.
+# SMRF overwrites Classification (ground->2). When the label lives in that dim,
+# add_hag(preserve_class_as=...) ferries it here BEFORE SMRF so a downstream
+# converter can read the real labels back after HAG.
 HAG_PRESERVED_CLASS_DIM = "label_src"
 
 
@@ -207,21 +207,34 @@ def add_hag(in_dir: str | Path, out_dir: str | Path, *, skip_ground: bool = Fals
     return summary
 
 
-def hag_for_cloud(cloud) -> "np.ndarray | None":
-    """Per-point HeightAboveGround (SMRF -> hag_nn) aligned 1:1 to cloud.xyz, for
-    INFERENCE (the twin of add_hag's per-file laz output — same stages, kept in RAM).
+def hag_for_cloud(cloud, skip_ground: bool = False,
+                  hag_filter: str = "hag_nn") -> "np.ndarray | None":
+    """Per-point HeightAboveGround (SMRF -> hag) aligned 1:1 to cloud.xyz, for
+    INFERENCE and per-tile HAG (the twin of add_hag's per-file laz output — same
+    stages, kept in RAM).
+
+    `skip_ground` drops the SMRF stage, but ONLY when the cloud already carries
+    ground (a Classification field with value 2) — hag_nn needs ground points, so
+    a tile with no ground is always SMRF'd regardless of the flag (safe default).
 
     Returns float32 of length cloud.n, or None if PDAL is unavailable or the
     pipeline drops/reorders points (the caller then falls back to a z-min proxy, so
-    a missing/odd PDAL is never worse than today's behaviour). smrf+hag_nn are
+    a missing/odd PDAL is never worse than today's behaviour). smrf+hag are
     point-wise filters that preserve input order; the length + first/last-X guard
     rejects the pathological case where they don't."""
     if not pdal_available():
         return None
+    if hag_filter not in HAG_FILTERS:
+        raise ValueError(f"hag_filter must be one of {HAG_FILTERS}, got {hag_filter!r}")
     import pdal
     try:
         arr_in = _structured_from_cloud(cloud)
-        stages = [{"type": "filters.smrf"}, {"type": "filters.hag_nn"}]
+        names = arr_in.dtype.names or ()
+        have_ground = "Classification" in names and bool((arr_in["Classification"] == 2).any())
+        stages = []
+        if not (skip_ground and have_ground):
+            stages.append({"type": "filters.smrf"})   # classify ground; hag needs it
+        stages.append({"type": f"filters.{hag_filter}"})
         pipe = pdal.Pipeline(json.dumps(stages), arrays=[arr_in])
         pipe.execute()
         arr = pipe.arrays[0]

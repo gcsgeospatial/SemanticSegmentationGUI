@@ -102,7 +102,7 @@ BACKBONES: dict[str, Backbone] = {b.key: b for b in [
     ),
     # --- HAG variants (real PDAL HeightAboveGround as an extra input channel) ---
     Backbone(
-        key="ptv3_hag", label="PTv3 + HAG", script="scripts/modal/modal_train_ptv3_hag.py",
+        key="ptv3_hag", label="PTv3_hag", script="scripts/modal/modal_train_ptv3_hag.py",
         app_name="ptv3-ieee-hag", warm=False, ready=True, folder_infer=True,
         rec_gpu="A100", min_vram_gb=16,
         grid_clamp=(0.05, 0.6),
@@ -111,7 +111,7 @@ BACKBONES: dict[str, Backbone] = {b.key: b for b in [
                + _common(250, 4),
     ),
     Backbone(
-        key="randlanet_hag", label="RandLA-Net + HAG",
+        key="randlanet_hag", label="RandLA-Net_hag",
         script="scripts/modal/modal_train_randlanet_hag.py",
         app_name="randlanet-cold-ieee-hag", warm=False, ready=True, folder_infer=True,
         rec_gpu="A10G", min_vram_gb=8,
@@ -125,7 +125,7 @@ BACKBONES: dict[str, Backbone] = {b.key: b for b in [
     # the HAG variant uses the z-scene-min HAG proxy since canonical data has no
     # HAG laz) plus --mode infer --infer-input for folder inference.
     Backbone(
-        key="kpconvx_cold_hag", label="KPConvX-L + HAG",
+        key="kpconvx_cold_hag", label="KPConvX-L_hag",
         script="scripts/modal/modal_train_kpconvx_cold_hag.py",
         app_name="kpconvx-cold-ieee-hag", warm=False, ready=True, folder_infer=True,
         rec_gpu="A100-80GB", min_vram_gb=24,

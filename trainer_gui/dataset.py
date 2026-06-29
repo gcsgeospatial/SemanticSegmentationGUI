@@ -529,6 +529,71 @@ def convert_infer_job(job_id: str, input_dir: str, staging_root: Path, progress=
     return out_root
 
 
+def add_hag_to_dataset(src_dir, out_dir, *, skip_ground: bool = False,
+                       hag_filter: str = "hag_nn", progress=None) -> Path:
+    """Add a per-tile HeightAboveGround channel to an already-converted dataset.
+
+    Reads each train|val/*.npz, recomputes HAG with PDAL (SMRF -> hag) on the
+    tile's OWN points (the inference twin pretrain.hag_for_cloud, kept in RAM),
+    and writes a sibling dataset with a `hag` key added to every tile. Returns
+    out_dir.
+
+    Per-tile ground is weaker than whole-cloud SMRF on tiles with little bare
+    earth; tiles where PDAL can't return an aligned result keep no `hag` key and
+    the *_hag trainer falls back to its z-min proxy for them, so `has_hag` records
+    whether ALL tiles got real HAG.
+    """
+    from . import pretrain
+
+    say = progress or (lambda s: None)
+    src_dir, out_dir = Path(src_dir), Path(out_dir)
+    meta_path = src_dir / "dataset_meta.json"
+    if not meta_path.exists():
+        raise FileNotFoundError(f"{src_dir} is not a converted dataset (no dataset_meta.json)")
+    if not pretrain.pdal_available():
+        raise RuntimeError("PDAL is not installed — cannot compute HeightAboveGround.")
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+
+    n_tiles = n_hag = 0
+    for split in ("train", "val"):
+        sdir = src_dir / split
+        if not sdir.is_dir():
+            continue
+        tiles = sorted(sdir.glob("*.npz"))
+        say(f"[{split}] {len(tiles)} tile(s)")
+        for npz_path in tiles:
+            with np.load(npz_path) as z:
+                data = {k: z[k] for k in z.files}
+            cloud = Cloud(
+                xyz=data["xyz"].astype(np.float64),
+                rgb=data.get("rgb"),
+                intensity=data.get("intensity"),
+                return_number=data.get("return_number"),
+            )
+            h = pretrain.hag_for_cloud(cloud, skip_ground=skip_ground, hag_filter=hag_filter)
+            if h is not None and len(h) == cloud.n:
+                data["hag"] = h.astype(np.float32)
+                n_hag += 1
+            out_path = out_dir / split / npz_path.name
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(out_path, **data)
+            n_tiles += 1
+            say(f"  {split}/{npz_path.name}: "
+                f"{'HAG' if 'hag' in data else 'proxy'} ({cloud.n:,} pts)")
+    if n_tiles == 0:
+        raise ValueError(f"No npz tiles under {src_dir}/train|val — convert the dataset first.")
+
+    meta["name"] = sanitize_name(out_dir.name)
+    meta["has_hag"] = (n_hag == n_tiles)
+    meta.setdefault("source", {})["hag_source"] = "per_tile_smrf"
+    meta["created_utc"] = datetime.now(timezone.utc).isoformat()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with open(out_dir / "dataset_meta.json", "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
+    say(f"✓ HAG dataset -> {out_dir}  ({n_hag}/{n_tiles} tiles with real HAG)")
+    return out_dir
+
+
 # --------------------------------------------------------------------- self-check
 
 def _selfcheck():

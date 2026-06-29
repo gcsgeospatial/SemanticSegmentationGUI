@@ -253,8 +253,8 @@ def main():
 
         # Train page's Modal-presence check parses `modal volume ls --json` entries
         # whose basename key varies by CLI version — lock the parser.
-        from trainer_gui.pages.train_page import _entry_name
-        check("train: _entry_name reads path/Filename/name across CLI shapes",
+        from trainer_gui.pages.infer_page import _entry_name
+        check("infer: _entry_name reads path/Filename/name across CLI shapes",
               _entry_name({"path": "/ds/dataset_meta.json"}) == "dataset_meta.json"
               and _entry_name({"Filename": "train/"}) == "train"
               and _entry_name({"name": "a.npz"}) == "a.npz"
@@ -385,6 +385,17 @@ def main():
             zt_hag = json.loads((txt_out / "scene_t_PC3.json").read_text())
             check("pretrain hag: txt sidecar HAG spans ground..elevated",
                   zt_hag["hag_max"] > 2.0)
+
+            # per-tile HAG over a converted dataset -> sibling <name>_hag with a hag key
+            hag_ds = dataset.add_hag_to_dataset(staged, tmp / "staging" / "laz_demo_hag",
+                                                progress=print)
+            zhd = np.load(hag_ds / "train" / "scene0.npz")
+            check("dataset: add_hag_to_dataset adds a per-tile hag channel",
+                  "hag" in zhd.files and zhd["hag"].shape[0] == zhd["xyz"].shape[0])
+            mhd = json.loads((hag_ds / "dataset_meta.json").read_text())
+            check("dataset: hag dataset meta tags per_tile source + keeps classes",
+                  mhd["source"]["hag_source"] == "per_tile_smrf"
+                  and mhd["num_classes"] == 3 and isinstance(mhd["has_hag"], bool))
         else:
             print("  - pretrain hag: skipped (pdal not installed)")
 

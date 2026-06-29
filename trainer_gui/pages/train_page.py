@@ -1,43 +1,48 @@
-"""Train page: dataset + backbone + recommended params -> modal run, live logs."""
+"""Train page (local Docker): dataset + model + recommended params -> a local
+`docker run`, with live logs + epoch metrics.
+
+Modal is gone from this page — runs execute locally on your GPU. The dataset
+check verifies the train/val standard (a staged folder with train/ and val/ npz)
+rather than a remote volume. The per-model Docker image (present? pull it?) lives
+in a small popup that mirrors the selected model. Domain-generalization training
+knobs are set per run here; inference-time DG (AdaBN/TTA) stays on the Infer page.
+"""
 
 from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QTextCursor
-from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDoubleSpinBox,
-                               QFileDialog, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout,
-                               QHeaderView, QLabel, QLineEdit, QPlainTextEdit, QPushButton,
-                               QSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog, QFileDialog,
+                               QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
+                               QPlainTextEdit, QPushButton, QTableWidget, QTableWidgetItem,
+                               QVBoxLayout, QWidget)
 
-from .. import analysis, appstate, local_cli, modal_cli, prep, theme, ui
-from ..backbones import BACKBONES, GPU_CHOICES
+from .. import analysis, appstate, local_cli, theme, ui
+from ..backbones import BACKBONES
 from ..jobs import FuncWorker, JobRunner, LogParser
 
 
 class TrainPage(QWidget):
-    models_changed = Signal()   # local backbone selection changed -> refresh other pages
+    models_changed = Signal()   # kept for main.py's Inference-page hookup (no longer emitted)
 
     def __init__(self, repo_root: str):
         super().__init__()
         self.repo_root = repo_root
-        self.runner = JobRunner(self)
-        self.log_runner = JobRunner(self)   # for re-attaching to detached runs
-        self.prep_worker = FuncWorker(self)  # local tiling/subsampling
-        self.prep_uploader = JobRunner(self)
-        self.verify_worker = FuncWorker(self)  # `modal volume ls` presence check
+        self.runner = JobRunner(self)          # the training docker process
         self.pull_runner = JobRunner(self)     # docker pull, streamed to the log
         self.status_worker = FuncWorker(self)  # off-thread image-presence check
-        self._pull_queue: list[str] = []       # backbone keys waiting to pull
-        self._pulling_key: str | None = None
-        self._last_statuses: dict = {}         # key -> status dict from all_statuses
         self.parser = LogParser(self)
         self._param_widgets: dict[str, QWidget] = {}
         self._meta: dict | None = None
         self._last_run_id: str | None = None
-        self._pending: dict | None = None   # launch args while prep/upload run
+        self._pending: dict | None = None
+        self._last_statuses: dict = {}         # key -> status dict from all_statuses
+        self._cfg_dialog: QDialog | None = None  # the per-model popup, when open
+        self._ds_ready = False                 # train/val standard met for the selected dataset
 
         root = QVBoxLayout(self)
         title = QLabel("Train")
@@ -52,38 +57,25 @@ class TrainPage(QWidget):
         form = self.form = QFormLayout(form_box)
         self.dataset_combo = QComboBox()
         self.dataset_combo.currentIndexChanged.connect(self._on_dataset_change)
-        ds_row = QHBoxLayout()
-        ds_row.addWidget(self.dataset_combo, 1)
-        self.verify_btn = QPushButton("Check on Modal")
-        self.verify_btn.clicked.connect(self._verify_dataset)
-        ds_row.addWidget(self.verify_btn)
-        form.addRow("Dataset", _wrap(ds_row))
+        form.addRow("Dataset", self.dataset_combo)
         self.ds_status = QLabel("")
         self.ds_status.setWordWrap(True)
         theme.set_accent(self.ds_status, "muted")
         form.addRow("", self.ds_status)
-        self.backbone_combo = QComboBox()  # populated per-dataset in _reload_backbones
+        self.backbone_combo = QComboBox()      # populated per-dataset in _reload_backbones
         self.backbone_combo.currentIndexChanged.connect(self._rebuild_params)
-        form.addRow("Model", self.backbone_combo)
-        self.gpu_combo = QComboBox()
-        self.gpu_combo.addItems(GPU_CHOICES)
-        self.gpu_combo.setCurrentText("A100")
-        form.addRow("GPU", self.gpu_combo)
-        opts_row = QHBoxLayout()
-        self.detach_chk = QCheckBox("Detached (survives closing the app)")
-        self.detach_chk.setChecked(True)
-        self.smoke_chk = QCheckBox("Smoke run (2 epochs × 50 steps on A10G)")
+        model_row = QHBoxLayout()
+        model_row.addWidget(self.backbone_combo, 1)
+        self.cfg_btn = QPushButton("Configure model…")
+        self.cfg_btn.setToolTip("Docker image status + pull for the selected model.")
+        self.cfg_btn.clicked.connect(self._open_model_config)
+        model_row.addWidget(self.cfg_btn)
+        form.addRow("Model", _wrap(model_row))
+        self.smoke_chk = QCheckBox("Smoke run (2 epochs × 50 steps)")
         self.smoke_chk.toggled.connect(self._apply_smoke)
-        opts_row.addWidget(self.detach_chk)
-        opts_row.addWidget(self.smoke_chk)
-        opts_row.addStretch()
-        form.addRow("Options", _wrap(opts_row))
-        self.prep_chk = QCheckBox("Prep tiles locally + upload (no Modal CPU time "
-                                  "spent on preprocessing)")
-        self.prep_chk.setChecked(True)
-        form.addRow("", self.prep_chk)
-        # Local mode: where runs/<id>/... land on the host (bind-mounted to /outputs).
-        # Nothing is uploaded — the checkpoints/metrics are written straight here.
+        form.addRow("Options", self.smoke_chk)
+        # Output folder (bind-mounted to /outputs): runs/<id>/... land here. Nothing
+        # is uploaded — checkpoints/metrics are written straight to the host.
         self.out_edit = QLineEdit()
         self.out_edit.setText(appstate.get("local_train_out", ""))
         self.out_edit.setPlaceholderText(
@@ -93,8 +85,7 @@ class TrainPage(QWidget):
         out_btn = QPushButton("Browse…")
         out_btn.clicked.connect(self._pick_out)
         out_row.addWidget(out_btn)
-        self.out_row_w = _wrap(out_row)
-        form.addRow("Output folder", self.out_row_w)
+        form.addRow("Output folder", _wrap(out_row))
 
         self.params_box = QGroupBox("Parameters (recommended values pre-filled)")
         self.params_form = QFormLayout(self.params_box)
@@ -107,20 +98,15 @@ class TrainPage(QWidget):
         self.launch_btn.setObjectName("primary")
         self.launch_btn.clicked.connect(self._launch)
         run_row.addWidget(self.launch_btn)
-        self.attach_btn = QPushButton("Re-attach to logs")
-        self.attach_btn.clicked.connect(self._reattach)
-        run_row.addWidget(self.attach_btn)
-        self.stop_btn = QPushButton("Stop local process")
+        self.stop_btn = QPushButton("Stop process")
         self.stop_btn.clicked.connect(self._stop)
         run_row.addWidget(self.stop_btn)
         run_row.addStretch()
 
-        # Config column (scrolls when squeezed so the log can take the room).
         config_col = QVBoxLayout()
         config_col.addWidget(form_box)
-        self._models_box = self._make_models_box()   # local-mode only (see apply_exec_mode)
-        config_col.addWidget(self._models_box)
         config_col.addWidget(self.params_box)
+        config_col.addWidget(self._dg_box())
         config_col.addWidget(self.warn_label)
         config_col.addLayout(run_row)
         config_col.addStretch()
@@ -128,7 +114,7 @@ class TrainPage(QWidget):
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setObjectName("log")
-        self.log.setPlaceholderText("Modal logs appear here…")
+        self.log.setPlaceholderText("Training logs appear here…")
 
         metrics_col = QVBoxLayout()
         metrics_col.addWidget(QLabel("Live epoch metrics"))
@@ -139,7 +125,6 @@ class TrainPage(QWidget):
         self.metrics_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         metrics_col.addWidget(self.metrics_table, 1)
 
-        # Drag the handles: config | (log | metrics) are all resizable.
         body = ui.hsplit(self.log, ui.wrap(metrics_col), sizes=[680, 340])
         root.addWidget(ui.vsplit(ui.scrollable(ui.wrap(config_col)), body,
                                  sizes=[400, 360]), 1)
@@ -147,15 +132,6 @@ class TrainPage(QWidget):
         self.runner.output.connect(self._on_output)
         self.runner.finished.connect(self._on_finished)
         self.runner.failed.connect(self._on_runner_failed)
-        self.log_runner.output.connect(self._on_output)
-        self.prep_worker.output.connect(self._append)
-        self.prep_worker.done.connect(self._on_prepped)
-        self.prep_worker.error.connect(self._on_prep_error)
-        self.prep_uploader.output.connect(lambda s: self._append(s, newline=False))
-        self.prep_uploader.finished.connect(self._on_prep_uploaded)
-        self.verify_worker.done.connect(self._on_verified)
-        self.verify_worker.error.connect(lambda tb: self._set_ds_status(
-            "Could not reach Modal — is the CLI authenticated? (modal token new)", "warn"))
         self.pull_runner.output.connect(lambda s: self._append(s, newline=False))
         self.pull_runner.finished.connect(self._on_pull_finished)
         self.pull_runner.failed.connect(self._on_pull_failed)
@@ -163,49 +139,34 @@ class TrainPage(QWidget):
         self.parser.epoch.connect(self._on_epoch)
         self.parser.run_id.connect(self._on_run_id)
 
-        self.apply_exec_mode(appstate.get_exec_mode() == "local")
+        self.apply_exec_mode(True)   # this page is local-only
         self._rebuild_params()
+        self.refresh_images()
 
     def apply_exec_mode(self, local: bool):
-        """Hide Modal-only controls + reword copy for the local (Docker) backend."""
-        self.form.setRowVisible(self.gpu_combo, not local)   # GPU type is a Modal pick
-        self.form.setRowVisible(self.prep_chk, not local)    # prep+upload is Modal-only
-        self.form.setRowVisible(self.out_row_w, local)       # output folder is a local pick
-        self.detach_chk.setVisible(not local)                # Modal detach
-        self.attach_btn.setVisible(not local)                # modal app logs
-        self.verify_btn.setVisible(not local)                # Check on Modal volume
-        self.smoke_chk.setText("Smoke run (2 epochs × 50 steps)" if local
-                               else "Smoke run (2 epochs × 50 steps on A10G)")
-        self._models_box.setVisible(local)
-        if local:
-            self._sync_model_checks()
-            self.registry_edit.setText(appstate.local_config().get("registry", ""))
-            self.refresh_images()
+        """Local-only page — kept for main.py's call. Just refresh copy + lists."""
         self.sub.setText(
             "Pick a dataset and a model. Parameters are pre-filled from the dataset's "
-            "density analysis — edit anything before launching. "
-            + ("Runs execute locally in Docker on your GPU."
-               if local else
-               "Runs execute on Modal; detached runs keep going if you close this app."))
+            "density analysis — edit anything before launching. Runs execute locally "
+            "in Docker on your GPU.")
         self.reload_datasets()
 
-    # ---------------------------------------------------- local model selection
-    def _make_models_box(self):
-        """Backbones to run + their Docker images (local mode only). One row per
-        backbone: tick the ones you'll run (the tick shows the backbone everywhere),
-        see its rough recommended GPU/VRAM, whether the image is present, and pull
-        the missing ones. A registry must be set for pulling — otherwise images are
-        local builds only. Ticks + registry persist (appstate), so you can pull,
-        refresh and run across restarts."""
-        box = QGroupBox("Backbones to run")
-        lay = QVBoxLayout(box)
-        hint = QLabel("Tick the backbones you'll run locally (untick to hide one "
-                      "everywhere). Recommended GPU/VRAM are rough starting points — "
-                      "tune to your data. Set a registry to pull prebuilt images, pull "
-                      "the missing ones, then Refresh and launch.")
-        hint.setWordWrap(True)
-        theme.set_accent(hint, "muted")
-        lay.addWidget(hint)
+    # ------------------------------------------------- per-model Docker popup
+    def _open_model_config(self):
+        b = self._backbone()
+        if b is None:
+            return
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Model configuration")
+        lay = QVBoxLayout(dlg)
+        self._cfg_model_lbl = QLabel()
+        self._cfg_model_lbl.setObjectName("pageTitle")
+        lay.addWidget(self._cfg_model_lbl)
+        self._cfg_tag = QLabel()
+        theme.set_accent(self._cfg_tag, "muted")
+        lay.addWidget(self._cfg_tag)
+        self._cfg_status = QLabel()
+        lay.addWidget(self._cfg_status)
 
         reg_row = QHBoxLayout()
         reg_row.addWidget(QLabel("Registry"))
@@ -216,155 +177,90 @@ class TrainPage(QWidget):
         reg_row.addWidget(self.registry_edit, 1)
         lay.addLayout(reg_row)
 
-        grid = QGridLayout()
-        grid.setColumnStretch(2, 1)   # let the status column take the slack
-        self._model_checks: dict[str, QCheckBox] = {}
-        self._img_status: dict[str, QLabel] = {}
-        self._pull_btns: dict[str, QPushButton] = {}
-        for r, (key, b) in enumerate(BACKBONES.items()):
-            chk = QCheckBox(b.label)
-            chk.toggled.connect(self._on_models_changed)
-            rec = QLabel(f"{b.rec_gpu} ({b.min_vram_gb} GB)")
-            theme.set_accent(rec, "muted")
-            rec.setToolTip("Rough recommended GPU + minimum VRAM for training this "
-                           "backbone — a starting point to tune to your data/tiles.")
-            status = QLabel("…")
-            theme.set_accent(status, "muted")
-            btn = QPushButton("Pull")
-            btn.clicked.connect(lambda _=False, k=key: self._pull_one(k))
-            self._model_checks[key] = chk
-            self._img_status[key] = status
-            self._pull_btns[key] = btn
-            grid.addWidget(chk, r, 0)
-            grid.addWidget(rec, r, 1)
-            grid.addWidget(status, r, 2)
-            grid.addWidget(btn, r, 3)
-        lay.addLayout(grid)
+        btn_row = QHBoxLayout()
+        self._cfg_pull_btn = QPushButton("Pull")
+        self._cfg_pull_btn.clicked.connect(self._pull_current)
+        refresh = QPushButton("Refresh")
+        refresh.clicked.connect(self.refresh_images)
+        close = QPushButton("Close")
+        close.clicked.connect(dlg.close)
+        btn_row.addWidget(self._cfg_pull_btn)
+        btn_row.addWidget(refresh)
+        btn_row.addStretch()
+        btn_row.addWidget(close)
+        lay.addLayout(btn_row)
 
-        foot = QHBoxLayout()
-        self.refresh_btn = QPushButton("Refresh status")
-        self.refresh_btn.clicked.connect(self.refresh_images)
-        self.pull_missing_btn = QPushButton("Pull checked && missing")
-        self.pull_missing_btn.clicked.connect(self._pull_missing)
-        foot.addWidget(self.refresh_btn)
-        foot.addWidget(self.pull_missing_btn)
-        foot.addStretch()
-        lay.addLayout(foot)
-        return box
+        self._cfg_dialog = dlg
+        dlg.finished.connect(lambda *_: setattr(self, "_cfg_dialog", None))
+        self._update_cfg_dialog()
+        self.refresh_images()        # async; _apply_statuses refreshes the dialog
+        dlg.show()                   # non-modal: pull progress shows in the main log
 
-    def _sync_model_checks(self):
-        en = appstate.enabled_backbones()        # None = all enabled
-        for key, chk in self._model_checks.items():
-            chk.blockSignals(True)
-            chk.setChecked(en is None or key in en)
-            chk.blockSignals(False)
+    @staticmethod
+    def _status_text(s: dict | None):
+        """(text, accent-role, pull-enabled) for an image-status dict."""
+        if s is None:
+            return "checking…", "muted", False
+        if not s["docker"]:
+            return "docker not found", "muted", False
+        if s["present"]:
+            return "✓ present", "ok", False
+        if s["pullable"]:
+            return "✗ not pulled", "warn", True
+        return "✗ build it (set a registry to pull)", "warn", False
 
-    def _on_models_changed(self):
-        keys = [k for k, chk in self._model_checks.items() if chk.isChecked()]
-        appstate.set_enabled_backbones(keys)
-        self._reload_backbones()
-        self.models_changed.emit()              # let the Inference page refresh too
-
-    # ------------------------------------------------- Docker image manager
-    def _on_registry_change(self):
-        cfg = {**appstate.get("local_config", {}), "registry": self.registry_edit.text().strip()}
-        appstate.set_local_config(cfg)
-        self.refresh_images()                   # pullability changed with the registry
+    def _update_cfg_dialog(self):
+        if self._cfg_dialog is None:
+            return
+        b = self._backbone()
+        if b is None:
+            return
+        self._cfg_model_lbl.setText(b.label)
+        self._cfg_tag.setText(f"image: {local_cli.image_for(b)}")
+        text, role, can_pull = self._status_text(self._last_statuses.get(b.key))
+        self._cfg_status.setText(f"status: {text}")
+        theme.set_accent(self._cfg_status, role)
+        self._cfg_pull_btn.setEnabled(can_pull and not self.pull_runner.running)
 
     def refresh_images(self):
-        """Re-check every backbone image's presence off the GUI thread."""
+        """Re-check image presence off the GUI thread; updates the popup when done."""
         if self.status_worker.running:
             return
-        for lbl in self._img_status.values():
-            lbl.setText("checking…")
-            theme.set_accent(lbl, "muted")
         self.status_worker.start(local_cli.all_statuses)
 
     def _apply_statuses(self, statuses: list):
         self._last_statuses = {s["key"]: s for s in statuses}
-        pulling = self.pull_runner.running
-        for s in statuses:
-            lbl, btn = self._img_status.get(s["key"]), self._pull_btns.get(s["key"])
-            if lbl is None:
-                continue
-            if not s["docker"]:
-                lbl.setText("docker not found"); theme.set_accent(lbl, "muted")
-                btn.setEnabled(False)
-            elif s["present"]:
-                lbl.setText("✓ present"); theme.set_accent(lbl, "ok")
-                btn.setEnabled(False)
-            elif s["pullable"]:
-                lbl.setText("✗ not pulled"); theme.set_accent(lbl, "warn")
-                btn.setEnabled(not pulling)
-            else:
-                lbl.setText("✗ build it (set a registry to pull)")
-                theme.set_accent(lbl, "warn"); btn.setEnabled(False)
+        self._update_cfg_dialog()
 
-    def _pullable_missing(self, key: str) -> bool:
-        s = self._last_statuses.get(key)
-        return bool(s and s["docker"] and s["pullable"] and not s["present"])
+    def _on_registry_change(self):
+        cfg = {**appstate.get("local_config", {}), "registry": self.registry_edit.text().strip()}
+        appstate.set_local_config(cfg)
+        self.refresh_images()        # pullability changed with the registry
 
-    def _pull_one(self, key: str):
-        if self._pullable_missing(key):
-            self._enqueue_pull([key])
-
-    def _pull_missing(self):
-        keys = [k for k, chk in self._model_checks.items()
-                if chk.isChecked() and self._pullable_missing(k)]
-        if not keys:
-            self._append("[local] Nothing to pull — checked images are present or not "
-                         "pullable (set a registry, and `docker login` if private).")
+    def _pull_current(self):
+        b = self._backbone()
+        if b is None:
             return
-        self._enqueue_pull(keys)
-
-    def _enqueue_pull(self, keys: list):
-        self._pull_queue += [k for k in keys if k not in self._pull_queue]
-        self._set_pull_enabled(False)
-        if not self.pull_runner.running:
-            self._pull_next()
-
-    def _pull_next(self):
-        if not self._pull_queue:
-            self._pulling_key = None
-            self._set_pull_enabled(True)
-            self.refresh_images()
+        s = self._last_statuses.get(b.key)
+        if not (s and s["docker"] and s["pullable"] and not s["present"]):
+            self._append("[local] Nothing to pull — image is present or not pullable "
+                         "(set a registry, and `docker login` if it's private).")
             return
-        self._pulling_key = self._pull_queue.pop(0)
-        b = BACKBONES[self._pulling_key]
+        if self.pull_runner.running:
+            return
+        self._cfg_pull_btn.setEnabled(False)
         prog, args = local_cli.pull(b)
         self._append(f"\n[local] $ {local_cli.preview(prog, args)}\n")
         self.pull_runner.start(prog, args, cwd=self.repo_root)
 
     def _on_pull_finished(self, code: int):
-        key = self._pulling_key
-        b = BACKBONES.get(key) if key else None
-        if b and code == 0:
-            self._append(f"[local] ✓ pulled {b.label}.")
-            lbl = self._img_status.get(key)
-            if lbl:
-                lbl.setText("✓ present"); theme.set_accent(lbl, "ok")
-        elif b:
-            self._append(f"[local] ✗ pull failed for {b.label} (exit {code}). "
-                         f"Run `docker login` first if the registry is private.")
-        self._pull_next()
+        self._append("[local] ✓ pulled." if code == 0
+                     else f"[local] ✗ pull failed (exit {code}). `docker login` first if private.")
+        self.refresh_images()
 
     def _on_pull_failed(self, err: str):
-        # QProcess FailedToStart fires `failed`, not `finished` — drain the queue
-        # and re-enable the buttons so a bad docker exec doesn't wedge the panel.
-        b = BACKBONES.get(self._pulling_key) if self._pulling_key else None
-        self._append(f"\n[local] ✗ couldn't start docker pull"
-                     f"{' for ' + b.label if b else ''}: {err}")
-        self._pull_queue.clear()
-        self._pull_next()
-
-    def _set_pull_enabled(self, on: bool):
-        self.refresh_btn.setEnabled(on)
-        self.pull_missing_btn.setEnabled(on)
-        if on and self._last_statuses:
-            self._apply_statuses(list(self._last_statuses.values()))  # restore per-row state
-        else:
-            for btn in self._pull_btns.values():
-                btn.setEnabled(False)
+        self._append(f"\n[local] ✗ couldn't start docker pull: {err}")
+        self._update_cfg_dialog()
 
     # ------------------------------------------------------------- datasets
     def reload_datasets(self):
@@ -388,19 +284,34 @@ class TrainPage(QWidget):
         if meta_path and os.path.exists(meta_path):
             with open(meta_path, "r", encoding="utf-8") as f:
                 self._meta = json.load(f)
-        # Show what we know locally; the actual Modal volume is only confirmed by
-        # the "Check on Modal" button (the local flag can be stale).
         if not name:
             self._set_ds_status("")
-        elif info.get("builtin"):
-            self._set_ds_status("Built-in dataset (lives on the ieee-data volume).")
-        elif info.get("uploaded"):
-            self._set_ds_status("Marked uploaded locally — click “Check on Modal” to confirm.")
+            self._ds_ready = False
         else:
-            self._set_ds_status("Not uploaded yet — upload it on the Datasets page first.",
-                                "warn")
-        self.verify_btn.setEnabled(bool(name) and not info.get("builtin"))
+            text, role, ready = self._local_split_status(info)
+            self._set_ds_status(text, role)
+            self._ds_ready = ready
+        self._dg_bind_density()
         self._reload_backbones()
+
+    def _local_split_status(self, info: dict):
+        """(text, role, ready) — verify the train/val standard locally instead of a
+        remote volume. Built-ins read raw data from /data, so they're trusted."""
+        if info.get("builtin"):
+            return ("Built-in IEEE — trains from /data/IEEE (set local_config data_root).",
+                    "muted", True)
+        staged = info.get("staged_dir", "")
+        if not staged or not os.path.isdir(staged):
+            return ("No local copy on this machine — convert it on the Datasets page first.",
+                    "warn", False)
+        root = Path(staged)
+        tr = list((root / "train").glob("*.npz")) if (root / "train").is_dir() else []
+        va = list((root / "val").glob("*.npz")) if (root / "val").is_dir() else []
+        if not tr or not va:
+            return (f"train/val standard not met — train {len(tr)}, val {len(va)} tile(s). "
+                    f"Re-tile it on the Datasets page.", "warn", False)
+        return (f"✓ train/val standard met — {len(tr)} train / {len(va)} val tile(s).",
+                "ok", True)
 
     def _set_ds_status(self, text: str, role: str = "muted"):
         theme.set_accent(self.ds_status, role)
@@ -413,41 +324,9 @@ class TrainPage(QWidget):
         if d:
             self.out_edit.setText(d)
 
-    def _verify_dataset(self):
-        """Actually list the dataset's Modal volume so the user can confirm the
-        upload is present rather than trusting the local 'uploaded' flag."""
-        name = self.dataset_combo.currentText()
-        info = appstate.known_datasets().get(name, {})
-        if not name or info.get("builtin"):
-            return
-        if self.verify_worker.running:
-            return
-        vol = info.get("volume", name)
-        self.verify_btn.setEnabled(False)
-        self._set_ds_status(f"Checking volume “{vol}” on Modal …")
-        self.verify_worker.start(_check_dataset_present, vol, name)
-
-    def _on_verified(self, res: dict):
-        self.verify_btn.setEnabled(True)
-        vol, n = res["volume"], res["scenes"]
-        if res["has_meta"]:
-            self._set_ds_status(
-                f"✓ Present on Modal volume “{vol}”: dataset_meta.json"
-                + (f" + {n} train scene(s)." if res["has_train"] else
-                   " but no train/ folder — re-upload on the Datasets page."),
-                "ok" if res["has_train"] else "warn")
-        else:
-            self._set_ds_status(
-                f"✗ Not found on Modal volume “{vol}” — upload it on the Datasets page "
-                f"before training.", "warn")
-
     def _apply_smoke(self):
-        """Reflect the smoke override in the form so it's visible, not silent:
-        lock epochs=2 / steps=50 / GPU=A10G while the box is checked."""
+        """Lock epochs=2 / steps=50 while the smoke box is checked (visible, not silent)."""
         on = self.smoke_chk.isChecked()
-        self.gpu_combo.setEnabled(not on)
-        if on:
-            self.gpu_combo.setCurrentText("A10G")
         for flag, val in (("epochs", 2), ("steps-per-epoch", 50)):
             w = self._param_widgets.get(flag)
             if w is not None:
@@ -457,7 +336,7 @@ class TrainPage(QWidget):
 
     def _reload_backbones(self):
         """Populate the model dropdown. Built-in IEEE datasets restrict it to the
-        scripts whose no-`--dataset` default trains on that data."""
+        scripts whose no-`--dataset` default trains on that data; otherwise all."""
         allowed = appstate.known_datasets().get(
             self.dataset_combo.currentText(), {}).get("backbones")
         prev = self.backbone_combo.currentData()
@@ -465,8 +344,6 @@ class TrainPage(QWidget):
         self.backbone_combo.clear()
         for key, b in BACKBONES.items():
             if allowed and key not in allowed:
-                continue
-            if not appstate.backbone_enabled(key):   # hidden in local mode by the user
                 continue
             self.backbone_combo.addItem(
                 b.label + ("" if b.ready else "  (script not wired yet)"), key)
@@ -478,24 +355,29 @@ class TrainPage(QWidget):
 
     # ------------------------------------------------------------- params form
     def _backbone(self):
-        return BACKBONES[self.backbone_combo.currentData()]
+        key = self.backbone_combo.currentData()
+        return BACKBONES.get(key) if key else None
 
     def _rebuild_params(self):
         while self.params_form.rowCount():
             self.params_form.removeRow(0)
         self._param_widgets.clear()
         b = self._backbone()
+        if b is None:
+            self.warn_label.setText("")
+            self._update_cfg_dialog()
+            return
         recs = (self._meta or {}).get("recommendations", {}).get(b.key, {})
         for spec in b.params:
             value = recs.get(spec.recommend_key, spec.default) if spec.recommend_key else spec.default
             if spec.kind == "float":
-                w = QDoubleSpinBox()
+                w = ui.NoWheelDoubleSpinBox()
                 w.setDecimals(spec.decimals)
                 w.setSingleStep(spec.step)
                 w.setRange(spec.lo, spec.hi)
                 w.setValue(float(value))
             else:
-                w = QSpinBox()
+                w = ui.NoWheelSpinBox()
                 w.setRange(int(spec.lo), int(spec.hi))
                 w.setValue(int(value))
             label = spec.label + ("  ★" if spec.recommend_key and spec.recommend_key in recs else "")
@@ -506,139 +388,157 @@ class TrainPage(QWidget):
             self.warn_label.setText("\n".join("⚠ " + w for w in warns))
         else:
             self.warn_label.setText("")
-        self._apply_smoke()   # re-lock epochs/steps if a smoke run is selected
+        self._apply_smoke()          # re-lock epochs/steps if a smoke run is selected
+        self._update_cfg_dialog()    # keep the popup in sync with the model
+
+    # ------------------------------------------------- domain generalization (per run)
+    def _dg_box(self) -> QGroupBox:
+        box = QGroupBox("Domain generalization (training) — applied to this run")
+        box.setToolTip("Make the model robust to inference at a different point density "
+                       "than it trained on. Set per run; not saved.")
+        lay = QVBoxLayout(box)
+        self.dg_train_lbl = QLabel("Pick a dataset to see its training density.")
+        theme.set_accent(self.dg_train_lbl, "muted")
+        lay.addWidget(self.dg_train_lbl)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Target inference density (pts/m²):"))
+        self.dg_infer = ui.NoWheelDoubleSpinBox()
+        self.dg_infer.setRange(0.01, 100000.0)
+        self.dg_infer.setDecimals(2)
+        self.dg_infer.setValue(2.0)
+        row.addWidget(self.dg_infer)
+        self.dg_reco_btn = QPushButton("Recommend")
+        self.dg_reco_btn.clicked.connect(self._dg_recommend)
+        row.addWidget(self.dg_reco_btn)
+        row.addStretch(1)
+        lay.addLayout(row)
+
+        self.dg_rationale = QLabel("")
+        self.dg_rationale.setWordWrap(True)
+        theme.set_accent(self.dg_rationale, "muted")
+        lay.addWidget(self.dg_rationale)
+
+        self.dg_aug = QCheckBox("Density augmentation — train across the density range")
+        self.dg_coarsen = ui.NoWheelDoubleSpinBox()
+        self.dg_coarsen.setRange(1.0, 6.0)
+        self.dg_coarsen.setSingleStep(0.1)
+        self.dg_coarsen.setValue(2.5)
+        self.dg_pnative = ui.NoWheelDoubleSpinBox()
+        self.dg_pnative.setRange(0.0, 1.0)
+        self.dg_pnative.setSingleStep(0.05)
+        self.dg_pnative.setValue(0.5)
+        r1 = QHBoxLayout()
+        r1.addWidget(self.dg_aug)
+        r1.addWidget(QLabel("coarsen ×"))
+        r1.addWidget(self.dg_coarsen)
+        r1.addWidget(QLabel("native P"))
+        r1.addWidget(self.dg_pnative)
+        r1.addStretch(1)
+        lay.addLayout(r1)
+
+        self.dg_logdk = QCheckBox("log d_k density channel — changes input dim")
+        self.dg_k = ui.NoWheelSpinBox()
+        self.dg_k.setRange(1, 64)
+        self.dg_k.setValue(8)
+        r2 = QHBoxLayout()
+        r2.addWidget(self.dg_logdk)
+        r2.addWidget(QLabel("k"))
+        r2.addWidget(self.dg_k)
+        r2.addStretch(1)
+        lay.addLayout(r2)
+
+        hint = QLabel("AdaBN & density-TTA are inference-time (no retrain) — set them "
+                      "per-run on the Inference page.")
+        hint.setWordWrap(True)
+        theme.set_accent(hint, "muted")
+        lay.addWidget(hint)
+        return box
+
+    def _dg_bind_density(self):
+        d = float((self._meta or {}).get("stats", {}).get("mean_pts_per_m2") or 0) or None
+        if d:
+            self.dg_train_lbl.setText(f"Training density: {d:.1f} pts/m²")
+        else:
+            self.dg_train_lbl.setText("This dataset has no stored density — set DG features "
+                                      "manually (Recommend needs a density).")
+        self.dg_reco_btn.setEnabled(bool(d))
+        self.dg_rationale.setText("")
+
+    def _dg_recommend(self):
+        d = float((self._meta or {}).get("stats", {}).get("mean_pts_per_m2") or 0) or None
+        if not d:
+            self.dg_rationale.setText("This dataset has no stored density to recommend from.")
+            return
+        rec = analysis.dg_recommend(d, self.dg_infer.value())
+        self.dg_aug.setChecked(rec["density_aug"])
+        self.dg_coarsen.setValue(rec["coarsen_max"])
+        self.dg_pnative.setValue(rec["p_native"])
+        self.dg_logdk.setChecked(rec["logdk"])
+        self.dg_k.setValue(rec["logdk_k"])
+        self.dg_rationale.setText(rec["rationale"])
+
+    def _dg_collect(self) -> dict:
+        return {"infer_density": round(self.dg_infer.value(), 2),
+                "density_aug": self.dg_aug.isChecked(),
+                "coarsen_max": round(self.dg_coarsen.value(), 2),
+                "p_native": round(self.dg_pnative.value(), 2),
+                "logdk": self.dg_logdk.isChecked(),
+                "logdk_k": self.dg_k.value()}
 
     # ------------------------------------------------------------- launch
     def _launch(self):
         b = self._backbone()
+        if b is None:
+            self._append("Pick a model first.")
+            return
         if not b.ready:
             self._append(f"{b.label} isn't wired for CLI args yet — pick a ready model.")
             return
         name = self.dataset_combo.currentText()
         if not name:
-            self._append("Create + upload a dataset on the Datasets page first.")
+            self._append("Create a dataset on the Datasets page first.")
             return
-        if self.runner.running or self.prep_worker.running or self.prep_uploader.running:
-            self._append("A local process is already running.")
+        if not self._ds_ready:
+            self._append("This dataset doesn't meet the train/val standard — fix it on the "
+                         "Datasets page before training.")
+            return
+        if self.runner.running:
+            self._append("A training process is already running.")
             return
 
         info = appstate.known_datasets().get(name, {})
         # Built-in IEEE datasets run the script's no-`--dataset` default (real data
-        # already on the ieee-data volume — real HAG for the HAG variants).
+        # already on /data — real HAG for the HAG variants).
         flags = {} if info.get("builtin") else {"dataset": name}
         for spec in b.params:
-            w = self._param_widgets[spec.flag]
-            flags[spec.flag] = w.value()
-        gpu = self.gpu_combo.currentText()
+            flags[spec.flag] = self._param_widgets[spec.flag].value()
         if self.smoke_chk.isChecked():
             flags["epochs"] = 2
             flags["steps-per-epoch"] = 50
-            gpu = "A10G"
 
+        dg_env = analysis.dg_config_to_env(self._dg_collect())
         self.log.clear()
         self.metrics_table.setRowCount(0)
         self._last_run_id = None
         self.launch_btn.setEnabled(False)
-        # Density-generalization: per-dataset config set on the Datasets "Advanced"
-        # panel -> DG_* env vars the training scripts read in their config block.
-        dg_env = analysis.dg_config_to_env(appstate.get_dg_config(name))
         if dg_env:
             self._append("[dg] density-generalization on: "
                          + " ".join(f"{k}={v}" for k, v in sorted(dg_env.items())))
-        self._pending = {"backbone": b, "flags": flags, "gpu": gpu, "dataset": name,
-                         "dg_env": dg_env}
-
-        # Optional local prep: tile/subsample here and upload the cache so the
-        # GPU container finds everything already preprocessed and skips it.
-        # Built-ins already have their prep on the ieee-data volume — skip it.
-        # Local mode skips prep+upload entirely: the staged dataset IS the data,
-        # bind-mounted straight into the container at /datasets.
-        if (appstate.get_exec_mode() == "modal" and self.prep_chk.isChecked()
-                and not info.get("builtin")):
-            staged = appstate.known_datasets().get(name, {}).get("staged_dir", "")
-            if not prep.supports_local_prep(b.key):
-                self._append(f"[prep] {b.label} has no local prep path — the script "
-                             f"will preprocess remotely.")
-            elif not staged or not os.path.isdir(staged):
-                self._append("[prep] No local staged copy of this dataset on this "
-                             "machine — the script will preprocess remotely.")
-            else:
-                self._append(f"[prep] Building {b.label} cache locally from {staged} …")
-                self.prep_worker.start(prep.prep_dataset, b.key, staged, dict(flags))
-                return
-
-        self._start_run()
-
-    def _on_prepped(self, prep_dir):
-        p = self._pending
-        if p is None:
-            return
-        tag = prep_dir.name
-        vol = p["dataset"]              # per-dataset volume named after the dataset
-        remote = f"/{vol}/prep/{tag}"
-        self._append(f"[prep] Uploading cache -> {vol}:{remote} …")
-        prog, args = modal_cli.volume_put(vol, str(prep_dir), remote)
-        self.prep_uploader.start(prog, args, cwd=self.repo_root,
-                                 pre=modal_cli.volume_create(vol))
-
-    def _on_prep_error(self, tb: str):
-        self._append(f"\n[prep] Local prep failed — falling back to remote "
-                     f"preprocessing.\n{tb}")
-        self._start_run()
-
-    def _on_prep_uploaded(self, code: int):
-        if code != 0:
-            self._append(f"[prep] Upload failed (exit {code}) — the script will "
-                         f"preprocess remotely instead.")
-        else:
-            self._append("[prep] ✓ Cache uploaded — remote preprocessing will be skipped.")
-        self._start_run()
-
-    def _start_run(self):
-        """Dispatch the pending launch to Modal (cloud) or Docker (local)."""
-        p, self._pending = self._pending, None
-        if p is None:
-            self.launch_btn.setEnabled(True)
-            return
-        if appstate.get_exec_mode() == "local":
-            self._start_local_run(p)
-        else:
-            self._start_modal_run(p)
-
-    def _start_modal_run(self, p):
-        prog, args = modal_cli.run_script(p["backbone"].script, p["flags"],
-                                          detach=self.detach_chk.isChecked())
-        # DG_* density flags: set client-side here; the modal shell forwards them into
-        # the container subprocess (local docker gets them via -e, see _start_local_run).
-        extra_env = {"TT_GPU": p["gpu"], **p.get("dg_env", {})}
-        # User datasets live in their own volume (= dataset name); tell the script
-        # to mount it at /datasets. Built-ins (no "dataset" flag) leave it unset, so
-        # the script falls back to terminal-datasets (also used by inference).
-        ds_vol = p["flags"].get("dataset")
-        if ds_vol:
-            extra_env["TT_DATASET_VOLUME"] = ds_vol
-        self._append(f"\n$ modal {' '.join(args)}   [TT_GPU={p['gpu']}"
-                     f"{', TT_DATASET_VOLUME=' + ds_vol if ds_vol else ''}]\n")
-        self.runner.start(prog, args, cwd=self.repo_root, extra_env=extra_env)
+        self._start_local_run({"backbone": b, "flags": flags, "dataset": name,
+                               "dg_env": dg_env, "info": info})
 
     def _start_local_run(self, p):
-        b, flags, gpu, name = p["backbone"], p["flags"], p["gpu"], p["dataset"]
-        info = appstate.known_datasets().get(name, {})
-        # Output folder (bind-mounted to /outputs): the user-picked dir, else a
-        # findable Downloads default (never a hidden app dir). Created here so the
-        # bind-mount source exists; remembered for next time. Nothing is uploaded.
+        b, flags, name, info = p["backbone"], p["flags"], p["dataset"], p["info"]
         out_root = self.out_edit.text().strip() or str(appstate.default_download_dir())
         os.makedirs(out_root, exist_ok=True)
         appstate.put("local_train_out", self.out_edit.text().strip())
         extra_mounts = []
         if info.get("builtin"):
-            # Built-ins read raw data from /data/IEEE — only the user can supply it.
             if not appstate.local_config().get("data_root"):
                 self._append("[local] ⚠ Built-in IEEE training reads /data/IEEE — set "
                              "local_config['data_root'] (host → /data) or the run will fail.")
         else:
-            # Mount the dataset's real staged dir at /datasets/<name> so local training
-            # works wherever it was converted (independent of datasets_root).
             staged = info.get("staged_dir", "")
             if staged and os.path.isdir(staged):
                 extra_mounts.append((staged, f"/datasets/{name}"))
@@ -646,15 +546,20 @@ class TrainPage(QWidget):
                 self._append(f"[local] ⚠ No local staged copy of '{name}' on this machine — "
                              f"the container won't find /datasets/{name}.")
         prog, args = local_cli.run_script(b.script, flags, b, repo_root=self.repo_root,
-                                          gpu=gpu, extra_mounts=extra_mounts,
-                                          outputs_root=out_root, env=p.get("dg_env", {}))
+                                          extra_mounts=extra_mounts, outputs_root=out_root,
+                                          env=p.get("dg_env", {}))
         self._append(f"\n[local] $ {local_cli.preview(prog, args)}\n")
         if not local_cli.have_docker():
             self._append(
                 "[local] docker not found on PATH — printed the exact command instead of "
-                "running it (design-now mode). On a Docker+GPU host, build the images with "
-                "docker/build_all script, then launch: training writes to "
-                f"{out_root}/runs/<id> (no upload/download).")
+                "running it. On a Docker+GPU host, build the images (docker/build_all), "
+                f"then launch: training writes to {out_root}/runs/<id>.")
+            self.launch_btn.setEnabled(True)
+            return
+        ok_gpu, msg_gpu = local_cli.gpu_preflight()
+        if msg_gpu:
+            self._append(msg_gpu)
+        if not ok_gpu:
             self.launch_btn.setEnabled(True)
             return
         ok, msg = local_cli.image_preflight(b)
@@ -666,29 +571,16 @@ class TrainPage(QWidget):
         self.runner.start(prog, args, cwd=self.repo_root)
 
     def _on_runner_failed(self, err: str):
-        # QProcess FailedToStart fires `failed`, not `finished`, so re-enable the
-        # button here (otherwise a bad docker/modal exec wedges the UI).
+        # QProcess FailedToStart fires `failed`, not `finished` — re-enable here.
         self.launch_btn.setEnabled(True)
         self._append(f"\n✗ Failed to start process: {err}")
 
-    def _reattach(self):
-        b = self._backbone()
-        if self.log_runner.running:
-            self.log_runner.terminate()
-            return
-        self._append(f"\n$ modal app logs {b.app_name}\n")
-        prog, args = modal_cli.app_logs(b.app_name)
-        self.log_runner.start(prog, args, cwd=self.repo_root)
-
     def _stop(self):
-        stopped = False
-        for r in (self.runner, self.log_runner):
-            if r.running:
-                r.terminate()
-                stopped = True
-        self._append("\n[stopped local process — a detached Modal run keeps going; "
-                     "use `modal app stop <app>` to kill it remotely]" if stopped
-                     else "\n[no local process running]")
+        if self.runner.running:
+            self.runner.terminate()
+            self._append("\n[stopped the local training process]")
+        else:
+            self._append("\n[no process running]")
 
     # ------------------------------------------------------------- stream
     def _on_output(self, text: str):
@@ -699,7 +591,7 @@ class TrainPage(QWidget):
         self.launch_btn.setEnabled(True)
         if code == 0:
             extra = (f" Run id: {self._last_run_id}." if self._last_run_id else "")
-            self._append(f"\n✓ Process finished.{extra} See the Runs page for artifacts.")
+            self._append(f"\n✓ Process finished.{extra} See the Runs/Plotting page for artifacts.")
         else:
             self._append(f"\n✗ Process exited with code {code}.")
 
@@ -716,7 +608,8 @@ class TrainPage(QWidget):
     def _on_run_id(self, run_id: str):
         self._last_run_id = run_id
         history = appstate.get("run_history", [])
-        history.append({"run_id": run_id, "backbone": self._backbone().key,
+        b = self._backbone()
+        history.append({"run_id": run_id, "backbone": b.key if b else "",
                         "dataset": self.dataset_combo.currentText()})
         appstate.put("run_history", history[-200:])
 
@@ -731,25 +624,3 @@ def _wrap(layout) -> QWidget:
     layout.setContentsMargins(0, 0, 0, 0)
     w.setLayout(layout)
     return w
-
-
-def _entry_name(entry: dict) -> str:
-    """Basename of a `modal volume ls --json` entry (key name varies by CLI ver)."""
-    for k in ("path", "Filename", "filename", "name", "Name"):
-        v = entry.get(k)
-        if v:
-            return str(v).rstrip("/").rsplit("/", 1)[-1]
-    return ""
-
-
-def _check_dataset_present(volume: str, name: str, progress=None) -> dict:
-    """List the dataset's Modal volume to confirm the upload is really there.
-    The training script reads <volume>:/<name>/dataset_meta.json + /train, so
-    those are what we look for. Runs in a worker thread (blocking subprocess)."""
-    root = modal_cli.list_volume_entries(volume, f"/{name}")
-    names = {_entry_name(e) for e in root}
-    train = modal_cli.list_volume_entries(volume, f"/{name}/train") if "train" in names else []
-    return {"volume": volume, "name": name,
-            "has_meta": "dataset_meta.json" in names,
-            "has_train": "train" in names,
-            "scenes": sum(1 for e in train if _entry_name(e).endswith(".npz"))}

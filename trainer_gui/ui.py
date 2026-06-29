@@ -11,7 +11,21 @@ window scrolls instead of being squeezed.
 from __future__ import annotations
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QHBoxLayout, QScrollArea, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (QDoubleSpinBox, QHBoxLayout, QScrollArea, QSpinBox, QVBoxLayout,
+                               QWidget)
+
+
+class NoWheelSpinBox(QSpinBox):
+    """A QSpinBox that ignores the scroll wheel — values change by typing or the
+    arrows only, so scrolling the page never silently nudges a number."""
+    def wheelEvent(self, e):  # noqa: N802 (Qt signature)
+        e.ignore()
+
+
+class NoWheelDoubleSpinBox(QDoubleSpinBox):
+    """QDoubleSpinBox twin of NoWheelSpinBox — wheel scrolling is ignored."""
+    def wheelEvent(self, e):  # noqa: N802 (Qt signature)
+        e.ignore()
 
 
 def vsplit(*widgets: QWidget, sizes: list[int] | None = None) -> QWidget:
