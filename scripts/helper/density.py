@@ -14,12 +14,44 @@ is built around the SPARSEST density you must serve.
 These are pure-numpy/scipy except `adabn_recalibrate` (torch). Run `python density.py`
 for the self-checks.
 """
+import os
+
 import numpy as np
 
 __all__ = [
     "effective_grid", "voxel_first_idx", "decimate_mask",
     "local_density_logdk", "adabn_recalibrate",
+    "env_bool", "env_float", "env_int", "env_str",
 ]
+
+
+# --------------------------------------------------------------------------- #
+# Env-var overrides. The GUI "Density generalization (advanced)" panel saves a
+# per-dataset DG config and passes it to the run as DG_* env vars; each script
+# reads them in its config block via, e.g.
+#     DG_DENSITY_AUG = dg.env_bool("DG_DENSITY_AUG", globals()["DG_DENSITY_AUG"])
+# so every flag is controllable from the GUI (or a direct `DG_*=1 python ...`)
+# without becoming a CLI argument. globals()[...] avoids the assign-before-ref
+# UnboundLocalError when the local shadows the module constant.
+# --------------------------------------------------------------------------- #
+def env_bool(name, default):
+    v = os.environ.get(name)
+    return bool(default) if v is None else v.strip().lower() in ("1", "true", "yes", "on")
+
+
+def env_float(name, default):
+    v = os.environ.get(name)
+    return float(v) if v not in (None, "") else float(default)
+
+
+def env_int(name, default):
+    v = os.environ.get(name)
+    return int(float(v)) if v not in (None, "") else int(default)
+
+
+def env_str(name, default):
+    v = os.environ.get(name)
+    return v if v not in (None, "") else default
 
 
 # --------------------------------------------------------------------------- #
@@ -171,6 +203,14 @@ def _demo():
     sparse = rng.uniform(0, side, size=(2000, 3)); sparse[:, 2] = 0.0
     assert local_density_logdk(sparse).mean() > local_density_logdk(dense).mean()
     assert local_density_logdk(np.zeros((1, 3))).shape == (1,)          # degenerate ok
+
+    # env overrides: default when unset; parsed when set.
+    os.environ.pop("DG_TEST_X", None)
+    assert env_bool("DG_TEST_X", True) is True and env_int("DG_TEST_X", 8) == 8
+    os.environ["DG_TEST_X"] = "off"; assert env_bool("DG_TEST_X", True) is False
+    os.environ["DG_TEST_X"] = "2.5"; assert env_float("DG_TEST_X", 1.0) == 2.5
+    os.environ["DG_TEST_X"] = "3"; assert env_int("DG_TEST_X", 0) == 3
+    os.environ.pop("DG_TEST_X", None)
 
     print("density.py self-checks passed")
 

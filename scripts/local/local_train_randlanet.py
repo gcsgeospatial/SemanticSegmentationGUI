@@ -150,6 +150,14 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     import torch
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "helper"))
     import density as dg
+    # DG flags: env-overridable (GUI "Density generalization" panel / DG_*=1 in the shell).
+    DG_DENSITY_AUG = dg.env_bool("DG_DENSITY_AUG", globals()["DG_DENSITY_AUG"])
+    DG_COARSEN_MAX = dg.env_float("DG_COARSEN_MAX", globals()["DG_COARSEN_MAX"])
+    DG_P_NATIVE    = dg.env_float("DG_P_NATIVE", globals()["DG_P_NATIVE"])
+    DG_LOGDK_FEAT  = dg.env_bool("DG_LOGDK_FEAT", globals()["DG_LOGDK_FEAT"])
+    DG_LOGDK_K     = dg.env_int("DG_LOGDK_K", globals()["DG_LOGDK_K"])
+    DG_INFER_ADABN = dg.env_bool("DG_INFER_ADABN", globals()["DG_INFER_ADABN"])
+    DG_INFER_TTA   = dg.env_int("DG_INFER_TTA", globals()["DG_INFER_TTA"])
     import torch.nn as nn
     import torch.optim as optim
     from torch.utils.data import DataLoader, Dataset

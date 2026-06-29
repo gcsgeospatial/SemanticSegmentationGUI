@@ -206,6 +206,22 @@ def _crop(cloud: Cloud, raw: np.ndarray | None, bounds: tuple):
 
 # --------------------------------------------------------------------- conversion
 
+def _hag_from_cloud(cloud: Cloud) -> np.ndarray | None:
+    """Return a source HeightAboveGround/HAG field when one exists and aligns 1:1.
+
+    `pretrain.add_hag()` writes LAS/LAZ with a `HeightAboveGround` extra dim;
+    readers.py exposes that as a numeric field. Preserve it into the canonical
+    npz so *_hag trainers get the real HAG feature instead of their z-min proxy.
+    """
+    for name, arr in cloud.fields.items():
+        key = name.lower().replace("_", "")
+        if key in ("heightaboveground", "hag"):
+            h = np.asarray(arr, dtype=np.float32).reshape(-1)
+            if len(h) == cloud.n:
+                return h
+    return None
+
+
 def _convert_one(cloud: Cloud, raw: np.ndarray | None, value_to_index: dict[int, int],
                  out_path: Path, intensity_norm: str = "max",
                  compute_hag: bool = False) -> dict:
@@ -239,7 +255,10 @@ def _convert_one(cloud: Cloud, raw: np.ndarray | None, value_to_index: dict[int,
             out["intensity"] = (cloud.intensity / raw_imax).astype(np.float32)
     if cloud.return_number is not None:
         out["return_number"] = cloud.return_number.astype(np.float32)
-    if compute_hag:
+    source_hag = _hag_from_cloud(cloud)
+    if source_hag is not None:
+        out["hag"] = source_hag.astype(np.float32)
+    if compute_hag and "hag" not in out:
         from . import pretrain
         h = pretrain.hag_for_cloud(cloud)
         if h is not None and len(h) == cloud.n:
@@ -259,6 +278,7 @@ def _convert_one(cloud: Cloud, raw: np.ndarray | None, value_to_index: dict[int,
         "has_rgb": cloud.rgb is not None,
         "has_intensity": cloud.intensity is not None,
         "has_return_number": cloud.return_number is not None,
+        "has_hag": "hag" in out,
     }
 
 
@@ -439,6 +459,7 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
             "label_field": spec.field if spec else "",
             "truth_dir": spec.truth_dir if spec else "",
             "intensity_norm": intensity_norm,
+            "hag_source": "source_dimension" if all(s["has_hag"] for s in all_stats) else "",
             "ignore_values": [int(v) for v in ignore_values],
         },
         "classes": classes,
@@ -447,6 +468,7 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
         "has_rgb": all(s["has_rgb"] for s in all_stats),
         "has_intensity": all(s["has_intensity"] for s in all_stats),
         "has_return_number": all(s["has_return_number"] for s in all_stats),
+        "has_hag": all(s["has_hag"] for s in all_stats),
         "splits": splits,
         "stats": stats,
     }

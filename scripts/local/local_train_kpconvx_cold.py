@@ -191,6 +191,17 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
 
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "helper"))
     import density as dg
+    # DG flags: env-overridable (GUI "Density generalization" panel / DG_*=1 in the shell).
+    # globals()[...] reads the module default; the local shadow is what the nested closures use.
+    DG_DENSITY_AUG = dg.env_bool("DG_DENSITY_AUG", globals()["DG_DENSITY_AUG"])
+    DG_COARSEN_MAX = dg.env_float("DG_COARSEN_MAX", globals()["DG_COARSEN_MAX"])
+    DG_P_NATIVE    = dg.env_float("DG_P_NATIVE", globals()["DG_P_NATIVE"])
+    DG_LOGDK_FEAT  = dg.env_bool("DG_LOGDK_FEAT", globals()["DG_LOGDK_FEAT"])
+    DG_LOGDK_K     = dg.env_int("DG_LOGDK_K", globals()["DG_LOGDK_K"])
+    DG_INFER_ADABN = dg.env_bool("DG_INFER_ADABN", globals()["DG_INFER_ADABN"])
+    DG_INFER_TTA   = dg.env_int("DG_INFER_TTA", globals()["DG_INFER_TTA"])
+    KP_AGGREGATION = dg.env_str("KP_AGGREGATION", globals()["KP_AGGREGATION"])
+    KP_NORM        = dg.env_str("KP_NORM", globals()["KP_NORM"])
 
     sys.path.insert(0, "/opt/kpconvx")
     EVAL_ONLY = (mode == "eval")

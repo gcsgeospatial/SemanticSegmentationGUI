@@ -216,3 +216,20 @@ def forget_dataset(name: str) -> None:
     ds = known_datasets()
     ds.pop(name, None)
     put("datasets", ds)
+
+
+# ---- per-dataset density-generalization config (Datasets page "Advanced" panel) ----
+# Kept in its own state key (not the dataset registry entry) so it works for the
+# built-in IEEE datasets too and never collides with the registry write path.
+
+def get_dg_config(name: str) -> dict:
+    return get("dg_config", {}).get(name, {})
+
+
+def set_dg_config(name: str, cfg: dict) -> None:
+    allc = get("dg_config", {})
+    if cfg:
+        allc[name] = cfg
+    else:
+        allc.pop(name, None)
+    put("dg_config", allc)

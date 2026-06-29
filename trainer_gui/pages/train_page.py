@@ -539,7 +539,14 @@ class TrainPage(QWidget):
         self.metrics_table.setRowCount(0)
         self._last_run_id = None
         self.launch_btn.setEnabled(False)
-        self._pending = {"backbone": b, "flags": flags, "gpu": gpu, "dataset": name}
+        # Density-generalization: per-dataset config set on the Datasets "Advanced"
+        # panel -> DG_* env vars the training scripts read in their config block.
+        dg_env = analysis.dg_config_to_env(appstate.get_dg_config(name))
+        if dg_env:
+            self._append("[dg] density-generalization on: "
+                         + " ".join(f"{k}={v}" for k, v in sorted(dg_env.items())))
+        self._pending = {"backbone": b, "flags": flags, "gpu": gpu, "dataset": name,
+                         "dg_env": dg_env}
 
         # Optional local prep: tile/subsample here and upload the cache so the
         # GPU container finds everything already preprocessed and skips it.
@@ -601,7 +608,9 @@ class TrainPage(QWidget):
     def _start_modal_run(self, p):
         prog, args = modal_cli.run_script(p["backbone"].script, p["flags"],
                                           detach=self.detach_chk.isChecked())
-        extra_env = {"TT_GPU": p["gpu"]}
+        # DG_* density flags: set client-side here; the modal shell forwards them into
+        # the container subprocess (local docker gets them via -e, see _start_local_run).
+        extra_env = {"TT_GPU": p["gpu"], **p.get("dg_env", {})}
         # User datasets live in their own volume (= dataset name); tell the script
         # to mount it at /datasets. Built-ins (no "dataset" flag) leave it unset, so
         # the script falls back to terminal-datasets (also used by inference).
@@ -638,7 +647,7 @@ class TrainPage(QWidget):
                              f"the container won't find /datasets/{name}.")
         prog, args = local_cli.run_script(b.script, flags, b, repo_root=self.repo_root,
                                           gpu=gpu, extra_mounts=extra_mounts,
-                                          outputs_root=out_root)
+                                          outputs_root=out_root, env=p.get("dg_env", {}))
         self._append(f"\n[local] $ {local_cli.preview(prog, args)}\n")
         if not local_cli.have_docker():
             self._append(

@@ -97,3 +97,69 @@ def warnings_for(meta: dict) -> list[str]:
             warns.append(f"Class '{c.get('name')}' is only {share * 100:.2f}% of training "
                          f"points — consider rare-class oversampling / focal loss.")
     return warns
+
+
+# ---- density-generalization advice (Datasets page "Advanced" panel) ----------
+
+def dg_recommend(train_density: float, infer_density: float) -> dict:
+    """Suggest density-generalization settings from the dataset's training density
+    and a target inference density. Heuristic; the user can override every field.
+
+    The occupancy lens (o = rho*g^2): training canonicalizes density to the model
+    grid, so the gap that hurts is inference at a DIFFERENT density. You can always
+    thin a denser cloud DOWN (the grid does it for free) but never invent points
+    for a sparser one — so the sparse direction needs train-time tolerance (density
+    aug + optional log-d_k channel), while the dense direction is handled by the
+    grid plus the label-free inference patches (AdaBN, TTA).
+    """
+    train_density = max(float(train_density), 1e-6)
+    infer_density = max(float(infer_density), 1e-6)
+    ratio = train_density / infer_density          # >1 => inference is SPARSER
+    gap = max(ratio, 1.0 / ratio)                  # fold factor, >=1
+
+    rec = {"density_aug": False, "coarsen_max": 2.5, "p_native": 0.5,
+           "logdk": False, "logdk_k": 8, "adabn": False, "tta": 0}
+
+    if gap < 1.2:
+        rec["rationale"] = (f"Train {train_density:.1f} vs infer {infer_density:.1f} pts/m² are "
+                            f"within {(gap - 1) * 100:.0f}% — no density adaptation needed.")
+        return rec
+
+    rec["adabn"] = True                            # label-free, cheap insurance either way
+    rec["tta"] = 3 if gap > 1.5 else 2
+    if ratio > 1.0:                                # inference SPARSER -> the hard direction
+        rec["density_aug"] = True
+        rec["coarsen_max"] = round(min(max(math.sqrt(ratio), 1.5), 4.0), 2)
+        rec["logdk"] = gap > 2.5
+        rec["rationale"] = (
+            f"Inference ({infer_density:.1f}) is {gap:.1f}x SPARSER than training "
+            f"({train_density:.1f} pts/m^2) — the hard direction. Train with density aug "
+            f"(coarsen x{rec['coarsen_max']}) to reach the sparse end"
+            + ("; add the log-d_k channel for the large gap" if rec["logdk"] else "")
+            + ". AdaBN + TTA patch the rest at inference (no retrain).")
+    else:                                          # inference DENSER -> the easy direction
+        rec["rationale"] = (
+            f"Inference ({infer_density:.1f}) is {gap:.1f}x DENSER than training "
+            f"({train_density:.1f} pts/m^2) — the easy direction: the grid subsample "
+            f"canonicalizes it down for free, so AdaBN + TTA suffice (no train aug).")
+    return rec
+
+
+def dg_config_to_env(cfg: dict) -> dict:
+    """Per-dataset TRAIN-time DG config -> DG_* env vars the training scripts read.
+    Emits only the toggles that are ON (+ their values); empty/unset = baseline.
+
+    Train-time only: density aug + the logdk channel (logdk changes the input width,
+    so it's baked into the weights and recorded in run.json). The label-free inference
+    patches (AdaBN, TTA) are set per-run on the Inference page, not here."""
+    if not cfg:
+        return {}
+    env: dict[str, str] = {}
+    if cfg.get("density_aug"):
+        env["DG_DENSITY_AUG"] = "1"
+        env["DG_COARSEN_MAX"] = str(cfg.get("coarsen_max", 2.5))
+        env["DG_P_NATIVE"] = str(cfg.get("p_native", 0.5))
+    if cfg.get("logdk"):
+        env["DG_LOGDK_FEAT"] = "1"
+        env["DG_LOGDK_K"] = str(int(cfg.get("logdk_k", 8)))
+    return env

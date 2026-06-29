@@ -20,6 +20,7 @@ only `add_hag` needs it. `tile_for_model` is pure numpy/laspy.
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -31,6 +32,11 @@ from .readers import SUPPORTED_EXTS, read_points
 
 LAS_EXTS = {".las", ".laz"}
 HAG_FILTERS = ("hag_nn", "hag_delaunay")
+
+# SMRF overwrites Classification (ground->2). When the label lives in that dim we
+# ferry it here BEFORE SMRF so the converter can read the real labels back after
+# HAG. Must match datasets_page._hag_conversion_spec, which reads this dim.
+HAG_PRESERVED_CLASS_DIM = "label_src"
 
 
 def pdal_available() -> bool:
@@ -65,6 +71,28 @@ def _structured_from_cloud(cloud) -> np.ndarray:
         for i, name in enumerate(("Red", "Green", "Blue")):
             dt.append((name, "u2"))
             cols[name] = cloud.rgb[:, i].astype(np.uint16)
+    used = {name.lower() for name, _ in dt}
+    for raw_name, values in cloud.fields.items():
+        arr0 = np.asarray(values)
+        if (arr0.ndim != 1 or len(arr0) != n
+                or not np.issubdtype(arr0.dtype, np.number)):
+            continue
+        lname = raw_name.lower()
+        dim = "Classification" if lname == "classification" else re.sub(
+            r"[^A-Za-z0-9_]", "_", raw_name.strip())
+        if not dim:
+            continue
+        if dim[0].isdigit():
+            dim = "field_" + dim
+        if dim.lower() in used:
+            continue
+        if dim == "Classification":
+            dt.append((dim, "u1"))
+            cols[dim] = np.clip(np.rint(arr0), 0, 255).astype(np.uint8)
+        else:
+            dt.append((dim, "f8"))
+            cols[dim] = arr0.astype(np.float64)
+        used.add(dim.lower())
     arr = np.empty(n, dtype=dt)
     for k, v in cols.items():
         arr[k] = v
@@ -72,16 +100,24 @@ def _structured_from_cloud(cloud) -> np.ndarray:
 
 
 def _hag_pipeline(reader_stage, out_path: str, skip_ground: bool,
-                  hag_filter: str, has_header: bool) -> list:
-    """[reader] -> [filters.smrf] -> filters.<hag> -> writers.las.
+                  hag_filter: str, has_header: bool,
+                  preserve_class_as: str | None = None) -> list:
+    """[reader] -> [ferry] -> [filters.smrf] -> filters.<hag> -> writers.las.
 
     `reader_stage` is the readers.las dict for LAS/LAZ inputs, or None when the
     points are injected as a numpy array (the first stage is then the filter).
+    `preserve_class_as` copies Classification into that extra dim before SMRF can
+    overwrite it (used when the user's labels live in Classification).
     writers.las options mirror kpconv-pdal/utils/las.py:write_las — write every
     extra dim (incl. HeightAboveGround), LAS 1.4; forward the header only when
     there is a LAS reader to forward it from.
     """
     stages: list = [reader_stage] if reader_stage else []
+    if preserve_class_as:
+        # SMRF rewrites Classification (ground->2); copy the user's labels aside
+        # first so the converter can read them back after HAG.
+        stages.append({"type": "filters.ferry",
+                       "dimensions": f"Classification=>{preserve_class_as}"})
     if not skip_ground:
         # SMRF sets Classification=2 on ground; hag_nn/hag_delaunay use it.
         stages.append({"type": "filters.smrf"})
@@ -95,7 +131,8 @@ def _hag_pipeline(reader_stage, out_path: str, skip_ground: bool,
 
 
 def add_hag(in_dir: str | Path, out_dir: str | Path, *, skip_ground: bool = False,
-            hag_filter: str = "hag_nn", progress=None) -> dict:
+            hag_filter: str = "hag_nn", preserve_class_as: str | None = None,
+            progress=None) -> dict:
     """Add a HeightAboveGround dim to every cloud in `in_dir` -> `out_dir`.
 
     LAS/LAZ are read by PDAL directly (CRS + dims preserved). Other supported
@@ -132,7 +169,7 @@ def add_hag(in_dir: str | Path, out_dir: str | Path, *, skip_ground: bool = Fals
             reader = None
             arrays = [_structured_from_cloud(read_points(path))]
         stages = _hag_pipeline(reader, str(out_path), skip_ground, hag_filter,
-                               has_header=is_las)
+                               has_header=is_las, preserve_class_as=preserve_class_as)
         pipe = (pdal.Pipeline(json.dumps(stages), arrays=arrays) if arrays
                 else pdal.Pipeline(json.dumps(stages)))
         n = pipe.execute()
@@ -240,3 +277,27 @@ def tile_for_model(in_dir: str | Path, out_dir: str | Path, backbone_key: str,
     prep_dir = prep.prep_dataset(backbone_key, staged, params, progress=say)
     say(f"✓ tiles ready -> {prep_dir}")
     return prep_dir
+
+
+# --------------------------------------------------------------------- self-check
+
+def _selfcheck():
+    """_hag_pipeline stage ordering (no PDAL needed): ferry-before-smrf when
+    preserving labels, smrf skipped when ground is given, writer always last."""
+    s = _hag_pipeline({"type": "readers.las"}, "/x.laz", skip_ground=False,
+                      hag_filter="hag_nn", has_header=True,
+                      preserve_class_as=HAG_PRESERVED_CLASS_DIM)
+    assert [st["type"] for st in s] == [
+        "readers.las", "filters.ferry", "filters.smrf",
+        "filters.hag_nn", "writers.las"], s
+    assert s[1]["dimensions"] == f"Classification=>{HAG_PRESERVED_CLASS_DIM}"
+    assert s[-1]["forward"] == "all"          # LAS reader -> forward the header
+    skip = _hag_pipeline(None, "/x.laz", skip_ground=True, hag_filter="hag_nn",
+                         has_header=False)
+    assert [st["type"] for st in skip] == ["filters.hag_nn", "writers.las"]
+    assert "forward" not in skip[-1]          # array input -> no header to forward
+    print("pretrain self-check OK")
+
+
+if __name__ == "__main__":
+    _selfcheck()

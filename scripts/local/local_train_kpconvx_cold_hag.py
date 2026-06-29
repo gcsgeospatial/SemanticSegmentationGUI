@@ -201,6 +201,17 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
 
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "helper"))
     import density as dg
+    # DG flags: env-overridable (GUI "Density generalization" panel / DG_*=1 in the shell).
+    # globals()[...] reads the module default; the local shadow is what the nested closures use.
+    DG_DENSITY_AUG = dg.env_bool("DG_DENSITY_AUG", globals()["DG_DENSITY_AUG"])
+    DG_COARSEN_MAX = dg.env_float("DG_COARSEN_MAX", globals()["DG_COARSEN_MAX"])
+    DG_P_NATIVE    = dg.env_float("DG_P_NATIVE", globals()["DG_P_NATIVE"])
+    DG_LOGDK_FEAT  = dg.env_bool("DG_LOGDK_FEAT", globals()["DG_LOGDK_FEAT"])
+    DG_LOGDK_K     = dg.env_int("DG_LOGDK_K", globals()["DG_LOGDK_K"])
+    DG_INFER_ADABN = dg.env_bool("DG_INFER_ADABN", globals()["DG_INFER_ADABN"])
+    DG_INFER_TTA   = dg.env_int("DG_INFER_TTA", globals()["DG_INFER_TTA"])
+    KP_AGGREGATION = dg.env_str("KP_AGGREGATION", globals()["KP_AGGREGATION"])
+    KP_NORM        = dg.env_str("KP_NORM", globals()["KP_NORM"])
 
     sys.path.insert(0, "/opt/kpconvx")
     EVAL_ONLY = (mode == "eval")
@@ -231,6 +242,7 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
     NUM_CLASSES = globals()["NUM_CLASSES"]
     CLASS_NAMES = list(globals()["CLASS_NAMES"])
     IEEE_INFER  = True
+    HAG_SOURCE  = "pdal_hag_nn"
     ds_root = f"/datasets/{dataset}" if dataset else None
     if ds_root:
         meta_path = f"{ds_root}/dataset_meta.json"
@@ -241,6 +253,7 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
             ds_meta = json.load(f)
         NUM_CLASSES = int(ds_meta["num_classes"])
         CLASS_NAMES = list(ds_meta["class_names"])
+        HAG_SOURCE = "pdal_hag_nn" if ds_meta.get("has_hag") else "z_minus_scene_min_proxy"
         PREP_DIR = f"{ds_root}/prep/kpconvx_cold_hag_grid{GRID:g}_c{int(CHUNK_XY)}"
     elif INFER and weights:
         # Infer reproduces the TRAINED geometry + class layout from the run's
@@ -371,8 +384,9 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
         """Canonical trainer_gui scene (.npz) -> (xyz, intensity, ret_num, lab).
         xyz origin-offset like load_ieee; intensity is already GUI-normalized
         (the p95 renorm below is skipped); no return-number channel (zeros);
-        labels are already contiguous indices (no ASPRS LUT). No HAG laz exists
-        for canonical scenes — tile_and_save uses the z-scene-min proxy."""
+        labels are already contiguous indices (no ASPRS LUT). If the canonical
+        npz carries `hag`, tile_and_save uses it; otherwise it falls back to the
+        z-scene-min proxy."""
         z = np.load(npz_path)
         xyz = (z["xyz"] - np.floor(z["xyz"].min(0))).astype(np.float32)
         if "intensity" in z.files:
@@ -392,7 +406,10 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
         try:
             if cls_path is None:          # canonical .npz (label embedded, no HAG laz)
                 xyz, intensity, ret_num, lab = load_canonical(pc_path)
-                hag = (xyz[:, 2] - xyz[:, 2].min()).astype(np.float32)   # z-scene-min proxy
+                z = np.load(pc_path)
+                hag = (z["hag"].astype(np.float32)
+                       if "hag" in z.files and len(z["hag"]) == len(xyz)
+                       else (xyz[:, 2] - xyz[:, 2].min()).astype(np.float32))
             else:
                 xyz, intensity, ret_num, lab = load_ieee(pc_path, cls_path)
                 hag = load_hag(name, hag_dir, xyz)
@@ -494,12 +511,12 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
             "stride": STRIDE,
             "holdout_seed": HOLDOUT_SEED,
             "n_val_holdout": N_VAL_HOLDOUT,
-            "label_map": {str(k): v for k, v in sorted(LABEL_MAP.items())},
+            "label_map": None if ds_root else {str(k): v for k, v in sorted(LABEL_MAP.items())},
             "min_pts_mask": 64,
             "min_pts_sub": 32,
             "intensity_norm": "p95_clip2",
             "feature_recipe": "bias,intensity,ret_num,hag",
-            "hag_source": "pdal_hag_nn",
+            "hag_source": HAG_SOURCE,
             "hag_train_dir": HAG_TRAIN_DIR,
             "hag_test_dir": HAG_TEST_DIR,
         }
@@ -649,7 +666,7 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
             "comparison_target": None if ds_root
                 else "kpconv-pdal/train_LAS.py (deformable KPFCNN)",
             "dataset": dataset or "IEEE GRSS 2019 DFC Track 4",
-            "hag_source": "z_minus_scene_min_proxy" if ds_root else "pdal_hag_nn",
+            "hag_source": HAG_SOURCE,
             "n_epochs": N_EPOCHS, "epoch_steps": EPOCH_STEPS,
             "pack_n": PACK_N, "accum": ACCUM,
             "grid_m": GRID, "kp_radius": KP_RADIUS, "radius_scaling": RADIUS_SCALING,

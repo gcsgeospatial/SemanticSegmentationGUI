@@ -4,7 +4,8 @@ Run:  python tests/smoke_test.py   (from the trainer_gui/ project dir)
 
 Covers: synthetic LAZ/PLY/ASCII scenes -> canonical conversion (field + companion
 label specs), npz contract, meta + recommendations, inference-job conversion,
-training-log parsing, viewer loading.
+local prep caches (the live ptv3/randlanet cold paths), density-generalization
+manifest round-trip, training-log parsing, viewer loading, local Docker backend.
 """
 
 from __future__ import annotations
@@ -174,7 +175,7 @@ def main():
 
         # ---------------- built-in IEEE / IEEE HAG known datasets
         from trainer_gui import appstate
-        from trainer_gui.backbones import BACKBONES
+        from trainer_gui.backbones import BACKBONES, infer_backbones
         kd = appstate.known_datasets()
         check("appstate: IEEE + IEEE HAG are built-in known datasets",
               kd.get("IEEE", {}).get("builtin") is True
@@ -194,7 +195,6 @@ def main():
               ip95.max() >= imax.max() and ip95.max() <= 2.0)
 
         # ---------------- backbones: infer-readiness contracts
-        from trainer_gui.backbones import BACKBONES, infer_backbones
         check("backbones: folder-infer set = the 6 IEEE cold/hag scripts",
               set(infer_backbones()) == {"ptv3", "randlanet", "ptv3_hag", "randlanet_hag",
                                          "kpconvx_cold", "kpconvx_cold_hag"})
@@ -214,6 +214,42 @@ def main():
         check("backbones: each carries a recommended GPU + min VRAM (Train specs bar)",
               all(b.rec_gpu and b.min_vram_gb > 0 for b in BACKBONES.values())
               and BACKBONES["kpconvx_cold"].min_vram_gb >= BACKBONES["randlanet"].min_vram_gb)
+
+        # ---------------- density generalization: env mapping + run.json round-trip
+        import train_common
+
+        # dg_config_to_env emits TRAIN-time vars only (density aug + the logdk channel,
+        # which changes the input width). AdaBN/TTA are inference-time (set on the Infer
+        # page), so they must NOT leak into the train launch env.
+        dg_cfg = {"density_aug": True, "coarsen_max": 2.5, "p_native": 0.5,
+                  "logdk": True, "logdk_k": 12, "adabn": True, "tta": 3}
+        dg_env = analysis.dg_config_to_env(dg_cfg)
+        check("dg: config_to_env emits train-time aug + logdk vars",
+              dg_env.get("DG_DENSITY_AUG") == "1" and dg_env.get("DG_LOGDK_FEAT") == "1"
+              and dg_env.get("DG_LOGDK_K") == "12")
+        check("dg: config_to_env does NOT emit inference-time AdaBN/TTA",
+              "DG_INFER_ADABN" not in dg_env and "DG_INFER_TTA" not in dg_env)
+        check("dg: empty config -> baseline (no vars)", analysis.dg_config_to_env({}) == {})
+
+        # write_run_manifest bakes the DG block (read from the training env) into run.json
+        # so a logdk model is self-describing; infer_meta reads it back at inference.
+        dg_run = tmp / "dg_run"
+        dg_run.mkdir()
+        (dg_run / "run_config.json").write_text(json.dumps(
+            {"num_classes": 5, "class_names": list("abcde"), "grid_m": 2.0}), encoding="utf-8")
+        os.environ["DG_LOGDK_FEAT"], os.environ["DG_LOGDK_K"] = "1", "12"
+        try:
+            man = train_common.write_run_manifest(str(dg_run), "kpconvx_cold")
+        finally:
+            os.environ.pop("DG_LOGDK_FEAT", None)
+            os.environ.pop("DG_LOGDK_K", None)
+        check("dg: run.json records the dg block (logdk + k) from the train env",
+              man["dg"]["logdk"] is True and man["dg"]["logdk_k"] == 12)
+        im = train_common.infer_meta(str(dg_run / "final_model.pth"))
+        check("dg: infer_meta reads the dg block back (self-describing weights)",
+              im["dg"]["logdk"] is True and im["dg"]["logdk_k"] == 12)
+        check("dg: baseline run (no DG env) records logdk off",
+              train_common.write_run_manifest(str(dg_run), "ptv3")["dg"]["logdk"] is False)
 
         # Train page's Modal-presence check parses `modal volume ls --json` entries
         # whose basename key varies by CLI version — lock the parser.
@@ -257,81 +293,54 @@ def main():
         check("plots: multi_run_figure overlays runs + an average line",
               len(line_labels) == 3 and any("average" in s for s in line_labels))
 
-        # ---------------- local prep caches (must match the scripts' layouts)
+        # ---------------- local prep caches (live cold backbones: ptv3, randlanet)
         from trainer_gui import prep
 
-        # ptv3_warm: tiles with intensity/ret_num keys, three splits, seed-42 holdout
-        pd = prep.prep_dataset("ptv3_warm", staged, {"chunk-xy": 50.0}, progress=print)
-        check("prep ptv3_warm: dir name", pd.name == "ptv3_warm_chunk50")
+        # ptv3 (cold): rgb tiles, train + test only — the cold script picks its val
+        # holdout at tile level in-script, so prep writes no val dir.
+        pd = prep.prep_dataset("ptv3", staged, {"chunk-xy": 50.0}, progress=print)
+        check("prep ptv3: dir name", pd.name == "ptv3_cold_chunk50")
         train_tiles = sorted((pd / "train").glob("*.npz"))
-        val_tiles = sorted((pd / "val").glob("*.npz"))
         test_tiles = sorted((pd / "test").glob("*.npz"))
-        check("prep ptv3_warm: tiles in all splits",
-              train_tiles and val_tiles and test_tiles)
-        zt = np.load(train_tiles[0])
-        check("prep ptv3_warm: tile keys",
-              set(zt.files) == {"xyz", "intensity", "ret_num", "lab"})
-        # the holdout must match the scripts' _split_scenes (seed 42, 1/5 capped at 10)
-        names = sorted(p.stem for p in (staged / "train").glob("*.npz"))
-        rng = np.random.RandomState(42)
-        idx = np.arange(len(names))
-        rng.shuffle(idx)
-        n_hold = min(10, max(1, len(names) // 5))
-        expect_val = sorted(names[i] for i in idx[:n_hold])
-        got_val = sorted({p.stem.rsplit("_x", 1)[0] for p in val_tiles})
-        check("prep ptv3_warm: holdout split matches script seed", got_val == expect_val)
+        check("prep ptv3: tiles in train + test", bool(train_tiles) and bool(test_tiles))
+        check("prep ptv3: no val dir (cold splits val at tile level)", not (pd / "val").exists())
+        check("prep ptv3: cold tile keys (rgb layout)",
+              set(np.load(train_tiles[0]).files) == {"xyz", "rgb", "lab"})
 
-        # randlanet_warm: whole-scene subsample, fewer points than input
-        pr = prep.prep_dataset("randlanet_warm", staged, {"sub-grid": 0.3})
-        check("prep randlanet_warm: dir name", pr.name == "randlanet_warm_grid30")
+        # randlanet (cold): whole-scene grid subsample, fewer points than input
+        pr = prep.prep_dataset("randlanet", staged, {"sub-grid": 0.3})
+        check("prep randlanet: dir name", pr.name == "randlanet_cold_grid30")
         zr = np.load(next((pr / "train").glob("*.npz")))
         zin = np.load(next((staged / "train").glob("*.npz")))
-        check("prep randlanet_warm: keys + subsampled",
-              set(zr.files) == {"xyz", "intensity", "ret_num", "lab"}
-              and len(zr["xyz"]) < len(zin["xyz"]))
+        check("prep randlanet: keys + subsampled",
+              set(zr.files) == {"xyz", "rgb", "lab"} and len(zr["xyz"]) < len(zin["xyz"]))
 
-        # octformer (cold): rgb + normals tiles, two splits only
-        # (50 m chunks — the synthetic scenes are too sparse for 25 m tiles to
-        # clear the 2048-point minimum, exactly as the remote script would skip)
-        po = prep.prep_dataset("octformer", staged, {"chunk-xy": 50.0})
-        check("prep octformer cold: dir name", po.name == "octformer_cold_chunk50")
-        check("prep octformer cold: no val split (two-dir layout)",
-              not (po / "val").exists())
-        zo = np.load(next((po / "train").glob("*.npz")))
-        check("prep octformer cold: keys incl. normals",
-              set(zo.files) == {"xyz", "rgb", "nrm", "lab"})
-        nrm = zo["nrm"]
-        check("prep octformer cold: normals unit-ish",
-              np.allclose(np.linalg.norm(nrm, axis=1), 1.0, atol=1e-4))
-
-        # kpconvx_warm: 30 m tiles, min 1024 pts
-        pk = prep.prep_dataset("kpconvx_warm", staged, {"chunk-xy": 30.0})
-        check("prep kpconvx_warm: dir name", pk.name == "kpconvx_warm_chunk30")
-        check("prep kpconvx_warm: tiles exist", any((pk / "train").glob("*.npz")))
-
-        # idempotency: second run does no extra work and keeps tile counts
+        # idempotency: a second run does no extra work and keeps tile counts
         n_before = len(list((pd / "train").glob("*.npz")))
-        prep.prep_dataset("ptv3_warm", staged, {"chunk-xy": 50.0})
+        prep.prep_dataset("ptv3", staged, {"chunk-xy": 50.0})
         check("prep: idempotent re-run",
               len(list((pd / "train").glob("*.npz"))) == n_before)
 
-        check("prep: kpconvx_cold correctly unsupported",
-              not prep.supports_local_prep("kpconvx_cold"))
+        # the live backbones without a local prep path are correctly unsupported
+        check("prep: kpconvx_cold + hag variants have no local prep",
+              not prep.supports_local_prep("kpconvx_cold")
+              and not prep.supports_local_prep("ptv3_hag")
+              and not prep.supports_local_prep("randlanet_hag"))
 
         # ---------------- Pretraining: tile_for_model (no PDAL needed)
         from trainer_gui import pretrain
 
         pt_out = tmp / "pretrain_tile"
         prep_dir = pretrain.tile_for_model(str(laz_root / "train"), pt_out,
-                                           "ptv3_warm", {"chunk-xy": 50.0}, progress=print)
-        check("pretrain tile: prep dir tag", prep_dir.name == "ptv3_warm_chunk50")
+                                           "ptv3", {"chunk-xy": 50.0}, progress=print)
+        check("pretrain tile: prep dir tag", prep_dir.name == "ptv3_cold_chunk50")
         check("pretrain tile: staged under out/_staged",
               (pt_out / "_staged" / "train").exists())
         pt_tiles = sorted((prep_dir / "train").glob("*.npz"))
         check("pretrain tile: train tiles produced", len(pt_tiles) > 0)
         zpt = np.load(pt_tiles[0])
         check("pretrain tile: tile keys match prep contract",
-              set(zpt.files) == {"xyz", "intensity", "ret_num", "lab"})
+              set(zpt.files) == {"xyz", "rgb", "lab"})
 
         # ---------------- Pretraining: add_hag (skipped if PDAL absent)
         try:
@@ -501,7 +510,7 @@ def main():
 
         import _modal_shim
         from trainer_gui import local_cli
-        from trainer_gui.backbones import BACKBONES as BB
+        BB = BACKBONES
 
         # the modal shim must import every training script (no torch / no cloud)
         # and expose its @app.local_entrypoint main + the recorded Image recipe.
@@ -593,7 +602,6 @@ def main():
               and appstate._app_base("win32", {"LOCALAPPDATA": "/la"}) == Path("/la"))
 
         # local_cli + appstate exec mode/config, isolated to a throwaway APPDATA
-        from trainer_gui import appstate
         _old_appdata = os.environ.get("APPDATA")
         os.environ["APPDATA"] = str(tmp / "appdata_local")
         try:

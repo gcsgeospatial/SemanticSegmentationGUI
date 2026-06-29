@@ -212,6 +212,13 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
     from scipy.spatial import cKDTree
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "helper"))
     import density as dg
+    # DG flags: env-overridable (GUI "Density generalization" panel / DG_*=1 in the shell).
+    DG_DENSITY_AUG = dg.env_bool("DG_DENSITY_AUG", globals()["DG_DENSITY_AUG"])
+    DG_COARSEN_MAX = dg.env_float("DG_COARSEN_MAX", globals()["DG_COARSEN_MAX"])
+    DG_P_NATIVE    = dg.env_float("DG_P_NATIVE", globals()["DG_P_NATIVE"])
+    DG_LOGDK_FEAT  = dg.env_bool("DG_LOGDK_FEAT", globals()["DG_LOGDK_FEAT"])
+    DG_LOGDK_K     = dg.env_int("DG_LOGDK_K", globals()["DG_LOGDK_K"])
+    DG_INFER_TTA   = dg.env_int("DG_INFER_TTA", globals()["DG_INFER_TTA"])
 
     sys.path.insert(0, "/opt")          # so `import ptv3.model` resolves
 
@@ -268,6 +275,7 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
     for raw, mapped in LABEL_MAP.items():
         LABEL_LUT[int(raw)] = mapped
 
+    HAG_SOURCE = "pdal_hag_nn"
     ds_root = f"{DATASETS_ROOT}/{dataset}" if dataset else None
     if ds_root:
         meta_path = f"{ds_root}/dataset_meta.json"
@@ -278,6 +286,7 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
             ds_meta = json.load(f)
         NUM_CLASSES = int(ds_meta["num_classes"])
         CLASS_NAMES = list(ds_meta["class_names"])
+        HAG_SOURCE = "pdal_hag_nn" if ds_meta.get("has_hag") else "z_minus_scene_min_proxy"
         PREP_DIR = f"{ds_root}/prep/ptv3_cold_hag_chunk{int(CHUNK_XY)}"
     else:
         CLASS_NAMES = list(globals()["CLASS_NAMES"])   # IEEE Track 4 default
@@ -378,6 +387,11 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                 xyz, rgb, lab = load_scene(src)
             except Exception as e:
                 print(f"  skip {src}: {e}", flush=True); continue
+            hag = None
+            if src.endswith(".npz"):
+                z = np.load(src)
+                if "hag" in z.files and len(z["hag"]) == len(xyz):
+                    hag = z["hag"].astype(np.float32)
             print(f"    [{fi+1}/{len(src_paths)}] {scene}: {len(xyz):,} pts "
                   f"loaded in {time.time()-t0:.1f}s, tiling…", flush=True)
             mins, maxs = xyz[:, :2].min(0), xyz[:, :2].max(0)
@@ -388,10 +402,12 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                          (xyz[:, 1] >= y0) & (xyz[:, 1] < y0 + chunk_xy))
                     if m.sum() < 2048: continue
                     out_path = f"{out_dir}/{scene}_x{int(x0)}_y{int(y0)}.npz"
-                    np.savez_compressed(out_path,
-                        xyz=xyz[m].astype(np.float32),
-                        rgb=rgb[m].astype(np.uint8),
-                        lab=lab[m].astype(np.int32))
+                    tile = {"xyz": xyz[m].astype(np.float32),
+                            "rgb": rgb[m].astype(np.uint8),
+                            "lab": lab[m].astype(np.int32)}
+                    if hag is not None:
+                        tile["hag"] = hag[m].astype(np.float32)
+                    np.savez_compressed(out_path, **tile)
                     n_tiles += 1
             print(f"      -> {n_tiles} tiles", flush=True)
 
@@ -745,8 +761,7 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                 "class_names": CLASS_NAMES,
                 "in_channels": 7,
                 "features": ["x", "y", "z", "rgb_r", "rgb_g", "rgb_b", "HAG"],
-                "hag_source": "z_minus_scene_min_proxy" if dataset
-                    else "PDAL hag_nn (trainer_gui Pretraining tab)",
+                "hag_source": HAG_SOURCE,
                 "chunk_xy": CHUNK_XY, "stride": STRIDE,
                 "steps_per_epoch": STEPS,
                 "flash_attn": USE_FLASH_ATTN,

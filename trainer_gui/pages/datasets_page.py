@@ -13,7 +13,9 @@ and intensity normalization live under Advanced.
 
 from __future__ import annotations
 
+import json
 import os
+import re
 from pathlib import Path
 
 from PySide6.QtCore import Qt
@@ -41,6 +43,7 @@ class DatasetsPage(QWidget):
         self._uploading: Path | None = None   # dir currently being uploaded
         self._label_values: dict[int, int] = {}
         self._done_cb = None
+        self._pending_hag_convert: dict | None = None
 
         root = QVBoxLayout(self)
         title = QLabel("Datasets")
@@ -82,6 +85,7 @@ class DatasetsPage(QWidget):
         theme.set_accent(self.stats_label, "muted")
         sd_row.addWidget(self.stats_label, 1)
         root.addLayout(sd_row)
+        root.addWidget(self._density_gen_box())   # per-dataset density-generalization
         self._reload_known()
 
         self._on_companion_toggled(False)
@@ -148,10 +152,22 @@ class DatasetsPage(QWidget):
         flbtn.clicked.connect(self._pick_hag_file)
         hag_in_row.addWidget(flbtn)
         form.addRow("Input folder or file", _wrap(hag_in_row))
+        self.hag_out = QLineEdit()
+        self.hag_out.setPlaceholderText("default: app staging folder / <input>_hag")
+        hag_out_row = QHBoxLayout()
+        hag_out_row.addWidget(self.hag_out)
+        hag_out_btn = QPushButton("Browse…")
+        hag_out_btn.clicked.connect(self._pick_hag_out)
+        hag_out_row.addWidget(hag_out_btn)
+        form.addRow("Output folder", _wrap(hag_out_row))
         self.hag_filter = QComboBox()
         self.hag_filter.addItems(list(pretrain.HAG_FILTERS))
         form.addRow("HAG filter", self.hag_filter)
-        self.hag_btn = QPushButton("Add HAG")
+        # Skip SMRF when the clouds already carry a ground class — re-running it
+        # wastes time and (for class-2-ground data) perturbs existing labels.
+        self.hag_skip_ground = QCheckBox("Clouds already have ground classified (class 2) — skip SMRF")
+        form.addRow("", self.hag_skip_ground)
+        self.hag_btn = QPushButton("Add HAG + Convert")
         self.hag_btn.clicked.connect(self._run_hag)
         row = QHBoxLayout()
         row.addWidget(self.hag_btn)
@@ -269,7 +285,7 @@ class DatasetsPage(QWidget):
     # ============================================================= 5. Convert/Upload
     def _go_layout(self) -> QVBoxLayout:
         go_row = QHBoxLayout()
-        self.convert_btn = QPushButton("Convert")
+        self.convert_btn = QPushButton("Convert without HAG")
         self.convert_btn.setObjectName("primary")
         self.convert_btn.clicked.connect(self._convert)
         go_row.addWidget(self.convert_btn)
@@ -369,6 +385,13 @@ class DatasetsPage(QWidget):
         if f:
             self.hag_in.setText(f)
 
+    def _pick_hag_out(self):
+        d = QFileDialog.getExistingDirectory(
+            self, "Output folder for HAG clouds",
+            self.hag_out.text().strip() or str(appstate.staging_dir()))
+        if d:
+            self.hag_out.setText(d)
+
     def _populate_fields(self, path: str):
         self.field_combo.clear()
         files = dataset.expand_inputs(path)
@@ -403,6 +426,32 @@ class DatasetsPage(QWidget):
     def _intensity_norm(self) -> str:
         return "p95" if self.intensity_norm.currentIndex() == 1 else "max"
 
+    def _hag_conversion_spec(self, spec: LabelSpec) -> LabelSpec:
+        """Label spec after add_hag writes LAZ outputs.
+
+        Companion labels still refer to the original truth folder, but the cloud
+        filename suffix changes to .laz. Non-LAS field names are sanitized into
+        LAS dimension names in pretrain._structured_from_cloud, so mirror that.
+        """
+        if spec.kind == "file":
+            suffix = spec.src_suffix.strip()
+            if suffix:
+                p = Path(suffix)
+                src_suffix = p.with_suffix(".laz").name if p.suffix else suffix + ".laz"
+            else:
+                src_suffix = ".laz"
+            return LabelSpec(kind="file", truth_dir=spec.truth_dir,
+                             src_suffix=src_suffix, dst_suffix=spec.dst_suffix)
+        field = spec.field.strip()
+        if field.lower() == "classification":
+            # add_hag ferried the original Classification here before SMRF
+            # clobbered it (see _run_hag's `preserve` arg).
+            return LabelSpec(kind="field", field=pretrain.HAG_PRESERVED_CLASS_DIM)
+        dim = re.sub(r"[^A-Za-z0-9_]", "_", field)
+        if dim and dim[0].isdigit():
+            dim = "field_" + dim
+        return LabelSpec(kind="field", field=dim or field)
+
     # ------------------------------------------------------------- pre-process (HAG)
     def _run_hag(self):
         in_dir = self.hag_in.text().strip()
@@ -412,16 +461,47 @@ class DatasetsPage(QWidget):
         if self.worker.running:
             self._append("A local job is already running — wait for it to finish.")
             return
-        # No output field: HAG writes to a sibling "<name>_hag" folder under the
-        # staging/output root and auto-feeds it in as the dataset input.
-        out_dir = str(self._output_root() / f"{Path(in_dir).stem}_hag")
+        # Empty output keeps the standard app config/staging location; a selected
+        # folder is used directly so users can put HAG products somewhere findable.
+        out_dir = (self.hag_out.text().strip()
+                   or str(appstate.staging_dir() / f"{Path(in_dir).stem}_hag"))
+        plan = self._conversion_plan(out_dir, require_input_exists=False)
+        if plan is None:
+            self._append("Add HAG + Convert needs the dataset name, label scan/classes, "
+                         "and split settings ready first.")
+            return
+        self._pending_hag_convert = plan
         flt = self.hag_filter.currentText()
+        skip_ground = self.hag_skip_ground.isChecked()
+        # SMRF overwrites Classification; when that's the label field, ferry it
+        # aside so the real labels survive HAG (mirrored by _hag_conversion_spec).
+        spec = plan["spec"]
+        preserve = (pretrain.HAG_PRESERVED_CLASS_DIM
+                    if spec.kind == "field" and spec.field.strip().lower() == "classification"
+                    else None)
+        # 'Separate validation folder' split: HAG the val folder too, so train and
+        # val carry the same real HAG feature (else val silently uses a z-min proxy
+        # and the dataset's has_hag flag flips off for everyone).
+        val_dir = plan["val_inputs"][0] if plan.get("val_inputs") else None
+        val_out = (str(appstate.staging_dir() / f"{Path(val_dir).stem}_hag")
+                   if val_dir else None)
         self.hag_btn.setEnabled(False)
+        self.convert_btn.setEnabled(False)
         self.hag_busy.setVisible(True)
-        self._append(f"Adding HAG ({flt}, SMRF ground) …")
+        self._append(f"Adding HAG ({flt}, "
+                     f"{'ground given' if skip_ground else 'SMRF ground'}), then converting …")
 
         def job(progress):
-            return pretrain.add_hag(in_dir, out_dir, hag_filter=flt, progress=progress)
+            summary = pretrain.add_hag(in_dir, out_dir, hag_filter=flt,
+                                       skip_ground=skip_ground,
+                                       preserve_class_as=preserve, progress=progress)
+            if val_dir:
+                progress(f"HAG on validation folder {Path(val_dir).name} …")
+                vs = pretrain.add_hag(val_dir, val_out, hag_filter=flt,
+                                      skip_ground=skip_ground,
+                                      preserve_class_as=preserve, progress=progress)
+                summary["val_output_dir"] = vs["output_dir"]
+            return summary
 
         self._done_cb = self._on_hag_done
         self.worker.start(job)
@@ -429,11 +509,17 @@ class DatasetsPage(QWidget):
     def _on_hag_done(self, summary):
         self.hag_btn.setEnabled(pretrain.pdal_available())
         out = summary["output_dir"]
-        if not self.input_edit.text().strip():   # streamline: feed straight into the dataset
-            self._set_input(out)
+        self._set_input(out)   # HAG output is now the dataset input for Scan/Convert/Upload.
         self._append(f"\n✓ HAG done — {summary['n_files']} cloud(s), "
-                     f"{summary['total_points']:,} pts -> {out}\n"
-                     f"  (set as the dataset input above — scan labels and convert).")
+                     f"{summary['total_points']:,} pts -> {out}")
+        plan = self._pending_hag_convert or self._conversion_plan(out)
+        self._pending_hag_convert = None
+        if plan is not None:
+            plan["in_path"] = out
+            if summary.get("val_output_dir"):
+                plan["val_inputs"] = [summary["val_output_dir"]]
+            plan["spec"] = self._hag_conversion_spec(plan["spec"])
+            self._start_convert(plan, hag=True)
 
     # ------------------------------------------------------------- scan / analyze
     def _scan_labels(self):
@@ -477,7 +563,8 @@ class DatasetsPage(QWidget):
                 self.class_table.setItem(r, col, item)
             self.class_table.setItem(r, 3, QTableWidgetItem(f"class_{val}"))
         self._append(f"Found {len(counts)} distinct label values. Name the classes, "
-                     f"uncheck any that mean 'unknown', then Convert.")
+                     f"uncheck any that mean 'unknown', then use Add HAG + Convert "
+                     f"or Convert without HAG.")
 
     def _analyze(self):
         in_path = self.input_edit.text().strip()
@@ -565,47 +652,65 @@ class DatasetsPage(QWidget):
             classes.append({"index": name_to_index[name], "source_value": val, "name": name})
         return classes, ignored
 
-    def _convert(self):
+    def _conversion_plan(self, in_path: str | None = None, *, require_input_exists: bool = True):
         name = self.name_edit.text().strip()
-        in_path = self.input_edit.text().strip()
-        if not (name and os.path.exists(in_path)):
+        in_path = in_path or self.input_edit.text().strip()
+        if not name or (require_input_exists and not os.path.exists(in_path)):
             self._append("Need a name and an input file or folder.")
-            return
+            return None
         split = self._split_config()
         val_inputs = None
         if split.strategy == "provided":
             val_dir = self.val_edit.text().strip()
             if not os.path.isdir(val_dir):
                 self._append("'Separate validation folder' is selected — choose that folder.")
-                return
+                return None
             val_inputs = [val_dir]
         if self.class_table.rowCount() == 0:
             self._append("Run 'Scan label values' and name your classes first.")
-            return
+            return None
         classes, ignored = self._classes_from_table()
         if not classes:
             self._append("All label values are unchecked — nothing to train on.")
-            return
-        spec = self._spec()
-        norm = self._intensity_norm()
-        out_root = self._output_root()
+            return None
+        return {
+            "name": name, "in_path": in_path, "split": split, "val_inputs": val_inputs,
+            "classes": classes, "ignored": ignored, "spec": self._spec(),
+            "norm": self._intensity_norm(), "out_root": self._output_root(),
+        }
+
+    def _start_convert(self, plan: dict, *, hag: bool = False):
+        name = plan["name"]
+        classes = plan["classes"]
+        ignored = plan["ignored"]
+        split = plan["split"]
+        out_root = plan["out_root"]
         self.convert_btn.setEnabled(False)
+        self.hag_btn.setEnabled(False)
         self.upload_btn.setEnabled(False)
         self.busy.setVisible(True)
-        self._append(f"Converting '{name}' ({len(classes)} classes, split={split.strategy}, "
-                     f"ignored values: {ignored}) -> {out_root}…")
+        kind = "HAG dataset" if hag else "dataset"
+        self._append(f"Converting {kind} '{name}' ({len(classes)} classes, "
+                     f"split={split.strategy}, ignored values: {ignored}) -> {out_root}…")
 
         def job(progress):
-            return dataset.convert_dataset(name, [in_path], spec, classes, ignored,
-                                           out_root, val_inputs=val_inputs,
-                                           split=split, intensity_norm=norm, progress=progress)
+            return dataset.convert_dataset(
+                name, [plan["in_path"]], plan["spec"], classes, ignored,
+                out_root, val_inputs=plan["val_inputs"], split=split,
+                intensity_norm=plan["norm"], progress=progress)
 
         self._done_cb = self._on_converted
         self.worker.start(job)
 
+    def _convert(self):
+        plan = self._conversion_plan()
+        if plan is not None:
+            self._start_convert(plan)
+
     def _on_converted(self, staged: Path):
         self._staged_dir = staged
         self.convert_btn.setEnabled(True)
+        self.hag_btn.setEnabled(pretrain.pdal_available())
         self.upload_btn.setEnabled(True)
         appstate.remember_dataset(staged.name, {
             "staged_dir": str(staged),
@@ -622,7 +727,7 @@ class DatasetsPage(QWidget):
 
     def _upload(self):
         if not (self._staged_dir and self._staged_dir.exists()):
-            self._append("Convert a dataset first.")
+            self._append("Convert a dataset first (Add HAG + Convert, or Convert without HAG).")
             return
         self._start_upload(self._staged_dir)
 
@@ -698,6 +803,7 @@ class DatasetsPage(QWidget):
 
     def _on_worker_error(self, tb: str):
         self._done_cb = None
+        self._pending_hag_convert = None
         self._busy_off()
         self.scan_btn.setEnabled(True)
         self.analyze_btn.setEnabled(True)
@@ -705,6 +811,163 @@ class DatasetsPage(QWidget):
         self.hag_btn.setEnabled(pretrain.pdal_available())
         self.status.setText("✗ Error — see the dialog for details.")
         QMessageBox.critical(self, "Dataset error", tb)
+
+    # ------------------------------------------------- density generalization
+    def _density_gen_box(self) -> QGroupBox:
+        """Per-dataset density-generalization options. Uses the dataset's stored
+        density + a target inference density to recommend which features to enable;
+        the choice is saved per dataset and applied as DG_* env vars at train time."""
+        box = QGroupBox("Density generalization (advanced)")
+        box.setToolTip("Make the model robust to inference at a different point density "
+                       "than it trained on. Pick a saved dataset below to configure.")
+        self._dg_name = None
+        self._dg_density = None
+        lay = QVBoxLayout(box)
+
+        self.dg_train_lbl = QLabel("Select a saved dataset below to configure.")
+        theme.set_accent(self.dg_train_lbl, "muted")
+        lay.addWidget(self.dg_train_lbl)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Target inference density (pts/m²):"))
+        self.dg_infer = QDoubleSpinBox()
+        self.dg_infer.setRange(0.01, 100000.0)
+        self.dg_infer.setDecimals(2)
+        self.dg_infer.setValue(2.0)
+        row.addWidget(self.dg_infer)
+        self.dg_reco_btn = QPushButton("Recommend")
+        self.dg_reco_btn.clicked.connect(self._dg_recommend)
+        row.addWidget(self.dg_reco_btn)
+        row.addStretch(1)
+        lay.addWidget(ui.wrap(row))
+
+        self.dg_rationale = QLabel("")
+        self.dg_rationale.setWordWrap(True)
+        theme.set_accent(self.dg_rationale, "muted")
+        lay.addWidget(self.dg_rationale)
+
+        self.dg_aug = QCheckBox("Density augmentation — train across the density range")
+        self.dg_coarsen = QDoubleSpinBox()
+        self.dg_coarsen.setRange(1.0, 6.0)
+        self.dg_coarsen.setSingleStep(0.1)
+        self.dg_coarsen.setValue(2.5)
+        self.dg_pnative = QDoubleSpinBox()
+        self.dg_pnative.setRange(0.0, 1.0)
+        self.dg_pnative.setSingleStep(0.05)
+        self.dg_pnative.setValue(0.5)
+        r1 = QHBoxLayout()
+        r1.addWidget(self.dg_aug)
+        r1.addWidget(QLabel("coarsen ×"))
+        r1.addWidget(self.dg_coarsen)
+        r1.addWidget(QLabel("native P"))
+        r1.addWidget(self.dg_pnative)
+        r1.addStretch(1)
+        lay.addWidget(ui.wrap(r1))
+
+        self.dg_logdk = QCheckBox("log d_k density channel — needs retrain (changes input dim)")
+        self.dg_k = QSpinBox()
+        self.dg_k.setRange(1, 64)
+        self.dg_k.setValue(8)
+        r2 = QHBoxLayout()
+        r2.addWidget(self.dg_logdk)
+        r2.addWidget(QLabel("k"))
+        r2.addWidget(self.dg_k)
+        r2.addStretch(1)
+        lay.addWidget(ui.wrap(r2))
+
+        # AdaBN + density-TTA are inference-time (label-free, no retrain) and apply to ANY
+        # model, so they live on the Inference page, not in this per-dataset train config.
+        infer_hint = QLabel("AdaBN & density-TTA are inference-time (no retrain) — turn them "
+                            "on per-run on the Inference page.")
+        infer_hint.setWordWrap(True)
+        theme.set_accent(infer_hint, "muted")
+        lay.addWidget(infer_hint)
+
+        r4 = QHBoxLayout()
+        self.dg_save_btn = QPushButton("Save to dataset")
+        self.dg_save_btn.clicked.connect(self._dg_save)
+        self.dg_clear_btn = QPushButton("Clear")
+        self.dg_clear_btn.clicked.connect(self._dg_clear)
+        r4.addWidget(self.dg_save_btn)
+        r4.addWidget(self.dg_clear_btn)
+        self.dg_status = QLabel("")
+        theme.set_accent(self.dg_status, "muted")
+        r4.addWidget(self.dg_status, 1)
+        lay.addWidget(ui.wrap(r4))
+
+        box.setEnabled(False)
+        self.dg_box = box
+        return box
+
+    def _dg_bind(self, name: str, info: dict):
+        """Point the panel at the selected dataset: read its training density from
+        dataset_meta.json and load any saved DG config."""
+        self._dg_name = name
+        self._dg_density = None
+        mp = info.get("meta_path", "")
+        if mp and os.path.isfile(mp):
+            try:
+                with open(mp, encoding="utf-8") as f:
+                    self._dg_density = float(json.load(f).get("stats", {})
+                                             .get("mean_pts_per_m2") or 0) or None
+            except (OSError, ValueError, json.JSONDecodeError):
+                self._dg_density = None
+        if self._dg_density:
+            self.dg_train_lbl.setText(f"Training density: {self._dg_density:.1f} pts/m²  ·  '{name}'")
+        else:
+            self.dg_train_lbl.setText(f"'{name}': no stored density — set features manually "
+                                      f"(Recommend needs a density).")
+        self.dg_reco_btn.setEnabled(bool(self._dg_density))
+        self.dg_box.setEnabled(True)
+        self.dg_rationale.setText("")
+        self._dg_load(appstate.get_dg_config(name))
+
+    def _dg_load(self, cfg: dict):
+        self.dg_infer.setValue(float(cfg.get("infer_density", self._dg_density or 2.0)))
+        self.dg_aug.setChecked(bool(cfg.get("density_aug", False)))
+        self.dg_coarsen.setValue(float(cfg.get("coarsen_max", 2.5)))
+        self.dg_pnative.setValue(float(cfg.get("p_native", 0.5)))
+        self.dg_logdk.setChecked(bool(cfg.get("logdk", False)))
+        self.dg_k.setValue(int(cfg.get("logdk_k", 8)))
+
+    def _dg_recommend(self):
+        if not self._dg_density:
+            self.dg_status.setText("This dataset has no stored density to recommend from.")
+            return
+        rec = analysis.dg_recommend(self._dg_density, self.dg_infer.value())
+        self.dg_aug.setChecked(rec["density_aug"])
+        self.dg_coarsen.setValue(rec["coarsen_max"])
+        self.dg_pnative.setValue(rec["p_native"])
+        self.dg_logdk.setChecked(rec["logdk"])
+        self.dg_k.setValue(rec["logdk_k"])
+        self.dg_rationale.setText(rec["rationale"])
+
+    def _dg_collect(self) -> dict:
+        return {"infer_density": round(self.dg_infer.value(), 2),
+                "density_aug": self.dg_aug.isChecked(),
+                "coarsen_max": round(self.dg_coarsen.value(), 2),
+                "p_native": round(self.dg_pnative.value(), 2),
+                "logdk": self.dg_logdk.isChecked(),
+                "logdk_k": self.dg_k.value()}
+
+    def _dg_save(self):
+        if not self._dg_name:
+            self.dg_status.setText("Select a dataset first.")
+            return
+        cfg = self._dg_collect()
+        appstate.set_dg_config(self._dg_name, cfg)
+        n = len(analysis.dg_config_to_env(cfg))
+        self.dg_status.setText(
+            f"✓ Saved for '{self._dg_name}' — {n} DG var(s) active at train."
+            if n else f"✓ Saved for '{self._dg_name}' — all features off (baseline).")
+
+    def _dg_clear(self):
+        if not self._dg_name:
+            return
+        appstate.set_dg_config(self._dg_name, {})
+        self.dg_rationale.setText("")
+        self._dg_load({})
+        self.dg_status.setText(f"Cleared DG config for '{self._dg_name}'.")
 
     # ------------------------------------------------------------- known list
     def _reload_known(self):
@@ -718,6 +981,7 @@ class DatasetsPage(QWidget):
         if not items:
             return
         info = appstate.known_datasets().get(items[0].text(), {})
+        self._dg_bind(items[0].text(), info)
         if info.get("builtin"):
             self.stats_label.setText(f"{items[0].text()} (built-in): {info.get('note', '')}")
             return

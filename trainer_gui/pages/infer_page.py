@@ -16,10 +16,10 @@ from pathlib import Path
 
 from PySide6.QtCore import QProcess
 from PySide6.QtGui import QColor, QTextCursor
-from PySide6.QtWidgets import (QColorDialog, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
-                               QFileDialog, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout, QLabel,
-                               QLineEdit, QPlainTextEdit, QPushButton, QRadioButton, QVBoxLayout,
-                               QWidget)
+from PySide6.QtWidgets import (QCheckBox, QColorDialog, QComboBox, QDialog, QDialogButtonBox,
+                               QDoubleSpinBox, QFileDialog, QFormLayout, QGridLayout, QGroupBox,
+                               QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit, QPushButton,
+                               QRadioButton, QSpinBox, QVBoxLayout, QWidget)
 
 from .. import appstate, dataset, local_cli, modal_cli, ui
 from ..backbones import BACKBONES, infer_backbones
@@ -46,6 +46,7 @@ class InferPage(QWidget):
         self._manifest: dict | None = None         # the picked run.json (local runs)
         self._manifest_path: Path | None = None
         self._local_weights: Path | None = None    # weights = the run.json's sibling
+        self._dg: dict = {}                         # DG settings baked into the weights (run.json["dg"])
 
         root = QVBoxLayout(self)
         title = QLabel("Inference")
@@ -134,6 +135,28 @@ class InferPage(QWidget):
         self.chunk_spin.setDecimals(0)
         self.chunk_spin.setValue(50.0)
         iform.addRow("Tile size (m)", self.chunk_spin)
+        # Density generalization — INFERENCE-time, label-free, no retrain. Applies to ANY
+        # model, so it lives here (a serving choice) not on the per-dataset Train panel.
+        # Worth turning on when this cloud's density differs from the training density.
+        self.dg_adabn_chk = QCheckBox("AdaBN — re-fit norm stats to this cloud (KPConvX / RandLA)")
+        self.dg_adabn_chk.setToolTip(
+            "Recompute BatchNorm running stats on the target tiles before predicting, so "
+            "source-density stats stop mis-normalizing at a different inference density. "
+            "Label-free, no retrain. No-op for PTv3 (its BN is stem/pooling only).")
+        iform.addRow("Density adapt", self.dg_adabn_chk)
+        self.dg_tta_chk = QCheckBox("Density TTA — average over")
+        self.dg_tta_chk.setToolTip(
+            "Average softmax over several density/scale resamplings of each tile to lower "
+            "boundary-point variance. Label-free, no retrain. More views = slower.")
+        self.dg_tta_spin = QSpinBox()
+        self.dg_tta_spin.setRange(1, 9)
+        self.dg_tta_spin.setValue(3)
+        tta_row = QHBoxLayout()
+        tta_row.addWidget(self.dg_tta_chk)
+        tta_row.addWidget(self.dg_tta_spin)
+        tta_row.addWidget(QLabel("extra views"))
+        tta_row.addStretch(1)
+        iform.addRow("", _wrap(tta_row))
         # Where prediction files land: on the host directly in local mode, or where
         # Modal predictions get downloaded. Always the user's express choice — empty
         # just falls back to a findable Downloads folder, never a hidden app dir.
@@ -381,6 +404,24 @@ class InferPage(QWidget):
         """#8: any edit to the path text drops the previously-loaded manifest, so a
         run can't proceed with stale weights/params (editingFinished reloads it)."""
         self._manifest = self._manifest_path = self._local_weights = None
+        self._dg = {}
+
+    def _infer_dg_env(self) -> dict:
+        """DG_* env for the inference container. Two sources, both inference-time:
+        logdk is RECOVERED from the weights' run.json (it changed the input width, so
+        the channel must be recomputed or the load fails); AdaBN/TTA are the live
+        toggles above (label-free, no retrain, applicable to any model)."""
+        env: dict[str, str] = {}
+        if self._dg.get("logdk"):
+            env["DG_LOGDK_FEAT"] = "1"
+            env["DG_LOGDK_K"] = str(int(self._dg.get("logdk_k", 8)))
+        if self.dg_adabn_chk.isChecked():
+            env["DG_INFER_ADABN"] = "1"
+        if self.dg_tta_chk.isChecked():
+            env["DG_INFER_TTA"] = str(self.dg_tta_spin.value())
+        if env:
+            self._append("[dg] inference: " + " ".join(f"{k}={v}" for k, v in sorted(env.items())))
+        return env
 
     def _load_run_manifest(self):
         """Apply the picked run.json — the SINGLE explicit input for local inference.
@@ -418,10 +459,17 @@ class InferPage(QWidget):
         if j >= 0:
             self.inorm_combo.setCurrentIndex(j)
         self._local_weights = p.parent / m.get("weights", "final_model.pth")
+        # DG settings baked into the weights: logdk changes the input width, so it MUST
+        # be re-fed at inference (re-injected as DG_* env below). AdaBN/TTA are separate
+        # inference-time toggles in the Input box.
+        self._dg = m.get("dg") or {}
         ok = "✓" if self._local_weights.is_file() else "✗ weights missing —"
         self._append(f"Loaded {p.name}: {bkey}, grid={m.get('grid')}, "
                      f"chunk={m.get('chunk_xy')}, intensity={m.get('intensity_norm')}. "
                      f"{ok} {self._local_weights}")
+        if self._dg.get("logdk"):
+            self._append(f"[dg] this model was trained with the log-d_k density channel "
+                         f"(k={self._dg.get('logdk_k', 8)}) — it will be recomputed at inference.")
 
     def _on_source_toggle(self):
         from_run = self.from_run_radio.isChecked()
@@ -708,7 +756,7 @@ class InferPage(QWidget):
             flags["chunk-xy"] = self.chunk_spin.value()
         self._stage = "run_local"
         prog, args = local_cli.run_script(b.script, flags, b, repo_root=self.repo_root,
-                                          extra_mounts=extra_mounts)
+                                          extra_mounts=extra_mounts, env=self._infer_dg_env())
         self._append(f"[local] Running inference in Docker ({b.label}) …")
         self._append(f"[local] $ {local_cli.preview(prog, args)}\n")
         if not local_cli.have_docker():

@@ -142,7 +142,7 @@ def _mounts(cfg: dict, repo_root: str, extra_mounts, outputs_root: str = "") -> 
 
 def run_script(script: str, flags: dict, backbone, *, repo_root: str,
                gpu: str = "", extra_mounts=None,
-               outputs_root: str = "") -> tuple[str, list[str]]:
+               outputs_root: str = "", env: "dict | None" = None) -> tuple[str, list[str]]:
     """`docker run --rm --gpus all -v ... <image> python scripts/local/local_train_<key>.py --flags`.
 
     `script` (the modal_train_*.py name) is accepted for call-site parity with
@@ -158,6 +158,8 @@ def run_script(script: str, flags: dict, backbone, *, repo_root: str,
     args += _mounts(cfg, repo_root, extra_mounts, outputs_root=outputs_root)
     if gpu:
         args += ["-e", f"TT_GPU={gpu}"]          # cosmetic locally; keeps log parity
+    for k, v in (env or {}).items():             # e.g. DG_* density-generalization flags
+        args += ["-e", f"{k}={v}"]
     args += list(cfg.get("extra_args", []))
     args += [effective_image(backbone), "python", f"scripts/local/local_train_{backbone.key}.py"]
     for key, val in flags.items():

@@ -52,6 +52,25 @@ class BestCheckpoint:
             save_last(self.final)
 
 
+def _dg_block() -> dict | None:
+    """DG settings that must travel WITH the weights, read from the same env the
+    training process ran under. `logdk` changes the model's input width, so
+    inference has to rebuild at that width and recompute the channel (with the same
+    k) — record both so run.json is self-describing. AdaBN/TTA are inference-time
+    choices made on the Infer page, NOT a property of the weights, so not here."""
+    try:
+        import density as dg   # sibling helper; always importable when a trainer runs
+    except ImportError:
+        return None
+    return {
+        "density_aug": dg.env_bool("DG_DENSITY_AUG", False),
+        "coarsen_max": dg.env_float("DG_COARSEN_MAX", 2.5),
+        "p_native":    dg.env_float("DG_P_NATIVE", 0.5),
+        "logdk":       dg.env_bool("DG_LOGDK_FEAT", False),
+        "logdk_k":     dg.env_int("DG_LOGDK_K", 8),
+    }
+
+
 def _intensity_norm_from_meta(meta: dict) -> str:
     """Where convert_dataset records the intensity normalization: under
     meta['source']['intensity_norm'] (a top-level copy is tolerated for other
@@ -86,6 +105,7 @@ def write_run_manifest(run_dir, backbone, dataset=None, weights="final_model.pth
                 inorm = _intensity_norm_from_meta(json.load(f))
         except (OSError, ValueError):
             inorm = "max"
+    dg = _dg_block()
     manifest = {
         "schema": "trainer_gui.run/2",
         "backbone": backbone,
@@ -100,6 +120,11 @@ def write_run_manifest(run_dir, backbone, dataset=None, weights="final_model.pth
         # model-specific extras (absent/None when a backbone doesn't use them):
         "label_map_asprs_to_index": rc.get("label_map_asprs_to_index"),  # ASPRS remap / IEEE flag
         "num_points": rc.get("num_points"),                              # RandLA sample size
+        # density-generalization settings baked into the weights. `logdk` changes the
+        # model input width, so inference MUST re-set DG_LOGDK_FEAT/_K to rebuild and
+        # recompute the channel — that's why it travels with the weights here. AdaBN/TTA
+        # are inference-time choices (Infer page), deliberately NOT recorded.
+        "dg": dg,
     }
     with open(os.path.join(run_dir, "run.json"), "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
@@ -124,7 +149,8 @@ def infer_meta(weights_path):
         except (OSError, ValueError):
             return None
         return {k: m.get(k) for k in ("num_classes", "class_names", "grid", "chunk_xy",
-                                      "hag_source", "label_map_asprs_to_index", "num_points")}
+                                      "hag_source", "label_map_asprs_to_index", "num_points",
+                                      "dg")}
     if os.path.exists(rc_path):
         try:
             with open(rc_path, encoding="utf-8") as f:
@@ -169,6 +195,13 @@ def _demo():  # ponytail: one runnable check -- `python train_common.py`
     assert m["intensity_norm"] == "p95" and m["feature_mode"] == "hag"
     assert m["hag_source"] == "pdal_hag_nn"
     assert os.path.exists(os.path.join(d, "run.json"))
+    # DG round-trip: defaults (no env) -> logdk off; env on -> recorded + readable back
+    assert m["dg"] is not None and m["dg"]["logdk"] is False
+    os.environ["DG_LOGDK_FEAT"] = "1"; os.environ["DG_LOGDK_K"] = "12"
+    m2 = write_run_manifest(d, "kpconvx_cold_hag")
+    assert m2["dg"]["logdk"] is True and m2["dg"]["logdk_k"] == 12
+    assert infer_meta(os.path.join(d, "final_model.pth"))["dg"]["logdk"] is True
+    os.environ.pop("DG_LOGDK_FEAT"); os.environ.pop("DG_LOGDK_K")
 
     # intensity_norm lives under dataset_meta['source'] — read it from there
     assert _intensity_norm_from_meta({"source": {"intensity_norm": "p95"}}) == "p95"

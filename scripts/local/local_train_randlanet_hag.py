@@ -173,6 +173,14 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     from torch.utils.data import DataLoader, Dataset
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "helper"))
     import density as dg
+    # DG flags: env-overridable (GUI "Density generalization" panel / DG_*=1 in the shell).
+    DG_DENSITY_AUG = dg.env_bool("DG_DENSITY_AUG", globals()["DG_DENSITY_AUG"])
+    DG_COARSEN_MAX = dg.env_float("DG_COARSEN_MAX", globals()["DG_COARSEN_MAX"])
+    DG_P_NATIVE    = dg.env_float("DG_P_NATIVE", globals()["DG_P_NATIVE"])
+    DG_LOGDK_FEAT  = dg.env_bool("DG_LOGDK_FEAT", globals()["DG_LOGDK_FEAT"])
+    DG_LOGDK_K     = dg.env_int("DG_LOGDK_K", globals()["DG_LOGDK_K"])
+    DG_INFER_ADABN = dg.env_bool("DG_INFER_ADABN", globals()["DG_INFER_ADABN"])
+    DG_INFER_TTA   = dg.env_int("DG_INFER_TTA", globals()["DG_INFER_TTA"])
 
     # --- resolve config: CLI args override the module defaults ---------------
     SUB_GRID_SIZE = sub_grid if sub_grid is not None else globals()["SUB_GRID_SIZE"]
@@ -186,6 +194,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     STEPS         = steps_per_epoch if steps_per_epoch is not None else 500
     NUM_CLASSES   = globals()["NUM_CLASSES"]
     CLASS_NAMES   = globals()["CLASS_NAMES"]
+    HAG_SOURCE    = "pdal_hag_nn"
 
     ds_root = f"{DATASETS_ROOT}/{dataset}" if dataset else None
     if ds_root:
@@ -197,6 +206,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
             ds_meta = json.load(f)
         NUM_CLASSES = int(ds_meta["num_classes"])
         CLASS_NAMES = list(ds_meta["class_names"])
+        HAG_SOURCE = "pdal_hag_nn" if ds_meta.get("has_hag") else "z_minus_scene_min_proxy"
         # No "warm" in the name: the cold sibling shares this cache (identical prep).
         PREP_DIR = f"{ds_root}/prep/randlanet_hag_grid{int(round(SUB_GRID_SIZE * 100))}_p95"
     else:
@@ -400,6 +410,12 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
             return load_canonical(pc_path)
         return load_ieee(pc_path, cls_path)
 
+    def load_canonical_hag(npz_path, xyz):
+        z = np.load(npz_path)
+        if "hag" in z.files and len(z["hag"]) == len(xyz):
+            return z["hag"].astype(np.float32)
+        return (xyz[:, 2] - xyz[:, 2].min()).astype(np.float32)
+
     def grid_subsample(xyz, intensity, ret_num, hag, lab, grid):
         keys = np.floor(xyz / grid).astype(np.int64)
         _, uniq = np.unique(keys, axis=0, return_index=True)
@@ -463,7 +479,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
             "label_map": (None if ds_root
                           else {str(k): v for k, v in sorted(LABEL_MAP.items())}),
             "feature_recipe": "xyz,intensity,return_number,hag",
-            "hag_source": ("z_minus_scene_min_proxy" if ds_root else "pdal_hag_nn"),
+            "hag_source": HAG_SOURCE,
             "hag_train_dir": (None if ds_root else HAG_TRAIN_DIR),
             "hag_test_dir": (None if ds_root else HAG_TEST_DIR),
         }
@@ -524,8 +540,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                 try:
                     xyz, intensity, ret_num, lab = load_scene(pc_path, cls_path)
                     n_in = len(xyz)
-                    # Real HAG for IEEE; z-scene-min proxy for canonical datasets.
-                    hag = ((xyz[:, 2] - xyz[:, 2].min()).astype(np.float32)
+                    hag = (load_canonical_hag(pc_path, xyz)
                            if ds_root else load_hag(name, hag_dir, xyz))
                     xyz, intensity, ret_num, hag, lab = grid_subsample(
                         xyz, intensity, ret_num, hag, lab, SUB_GRID_SIZE)
@@ -925,7 +940,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
             "batch_size": BATCH_SIZE, "num_points": NUM_POINTS,
             "sub_grid_size": SUB_GRID_SIZE, "in_dim": IN_DIM,
             "features": ["x", "y", "z", "intensity", "return_number", "HAG"],
-            "hag_source": "PDAL hag_nn (trainer_gui Pretraining tab)",
+            "hag_source": HAG_SOURCE,
             "steps_per_epoch": STEPS,
             "class_balance": {"weighting": CLASS_WEIGHTING, "beta": WEIGHT_BETA,
                               "weight_scheme": "inv_sqrt_freq" if WEIGHT_BETA == 0.5

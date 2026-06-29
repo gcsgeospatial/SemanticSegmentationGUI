@@ -112,7 +112,33 @@ model input dim by 1 — retrain-only (old weights won't load); KPConvX feeds it
 - **D0/D0b explicit knob** — all three backbones already grid-canonicalize density at inference, so a
   separate knob is a no-op for the current grids; expose only if a deploy needs a g0 ≠ the model grid.
 
-**How to turn on:** set the flags in a script's config block. Cheapest first read on how much
-density hurts today — no retrain: `DG_INFER_ADABN=True` and/or `DG_INFER_TTA=3` on a
-different-density cloud. Bulk lever (retrain): `DG_DENSITY_AUG=True`, tune `DG_COARSEN_MAX`
-to `1/(g0*sqrt(rho_min))`.
+**How to turn on — three ways (all the same `DG_*` knobs).** The GUI is split by lifecycle:
+- **Train-time** (`density_aug`, `logdk`) — bake into the weights:
+1. **GUI**: Datasets page -> select a saved dataset -> **"Density generalization (advanced)"** panel.
+   It reads the dataset's stored density, takes your **target inference density**, and **Recommend**
+   fills the train toggles (`analysis.dg_recommend`); **Save to dataset** persists it (`appstate`
+   `dg_config`). The Train page injects them as `DG_*` env at launch (local docker `-e`). At the end of
+   training `write_run_manifest` reads the same env and records a **`dg` block in `run.json`** (logdk +
+   k), so the model is self-describing.
+- **Inference-time** (`adabn`, `tta`) — label-free, no retrain, applies to any model:
+1. **GUI**: Inference page -> Input box -> **AdaBN** / **Density TTA** toggles. The launch
+   (`_infer_dg_env`) also re-injects `DG_LOGDK_FEAT`/`_K` **recovered from the run.json `dg` block**, so
+   a logdk-trained model rebuilds at the right width and recomputes the channel automatically. (A bare
+   `.pth` with no run.json can't recover logdk — pick the run.json, or the load fails loudly.)
+- Either lifecycle, **directly**:
+2. **Env var**: `DG_DENSITY_AUG=1 DG_INFER_ADABN=1 python local_train_kpconvx_cold.py ...`.
+   Each script reads `DG_*` in its config block via `dg.env_bool/float/int/str(name, globals()[name])`.
+3. **Edit the constant** in the script's config block.
+
+Cheapest first read on how much density hurts today — no retrain: `DG_INFER_ADABN=1` and/or
+`DG_INFER_TTA=3` on a different-density cloud. Bulk lever (retrain): `DG_DENSITY_AUG=1`, tune
+`DG_COARSEN_MAX` to `1/(g0*sqrt(rho_min))` (the GUI's Recommend computes `sqrt(train/infer)` for you).
+
+**Plumbing:** `scripts/helper/density.py` `env_*` helpers + per-script env-shadow block;
+`train_common.py` `_dg_block`/`write_run_manifest` (records the `dg` block in run.json) + `infer_meta`
+(reads it back); `trainer_gui/analysis.py` `dg_recommend`/`dg_config_to_env` (train-time only);
+`appstate.get/set_dg_config`; `pages/datasets_page.py` `_density_gen_box` (train-time toggles);
+`pages/train_page.py` injection; `pages/infer_page.py` `_infer_dg_env` (AdaBN/TTA toggles + logdk
+recovery); `local_cli.run_script(env=)` (used by BOTH train and infer launches).
+Modal note: env lands client-side — the modal shell still needs to forward `DG_*` into the
+container subprocess (local docker already does via `-e`). Modal is frozen (`scripts/modal/DEPRECATED.md`).
