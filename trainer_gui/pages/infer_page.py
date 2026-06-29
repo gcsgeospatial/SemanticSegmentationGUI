@@ -47,6 +47,7 @@ class InferPage(QWidget):
         self._manifest_path: Path | None = None
         self._local_weights: Path | None = None    # weights = the run.json's sibling
         self._dg: dict = {}                         # DG settings baked into the weights (run.json["dg"])
+        self._run_class_names: list | None = None   # the loaded run's own classes (run.json)
 
         root = QVBoxLayout(self)
         title = QLabel("Inference")
@@ -205,8 +206,10 @@ class InferPage(QWidget):
         btn_col.addWidget(QLabel("Class palette (legend)"))
         self.palette_combo = QComboBox()
         self.palette_combo.setToolTip(
-            "Pick the class names for the legend. Auto = names embedded in the file, "
-            "else IEEE. Use 'Configure Palette…' to set the colour of each class.")
+            "Class names for the legend + 3D viewer. 'From the loaded run' uses the "
+            "model's OWN trained classes (auto-selected when you pick a run); or pick a "
+            "dataset, or Auto (names in the file, else IEEE). 'Configure Palette…' sets "
+            "each class colour.")
         self.palette_combo.currentIndexChanged.connect(self._on_palette_change)
         btn_col.addWidget(self.palette_combo)
         self.configure_palette_btn = QPushButton("Configure Palette…")
@@ -282,19 +285,47 @@ class InferPage(QWidget):
 
     # ------------------------------------------------------- class palette
     def reload_palettes(self):
-        """Offer 'Auto' + every known dataset whose class names we can resolve
-        (built-ins, or a converted dataset with a readable dataset_meta.json)."""
+        """Offer the loaded run's OWN classes (top, the match for its predictions),
+        then 'Auto', then every known dataset whose class names we can resolve
+        (built-ins, or a converted dataset with a readable dataset_meta.json).
+        Preserves the current pick across reloads."""
+        prev = self.palette_combo.currentData()
         self.palette_combo.blockSignals(True)
         self.palette_combo.clear()
+        if self._run_class_names:
+            self.palette_combo.addItem(
+                f"From the loaded run ({len(self._run_class_names)} classes)", "__run__")
         self.palette_combo.addItem("Auto (from file / IEEE)", None)
         for nm, info in sorted(appstate.known_datasets().items()):
             if info.get("builtin") or os.path.exists(info.get("meta_path", "") or ""):
                 self.palette_combo.addItem(nm, nm)
-        want = appstate.get("infer_palette") or None
-        i = self.palette_combo.findData(want)
+        i = self.palette_combo.findData(prev)
+        if i < 0:
+            i = self.palette_combo.findData(appstate.get("infer_palette") or None)
         self.palette_combo.setCurrentIndex(i if i >= 0 else 0)
         self.palette_combo.blockSignals(False)
         self._refresh_legend()
+
+    def _set_run_classes(self, names):
+        """Adopt the loaded run's class names for the legend/palette and auto-select
+        that option, so predictions are labelled with the model's OWN trained
+        classes (matched to the run config) rather than a guessed dataset."""
+        self._run_class_names = list(names) if names else None
+        self.reload_palettes()
+        if self._run_class_names:
+            i = self.palette_combo.findData("__run__")
+            if i >= 0:
+                self.palette_combo.setCurrentIndex(i)   # fires _on_palette_change -> legend
+
+    @staticmethod
+    def _names_from_manifest(m: dict) -> list | None:
+        """Class names from a run manifest: explicit class_names, else synthesized
+        'class 0..n-1' from num_classes, else None."""
+        names = m.get("class_names")
+        if names:
+            return list(names)
+        n = m.get("num_classes")
+        return [f"class {i}" for i in range(int(n))] if n else None
 
     def _effective_names(self) -> list:
         """Class names labelling the palette: the selected dataset's, else IEEE."""
@@ -346,8 +377,11 @@ class InferPage(QWidget):
         self._refresh_legend()
 
     def _selected_class_names(self) -> list | None:
-        """Class names for the chosen dataset's palette, or None for 'Auto'."""
+        """Class names for the chosen palette: the loaded run's OWN classes, a
+        dataset's, or None for 'Auto'."""
         name = self.palette_combo.currentData()
+        if name == "__run__":
+            return self._run_class_names
         if not name:
             return None
         info = appstate.known_datasets().get(name, {})
@@ -385,12 +419,31 @@ class InferPage(QWidget):
         self._on_run_pick()
 
     def _on_run_pick(self):
-        """Modal run-id combo: sync the architecture from the picked run's backbone."""
+        """Modal run-id combo: sync the architecture from the picked run's backbone,
+        and (when the run was downloaded locally) adopt its classes for the palette."""
         h = self.run_combo.currentData()
         if isinstance(h, dict) and h.get("backbone") in BACKBONES:
             i = self.backbone_combo.findData(h["backbone"])
             if i >= 0:
                 self.backbone_combo.setCurrentIndex(i)
+        if appstate.get_exec_mode() != "local":
+            self._set_run_classes(self._run_pick_class_names(h))
+
+    def _run_pick_class_names(self, h) -> list | None:
+        """Class names for a Modal run, if it was downloaded locally (its run.json /
+        run_config.json sits under the Runs-page download dir). None otherwise."""
+        if not isinstance(h, dict):
+            return None
+        rdir = appstate.runs_dir() / str(h.get("backbone", "")) / str(h.get("run_id", ""))
+        for fn in ("run.json", "run_config.json"):
+            p = rdir / fn
+            if p.exists():
+                try:
+                    with open(p, encoding="utf-8") as f:
+                        return self._names_from_manifest(json.load(f))
+                except (OSError, json.JSONDecodeError):
+                    pass
+        return None
 
     def _pick_runjson(self):
         start = self.runjson_edit.text().strip() or str(appstate.local_runs_dir())
@@ -463,6 +516,9 @@ class InferPage(QWidget):
         # be re-fed at inference (re-injected as DG_* env below). AdaBN/TTA are separate
         # inference-time toggles in the Input box.
         self._dg = m.get("dg") or {}
+        # Label the legend + viewer with the model's OWN classes (the uploaded
+        # dataset's classes, as recorded in the run config), combined with the palette.
+        self._set_run_classes(self._names_from_manifest(m))
         ok = "✓" if self._local_weights.is_file() else "✗ weights missing —"
         self._append(f"Loaded {p.name}: {bkey}, grid={m.get('grid')}, "
                      f"chunk={m.get('chunk_xy')}, intensity={m.get('intensity_norm')}. "

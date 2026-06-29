@@ -163,3 +163,32 @@ def dg_config_to_env(cfg: dict) -> dict:
         env["DG_LOGDK_FEAT"] = "1"
         env["DG_LOGDK_K"] = str(int(cfg.get("logdk_k", 8)))
     return env
+
+
+# Script defaults for the loss / class-balance knobs (same in all 6 scripts); the
+# panel only emits an env var when the user departs from these, so a baseline run
+# stays env-free and reproducible from the script constants alone.
+LOSS_DEFAULTS = {"focal": False, "focal_gamma": 2.0, "class_weighting": True,
+                 "weight_beta": 0.5, "rare_oversample": True}
+
+
+def loss_config_to_env(cfg: dict) -> dict:
+    """Per-run loss / class-balance config -> LOSS_*/RARE_* env vars the training
+    scripts read (mirrors the DG env pattern). Emits only values that differ from
+    the script defaults; the run's choices are recorded in run_config.json's loss
+    block. focal_gamma is emitted only when focal is on (otherwise it's a no-op)."""
+    env: dict[str, str] = {}
+    if not cfg:
+        return env
+    b = lambda v: "1" if v else "0"
+    if cfg.get("focal", False) != LOSS_DEFAULTS["focal"]:
+        env["LOSS_FOCAL"] = b(cfg.get("focal"))
+    if cfg.get("focal") and float(cfg.get("focal_gamma", 2.0)) != LOSS_DEFAULTS["focal_gamma"]:
+        env["LOSS_FOCAL_GAMMA"] = str(float(cfg["focal_gamma"]))
+    if cfg.get("class_weighting", True) != LOSS_DEFAULTS["class_weighting"]:
+        env["LOSS_CLASS_WEIGHTING"] = b(cfg.get("class_weighting"))
+    if float(cfg.get("weight_beta", 0.5)) != LOSS_DEFAULTS["weight_beta"]:
+        env["LOSS_WEIGHT_BETA"] = str(float(cfg["weight_beta"]))
+    if cfg.get("rare_oversample", True) != LOSS_DEFAULTS["rare_oversample"]:
+        env["RARE_OVERSAMPLE"] = b(cfg.get("rare_oversample"))
+    return env

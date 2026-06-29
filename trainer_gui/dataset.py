@@ -52,16 +52,18 @@ class LabelSpec:
 class SplitConfig:
     """How to derive train/val when the user hasn't pre-split into two folders.
 
-    strategy="auto"     1 file -> "tile", many files -> "scene".
-    strategy="scene"    hold out whole files (needs >= 2 files); each file is
-                        still tiled into a grid for training.
-    strategy="tile"     cut each file into a grid, hold out whole tiles.
+    The dataset layer does NOT tile — each training script tiles for its own model
+    (chunk windows / spheres / voxels). Here we only decide which WHOLE scenes (or
+    scene regions) land in each split.
+
+    strategy="auto"     1 file -> "spatial", many files -> "scene".
+    strategy="scene"    hold out whole files (needs >= 2 files); each file is one scene.
+    strategy="spatial"  one cloud -> a single spatial train/val cut by val_ratio.
     strategy="provided" caller passes an explicit val set (set via val_inputs).
     """
     strategy: str = "auto"
     val_ratio: float = 0.2
     seed: int = 42
-    tile_m: float = 0.0            # 0 = auto (≈ a 5×5 grid over the scene extent)
 
 
 @dataclass
@@ -143,9 +145,9 @@ def sanitize_name(name: str) -> str:
 # --------------------------------------------------------------------- splitting
 
 def resolve_strategy(strategy: str, n_files: int) -> str:
-    if strategy in ("scene", "tile", "provided"):
+    if strategy in ("scene", "spatial", "provided"):
         return strategy
-    return "tile" if n_files == 1 else "scene"      # "auto"
+    return "spatial" if n_files == 1 else "scene"      # "auto"
 
 
 def _ratio_split(items: list, val_ratio: float, seed: int) -> tuple[list, list]:
@@ -163,47 +165,29 @@ def _ratio_split(items: list, val_ratio: float, seed: int) -> tuple[list, list]:
     return train, val
 
 
-def density_tile_m(xyz: np.ndarray) -> float:
-    """Density-based tile size (m): target ~250k points per tile, clamped to
-    [25, 100] m and rounded to 5 — the same heuristic analysis.recommend uses,
-    so the converter's default tiling matches the per-backbone recommendation."""
-    ext = xyz[:, :2].max(0) - xyz[:, :2].min(0)
-    area = max(float(ext[0] * ext[1]), 1.0)
-    density = len(xyz) / area
-    t = float(np.sqrt(250_000 / max(density, 0.01)))
-    return float(min(max(5 * round(t / 5), 25), 100))
-
-
-def grid_cells(xyz: np.ndarray, tile_m: float) -> list[tuple]:
-    """Coarse XY grid over a cloud -> [(name, (x0,y0,x1,y1)), ...]. tile_m<=0
-    auto-sizes from point density (~250k pts/tile)."""
-    mn = xyz[:, :2].min(0)
-    mx = xyz[:, :2].max(0)
-    ext = mx - mn
-    if tile_m <= 0:
-        tile_m = density_tile_m(xyz)
-    cells = []
-    xs = np.arange(mn[0], mx[0] + tile_m, tile_m)[:-1] if ext[0] > 0 else [mn[0]]
-    ys = np.arange(mn[1], mx[1] + tile_m, tile_m)[:-1] if ext[1] > 0 else [mn[1]]
-    for i, x0 in enumerate(xs):
-        for j, y0 in enumerate(ys):
-            cells.append((f"r{i}_c{j}", (float(x0), float(y0),
-                                         float(x0) + tile_m, float(y0) + tile_m)))
-    return cells
-
-
-def _crop(cloud: Cloud, raw: np.ndarray | None, bounds: tuple):
-    x0, y0, x1, y1 = bounds
-    m = ((cloud.xyz[:, 0] >= x0) & (cloud.xyz[:, 0] < x1) &
-         (cloud.xyz[:, 1] >= y0) & (cloud.xyz[:, 1] < y1))
+def _subset(cloud: Cloud, raw: np.ndarray | None, mask: np.ndarray):
+    """A boolean-masked copy of a cloud (+ its labels)."""
     sub = Cloud(
-        xyz=cloud.xyz[m],
-        rgb=cloud.rgb[m] if cloud.rgb is not None else None,
-        intensity=cloud.intensity[m] if cloud.intensity is not None else None,
-        return_number=cloud.return_number[m] if cloud.return_number is not None else None,
-        fields={k: v[m] for k, v in cloud.fields.items()},
+        xyz=cloud.xyz[mask],
+        rgb=cloud.rgb[mask] if cloud.rgb is not None else None,
+        intensity=cloud.intensity[mask] if cloud.intensity is not None else None,
+        return_number=cloud.return_number[mask] if cloud.return_number is not None else None,
+        fields={k: v[mask] for k, v in cloud.fields.items()},
     )
-    return sub, (raw[m] if raw is not None else None)
+    return sub, (raw[mask] if raw is not None else None)
+
+
+def _spatial_split(cloud: Cloud, raw: np.ndarray | None, val_ratio: float):
+    """Cut one cloud into (train, val) along its longer XY axis at the val_ratio
+    boundary — a single spatial split (NOT tiling), leak-free (disjoint regions).
+    The low end of the axis becomes val. Returns ((train, train_raw), (val, val_raw))."""
+    xy = cloud.xyz[:, :2]
+    mn = xy.min(0)
+    ext = xy.max(0) - mn
+    ax = 0 if ext[0] >= ext[1] else 1
+    cut = mn[ax] + float(val_ratio) * ext[ax]
+    val_mask = cloud.xyz[:, ax] < cut
+    return _subset(cloud, raw, ~val_mask), _subset(cloud, raw, val_mask)
 
 
 # --------------------------------------------------------------------- conversion
@@ -326,59 +310,32 @@ def _plan_and_convert(train_files: list[Path], val_files: list[Path] | None,
         return stats
 
     if strategy == "scene":
-        # Hold out whole files (so train/val never share a cloud = no leakage), but
-        # TILE each file into grid cells — a folder of large clouds becomes many
-        # training tiles, not one giant scene per file. Every tile inherits its
-        # source file's split.
+        # Hold out whole files (train/val never share a cloud = no leakage). Each
+        # file is one whole scene; the training script tiles it for its own model.
         tr, va = _ratio_split(train_files, split.val_ratio, split.seed)
-        say(f"scene-split: {len(tr)} train / {len(va)} val file(s), each tiled")
+        say(f"scene-split: {len(tr)} train / {len(va)} val scene(s) (whole, untiled)")
         for split_name, files in (("train", tr), ("val", va)):
             for f in files:
-                say(f"  tiling {f.name} ...")
+                say(f"  converting {f.name} ...")
                 cloud = read_points(f)
                 raw = read_labels(f, cloud, spec) if spec is not None else None
-                kept = 0
-                for cname, bounds in grid_cells(cloud.xyz, split.tile_m):
-                    sub, sub_raw = _crop(cloud, raw, bounds)
-                    if sub.n >= MIN_TILE_PTS:
-                        emit(split_name, sub, sub_raw, f"{f.stem}_{cname}")
-                        kept += 1
-                if kept == 0:        # cloud smaller than one tile -> emit it whole
-                    emit(split_name, cloud, raw, f.stem)
-                    kept = 1
-                say(f"  {f.stem}: {kept} tile(s) -> {split_name}")
+                emit(split_name, cloud, raw, f.stem)
         return stats
 
-    # strategy == "tile": grid each file, hold out whole tiles.
+    # strategy == "spatial": one (or each) cloud -> a single spatial train/val cut.
     for f in train_files:
-        say(f"  tiling {f.name} ...")
+        say(f"  spatial-split {f.name} ...")
         cloud = read_points(f)
         raw = read_labels(f, cloud, spec) if spec is not None else None
-        kept = []
-        for cname, bounds in grid_cells(cloud.xyz, split.tile_m):
-            sub, sub_raw = _crop(cloud, raw, bounds)
-            if sub.n >= MIN_TILE_PTS:
-                kept.append((cname, sub, sub_raw))
-        if len(kept) < 2:
+        (tr_c, tr_r), (va_c, va_r) = _spatial_split(cloud, raw, split.val_ratio)
+        if tr_c.n < MIN_TILE_PTS or va_c.n < MIN_TILE_PTS:
             raise ValueError(
-                f"{f.name}: tile-split produced {len(kept)} usable tile(s) "
-                f"(need >= 2). Use a smaller tile size, add more data, or supply "
-                f"a separate validation folder.")
-        val_pos = set(_split_indices(len(kept), split.val_ratio, split.seed))
-        n_tr = len(kept) - len(val_pos)
-        say(f"  {f.stem}: {len(kept)} tiles -> {n_tr} train / {len(val_pos)} val")
-        for k, (cname, sub, sub_raw) in enumerate(kept):
-            split_name = "val" if k in val_pos else "train"
-            emit(split_name, sub, sub_raw, f"{f.stem}_{cname}")
+                f"{f.name}: spatial split left an almost-empty side (train {tr_c.n}, "
+                f"val {va_c.n} pts). Add more data or supply a separate val folder.")
+        say(f"  {f.stem}: {tr_c.n:,} train / {va_c.n:,} val pts")
+        emit("train", tr_c, tr_r, f"{f.stem}_train")
+        emit("val", va_c, va_r, f"{f.stem}_val")
     return stats
-
-
-def _split_indices(n: int, val_ratio: float, seed: int) -> list[int]:
-    rng = np.random.RandomState(seed)
-    idx = np.arange(n)
-    rng.shuffle(idx)
-    n_val = min(max(1, round(val_ratio * n)), n - 1)
-    return idx[:n_val].tolist()
 
 
 def convert_dataset(name: str, inputs, spec: LabelSpec | None,
@@ -490,7 +447,6 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
             "val_inputs": [str(p) for p in (val_inputs or [])],
             "split_strategy": strategy,
             "val_ratio": split.val_ratio, "split_seed": split.seed,
-            "tile_m": split.tile_m,
             "label_kind": spec.kind if spec else None,
             "label_field": spec.field if spec else "",
             "truth_dir": spec.truth_dir if spec else "",
@@ -634,8 +590,8 @@ def add_hag_to_dataset(src_dir, out_dir, *, skip_ground: bool = False,
 # --------------------------------------------------------------------- self-check
 
 def _selfcheck():
-    """Synthesize a single labeled cloud, tile-split it, and assert the splits
-    partition the points (no leakage, none lost above the tile floor)."""
+    """Synthesize labeled clouds and assert the splits partition the points with no
+    leakage and no tiling (the dataset layer only splits; scripts tile)."""
     import tempfile
 
     rng = np.random.RandomState(0)
@@ -646,26 +602,28 @@ def _selfcheck():
         td = Path(td)
         np.savez(td / "scene.npz", xyz=xyz, classification=cls)
         classes = [{"index": i, "source_value": i, "name": f"c{i}"} for i in range(3)]
+        # single cloud -> ONE spatial train/val cut (not a grid of tiles)
         out = convert_dataset("selftest", td / "scene.npz",
                               LabelSpec(kind="field", field="classification"),
                               classes, [], td / "staging",
-                              split=SplitConfig(strategy="tile", tile_m=20.0))
+                              split=SplitConfig(strategy="spatial"))
         meta = json.loads((out / "dataset_meta.json").read_text())
         tr, va = meta["splits"]["train"], meta["splits"]["val"]
-        assert tr["scenes"] and va["scenes"], "both splits must be non-empty"
+        assert len(tr["scenes"]) == 1 and len(va["scenes"]) == 1, "spatial = one train + one val"
         assert tr["total_points"] + va["total_points"] == n, "points must be conserved"
-        # scene-split path: each file is tiled, but no file spans both splits
+        # scene-split path: whole files, no tiling, no file spans both splits
+        multi = td / "multi"
+        multi.mkdir()
         for k in range(3):
-            np.savez(td / f"s{k}.npz", xyz=xyz, classification=cls)
-        out2 = convert_dataset("selftest2", td, LabelSpec(field="classification"),
+            np.savez(multi / f"s{k}.npz", xyz=xyz, classification=cls)
+        out2 = convert_dataset("selftest2", multi, LabelSpec(field="classification"),
                                classes, [], td / "staging",
-                               split=SplitConfig(strategy="scene", tile_m=20.0))
+                               split=SplitConfig(strategy="scene"))
         m2 = json.loads((out2 / "dataset_meta.json").read_text())
         tr2, va2 = m2["splits"]["train"]["scenes"], m2["splits"]["val"]["scenes"]
         assert tr2 and va2, "both splits must be non-empty"
-        assert len(tr2) + len(va2) > 3, "each scene must be tiled into >1 tile"
-        srcs = lambda ss: {s.split("_r")[0] for s in ss}   # tile name -> source file
-        assert not (srcs(tr2) & srcs(va2)), "no source file may span both splits"
+        assert len(tr2) + len(va2) == 3, "scene-split keeps whole scenes (no tiling)"
+        assert not (set(tr2) & set(va2)), "no scene may be in both splits"
     print("dataset self-check OK")
 
 

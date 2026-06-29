@@ -2,9 +2,9 @@
 
   1. New dataset   point at a file/folder, name it, say which field holds labels
   2. Classes       scan label values, name them, mark ignored, check density
-  3. Tiling        train/val split + tile size; optionally compute a per-tile
-                   Height-Above-Ground channel in the same pass (PDAL SMRF -> hag);
-                   Start Tiling stages the dataset
+  3. Split         train/val split (whole scenes; the dataset layer does NOT tile —
+                   each training script tiles for its own model) + optionally compute
+                   a per-scene Height-Above-Ground channel (PDAL SMRF -> hag)
 
 Labels come from a field in the cloud (companion/sidecar label files are no
 longer offered here). Intensity is normalized by max (i/max -> 0..1) by default.
@@ -30,7 +30,7 @@ from ..jobs import FuncWorker, JobRunner
 from ..readers import list_label_fields
 
 # split combo index -> SplitConfig.strategy
-_SPLIT_STRATEGIES = ["scene", "tile", "provided"]
+_SPLIT_STRATEGIES = ["scene", "spatial", "provided"]
 
 
 class DatasetsPage(QWidget):
@@ -99,11 +99,10 @@ class DatasetsPage(QWidget):
         self.sub.setText(
             "Build a trainable dataset, step by step: point at point clouds "
             "(las/laz, ply, txt/csv, pcd, npy/npz), name the classes, split "
-            "train/val and Start Tiling"
-            + (" — it's staged on disk and ready to train in Docker. "
+            "train/val and Build dataset"
+            + (" — it's staged on disk and ready to train in Docker."
                if local else
-               ", then upload it to a per-dataset Modal volume. ")
-            + "Optionally compute a Height-Above-Ground channel during tiling.")
+               ", then upload it to a per-dataset Modal volume."))
         self._reload_known()
 
     # ============================================================= 1. New dataset
@@ -132,8 +131,8 @@ class DatasetsPage(QWidget):
 
     # ============================================================= 2. Classes
     def _classes_box(self) -> QWidget:
-        box = QGroupBox("2 · Classes — uncheck 'Train' to ignore a value; rows that share a "
-                        "Class name are merged into one class")
+        box = QGroupBox("2 · Classes — uncheck 'Train' to ignore a value; select rows + "
+                        "Combine to merge them into one class")
         cl = QVBoxLayout(box)
         btn_row = QHBoxLayout()
         self.scan_btn = QPushButton("Scan label values")
@@ -148,7 +147,7 @@ class DatasetsPage(QWidget):
         btn_row.addStretch()
         cl.addLayout(btn_row)
         self.class_table = QTableWidget(0, 4)
-        self.class_table.setHorizontalHeaderLabels(["Train", "Source value", "Points seen", "Class name"])
+        self.class_table.setHorizontalHeaderLabels(["Train", "Source value(s)", "Points seen", "Class name"])
         self.class_table.verticalHeader().setVisible(False)
         self.class_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
         self.class_table.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed)
@@ -162,23 +161,20 @@ class DatasetsPage(QWidget):
         cl.addWidget(self.analyze_label)
         return box
 
-    # ============================================================= 3. Tiling
+    # ============================================================= 3. Split
     def _tiling_box(self) -> QWidget:
-        box = QGroupBox("3 · Tiling")
+        box = QGroupBox("3 · Train / val split")
         form = QFormLayout(box)
         self.split_combo = QComboBox()
         self.split_combo.addItems([
-            "Folder of clouds → tile + split by val fraction",
-            "Single cloud → tile & split by val fraction",
+            "Folder of clouds → split scenes by val fraction",
+            "Single cloud → spatial train/val split by val fraction",
             "Separate train + val folders (use as-is)",
         ])
         self.split_combo.currentIndexChanged.connect(self._on_split_changed)
         form.addRow("Train / val split", self.split_combo)
-        self.tile_m = QDoubleSpinBox()
-        self.tile_m.setRange(0.0, 100000.0)
-        self.tile_m.setValue(0.0)
-        self.tile_m.setSpecialValueText("auto (from density)")
-        form.addRow("Tile size (m)", self.tile_m)
+        # No tiling here — each training script tiles for its own model; the dataset
+        # layer only decides which whole scenes (or scene regions) go to each split.
         self.val_ratio = QDoubleSpinBox()
         self.val_ratio.setRange(0.05, 0.5)
         self.val_ratio.setSingleStep(0.05)
@@ -186,11 +182,11 @@ class DatasetsPage(QWidget):
         form.addRow("Validation fraction", self.val_ratio)
         self.val_edit, self.val_row_w = self._dir_row(self._pick_val)
         form.addRow("Validation folder", self.val_row_w)
-        # Optional: compute HeightAboveGround in the SAME pass as tiling — one
-        # read/write per tile instead of a separate add-HAG reload of every npz.
-        self.hag_chk = QCheckBox("Compute Height-Above-Ground (HAG) during tiling")
+        # Optional: compute HeightAboveGround per scene in the same pass (one read/
+        # write per scene). Whole-scene SMRF -> better ground than per-tile.
+        self.hag_chk = QCheckBox("Compute Height-Above-Ground (HAG)")
         self.hag_chk.setToolTip("Bakes a per-point HAG channel (PDAL SMRF -> hag) into every "
-                                "tile as it's written. The *_hag models use it; the others "
+                                "scene as it's written. The *_hag models use it; the others "
                                 "ignore the extra channel.")
         self.hag_chk.toggled.connect(lambda on: self.hag_opts_w.setVisible(on))
         form.addRow("Height-Above-Ground", self.hag_chk)
@@ -208,7 +204,7 @@ class DatasetsPage(QWidget):
         if not pretrain.pdal_available():
             self.hag_chk.setEnabled(False)
             self.hag_chk.setText("Compute Height-Above-Ground (HAG) — PDAL not installed")
-        self.tile_btn = QPushButton("Start Tiling")
+        self.tile_btn = QPushButton("Build dataset")
         self.tile_btn.setObjectName("primary")
         self.tile_btn.clicked.connect(self._start_tiling)
         row = QHBoxLayout()
@@ -227,7 +223,6 @@ class DatasetsPage(QWidget):
         self.log.setMinimumHeight(140)
         self.log.setPlaceholderText("Progress and messages appear here…")
         lay = QVBoxLayout()
-        lay.addWidget(QLabel("Log"))
         lay.addWidget(self.log)
         return lay
 
@@ -305,8 +300,7 @@ class DatasetsPage(QWidget):
 
     def _split_config(self) -> SplitConfig:
         return SplitConfig(strategy=_SPLIT_STRATEGIES[self.split_combo.currentIndex()],
-                           val_ratio=float(self.val_ratio.value()),
-                           tile_m=float(self.tile_m.value()))
+                           val_ratio=float(self.val_ratio.value()))
 
     # ------------------------------------------------------------- scan / analyze
     def _scan_labels(self):
@@ -347,7 +341,7 @@ class DatasetsPage(QWidget):
                 self.class_table.setItem(r, col, item)
             self.class_table.setItem(r, 3, QTableWidgetItem(f"class_{val}"))
         self._append(f"Found {len(counts)} distinct label values. Name the classes, "
-                     f"uncheck any that mean 'unknown', then Start Tiling.")
+                     f"uncheck any that mean 'unknown', then Build dataset.")
 
     def _analyze(self):
         in_path = self.input_edit.text().strip()
@@ -369,69 +363,60 @@ class DatasetsPage(QWidget):
         self.analyze_btn.setEnabled(True)
         recs = analysis.recommend(stats)
         chunk = next(iter(recs.values())).get("chunk_xy", 0.0)
-        if chunk:                                   # density preset -> fill the tile size
-            self.tile_m.setValue(float(chunk))
         self.analyze_label.setText(
             f"Density: {stats['mean_pts_per_m2']:.2f} pts/m²  ·  "
             f"spacing {stats['mean_spacing_m']:.2f} m  ·  "
             f"largest scene {stats['max_scene_points']:,} pts  ·  "
-            f"recommended tile {chunk:.0f} m (set in Tiling).")
+            f"suggested training tile {chunk:.0f} m (set per model on the Train page).")
 
     # ------------------------------------------------------------- convert/upload
     def _combine_selected(self):
-        """Merge the selected class rows into one class by giving them a shared
-        name — rows with the same Class name map to the same index on convert."""
+        """Collapse the selected rows into ONE row whose Source value lists every
+        merged value (e.g. "5,6") and whose Points seen is their total, under a
+        shared name — so a combine reads as one class, not duplicated rows."""
         rows = sorted({i.row() for i in self.class_table.selectedItems()})
         if len(rows) < 2:
             self._append("Combine: select 2+ class rows first (click rows; Ctrl/Shift for many).")
             return
         first = self.class_table.item(rows[0], 3)
-        base = (first.text().strip() if first else "") or \
-            f"class_{self.class_table.item(rows[0], 1).text()}"
+        base = first.text().strip() if first else ""
         name, ok = QInputDialog.getText(self, "Combine classes",
                                         "Name for the combined class:", text=base)
         name = name.strip()
         if not ok or not name:
             return
+        # Gather every source value across the selected rows (a row may already be
+        # a combined "5,6"), dedupe + sort, sum their point counts.
+        vals: list[int] = []
         for r in rows:
-            self.class_table.setItem(r, 3, QTableWidgetItem(name))
-            chk = self.class_table.cellWidget(r, 0).findChild(QCheckBox)
-            chk.setChecked(True)            # combining implies training on it
-        self._refresh_group_counts()        # show the merged classes added together
-        vals = ", ".join(self.class_table.item(r, 1).text() for r in rows)
-        self._append(f"Combined source values [{vals}] into one class '{name}'.")
-
-    def _refresh_group_counts(self):
-        """Display each row's 'Points seen' as the total over all rows sharing its
-        class name, so combined classes read as one added-together class. Col 2 is
-        display-only — conversion recounts class totals from the actual data."""
-        totals: dict[str, int] = {}
-        for r in range(self.class_table.rowCount()):
-            val = int(self.class_table.item(r, 1).text())
-            name = self.class_table.item(r, 3).text().strip() or f"class_{val}"
-            totals[name] = totals.get(name, 0) + self._label_values.get(val, 0)
-        for r in range(self.class_table.rowCount()):
-            val = int(self.class_table.item(r, 1).text())
-            name = self.class_table.item(r, 3).text().strip() or f"class_{val}"
-            cell = self.class_table.item(r, 2)
-            if cell:
-                cell.setText(f"{totals[name]:,}")
+            vals += _parse_values(self.class_table.item(r, 1).text())
+        vals = sorted(dict.fromkeys(vals))
+        total = sum(self._label_values.get(v, 0) for v in vals)
+        keep = rows[0]
+        self.class_table.item(keep, 1).setText(",".join(str(v) for v in vals))
+        self.class_table.item(keep, 2).setText(f"{total:,}")
+        self.class_table.setItem(keep, 3, QTableWidgetItem(name))
+        self.class_table.cellWidget(keep, 0).findChild(QCheckBox).setChecked(True)
+        for r in reversed(rows[1:]):        # drop the rows now folded into `keep`
+            self.class_table.removeRow(r)
+        self._append(f"Combined source values [{', '.join(map(str, vals))}] into class '{name}'.")
 
     def _classes_from_table(self):
-        """Rows sharing a Class name collapse to one class index (combine); each
-        unique name gets the next contiguous index, in first-seen order."""
+        """One class per row. A row's Source value may list several values (a
+        combine, e.g. "5,6") — each maps to the SAME class index/name."""
         name_to_index: dict[str, int] = {}
         classes, ignored = [], []
         for r in range(self.class_table.rowCount()):
-            val = int(self.class_table.item(r, 1).text())
+            vals = _parse_values(self.class_table.item(r, 1).text())
             chk = self.class_table.cellWidget(r, 0).findChild(QCheckBox)
             if not chk.isChecked():
-                ignored.append(val)
+                ignored.extend(vals)
                 continue
-            name = self.class_table.item(r, 3).text().strip() or f"class_{val}"
+            name = self.class_table.item(r, 3).text().strip() or f"class_{vals[0]}"
             if name not in name_to_index:
                 name_to_index[name] = len(name_to_index)
-            classes.append({"index": name_to_index[name], "source_value": val, "name": name})
+            for v in vals:
+                classes.append({"index": name_to_index[name], "source_value": v, "name": name})
         return classes, ignored
 
     def _conversion_plan(self):
@@ -472,7 +457,7 @@ class DatasetsPage(QWidget):
         split, out_root = plan["split"], plan["out_root"]
         self.tile_btn.setEnabled(False)
         hag = "  + HAG" if plan["compute_hag"] else ""
-        self._append(f"Tiling '{name}'{hag} ({len(classes)} classes, split={split.strategy}, "
+        self._append(f"Building '{name}'{hag} ({len(classes)} classes, split={split.strategy}, "
                      f"ignored values: {ignored}) -> {out_root}…")
 
         def job(progress):
@@ -497,10 +482,10 @@ class DatasetsPage(QWidget):
         self._reload_known()
         hag = " (with HAG)" if self.hag_chk.isChecked() and pretrain.pdal_available() else ""
         if appstate.get_exec_mode() == "local":
-            self._append(f"✓ Tiled{hag} -> {staged}. Ready — pick '{staged.name}' on the Train "
+            self._append(f"✓ Built{hag} -> {staged}. Ready — pick '{staged.name}' on the Train "
                          f"page (bind-mounted at /datasets/{staged.name}).")
         else:
-            self._append(f"✓ Tiled{hag} -> {staged}. Select it under Saved Datasets to upload.")
+            self._append(f"✓ Built{hag} -> {staged}. Select it under Saved Datasets to upload.")
 
     def _upload_saved(self):
         """Upload a dataset already listed under Saved Datasets, using its
@@ -621,6 +606,12 @@ class DatasetsPage(QWidget):
         self.log.moveCursor(QTextCursor.End)
         self.log.insertPlainText(text + ("\n" if newline else ""))
         self.log.moveCursor(QTextCursor.End)
+
+
+def _parse_values(text: str) -> list[int]:
+    """Source-value cell -> ints. A cell may hold one value ("5") or a combined
+    list ("5,6" / "5 6"); both parse to a list of ints."""
+    return [int(t) for t in text.replace(",", " ").split() if t]
 
 
 def _wrap(layout) -> QWidget:

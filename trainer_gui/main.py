@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import QByteArray, Qt
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (QApplication, QComboBox, QHBoxLayout, QLabel, QListWidget,
                                QListWidgetItem, QMessageBox, QStackedWidget, QVBoxLayout, QWidget)
 
@@ -152,6 +153,16 @@ class MainWindow(QWidget):
         super().closeEvent(event)
 
 
+def _app_icon() -> QIcon:
+    """Window/taskbar icon — icon.png shipped at the repo root (or the package)."""
+    here = Path(__file__).resolve()
+    for base in (here.parent, here.parents[1], here.parents[2]):
+        p = base / "icon.png"
+        if p.exists():
+            return QIcon(str(p))
+    return QIcon()
+
+
 def _check_modal_cli(parent=None) -> bool:
     if shutil.which("modal"):
         return True
@@ -166,8 +177,17 @@ def _check_modal_cli(parent=None) -> bool:
 
 def main() -> int:
     from . import appstate, theme
+    if sys.platform == "win32":
+        # Give the app its OWN taskbar identity so Windows shows icon.png there
+        # instead of the generic python.exe icon.
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("trainer_gui")
+        except Exception:  # noqa: BLE001
+            pass
     app = QApplication(sys.argv)
     app.setApplicationName("trainer_gui")
+    app.setWindowIcon(_app_icon())
     theme.apply(app, appstate.get("ui_theme", "system"))
     try:   # live-follow the OS light/dark switch while in System mode
         app.styleHints().colorSchemeChanged.connect(

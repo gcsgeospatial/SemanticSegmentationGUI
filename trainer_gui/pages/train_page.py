@@ -107,6 +107,7 @@ class TrainPage(QWidget):
         config_col.addWidget(form_box)
         config_col.addWidget(self.params_box)
         config_col.addWidget(self._dg_box())
+        config_col.addWidget(self._loss_box())
         config_col.addWidget(self.warn_label)
         config_col.addLayout(run_row)
         config_col.addStretch()
@@ -486,6 +487,73 @@ class TrainPage(QWidget):
                 "logdk": self.dg_logdk.isChecked(),
                 "logdk_k": self.dg_k.value()}
 
+    # ------------------------------------------- loss / class balance (per run)
+    def _loss_box(self) -> QGroupBox:
+        box = QGroupBox("Loss & class balance (advanced)")
+        box.setCheckable(True)
+        box.setChecked(False)
+        outer = QVBoxLayout(box)
+        inner = QWidget()
+        lay = QVBoxLayout(inner)
+        lay.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(inner)
+        box.toggled.connect(inner.setVisible)
+        inner.setVisible(False)
+        self.loss_box = box      # unchecked = section off (use script defaults)
+
+        hint = QLabel("Defaults already fight class imbalance: inverse-sqrt class "
+                      "weighting + Lovász-Softmax + auto rare-class oversampling. Tweak "
+                      "per run here (recorded in the run's run_config.json).")
+        hint.setWordWrap(True)
+        theme.set_accent(hint, "muted")
+        lay.addWidget(hint)
+
+        self.loss_focal = QCheckBox("Use focal loss instead of weighted cross-entropy")
+        self.loss_focal.setToolTip("Focal down-weights easy points so training focuses on hard / "
+                                   "rare ones. Off by default (weighted CE + Lovász).")
+        self.loss_gamma = ui.NoWheelDoubleSpinBox()
+        self.loss_gamma.setRange(0.0, 5.0)
+        self.loss_gamma.setSingleStep(0.5)
+        self.loss_gamma.setValue(2.0)
+        self.loss_gamma.setEnabled(False)
+        self.loss_focal.toggled.connect(self.loss_gamma.setEnabled)
+        r1 = QHBoxLayout()
+        r1.addWidget(self.loss_focal)
+        r1.addWidget(QLabel("γ (focus)"))
+        r1.addWidget(self.loss_gamma)
+        r1.addStretch(1)
+        lay.addLayout(r1)
+
+        self.loss_cw = QCheckBox("Weight classes by inverse frequency")
+        self.loss_cw.setChecked(True)
+        self.loss_beta = ui.NoWheelDoubleSpinBox()
+        self.loss_beta.setRange(0.0, 1.0)
+        self.loss_beta.setSingleStep(0.05)
+        self.loss_beta.setValue(0.5)
+        self.loss_beta.setToolTip("0 = no weighting, 0.5 = inverse-sqrt (default), 1 = full "
+                                  "inverse-frequency (most aggressive toward rare classes).")
+        self.loss_cw.toggled.connect(self.loss_beta.setEnabled)
+        r2 = QHBoxLayout()
+        r2.addWidget(self.loss_cw)
+        r2.addWidget(QLabel("strength β"))
+        r2.addWidget(self.loss_beta)
+        r2.addStretch(1)
+        lay.addLayout(r2)
+
+        self.loss_rare = QCheckBox("Oversample rare-class tiles (auto-detected from the data)")
+        self.loss_rare.setChecked(True)
+        lay.addWidget(self.loss_rare)
+        return box
+
+    def _loss_collect(self) -> dict:
+        if not self.loss_box.isChecked():       # section collapsed/off -> script defaults
+            return {}
+        return {"focal": self.loss_focal.isChecked(),
+                "focal_gamma": round(self.loss_gamma.value(), 2),
+                "class_weighting": self.loss_cw.isChecked(),
+                "weight_beta": round(self.loss_beta.value(), 2),
+                "rare_oversample": self.loss_rare.isChecked()}
+
     # ------------------------------------------------------------- launch
     def _launch(self):
         b = self._backbone()
@@ -518,6 +586,8 @@ class TrainPage(QWidget):
             flags["steps-per-epoch"] = 50
 
         dg_env = analysis.dg_config_to_env(self._dg_collect())
+        loss_env = analysis.loss_config_to_env(self._loss_collect())
+        env = {**dg_env, **loss_env}
         self.log.clear()
         self.metrics_table.setRowCount(0)
         self._last_run_id = None
@@ -525,8 +595,11 @@ class TrainPage(QWidget):
         if dg_env:
             self._append("[dg] density-generalization on: "
                          + " ".join(f"{k}={v}" for k, v in sorted(dg_env.items())))
+        if loss_env:
+            self._append("[loss] overrides: "
+                         + " ".join(f"{k}={v}" for k, v in sorted(loss_env.items())))
         self._start_local_run({"backbone": b, "flags": flags, "dataset": name,
-                               "dg_env": dg_env, "info": info})
+                               "env": env, "info": info})
 
     def _start_local_run(self, p):
         b, flags, name, info = p["backbone"], p["flags"], p["dataset"], p["info"]
@@ -547,7 +620,7 @@ class TrainPage(QWidget):
                              f"the container won't find /datasets/{name}.")
         prog, args = local_cli.run_script(b.script, flags, b, repo_root=self.repo_root,
                                           extra_mounts=extra_mounts, outputs_root=out_root,
-                                          env=p.get("dg_env", {}))
+                                          env=p.get("env", {}))
         self._append(f"\n[local] $ {local_cli.preview(prog, args)}\n")
         if not local_cli.have_docker():
             self._append(

@@ -122,18 +122,29 @@ def main():
         check("meta: kpconvx grid clamped to its band",
               0.5 <= meta["recommendations"]["kpconvx_cold"]["grid"] <= 3.0)
 
-        # ---------------- scene split: a folder of clouds is TILED (not kept whole),
-        # but no source file spans both train and val (leak-free hold-out)
+        # ---------------- scene split: a folder of clouds is kept WHOLE (no tiling),
+        # whole files held out to train/val (the scripts tile for their own model)
         staged_sc = dataset.convert_dataset(
             "laz_scene", str(laz_root / "train"), spec, classes, [0], tmp / "staging",
-            split=dataset.SplitConfig(strategy="scene", tile_m=30.0))
+            split=dataset.SplitConfig(strategy="scene"))
         msc = json.loads((staged_sc / "dataset_meta.json").read_text())
         tr_sc, va_sc = msc["splits"]["train"]["scenes"], msc["splits"]["val"]["scenes"]
-        check("scene-split: folder of clouds is tiled (more tiles than files)",
-              len(tr_sc) + len(va_sc) > 2)
-        _src = lambda ss: {s.split("_r")[0] for s in ss}
-        check("scene-split: no source file spans both train and val (leak-free)",
-              bool(tr_sc) and bool(va_sc) and not (_src(tr_sc) & _src(va_sc)))
+        check("scene-split: whole scenes, no tiling (one npz per source file)",
+              len(tr_sc) + len(va_sc) == 2 and bool(tr_sc) and bool(va_sc))
+        check("scene-split: no scene in both train and val (leak-free)",
+              not (set(tr_sc) & set(va_sc)))
+
+        # ---------------- spatial split: one cloud -> ONE train + ONE val region (no grid)
+        staged_sp = dataset.convert_dataset(
+            "laz_spatial", str(laz_root / "train" / "scene0.laz"), spec, classes, [0],
+            tmp / "staging", split=dataset.SplitConfig(strategy="spatial"))
+        msp = json.loads((staged_sp / "dataset_meta.json").read_text())
+        nt = len(msp["splits"]["train"]["scenes"]); nv = len(msp["splits"]["val"]["scenes"])
+        check("spatial-split: single cloud -> 1 train + 1 val region (not a grid)",
+              nt == 1 and nv == 1)
+        check("spatial-split: points conserved across the cut (20k in -> 20k out)",
+              msp["splits"]["train"]["total_points"]
+              + msp["splits"]["val"]["total_points"] == 20_000)
 
         # ---------------- PLY dataset with field labels
         ply_root = tmp / "ply_src"
@@ -243,6 +254,18 @@ def main():
         check("dg: config_to_env does NOT emit inference-time AdaBN/TTA",
               "DG_INFER_ADABN" not in dg_env and "DG_INFER_TTA" not in dg_env)
         check("dg: empty config -> baseline (no vars)", analysis.dg_config_to_env({}) == {})
+
+        # loss/class-balance: only non-default knobs become LOSS_*/RARE_* env
+        base = {"focal": False, "focal_gamma": 2.0, "class_weighting": True,
+                "weight_beta": 0.5, "rare_oversample": True}
+        check("loss: all-default config emits nothing", analysis.loss_config_to_env(base) == {})
+        le = analysis.loss_config_to_env({**base, "focal": True, "focal_gamma": 3.0,
+                                          "weight_beta": 1.0, "rare_oversample": False})
+        check("loss: focal+gamma+beta+rare overrides map to env",
+              le == {"LOSS_FOCAL": "1", "LOSS_FOCAL_GAMMA": "3.0",
+                     "LOSS_WEIGHT_BETA": "1.0", "RARE_OVERSAMPLE": "0"})
+        check("loss: gamma is ignored unless focal is on",
+              "LOSS_FOCAL_GAMMA" not in analysis.loss_config_to_env({**base, "focal_gamma": 3.0}))
 
         # write_run_manifest bakes the DG block (read from the training env) into run.json
         # so a logdk model is self-describing; infer_meta reads it back at inference.

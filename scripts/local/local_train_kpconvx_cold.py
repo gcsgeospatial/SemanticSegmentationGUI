@@ -200,6 +200,13 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
     DG_LOGDK_K     = dg.env_int("DG_LOGDK_K", globals()["DG_LOGDK_K"])
     DG_INFER_ADABN = dg.env_bool("DG_INFER_ADABN", globals()["DG_INFER_ADABN"])
     DG_INFER_TTA   = dg.env_int("DG_INFER_TTA", globals()["DG_INFER_TTA"])
+    # Loss / class-balance overrides (GUI "Loss & class balance" panel -> LOSS_*/
+    # RARE_* env; mirrors the DG env pattern). Unset env -> the script constants.
+    USE_FOCAL       = dg.env_bool("LOSS_FOCAL", globals()["USE_FOCAL"])
+    FOCAL_GAMMA     = dg.env_float("LOSS_FOCAL_GAMMA", globals()["FOCAL_GAMMA"])
+    CLASS_WEIGHTING = dg.env_bool("LOSS_CLASS_WEIGHTING", globals()["CLASS_WEIGHTING"])
+    WEIGHT_BETA     = dg.env_float("LOSS_WEIGHT_BETA", globals()["WEIGHT_BETA"])
+    RARE_OVERSAMPLE = dg.env_bool("RARE_OVERSAMPLE", globals()["RARE_OVERSAMPLE"])
     KP_AGGREGATION = dg.env_str("KP_AGGREGATION", globals()["KP_AGGREGATION"])
     KP_NORM        = dg.env_str("KP_NORM", globals()["KP_NORM"])
 
