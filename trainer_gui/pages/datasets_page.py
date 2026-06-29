@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDoubleS
                                QLineEdit, QListWidget, QMessageBox, QProgressBar, QPushButton, QSpinBox,
                                QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
-from .. import analysis, appstate, dataset, modal_cli, pretrain, ui
+from .. import analysis, appstate, dataset, modal_cli, pretrain, theme, ui
 from ..dataset import LabelSpec, SplitConfig
 from ..jobs import FuncWorker, JobRunner
 from ..readers import list_label_fields
@@ -79,7 +79,7 @@ class DatasetsPage(QWidget):
         self.stats_label = QLabel("")
         self.stats_label.setWordWrap(True)
         self.stats_label.setAlignment(Qt.AlignTop)
-        self.stats_label.setStyleSheet("color: #5b6273;")
+        theme.set_accent(self.stats_label, "muted")
         sd_row.addWidget(self.stats_label, 1)
         root.addLayout(sd_row)
         self._reload_known()
@@ -168,7 +168,7 @@ class DatasetsPage(QWidget):
             self.hag_btn.setEnabled(False)
             warn = QLabel("PDAL not found — install python-pdal to enable this step.")
             warn.setWordWrap(True)
-            warn.setStyleSheet("color: #b03030;")
+            theme.set_accent(warn, "error")
             form.addRow("", warn)
         return box
 
@@ -200,7 +200,7 @@ class DatasetsPage(QWidget):
         cl.addWidget(self.class_table)
         self.analyze_label = QLabel("")
         self.analyze_label.setWordWrap(True)
-        self.analyze_label.setStyleSheet("color: #5b6273;")
+        theme.set_accent(self.analyze_label, "muted")
         cl.addWidget(self.analyze_label)
         return box
 
@@ -287,7 +287,7 @@ class DatasetsPage(QWidget):
         self.busy.setVisible(False)
         self.status = QLabel("")
         self.status.setWordWrap(True)
-        self.status.setStyleSheet("color: #5b6273;")
+        theme.set_accent(self.status, "muted")
         lay = QVBoxLayout()
         lay.addLayout(go_row)
         lay.addWidget(self.busy)

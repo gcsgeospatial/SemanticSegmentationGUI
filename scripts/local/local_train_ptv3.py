@@ -110,6 +110,21 @@ AUG_FLIP_P       = 0.5          # per-axis (x, y) coordinate flip probability
 AUG_JITTER_SIGMA = 0.005        # gaussian per-point noise (m)
 AUG_JITTER_CLIP  = 0.02         # clip jitter to +/- this (m)
 
+# D3b: explicit local-density input channel (log k-th-NN distance) -> bumps in_channels
+# 6->7 (retrain). Pair with DG_DENSITY_AUG so rho varies. FiLM form lives in the ptv3 lib.
+DG_LOGDK_FEAT  = False
+DG_LOGDK_K     = 8
+
+# --- density domain-generalization (scripts/helper/density.py; see DENSITY_DG.md) ---
+# o = rho*g^2; density-invariant for o>=1, breaks for o<1. D1 jitters the voxel grid
+# in training so the model spans the inference density range; D5 averages density
+# (scale) views at inference. NOTE: D2b AdaBN is intentionally omitted for PTv3 — its
+# BN is only in pooling/stem (LayerNorm elsewhere), so BN-recalibration barely helps.
+DG_DENSITY_AUG = False   # D1: jitter GRID_SIZE per tile during training
+DG_COARSEN_MAX = 2.5     # = 1/(GRID_SIZE*sqrt(rho_min)); density sweep-down factor
+DG_P_NATIVE    = 0.5     # P(tile kept at native GRID_SIZE)
+DG_INFER_TTA   = 0       # D5: # extra density(scale) views to average at inference (0=off)
+
 # Loss = weighted CE (+ optional focal / label smoothing) + Lovász-Softmax,
 # mirroring modal_train_kpconvx_cold.py. PTv3's own outdoor loss is CE + Lovász.
 CLASS_WEIGHTING  = True
@@ -177,6 +192,8 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
     from datetime import datetime
     import numpy as np
     import torch
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "helper"))
+    import density as dg
     from plyfile import PlyData
 
     sys.path.insert(0, "/opt")          # so `import ptv3.model` resolves
@@ -436,7 +453,7 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                 print("  flash_attn unavailable — falling back to "
                       "enable_flash=False (slower attention).", flush=True)
         backbone = PointTransformerV3(
-            in_channels=6,                # xyz + rgb
+            in_channels=6 + (1 if DG_LOGDK_FEAT else 0),   # xyz + rgb (+ log d_k, D3b)
             order=("z", "z-trans", "hilbert", "hilbert-trans"),
             stride=(2, 2, 2, 2),
             enc_depths=(2, 2, 2, 6, 2),
@@ -493,24 +510,35 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                         if m.sum() < 64:
                             continue
                         idx = np.where(m)[0]
-                        w = (xyz[idx] - xyz[idx].mean(0)).astype(np.float32)
-                        keys = np.floor(w / GRID_SIZE).astype(np.int64)
-                        _, first, inverse = np.unique(keys, axis=0, return_index=True,
-                                                      return_inverse=True)
-                        vx = w[first]
-                        feat = np.concatenate(
-                            [vx, rgb[idx][first].astype(np.float32) / 255.0],
-                            axis=1).astype(np.float32)
-                        coord = torch.from_numpy(vx).cuda()
-                        featt = torch.from_numpy(feat).cuda()
-                        offset = torch.tensor([len(vx)], dtype=torch.long).cuda()
-                        gc = keys[first] - keys[first].min(0)   # unique, dedup-consistent
-                        grid_coord = torch.from_numpy(np.ascontiguousarray(gc)).long().cuda()
-                        point = backbone({"coord": coord, "grid_coord": grid_coord,
-                                          "feat": featt, "offset": offset})
-                        fe = point["feat"] if isinstance(point, dict) else point.feat
-                        voxel_pred = head(fe).argmax(-1).cpu().numpy()
-                        pred[idx] = voxel_pred[inverse]
+                        w0 = (xyz[idx] - xyz[idx].mean(0)).astype(np.float32)
+                        rgbf = rgb[idx].astype(np.float32) / 255.0
+                        # D5 density-TTA: isotropic scale s is a density change (o->o/s^2);
+                        # re-voxelize per view, average per-point softmax. views=[1.0] when
+                        # off -> identical to the old single-view argmax.
+                        views = [1.0] + (list(np.linspace(0.85, 1.2, DG_INFER_TTA))
+                                         if DG_INFER_TTA else [])
+                        pprob = None
+                        for s in views:
+                            w = (w0 * s).astype(np.float32)
+                            keys = np.floor(w / GRID_SIZE).astype(np.int64)
+                            _, first, inverse = np.unique(keys, axis=0, return_index=True,
+                                                          return_inverse=True)
+                            vx = w[first]
+                            feat = np.concatenate(
+                                [vx, rgbf[first]]
+                                + ([dg.local_density_logdk(vx, DG_LOGDK_K)[:, None]] if DG_LOGDK_FEAT else []),
+                                axis=1).astype(np.float32)
+                            coord = torch.from_numpy(vx).cuda()
+                            featt = torch.from_numpy(feat).cuda()
+                            offset = torch.tensor([len(vx)], dtype=torch.long).cuda()
+                            gc = keys[first] - keys[first].min(0)   # unique, dedup-consistent
+                            grid_coord = torch.from_numpy(np.ascontiguousarray(gc)).long().cuda()
+                            point = backbone({"coord": coord, "grid_coord": grid_coord,
+                                              "feat": featt, "offset": offset})
+                            fe = point["feat"] if isinstance(point, dict) else point.feat
+                            vp = torch.softmax(head(fe).float(), -1).cpu().numpy()[inverse]
+                            pprob = vp if pprob is None else pprob + vp
+                        pred[idx] = pprob.argmax(-1)
             miss = pred < 0
             if miss.any() and (~miss).any():
                 _, nn = cKDTree(xyz[~miss]).query(xyz[miss])
@@ -528,16 +556,25 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
         wpath = f"/outputs/{weights}"
         if not os.path.exists(wpath):
             raise FileNotFoundError(f"weights not found on outputs volume: {wpath}")
-        ckpt = torch.load(wpath, map_location="cpu", weights_only=False)
+        try:   # weights_only=True: a hand-picked .pth can't run code on load
+            ckpt = torch.load(wpath, map_location="cpu", weights_only=True)
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to load weights '{wpath}': {e}\n"
+                f"  (loaded safely with weights_only=True — a full-model pickle or a "
+                f"checkpoint from another script is rejected; re-export as a state_dict.)"
+            ) from e
         bsd, hsd = ckpt["backbone"], ckpt["head"]
         num_classes = int(hsd["weight"].shape[0])
         class_names = [f"class_{i}" for i in range(num_classes)]
-        run_cfg_path = os.path.join(os.path.dirname(os.path.dirname(wpath)), "run_config.json") \
-            if os.path.basename(os.path.dirname(wpath)) == "checkpoints" \
-            else os.path.join(os.path.dirname(wpath), "run_config.json")
-        if os.path.exists(run_cfg_path):
-            with open(run_cfg_path) as f:
-                class_names = json.load(f).get("class_names") or class_names
+        import os as _os, sys as _sys   # read the run's run.json (single manifest) beside the weights
+        _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "helper"))
+        from train_common import infer_meta
+        meta = infer_meta(wpath)
+        if meta:
+            class_names = meta.get("class_names") or class_names
+            if meta.get("grid") is not None:
+                GRID_SIZE = float(meta["grid"])
 
         backbone, head = build_model(num_classes)
         backbone.load_state_dict(bsd)
@@ -678,7 +715,7 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
         lr=BASE_LR, weight_decay=WEIGHT_DECAY,
     )
     if resume_ckpt is not None:
-        rckpt = torch.load(resume_ckpt, map_location="cuda", weights_only=False)
+        rckpt = torch.load(resume_ckpt, map_location="cuda", weights_only=True)
         backbone.load_state_dict(rckpt["backbone"]); head.load_state_dict(rckpt["head"])
         if "optim" in rckpt:
             optim.load_state_dict(rckpt["optim"])
@@ -906,13 +943,20 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
             # floor((coord-min)/GRID) uses a different phase and can collapse two
             # distinct voxels onto one grid_coord — which corrupts spconv's
             # submanifold rulebook (out-of-bounds gather -> CUDA device assert).
-            keys = np.floor(xyz / GRID_SIZE).astype(np.int64)
+            # D1 density jitter: coarsen the voxel grid per tile (train only) so the
+            # model spans the inference density range. grid_coord still comes from the
+            # dedup keys below, so the spconv submanifold invariant is preserved.
+            g_eff = (dg.effective_grid(GRID_SIZE, DG_COARSEN_MAX, DG_P_NATIVE)
+                     if (training and DG_DENSITY_AUG) else GRID_SIZE)
+            keys = np.floor(xyz / g_eff).astype(np.int64)
             _, uniq = np.unique(keys, axis=0, return_index=True)
             xyz = xyz[uniq]; rgb = rgb[uniq]; lab = lab[uniq]
             # feat = augmented/centered coords + color/intensity (intensity is
             # carried in the rgb channels for LiDAR canonical datasets).
             feat = np.concatenate(
-                [xyz.astype(np.float32), rgb.astype(np.float32) / 255.0], axis=1)
+                [xyz.astype(np.float32), rgb.astype(np.float32) / 255.0]
+                + ([dg.local_density_logdk(xyz, DG_LOGDK_K)[:, None]] if DG_LOGDK_FEAT else []),
+                axis=1)
             coords.append(xyz); feats.append(feat); labels.append(lab)
             grid_coords.append(keys[uniq])
             running += len(xyz)
@@ -999,7 +1043,9 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                                                   return_inverse=True)
                     vx = cxyz[first].astype(np.float32)
                     feat = np.concatenate(
-                        [vx, rgb[first].astype(np.float32) / 255.0], axis=1).astype(np.float32)
+                        [vx, rgb[first].astype(np.float32) / 255.0]
+                        + ([dg.local_density_logdk(vx, DG_LOGDK_K)[:, None]] if DG_LOGDK_FEAT else []),
+                        axis=1).astype(np.float32)
                     coord = torch.from_numpy(vx).cuda()
                     featt = torch.from_numpy(feat).cuda()
                     offset = torch.tensor([len(vx)], dtype=torch.long).cuda()
@@ -1087,8 +1133,9 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
 
     import os as _os, sys as _sys   # scripts/helper is a sibling dir (flat /root in Modal)
     _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "helper"))
-    from train_common import BestCheckpoint
+    from train_common import BestCheckpoint, write_run_manifest
     best = BestCheckpoint(run_dir)
+    write_run_manifest(run_dir, "ptv3", dataset)   # the single inference manifest (run.json)
 
     def run_eval(ep, write_json=False):
         backbone.eval(); head.eval()

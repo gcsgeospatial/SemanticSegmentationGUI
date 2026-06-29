@@ -68,6 +68,20 @@ IN_DIM        = 5                # [x, y, z, intensity, return_number]
 N_VAL_HOLDOUT = 10               # number of train scenes held out for val
 HOLDOUT_SEED  = 42
 
+# --- density domain-generalization (scripts/helper/density.py; see DENSITY_DG.md) ---
+# o = rho*g^2; density-invariant for o>=1, breaks for o<1. RandLA's fixed-N absorbs a
+# plain keep-fraction, so D1 jitters the SUB_GRID per sphere (the real density knob);
+# D2b/D5 patch inference. All default to current behaviour.
+DG_DENSITY_AUG = False   # D1: per-sphere coarser SUB_GRID during training
+DG_COARSEN_MAX = 2.0     # = 1/(SUB_GRID_SIZE*sqrt(rho_min)); density sweep-down factor
+DG_P_NATIVE    = 0.5     # P(sphere kept at native SUB_GRID_SIZE)
+DG_INFER_ADABN = False   # D2b: recompute BN stats on target tiles before predicting (RandLA is pure-BN)
+DG_INFER_TTA   = 0       # D5: # extra density(scale) views to average at inference (0=off)
+# D3b: explicit local-density input channel (log k-th-NN distance) -> bumps IN_DIM 5->6
+# (retrain; old fc0 weights won't load). Pair with DG_DENSITY_AUG so rho varies.
+DG_LOGDK_FEAT  = False
+DG_LOGDK_K     = 8
+
 # Class balance (rare classes derived from train frequency, so this also works
 # for canonical --dataset runs with arbitrary class sets).
 CLASS_WEIGHTING  = True
@@ -134,12 +148,18 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     from datetime import datetime
     import numpy as np
     import torch
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "helper"))
+    import density as dg
     import torch.nn as nn
     import torch.optim as optim
     from torch.utils.data import DataLoader, Dataset
 
     # --- resolve config: CLI args override the module defaults ---------------
     SUB_GRID_SIZE = sub_grid if sub_grid is not None else globals()["SUB_GRID_SIZE"]
+    # D3b: effective input dim grows by 1 when the log-d_k channel is on. Shadow IN_DIM
+    # here (before build_net is defined) so build_net's default, the checkpoint in-dim
+    # check, and the run-config all track it.
+    IN_DIM = globals()["IN_DIM"] + (1 if DG_LOGDK_FEAT else 0)
     NUM_POINTS    = num_points if num_points is not None else globals()["NUM_POINTS"]
     N_EPOCHS      = epochs if epochs is not None else globals()["N_EPOCHS"]
     BATCH_SIZE    = batch if batch is not None else globals()["BATCH_SIZE"]
@@ -535,6 +555,17 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
             if len(sel) < cfg.num_points:
                 sel = np.concatenate([sel, rng.choice(len(xyz), cfg.num_points - len(sel))])
             rng.shuffle(sel)
+            # D1 density jitter: re-subsample the sphere to a coarser grid so the model
+            # trains across the inference density range. Fixed-N is preserved by padding
+            # from the (now sparser) point set, so the kNN graph sees sparser geometry.
+            if augment and DG_DENSITY_AUG:
+                g_eff = dg.effective_grid(SUB_GRID_SIZE, DG_COARSEN_MAX, DG_P_NATIVE, rng=rng)
+                if g_eff > SUB_GRID_SIZE:
+                    keep = dg.voxel_first_idx(xyz[sel], g_eff)
+                    sel = sel[keep]
+                    if len(sel) < cfg.num_points:
+                        sel = np.concatenate([sel, rng.choice(sel, cfg.num_points - len(sel))])
+                    rng.shuffle(sel)
             pc = (xyz[sel] - center).astype(np.float32)
             if augment:
                 theta = rng.rand() * 2 * np.pi
@@ -544,7 +575,9 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                 if rng.rand() < 0.5:
                     pc[:, 0] *= -1.0
                 pc = pc * np.float32(rng.uniform(0.9, 1.1))
-            feat2 = np.stack([intensity[sel], ret_num[sel]], axis=1).astype(np.float32)
+            feat2 = np.stack([intensity[sel], ret_num[sel]]
+                             + ([dg.local_density_logdk(pc, DG_LOGDK_K)] if DG_LOGDK_FEAT else []),
+                             axis=1).astype(np.float32)   # D3b: + log d_k on the (augmented) coords
             lb = lab[sel].astype(np.int64)
             return pc.astype(np.float32), feat2, lb, sel.astype(np.int32), \
                    np.array([cloud_idx], dtype=np.int32)
@@ -632,7 +665,9 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                     if real < 64:
                         continue
                     block = sub_sorted[s:s + N]
-                    f2 = np.stack([sub_itn[s:s + N], sub_ret[s:s + N]], axis=1)
+                    f2 = np.stack([sub_itn[s:s + N], sub_ret[s:s + N]]
+                                  + ([dg.local_density_logdk(block, DG_LOGDK_K)] if DG_LOGDK_FEAT else []),
+                                  axis=1)   # D3b
                     orig = order[s:s + real].astype(np.int64)   # indices into sub_xyz
                     if real < N:                         # pad the final short block
                         pad = np.random.choice(real, N - real)
@@ -643,16 +678,26 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                     # order (training spheres shuffle); shuffle, unshuffle on scatter.
                     perm = np.random.permutation(N)
                     block, f2, orig = block[perm], f2[perm], orig[perm]
-                    pc_c = (block - block.mean(0, keepdims=True)).astype(np.float32)
-                    item = (pc_c, f2.astype(np.float32), np.zeros(N, np.int64),
-                            np.arange(N, dtype=np.int32), np.array([0], np.int32))
-                    batch = collate_fn([item])
-                    for k in ("features", "labels", "input_inds", "cloud_inds"):
-                        batch[k] = batch[k].to(device)
-                    for k in ("xyz", "neigh_idx", "sub_idx", "interp_idx"):
-                        batch[k] = [t.to(device) for t in batch[k]]
-                    end_points = net(batch)
-                    p = end_points["logits"].transpose(1, 2).reshape(-1, num_classes).argmax(-1).cpu().numpy()
+                    pc0 = (block - block.mean(0, keepdims=True)).astype(np.float32)
+                    # D5 density-TTA: isotropic scale s rescales the LocSE relative-coord
+                    # magnitudes (a density view); average softmax over views. views=[1.0]
+                    # when off -> identical to the old single-view argmax.
+                    views = [1.0] + (list(np.linspace(0.85, 1.2, DG_INFER_TTA))
+                                     if DG_INFER_TTA else [])
+                    prob = None
+                    for sv in views:
+                        pc_c = (pc0 * sv).astype(np.float32)
+                        item = (pc_c, f2.astype(np.float32), np.zeros(N, np.int64),
+                                np.arange(N, dtype=np.int32), np.array([0], np.int32))
+                        batch = collate_fn([item])
+                        for k in ("features", "labels", "input_inds", "cloud_inds"):
+                            batch[k] = batch[k].to(device)
+                        for k in ("xyz", "neigh_idx", "sub_idx", "interp_idx"):
+                            batch[k] = [t.to(device) for t in batch[k]]
+                        lg = net(batch)["logits"].transpose(1, 2).reshape(-1, num_classes)
+                        pp = torch.softmax(lg.float(), -1).cpu().numpy()
+                        prob = pp if prob is None else prob + pp
+                    p = prob.argmax(-1)
                     valid = orig >= 0
                     sub_pred[orig[valid]] = p[valid]
             valid = sub_pred >= 0
@@ -671,17 +716,26 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         wpath = f"/outputs/{weights}"
         if not os.path.exists(wpath):
             raise FileNotFoundError(f"weights not found on outputs volume: {wpath}")
-        ckpt = torch.load(wpath, map_location=device, weights_only=False)
+        try:   # weights_only=True: a hand-picked .pth can't run code on load
+            ckpt = torch.load(wpath, map_location=device, weights_only=True)
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to load weights '{wpath}': {e}\n"
+                f"  (loaded safely with weights_only=True — a full-model pickle or a "
+                f"checkpoint from another script is rejected; re-export as a state_dict.)"
+            ) from e
         sd = ckpt.get("model", ckpt.get("model_state_dict", ckpt.get("state_dict", ckpt)))
         fc3_key = next((k for k in sd if k.startswith("fc3.") and k.endswith("weight")), None)
         num_classes = int(sd[fc3_key].shape[0]) if fc3_key else NUM_CLASSES
         class_names = [f"class_{i}" for i in range(num_classes)]
-        run_cfg_path = os.path.join(os.path.dirname(os.path.dirname(wpath)), "run_config.json") \
-            if os.path.basename(os.path.dirname(wpath)) == "checkpoints" \
-            else os.path.join(os.path.dirname(wpath), "run_config.json")
-        if os.path.exists(run_cfg_path):
-            with open(run_cfg_path) as f:
-                class_names = json.load(f).get("class_names", class_names)
+        import os as _os, sys as _sys   # read the run's run.json (single manifest) beside the weights
+        _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "helper"))
+        from train_common import infer_meta
+        meta = infer_meta(wpath)
+        if meta:
+            class_names = meta.get("class_names") or class_names
+            if meta.get("grid") is not None:
+                SUB_GRID_SIZE = float(meta["grid"])
 
         fc0_key = next((k for k in sd if k.startswith("fc0.") and sd[k].dim() >= 2), None)
         ckpt_in_dim = int(sd[fc0_key].shape[1]) if fc0_key is not None else 3
@@ -717,6 +771,55 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         predict_scene = make_predict_scene(net, num_classes)
         palette = _palette(num_classes)
         print(f"  [infer] labeling {len(scenes)} scene(s) -> {pred_dir}", flush=True)
+        if DG_INFER_ADABN:
+            # D2b: re-estimate BN running stats on the target tiles (label-free) so the
+            # source-density stats stop mis-normalizing at a different inference density.
+            print("  [infer] AdaBN: recomputing BN stats on target tiles...", flush=True)
+
+            def _target_batches(cap=30):
+                seen = 0
+                N = cfg.num_points
+                for pc_path in scenes:
+                    if seen >= cap:
+                        return
+                    z = np.load(pc_path)
+                    xyz0 = z["xyz"].astype(np.float32)
+                    itn0 = (z["intensity"].astype(np.float32) if "intensity" in z
+                            else np.full(len(xyz0), 0.5, np.float32))
+                    ret0 = (z["return_number"].astype(np.float32) if "return_number" in z
+                            else (z["ret_num"].astype(np.float32) if "ret_num" in z
+                                  else np.zeros(len(xyz0), np.float32)))
+                    keys = np.floor(xyz0 / SUB_GRID_SIZE).astype(np.int64)
+                    _, uniq = np.unique(keys, axis=0, return_index=True)
+                    sx, si, sr = xyz0[uniq], itn0[uniq], ret0[uniq]
+                    for s0 in range(0, len(sx), N):
+                        if seen >= cap:
+                            return
+                        real = min(N, len(sx) - s0)
+                        if real < 64:
+                            continue
+                        block = sx[s0:s0 + N]
+                        f2 = np.stack([si[s0:s0 + N], sr[s0:s0 + N]]
+                                      + ([dg.local_density_logdk(block, DG_LOGDK_K)] if DG_LOGDK_FEAT else []),
+                                      axis=1)   # D3b
+                        if real < N:
+                            pad = np.random.choice(real, N - real)
+                            block = np.concatenate([block, block[pad]], 0)
+                            f2 = np.concatenate([f2, f2[pad]], 0)
+                        perm = np.random.permutation(N)
+                        block, f2 = block[perm], f2[perm]
+                        pc_c = (block - block.mean(0, keepdims=True)).astype(np.float32)
+                        item = (pc_c, f2.astype(np.float32), np.zeros(N, np.int64),
+                                np.arange(N, dtype=np.int32), np.array([0], np.int32))
+                        batch = collate_fn([item])
+                        for k in ("features", "labels", "input_inds", "cloud_inds"):
+                            batch[k] = batch[k].to(device)
+                        for k in ("xyz", "neigh_idx", "sub_idx", "interp_idx"):
+                            batch[k] = [t.to(device) for t in batch[k]]
+                        seen += 1
+                        yield batch
+            dg.adabn_recalibrate(net, _target_batches(), forward=lambda m, b: m(b))
+            net.eval()
         for pc_path in scenes:
             name = os.path.splitext(os.path.basename(pc_path))[0]
             t0 = time.time()
@@ -884,7 +987,9 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                     if real < 64:
                         continue
                     pts_blk = xyz[blk]
-                    f2 = np.stack([intensity[blk], ret_num[blk]], axis=1).astype(np.float32)
+                    f2 = np.stack([intensity[blk], ret_num[blk]]
+                                  + ([dg.local_density_logdk(pts_blk, DG_LOGDK_K)] if DG_LOGDK_FEAT else []),
+                                  axis=1).astype(np.float32)   # D3b
                     orig = blk.astype(np.int64)
                     if real < N:                         # pad the final short block
                         pad = np.random.choice(real, N - real)
@@ -960,8 +1065,9 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
 
     import os as _os, sys as _sys   # scripts/helper is a sibling dir (flat /root in Modal)
     _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "helper"))
-    from train_common import BestCheckpoint
+    from train_common import BestCheckpoint, write_run_manifest
     best = BestCheckpoint(run_dir)
+    write_run_manifest(run_dir, "randlanet", dataset)   # the single inference manifest (run.json)
 
     def run_eval(ep, write_json=False):
         net.eval()

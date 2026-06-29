@@ -16,38 +16,6 @@ from PySide6.QtWidgets import (QApplication, QComboBox, QHBoxLayout, QLabel, QLi
 #   .../<repo>/trainer_gui/main.py  -> parents[0]=trainer_gui pkg, parents[1]=<repo>
 REPO_ROOT = str(Path(__file__).resolve().parents[1])
 
-STYLE = """
-QWidget { font-size: 14px; }
-#sidebar { background: #1f2430; }
-#sidebar QListWidget { background: #1f2430; color: #c8cdd6; border: none; outline: none; }
-#sidebar QListWidget::item { padding: 12px 18px; }
-#sidebar QListWidget::item:selected { background: #323a4d; color: #ffffff; }
-#sidebar QListWidget::item:disabled { color: #5b6273; }
-#brand { color: #ffffff; font-size: 18px; font-weight: 600; padding: 18px 18px 6px 18px; }
-#brandSub { color: #7f8696; padding: 0 18px 14px 18px; }
-#modeLabel { color: #7f8696; padding: 4px 18px 2px 18px; font-size: 12px; }
-#sidebar QComboBox { background: #2a3040; color: #d6dae3; border: 1px solid #3a4252;
-                     border-radius: 4px; padding: 4px 8px; margin: 0 18px 12px 18px; }
-#sidebar QComboBox QAbstractItemView { background: #2a3040; color: #d6dae3;
-                                       selection-background-color: #3b6cf6; }
-#pageTitle { font-size: 22px; font-weight: 600; }
-#pageSub { color: #5b6273; margin-bottom: 8px; }
-#log { font-family: Consolas, "Courier New", monospace; font-size: 12px;
-       background: #11141b; color: #d6dae3; }
-QPushButton { padding: 7px 14px; border-radius: 5px; border: 1px solid #c2c8d2; background: #fff; }
-QPushButton:hover { background: #f0f2f6; }
-QPushButton#primary { background: #3b6cf6; color: #fff; border: none; font-weight: 600; }
-QPushButton#primary:hover { background: #2f59d6; }
-QPushButton#primary:disabled { background: #9bb0ee; }
-QGroupBox { font-weight: 600; margin-top: 10px; border: 1px solid #e1e4ea;
-            border-radius: 6px; padding: 10px; }
-QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; }
-QSplitter::handle { background: #e7eaf0; border-radius: 3px; }
-QSplitter::handle:hover { background: #b9c2d4; }
-QSplitter::handle:vertical { height: 8px; margin: 1px 60px; }
-QSplitter::handle:horizontal { width: 8px; margin: 60px 1px; }
-"""
-
 PAGES = ["Datasets", "Train", "Inference", "Plotting"]
 
 
@@ -89,6 +57,19 @@ class MainWindow(QWidget):
         self.mode_combo.currentIndexChanged.connect(self._on_mode_change)
         sl.addWidget(self.mode_combo)
         self._apply_mode_tag(appstate.get_exec_mode())
+
+        # Appearance: System (follows the OS), Light or Dark — persisted.
+        theme_label = QLabel("Appearance")
+        theme_label.setObjectName("modeLabel")
+        sl.addWidget(theme_label)
+        self.theme_combo = QComboBox()
+        self.theme_combo.addItem("System", "system")
+        self.theme_combo.addItem("Light", "light")
+        self.theme_combo.addItem("Dark", "dark")
+        self.theme_combo.setCurrentIndex(
+            max(0, self.theme_combo.findData(appstate.get("ui_theme", "system"))))
+        self.theme_combo.currentIndexChanged.connect(self._on_theme_change)
+        sl.addWidget(self.theme_combo)
 
         self.nav = QListWidget()
         for name in PAGES:
@@ -138,6 +119,12 @@ class MainWindow(QWidget):
         self.tag.setText("point-cloud training — local (Docker)" if mode == "local"
                          else "point-cloud training on Modal")
 
+    def _on_theme_change(self):
+        from . import appstate, theme
+        mode = self.theme_combo.currentData()
+        appstate.put("ui_theme", mode)
+        theme.apply(QApplication.instance(), mode)
+
     def _go(self, row: int):
         # PAGES = [Datasets, Train, Inference, Plotting]
         if row == 1:
@@ -178,9 +165,16 @@ def _check_modal_cli(parent=None) -> bool:
 
 
 def main() -> int:
+    from . import appstate, theme
     app = QApplication(sys.argv)
     app.setApplicationName("trainer_gui")
-    app.setStyleSheet(STYLE)
+    theme.apply(app, appstate.get("ui_theme", "system"))
+    try:   # live-follow the OS light/dark switch while in System mode
+        app.styleHints().colorSchemeChanged.connect(
+            lambda *_: (appstate.get("ui_theme", "system") == "system")
+            and theme.apply(app, appstate.get("ui_theme", "system")))
+    except (AttributeError, TypeError):
+        pass
     win = MainWindow()
     win.show()
     _check_modal_cli(win)

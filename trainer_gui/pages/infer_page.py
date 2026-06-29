@@ -43,6 +43,9 @@ class InferPage(QWidget):
         self._run_id = ""
         self._dl_dest: Path | None = None
         self._pred_dir: Path | None = None   # where local predictions land (host)
+        self._manifest: dict | None = None         # the picked run.json (local runs)
+        self._manifest_path: Path | None = None
+        self._local_weights: Path | None = None    # weights = the run.json's sibling
 
         root = QVBoxLayout(self)
         title = QLabel("Inference")
@@ -54,7 +57,7 @@ class InferPage(QWidget):
         root.addWidget(self.sub)
 
         wbox = QGroupBox("Weights")
-        wf = QFormLayout(wbox)
+        wf = self.wf = QFormLayout(wbox)
         radio_row = QHBoxLayout()
         self.from_run_radio = QRadioButton("From a training run")
         self.from_run_radio.setChecked(True)
@@ -64,6 +67,23 @@ class InferPage(QWidget):
         radio_row.addWidget(self.from_file_radio)
         radio_row.addStretch()
         wf.addRow("Source", _wrap(radio_row))
+        # LOCAL: pick the run's run.json — the self-contained manifest training writes
+        # next to the weights. Architecture, grid, tile, intensity norm, HAG, and the
+        # weights path (its sibling) all come from it. No searching, no conventions.
+        self.runjson_edit = QLineEdit()
+        self.runjson_edit.setPlaceholderText("…/local_runs/runs/<id>/run.json")
+        # #8: a typed/pasted path loads on Enter/focus-out; any edit drops the stale
+        # load so a run can't proceed with a manifest that no longer matches the text.
+        self.runjson_edit.editingFinished.connect(self._load_run_manifest)
+        self.runjson_edit.textChanged.connect(self._invalidate_manifest)
+        rj_row = QHBoxLayout()
+        rj_row.addWidget(self.runjson_edit)
+        rj_btn = QPushButton("Browse…")
+        rj_btn.clicked.connect(self._pick_runjson)
+        rj_row.addWidget(rj_btn)
+        self.runjson_row_w = _wrap(rj_row)
+        wf.addRow("Run file (run.json)", self.runjson_row_w)
+        # MODAL: pick/paste a run id (weights live on the cloud outputs volume).
         self.run_combo = QComboBox()
         self.run_combo.setEditable(True)   # run ids can also be typed/pasted
         self.run_combo.currentIndexChanged.connect(self._on_run_pick)
@@ -114,11 +134,13 @@ class InferPage(QWidget):
         self.chunk_spin.setDecimals(0)
         self.chunk_spin.setValue(50.0)
         iform.addRow("Tile size (m)", self.chunk_spin)
-        # Local mode: where prediction files land on the host (bind-mounted to the
-        # container's predictions dir). Empty = the app staging folder. No upload.
+        # Where prediction files land: on the host directly in local mode, or where
+        # Modal predictions get downloaded. Always the user's express choice — empty
+        # just falls back to a findable Downloads folder, never a hidden app dir.
         self.out_edit = QLineEdit()
         self.out_edit.setText(appstate.get("infer_out", ""))
-        self.out_edit.setPlaceholderText("default: app staging folder")
+        self.out_edit.setPlaceholderText(
+            f"default: {appstate.default_download_dir().as_posix()}")
         out_row = QHBoxLayout()
         out_row.addWidget(self.out_edit)
         out_btn = QPushButton("Browse…")
@@ -209,10 +231,16 @@ class InferPage(QWidget):
         """Reword copy for the backend + apply the local backbone filter. Inference
         has no other Modal-only controls (just weights + a folder)."""
         self.sub.setText(
-            "Label new point clouds with an already-trained model. Pick the weights "
-            "(a finished run, or a local .pth), point at a folder of clouds, and run"
-            + (" — inference runs locally in Docker." if local else " on Modal."))
-        self.iform.setRowVisible(self.out_row_w, local)   # output folder is a local pick
+            "Label new point clouds with an already-trained model. "
+            + ("Pick the run's run.json (or a local .pth), a folder of clouds, and run "
+               "— inference runs locally in Docker."
+               if local else
+               "Pick a training run (or a local .pth), a folder of clouds, and run on Modal."))
+        # Output folder is shown in BOTH modes: in modal mode it's where predictions
+        # download to, so the user always chooses a findable location (not %APPDATA%).
+        self.iform.setRowVisible(self.out_row_w, True)
+        self.wf.setRowVisible(self.runjson_row_w, local)  # run.json picker = local only
+        self.wf.setRowVisible(self.run_combo, not local)  # run-id combo = modal only
         self.reload_backbones()
 
     def reload_backbones(self):
@@ -334,58 +362,71 @@ class InferPage(QWidget):
         self._on_run_pick()
 
     def _on_run_pick(self):
+        """Modal run-id combo: sync the architecture from the picked run's backbone."""
         h = self.run_combo.currentData()
         if isinstance(h, dict) and h.get("backbone") in BACKBONES:
             i = self.backbone_combo.findData(h["backbone"])
             if i >= 0:
-                self.backbone_combo.setCurrentIndex(i)   # fires _sync_controls -> defaults
-        self._prefill_geometry_from_run()
+                self.backbone_combo.setCurrentIndex(i)
 
-    def _run_config(self, run_id: str, backbone: str | None) -> dict:
-        """The picked run's run_config.json from wherever it landed on THIS host
-        (local training, or a Modal run downloaded via the Runs page). {} if none."""
-        cands = [appstate.local_runs_dir() / "runs" / run_id / "run_config.json"]
-        if backbone:
-            cands.append(appstate.runs_dir() / backbone / run_id / "run_config.json")
-        cands += list(appstate.runs_dir().glob(f"*/{run_id}/run_config.json"))
-        for p in cands:
-            if p.exists():
-                try:
-                    with open(p, encoding="utf-8") as f:
-                        return json.load(f)
-                except (OSError, json.JSONDecodeError):
-                    return {}
-        return {}
+    def _pick_runjson(self):
+        start = self.runjson_edit.text().strip() or str(appstate.local_runs_dir())
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Choose the run's run.json", start, "Run manifest (run.json *.json)")
+        if path:
+            self.runjson_edit.setText(path)
+            self._load_run_manifest()
 
-    def _prefill_geometry_from_run(self):
-        """H1: override the backbone-DEFAULT grid/tile with the picked run's TRAINED
-        geometry, so inference voxelizes exactly as training did (PTv3/RandLA infer
-        at whatever --grid the GUI sends; a default ≠ the trained grid is a silent
-        10× mismatch that wrecks predictions). Runs AFTER _sync_controls, which sets
-        the defaults this overrides. No-op for a Modal run not downloaded locally."""
-        h = self.run_combo.currentData()
-        if isinstance(h, dict):
-            run_id, bkey = h.get("run_id", ""), h.get("backbone")
-        else:
-            parts = self.run_combo.currentText().split()
-            run_id, bkey = (parts[0] if parts else ""), self.backbone_combo.currentData()
-        if not run_id:
+    def _invalidate_manifest(self):
+        """#8: any edit to the path text drops the previously-loaded manifest, so a
+        run can't proceed with stale weights/params (editingFinished reloads it)."""
+        self._manifest = self._manifest_path = self._local_weights = None
+
+    def _load_run_manifest(self):
+        """Apply the picked run.json — the SINGLE explicit input for local inference.
+        Architecture, grid, tile and intensity norm are read straight from it (no
+        GUI-default guessing); weights resolve as its sibling. Refuses (rather than
+        silently keeping the wrong architecture) if the run's backbone isn't
+        selectable here (#7)."""
+        self._invalidate_manifest()
+        text = self.runjson_edit.text().strip()
+        if not text:
             return
-        cfg = self._run_config(run_id, bkey)
-        if not cfg:
+        p = Path(text)
+        if not p.is_file():
+            self._append(f"✗ run.json not found: {p}")
             return
-        # key name varies by backbone family: PTv3 grid_size/chunk_xy,
-        # KPConvX grid_m/chunk_xy_m, RandLA sub_grid_size (no tile).
-        grid = cfg.get("grid_size", cfg.get("grid_m", cfg.get("sub_grid_size")))
-        if grid is not None:
-            self.grid_spin.setValue(float(grid))
-        chunk = cfg.get("chunk_xy", cfg.get("chunk_xy_m"))
-        if chunk is not None and self.chunk_spin.isEnabled():
-            self.chunk_spin.setValue(float(chunk))
+        try:
+            with open(p, encoding="utf-8") as f:
+                m = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            self._append(f"✗ couldn't read {p.name}: {e}")
+            return
+        bkey = m.get("backbone")
+        i = self.backbone_combo.findData(bkey)
+        if i < 0:   # #7: the run's model is hidden/unknown — don't keep the wrong one
+            self._append(f"✗ This run's model '{bkey}' isn't available here. Enable it on "
+                         f"the Train page (backbone checkboxes), then reload this run.json.")
+            return
+        self._manifest, self._manifest_path = m, p
+        self.backbone_combo.setCurrentIndex(i)       # fires _sync_controls (sets defaults)
+        if m.get("grid") is not None:                # then the manifest overrides them
+            self.grid_spin.setValue(float(m["grid"]))
+        if m.get("chunk_xy") is not None and self.chunk_spin.isEnabled():
+            self.chunk_spin.setValue(float(m["chunk_xy"]))
+        j = self.inorm_combo.findData(m.get("intensity_norm", "p95"))
+        if j >= 0:
+            self.inorm_combo.setCurrentIndex(j)
+        self._local_weights = p.parent / m.get("weights", "final_model.pth")
+        ok = "✓" if self._local_weights.is_file() else "✗ weights missing —"
+        self._append(f"Loaded {p.name}: {bkey}, grid={m.get('grid')}, "
+                     f"chunk={m.get('chunk_xy')}, intensity={m.get('intensity_norm')}. "
+                     f"{ok} {self._local_weights}")
 
     def _on_source_toggle(self):
         from_run = self.from_run_radio.isChecked()
         self.run_combo.setEnabled(from_run)
+        self.runjson_row_w.setEnabled(from_run)
         self.pth_row_w.setEnabled(not from_run)
 
     def _sync_controls(self):
@@ -420,11 +461,17 @@ class InferPage(QWidget):
     def _pick_out(self):
         d = QFileDialog.getExistingDirectory(
             self, "Output folder for predictions",
-            self.out_edit.text() or str(appstate.staging_dir()))
+            self.out_edit.text() or str(appstate.default_download_dir()))
         if d:
             self.out_edit.setText(d)
 
     def _backbone(self):
+        # The run.json's backbone is authoritative for a from-a-run LOCAL inference,
+        # so execution never uses a stale/changed architecture dropdown (#7).
+        if (self._manifest and self.from_run_radio.isChecked()
+                and appstate.get_exec_mode() == "local"
+                and self._manifest.get("backbone") in BACKBONES):
+            return BACKBONES[self._manifest["backbone"]]
         return BACKBONES[self.backbone_combo.currentData()]
 
     # ------------------------------------------------------------- run chain
@@ -434,13 +481,34 @@ class InferPage(QWidget):
             self._append("Choose an input folder first.")
             return
         modal = appstate.get_exec_mode() != "local"
-        weights_run_id = ""          # set on the from-a-run path; drives the H4 preflight
-        if self.from_run_radio.isChecked():
+        weights_run_id = ""          # modal from-a-run only; drives the H4 preflight
+        if self.from_file_radio.isChecked():
+            if not os.path.isfile(self.pth_edit.text().strip()):
+                self._append("Choose a .pth file.")
+                return
+            self._weights_remote = f"uploads/{Path(self.pth_edit.text()).name}"
+        elif not modal:
+            # LOCAL from-a-run: the run.json is the single explicit input; weights are
+            # its sibling (resolved on load). No run-id parsing, no searching.
+            if not (self._manifest and self._manifest_path):
+                self._append("Pick the run's run.json first (Browse…).")
+                return
+            if not (self._local_weights and self._local_weights.is_file()):
+                self._append(f"✗ weights not found next to the run.json "
+                             f"({self._local_weights}). Point at a run.json that sits "
+                             f"beside its final_model.pth.")
+                return
+            bkey = self._manifest.get("backbone")
+            if bkey in BACKBONES and not BACKBONES[bkey].folder_infer:
+                self._append(f"✗ {BACKBONES[bkey].label} doesn't support folder inference.")
+                return
+        else:
+            # MODAL from-a-run: weights live on the cloud volume, keyed by run id.
             h = self.run_combo.currentData()
             if isinstance(h, dict):
                 run_id = h["run_id"]
             else:
-                parts = self.run_combo.currentText().split()   # H4/M6: empty combo -> no crash
+                parts = self.run_combo.currentText().split()   # empty combo -> no crash
                 run_id = parts[0] if parts else ""
             if not run_id:
                 self._append("Pick or type a run id.")
@@ -448,16 +516,10 @@ class InferPage(QWidget):
             bkey = h.get("backbone") if isinstance(h, dict) else None
             if bkey in BACKBONES and not BACKBONES[bkey].folder_infer:
                 self._append(f"✗ {BACKBONES[bkey].label} doesn't support folder inference "
-                             f"(its script has no --infer-input mode). Open that run's "
-                             f"predictions on the Runs page instead.")
+                             f"(its script has no --infer-input mode).")
                 return
             self._weights_remote = f"runs/{run_id}/final_model.pth"
             weights_run_id = run_id
-        else:
-            if not os.path.isfile(self.pth_edit.text().strip()):
-                self._append("Choose a .pth file.")
-                return
-            self._weights_remote = f"uploads/{Path(self.pth_edit.text()).name}"
 
         self._job_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         self._run_id = ""
@@ -495,21 +557,13 @@ class InferPage(QWidget):
                              appstate.staging_dir(), intensity_norm=norm, hag=want_hag)
 
     def _run_wants_real_hag(self) -> bool:
-        """True if the picked run trained on real PDAL HAG, so convert_infer_job
-        reproduces it instead of a z-min proxy. Only *_hag backbones use HAG; a local
-        .pth (or a Modal run not downloaded locally) has no readable run_config, so
-        this defaults off — the proxy, i.e. today's behaviour."""
-        if not self.from_run_radio.isChecked():
+        """True if the picked run trained on real PDAL HAG (read from its run.json),
+        so convert_infer_job reproduces it instead of a z-min proxy. A bare .pth, or a
+        run.json that records the proxy, -> False."""
+        m = self._manifest if (self.from_run_radio.isChecked() and self._manifest) else None
+        if not m:
             return False
-        h = self.run_combo.currentData()
-        if isinstance(h, dict):
-            run_id, bkey = h.get("run_id", ""), h.get("backbone")
-        else:
-            parts = self.run_combo.currentText().split()
-            run_id, bkey = (parts[0] if parts else ""), self.backbone_combo.currentData()
-        if not run_id or not (bkey and str(bkey).endswith("hag")):
-            return False
-        s = str(self._run_config(run_id, bkey).get("hag_source", "")).lower()
+        s = str(m.get("hag_source", "")).lower()
         return ("pdal" in s or "hag_nn" in s) and "proxy" not in s and "z_minus" not in s
 
     def _on_preflight(self, present):
@@ -565,7 +619,11 @@ class InferPage(QWidget):
             # Predictions now live on the shared terminal-datasets volume next to the
             # input scenes (_infer/<job_id>/predictions), keyed on the job id we
             # generated — no need to parse a per-backbone run id from the logs.
-            self._dl_dest = appstate.runs_dir() / "_infer" / self._job_id
+            # Download into the user's chosen folder (findable Downloads by default),
+            # not a hidden app dir. job-id subfolder keeps repeat runs from colliding.
+            base = self.out_edit.text().strip() or str(appstate.default_download_dir())
+            appstate.put("infer_out", self.out_edit.text().strip())
+            self._dl_dest = Path(base) / f"predictions_{self._job_id}"
             self._dl_dest.mkdir(parents=True, exist_ok=True)
             self._append(f"[4/4] Downloading predictions -> {self._dl_dest} …")
             self._stage = "download"
@@ -634,29 +692,12 @@ class InferPage(QWidget):
                 (str(self._pred_dir), f"/datasets/_infer/{self._job_id}/predictions"))
         else:
             self._pred_dir = self._staged / "predictions"
-        if self.from_file_radio.isChecked():
-            wpath = Path(self.pth_edit.text().strip())
-            extra_mounts.append((str(wpath.parent), "/outputs/_local_weights"))
-            weights = f"_local_weights/{wpath.name}"
-        else:
-            # Resolve the run's weights on THIS host. A locally-trained run lands at
-            # local_runs/runs/<id> (already under the /outputs mount); a Modal run
-            # downloaded via the Runs page lives under runs/<backbone>/<id> — bind-mount
-            # whichever exists. Refuse (don't fail in-container) if neither does.
-            run_id = self._weights_remote.split("/")[1]   # runs/<id>/final_model.pth
-            local_w = appstate.local_runs_dir() / "runs" / run_id / "final_model.pth"
-            dl_w = next(iter(appstate.runs_dir().glob(f"*/{run_id}/final_model.pth")), None)
-            if local_w.exists():
-                weights = self._weights_remote
-            elif dl_w is not None:
-                extra_mounts.append((str(dl_w.parent), "/outputs/_local_weights"))
-                weights = "_local_weights/final_model.pth"
-            else:
-                self._append(f"✗ Run '{run_id}' has no local weights (looked in "
-                             f"{local_w.parent} and {appstate.runs_dir()}). Train it locally, "
-                             f"download it on the Runs page, or use the 'Local .pth file' option.")
-                self.run_btn.setEnabled(True)
-                return
+        # Weights = an explicit host file: the picked .pth, or the run.json's sibling
+        # (resolved on load). Mount its dir into the container; no searching.
+        wpath = Path(self.pth_edit.text().strip()) if self.from_file_radio.isChecked() \
+            else self._local_weights
+        extra_mounts.append((str(wpath.parent), "/outputs/_local_weights"))
+        weights = f"_local_weights/{wpath.name}"
         flags = {
             "mode": "infer",
             "weights": weights,

@@ -129,6 +129,23 @@ AUG_SYMMETRY_X = True        # augment_symmetries = [True, False, False]
 AUG_NOISE     = 0.05         # augment_noise
 AUG_COLOR     = 0.8          # augment_color: P(keep features) = 0.8
 
+# --- density domain-generalization (scripts/helper/density.py; see DENSITY_DG.md) ---
+# o = rho*g^2; density-invariant for o>=1, breaks for o<1. D1 trains across the o-range,
+# D5 averages density views at inference; D2b recomputes BN stats on the target (its
+# AdaBN target-batch builder uses a z-min HAG proxy for the feature column).
+DG_DENSITY_AUG = False   # D1: per-tile coarsen the loaded tile to a jittered grid (train only)
+DG_COARSEN_MAX = 2.5     # = 1/(GRID*sqrt(rho_min)); density sweep-down factor
+DG_P_NATIVE    = 0.5     # P(tile kept at native GRID)
+DG_INFER_ADABN = False   # D2b: recompute BN stats on the target tiles before predicting
+DG_INFER_TTA   = 0       # D5: # extra density(scale) views to average at inference (0=off)
+# D3b: explicit local-density input channel (log k-th-NN distance) -> bumps input_channels
+# by 1 (retrain). Pair with DG_DENSITY_AUG so rho varies.
+DG_LOGDK_FEAT  = False
+DG_LOGDK_K     = 8
+# D2a/D2c (staged): KPConvX aggregation + norm knobs (defaults = current; change+retrain to A/B).
+KP_AGGREGATION = "nearest"
+KP_NORM        = "batch"
+
 # Optimizer — KPConvX's own recipe (experiments/S3DIS/train_S3DIS.py).
 WEIGHT_DECAY  = 0.05
 CYC_LR0       = 1e-4         # start (and floor) lr of the 1-cycle schedule
@@ -182,6 +199,9 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
     import laspy
     from scipy.spatial import cKDTree
 
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "helper"))
+    import density as dg
+
     sys.path.insert(0, "/opt/kpconvx")
     EVAL_ONLY = (mode == "eval")
     INFER     = (mode == "infer")   # arbitrary-folder inference (trainer_gui)
@@ -223,25 +243,25 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
         CLASS_NAMES = list(ds_meta["class_names"])
         PREP_DIR = f"{ds_root}/prep/kpconvx_cold_hag_grid{GRID:g}_c{int(CHUNK_XY)}"
     elif INFER and weights:
-        # Infer must reproduce the TRAINED geometry + class layout, not the GUI's
-        # defaults — read them from the run's config next to the checkpoint.
-        cfg_dir = os.path.dirname(f"/outputs/{weights}")
-        if os.path.basename(cfg_dir) == "checkpoints":
-            cfg_dir = os.path.dirname(cfg_dir)
-        rc_path = f"{cfg_dir}/run_config.json"
-        if os.path.exists(rc_path):
-            with open(rc_path) as f:
-                rcfg = json.load(f)
-            if rcfg and "hag_source" not in rcfg:   # M5: a non-HAG run loads silently
+        # Infer reproduces the TRAINED geometry + class layout from the run's
+        # run.json (the single self-contained manifest beside the weights; legacy
+        # run_config.json is the fallback), NOT the GUI defaults.
+        import os as _os, sys as _sys
+        _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "helper"))
+        from train_common import infer_meta
+        meta = infer_meta(f"/outputs/{weights}")
+        if meta:
+            if not meta.get("hag_source"):   # M5: a non-HAG run in the +HAG script
                 raise ValueError(
                     "These weights are from a plain KPConvX-L run (no 'hag_source' in "
-                    "run_config): its 4th input channel is the height proxy, not real "
+                    "run.json): its 4th input channel is the height proxy, not real "
                     "HAG. Re-run inference with the plain 'KPConvX-L' backbone.")
-            NUM_CLASSES = int(rcfg.get("num_classes", NUM_CLASSES))
-            CLASS_NAMES = list(rcfg.get("class_names", CLASS_NAMES))
-            GRID = float(rcfg.get("grid_m", GRID)); CHUNK_XY = float(rcfg.get("chunk_xy_m", CHUNK_XY))
+            NUM_CLASSES = int(meta.get("num_classes") or NUM_CLASSES)
+            CLASS_NAMES = list(meta.get("class_names") or CLASS_NAMES)
+            if meta.get("grid") is not None: GRID = float(meta["grid"])
+            if meta.get("chunk_xy") is not None: CHUNK_XY = float(meta["chunk_xy"])
             STRIDE = CHUNK_XY / 2.0
-            IEEE_INFER = rcfg.get("label_map_asprs_to_index") is not None
+            IEEE_INFER = meta.get("label_map_asprs_to_index") is not None
         PREP_DIR = globals()["PREP_DIR"]
     else:
         # IEEE default: keep the canonical cache path for the trained defaults; a
@@ -678,13 +698,13 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
     cfg.model.kp_radius     = KP_RADIUS
     cfg.model.kp_sigma      = KP_RADIUS
     cfg.model.kp_influence  = "linear"
-    cfg.model.kp_aggregation = "nearest"
+    cfg.model.kp_aggregation = KP_AGGREGATION
     cfg.model.kp_fixed      = "center"
     cfg.model.conv_groups   = -1
     cfg.model.share_kp      = True
     cfg.model.init_channels = 64
     cfg.model.channel_scaling = 1.41
-    cfg.model.norm          = "batch"
+    cfg.model.norm          = KP_NORM
     cfg.model.bn_momentum   = BN_MOMENTUM
     cfg.model.in_sub_size   = GRID
     cfg.model.in_sub_mode   = "grid"
@@ -693,7 +713,7 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
     cfg.model.decoder_layer = True
     cfg.model.upsample_n    = 3
     cfg.model.drop_path_rate = 0.3
-    cfg.model.input_channels = INPUT_CHANNELS  # [1, intensity, ret_num, HAG]
+    cfg.model.input_channels = INPUT_CHANNELS + (1 if DG_LOGDK_FEAT else 0)  # [1, intensity, ret_num, HAG] (+log d_k, D3b)
     cfg.model.neighbor_limits = [12, 16, 20, 20, 20]
     cfg.model.use_strided_conv = True
     cfg.model.kpx_upcut     = False
@@ -728,7 +748,7 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
     # Resume from the latest checkpoint: restore weights (and optimizer state,
     # which checkpoints now include). LR is set per-epoch from lr_at().
     if resume_ckpt is not None:
-        ckpt = torch.load(resume_ckpt, map_location="cuda")
+        ckpt = torch.load(resume_ckpt, map_location="cuda", weights_only=True)
         net.load_state_dict(ckpt["model"])
         if "optim" in ckpt:
             optim.load_state_dict(ckpt["optim"])
@@ -743,7 +763,7 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
         if weights and not os.path.exists(fm):
             raise FileNotFoundError(f"--weights not found on outputs volume: {fm}")
         if os.path.exists(fm):
-            net.load_state_dict(torch.load(fm, map_location="cuda")["model"])
+            net.load_state_dict(torch.load(fm, map_location="cuda", weights_only=True)["model"])
             print(f"  EVAL-ONLY: loaded {fm}", flush=True)
         start_epoch = N_EPOCHS
 
@@ -751,7 +771,14 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
         fm = f"/outputs/{weights}" if weights else None
         if not fm or not os.path.exists(fm):
             raise FileNotFoundError(f"--mode infer requires --weights; not found: {fm}")
-        ck = torch.load(fm, map_location="cuda")
+        try:   # weights_only=True: a hand-picked .pth can't run code on load
+            ck = torch.load(fm, map_location="cuda", weights_only=True)
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to load weights '{fm}': {e}\n"
+                f"  (loaded safely with weights_only=True — a full-model pickle or a "
+                f"checkpoint from another script is rejected; re-export as a state_dict.)"
+            ) from e
         net.load_state_dict(ck["model"] if isinstance(ck, dict) and "model" in ck else ck)
         print(f"  [infer] loaded {weights} (final_model = best-val epoch "
               f"{ck.get('epoch', '?') if isinstance(ck, dict) else '?'})", flush=True)
@@ -878,7 +905,10 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
                                 hag[:, None]], axis=1).astype(np.float32)
         if drop:
             attrs[:, 1:] = 0.0   # keep intensity (water's main cue); drop ret_num/HAG
-        return np.concatenate([bias, attrs], axis=1).astype(np.float32)
+        cols = [bias, attrs]
+        if DG_LOGDK_FEAT:        # D3b: never dropped — the density signal to condition on
+            cols.append(dg.local_density_logdk(xyz, DG_LOGDK_K)[:, None])
+        return np.concatenate(cols, axis=1).astype(np.float32)
 
     def sample_tile(tile_path, max_pts=60000, min_pts=32, training=True):
         z = np.load(tile_path)
@@ -891,6 +921,14 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
             idx = np.random.choice(idx, max_pts, replace=False)
         xyz, intensity, ret_num, lab, hag = \
             xyz[idx], intensity[idx], ret_num[idx], lab[idx], hag[idx]
+        # D1 density jitter: coarsen the tile to a jittered grid (train only). hag is
+        # sliced by the SAME index so the per-point feature never desyncs.
+        if training and DG_DENSITY_AUG:
+            g_eff = dg.effective_grid(GRID, DG_COARSEN_MAX, DG_P_NATIVE)
+            if g_eff > GRID:
+                keep = dg.voxel_first_idx(xyz, g_eff)
+                xyz, intensity, ret_num, lab, hag = (xyz[keep], intensity[keep],
+                    ret_num[keep], lab[keep], hag[keep])
         # HAG comes straight from the cached per-point height-above-ground.
         drop = (training and np.random.rand() > AUG_COLOR)
         feat = build_feat(xyz, intensity, ret_num, hag, drop=drop)
@@ -957,10 +995,18 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
                     sub_hag = (sa[:, 2] if hag is not None
                                else (sx[:, 2] - sx[:, 2].min()).astype(np.float32))
                     feat = build_feat(sx, sa[:, 0], sa[:, 1], sub_hag)
-                    cxyz = (sx - sx.mean(0)).astype(np.float32)
+                    base = (sx - sx.mean(0)).astype(np.float32)
+                    # D5 density-TTA: scale s is a density change (o->o/s^2); average
+                    # softmax over views. views=[1.0] when off -> old single-view argmax.
+                    views = [1.0] + (list(np.linspace(0.85, 1.2, DG_INFER_TTA))
+                                     if DG_INFER_TTA else [])
                     try:
-                        batch, _ = make_kp_pack([(cxyz, feat, None)])
-                        sub_pred = net(batch).argmax(-1).cpu().numpy()
+                        prob = None
+                        for s in views:
+                            batch, _ = make_kp_pack([((base * s).astype(np.float32), feat, None)])
+                            p = torch.softmax(net(batch).float(), -1).cpu().numpy()
+                            prob = p if prob is None else prob + p
+                        sub_pred = prob.argmax(-1)
                     except Exception:
                         continue
                     _, nn = cKDTree(sx).query(xyz[idx])
@@ -1019,6 +1065,48 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
                        "hag": "proxy_z_tile_min", "gpu": GPU_TYPE,
                        "scenes": [os.path.basename(s) for s in scenes]}, f, indent=2)
         print(f"  [infer] labeling {len(scenes)} scene(s) -> {run_dir}/predictions", flush=True)
+        if DG_INFER_ADABN:
+            # D2b: re-estimate BN running stats on the target tiles (label-free). The hag
+            # channel uses the z-min proxy here — BN-stat estimation doesn't need exact HAG.
+            print("  [infer] AdaBN: recomputing BN stats on target tiles...", flush=True)
+
+            def _target_batches(cap=30):
+                seen = 0
+                for pc_path in scenes:
+                    if seen >= cap:
+                        return
+                    z = np.load(pc_path)
+                    txyz = z["xyz"].astype(np.float32)
+                    tin = (z["intensity"].astype(np.float32) if "intensity" in z
+                           else np.full(len(txyz), 0.5, np.float32))
+                    trn = (z["return_number"].astype(np.float32) if "return_number" in z
+                           else (z["ret_num"].astype(np.float32) if "ret_num" in z
+                                 else np.zeros(len(txyz), np.float32)))
+                    mins, maxs = txyz[:, :2].min(0), txyz[:, :2].max(0)
+                    for x0 in np.arange(mins[0], maxs[0] + CHUNK_XY, CHUNK_XY):
+                        for y0 in np.arange(mins[1], maxs[1] + CHUNK_XY, CHUNK_XY):
+                            if seen >= cap:
+                                return
+                            m = ((txyz[:, 0] >= x0) & (txyz[:, 0] < x0 + CHUNK_XY) &
+                                 (txyz[:, 1] >= y0) & (txyz[:, 1] < y0 + CHUNK_XY))
+                            if m.sum() < 64:
+                                continue
+                            idx = np.where(m)[0]
+                            attrs = np.stack([tin[idx], trn[idx]], 1).astype(np.float32)
+                            sx, sa, _ = grid_subsample(txyz[idx], attrs, None, GRID)
+                            if len(sx) < 32:
+                                continue
+                            sub_hag = (sx[:, 2] - sx[:, 2].min()).astype(np.float32)
+                            feat = build_feat(sx, sa[:, 0], sa[:, 1], sub_hag)
+                            cxyz = (sx - sx.mean(0)).astype(np.float32)
+                            try:
+                                b, _ = make_kp_pack([(cxyz, feat, None)])
+                            except Exception:
+                                continue
+                            seen += 1
+                            yield b
+            dg.adabn_recalibrate(net, _target_batches(), forward=lambda m, b: m(b))
+            net.eval()
         for pc_path in scenes:
             name = os.path.splitext(os.path.basename(pc_path))[0]
             t0 = time.time()
@@ -1171,8 +1259,9 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
 
     import os as _os, sys as _sys   # scripts/helper is a sibling dir (flat /root in Modal)
     _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "helper"))
-    from train_common import BestCheckpoint
+    from train_common import BestCheckpoint, write_run_manifest
     best = BestCheckpoint(run_dir)
+    write_run_manifest(run_dir, "kpconvx_cold_hag", dataset)   # the single inference manifest (run.json)
 
     def run_eval(ep, write_json=False):
         net.eval()

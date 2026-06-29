@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDoubleS
                                QHeaderView, QLabel, QLineEdit, QPlainTextEdit, QPushButton,
                                QSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
-from .. import analysis, appstate, local_cli, modal_cli, prep, ui
+from .. import analysis, appstate, local_cli, modal_cli, prep, theme, ui
 from ..backbones import BACKBONES, GPU_CHOICES
 from ..jobs import FuncWorker, JobRunner, LogParser
 
@@ -60,7 +60,7 @@ class TrainPage(QWidget):
         form.addRow("Dataset", _wrap(ds_row))
         self.ds_status = QLabel("")
         self.ds_status.setWordWrap(True)
-        self.ds_status.setStyleSheet("color: #6a6a6a;")
+        theme.set_accent(self.ds_status, "muted")
         form.addRow("", self.ds_status)
         self.backbone_combo = QComboBox()  # populated per-dataset in _reload_backbones
         self.backbone_combo.currentIndexChanged.connect(self._rebuild_params)
@@ -86,7 +86,8 @@ class TrainPage(QWidget):
         # Nothing is uploaded — the checkpoints/metrics are written straight here.
         self.out_edit = QLineEdit()
         self.out_edit.setText(appstate.get("local_train_out", ""))
-        self.out_edit.setPlaceholderText(f"default: {appstate.local_runs_dir().as_posix()}")
+        self.out_edit.setPlaceholderText(
+            f"default: {appstate.default_download_dir().as_posix()}")
         out_row = QHBoxLayout()
         out_row.addWidget(self.out_edit)
         out_btn = QPushButton("Browse…")
@@ -99,7 +100,7 @@ class TrainPage(QWidget):
         self.params_form = QFormLayout(self.params_box)
         self.warn_label = QLabel("")
         self.warn_label.setWordWrap(True)
-        self.warn_label.setStyleSheet("color: #b25f00;")
+        theme.set_accent(self.warn_label, "warn")
 
         run_row = QHBoxLayout()
         self.launch_btn = QPushButton("Launch training")
@@ -154,7 +155,7 @@ class TrainPage(QWidget):
         self.prep_uploader.finished.connect(self._on_prep_uploaded)
         self.verify_worker.done.connect(self._on_verified)
         self.verify_worker.error.connect(lambda tb: self._set_ds_status(
-            "Could not reach Modal — is the CLI authenticated? (modal token new)", "#b25f00"))
+            "Could not reach Modal — is the CLI authenticated? (modal token new)", "warn"))
         self.pull_runner.output.connect(lambda s: self._append(s, newline=False))
         self.pull_runner.finished.connect(self._on_pull_finished)
         self.pull_runner.failed.connect(self._on_pull_failed)
@@ -203,7 +204,7 @@ class TrainPage(QWidget):
                       "tune to your data. Set a registry to pull prebuilt images, pull "
                       "the missing ones, then Refresh and launch.")
         hint.setWordWrap(True)
-        hint.setStyleSheet("color: #6a6a6a;")
+        theme.set_accent(hint, "muted")
         lay.addWidget(hint)
 
         reg_row = QHBoxLayout()
@@ -224,11 +225,11 @@ class TrainPage(QWidget):
             chk = QCheckBox(b.label)
             chk.toggled.connect(self._on_models_changed)
             rec = QLabel(f"{b.rec_gpu} ({b.min_vram_gb} GB)")
-            rec.setStyleSheet("color: #6a6a6a;")
+            theme.set_accent(rec, "muted")
             rec.setToolTip("Rough recommended GPU + minimum VRAM for training this "
                            "backbone — a starting point to tune to your data/tiles.")
             status = QLabel("…")
-            status.setStyleSheet("color: #6a6a6a;")
+            theme.set_accent(status, "muted")
             btn = QPushButton("Pull")
             btn.clicked.connect(lambda _=False, k=key: self._pull_one(k))
             self._model_checks[key] = chk
@@ -276,7 +277,7 @@ class TrainPage(QWidget):
             return
         for lbl in self._img_status.values():
             lbl.setText("checking…")
-            lbl.setStyleSheet("color: #6a6a6a;")
+            theme.set_accent(lbl, "muted")
         self.status_worker.start(local_cli.all_statuses)
 
     def _apply_statuses(self, statuses: list):
@@ -287,17 +288,17 @@ class TrainPage(QWidget):
             if lbl is None:
                 continue
             if not s["docker"]:
-                lbl.setText("docker not found"); lbl.setStyleSheet("color: #6a6a6a;")
+                lbl.setText("docker not found"); theme.set_accent(lbl, "muted")
                 btn.setEnabled(False)
             elif s["present"]:
-                lbl.setText("✓ present"); lbl.setStyleSheet("color: #2e7d32;")
+                lbl.setText("✓ present"); theme.set_accent(lbl, "ok")
                 btn.setEnabled(False)
             elif s["pullable"]:
-                lbl.setText("✗ not pulled"); lbl.setStyleSheet("color: #b25f00;")
+                lbl.setText("✗ not pulled"); theme.set_accent(lbl, "warn")
                 btn.setEnabled(not pulling)
             else:
                 lbl.setText("✗ build it (set a registry to pull)")
-                lbl.setStyleSheet("color: #b25f00;"); btn.setEnabled(False)
+                theme.set_accent(lbl, "warn"); btn.setEnabled(False)
 
     def _pullable_missing(self, key: str) -> bool:
         s = self._last_statuses.get(key)
@@ -341,7 +342,7 @@ class TrainPage(QWidget):
             self._append(f"[local] ✓ pulled {b.label}.")
             lbl = self._img_status.get(key)
             if lbl:
-                lbl.setText("✓ present"); lbl.setStyleSheet("color: #2e7d32;")
+                lbl.setText("✓ present"); theme.set_accent(lbl, "ok")
         elif b:
             self._append(f"[local] ✗ pull failed for {b.label} (exit {code}). "
                          f"Run `docker login` first if the registry is private.")
@@ -397,18 +398,18 @@ class TrainPage(QWidget):
             self._set_ds_status("Marked uploaded locally — click “Check on Modal” to confirm.")
         else:
             self._set_ds_status("Not uploaded yet — upload it on the Datasets page first.",
-                                "#b25f00")
+                                "warn")
         self.verify_btn.setEnabled(bool(name) and not info.get("builtin"))
         self._reload_backbones()
 
-    def _set_ds_status(self, text: str, color: str = "#6a6a6a"):
-        self.ds_status.setStyleSheet(f"color: {color};")
+    def _set_ds_status(self, text: str, role: str = "muted"):
+        theme.set_accent(self.ds_status, role)
         self.ds_status.setText(text)
 
     def _pick_out(self):
         d = QFileDialog.getExistingDirectory(
             self, "Output folder for training runs (runs/<id>/… land here)",
-            self.out_edit.text() or str(appstate.local_runs_dir()))
+            self.out_edit.text() or str(appstate.default_download_dir()))
         if d:
             self.out_edit.setText(d)
 
@@ -434,11 +435,11 @@ class TrainPage(QWidget):
                 f"✓ Present on Modal volume “{vol}”: dataset_meta.json"
                 + (f" + {n} train scene(s)." if res["has_train"] else
                    " but no train/ folder — re-upload on the Datasets page."),
-                "#2e7d32" if res["has_train"] else "#b25f00")
+                "ok" if res["has_train"] else "warn")
         else:
             self._set_ds_status(
                 f"✗ Not found on Modal volume “{vol}” — upload it on the Datasets page "
-                f"before training.", "#b25f00")
+                f"before training.", "warn")
 
     def _apply_smoke(self):
         """Reflect the smoke override in the form so it's visible, not silent:
@@ -614,10 +615,10 @@ class TrainPage(QWidget):
     def _start_local_run(self, p):
         b, flags, gpu, name = p["backbone"], p["flags"], p["gpu"], p["dataset"]
         info = appstate.known_datasets().get(name, {})
-        # Output folder (bind-mounted to /outputs): the user-picked dir, else the
-        # default app local_runs dir. Created here so the bind-mount source exists;
-        # remembered for next time. Nothing is uploaded — runs land straight here.
-        out_root = self.out_edit.text().strip() or str(appstate.local_runs_dir())
+        # Output folder (bind-mounted to /outputs): the user-picked dir, else a
+        # findable Downloads default (never a hidden app dir). Created here so the
+        # bind-mount source exists; remembered for next time. Nothing is uploaded.
+        out_root = self.out_edit.text().strip() or str(appstate.default_download_dir())
         os.makedirs(out_root, exist_ok=True)
         appstate.put("local_train_out", self.out_edit.text().strip())
         extra_mounts = []
