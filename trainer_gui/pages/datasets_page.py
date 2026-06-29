@@ -2,9 +2,9 @@
 
   1. New dataset   point at a file/folder, name it, say which field holds labels
   2. Classes       scan label values, name them, mark ignored, check density
-  3. Tiling        train/val split + tile size; Start Tiling stages the dataset
-  4. HAG           add a per-tile Height-Above-Ground channel -> a sibling
-                   <name>_hag dataset (PDAL SMRF -> hag_nn over each tile)
+  3. Tiling        train/val split + tile size; optionally compute a per-tile
+                   Height-Above-Ground channel in the same pass (PDAL SMRF -> hag);
+                   Start Tiling stages the dataset
 
 Labels come from a field in the cloud (companion/sidecar label files are no
 longer offered here). Intensity is normalized by max (i/max -> 0..1) by default.
@@ -18,9 +18,10 @@ import os
 from pathlib import Path
 
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
                                QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel,
-                               QLineEdit, QListWidget, QMessageBox, QProgressBar, QPushButton,
+                               QLineEdit, QListWidget, QMessageBox, QPlainTextEdit, QPushButton,
                                QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
 from .. import analysis, appstate, dataset, modal_cli, pretrain, theme
@@ -55,8 +56,7 @@ class DatasetsPage(QWidget):
         # The whole page scrolls, so each section keeps its natural height.
         root.addWidget(self._new_dataset_box())   # 1
         root.addWidget(self._classes_box())        # 2
-        root.addWidget(self._tiling_box())         # 3  (incl. Start Tiling)
-        root.addWidget(self._prep_box())           # 4  (HAG — a sibling dataset)
+        root.addWidget(self._tiling_box())         # 3  (incl. optional HAG + Start Tiling)
         root.addLayout(self._status_block())       # shared busy bar + status line
 
         # ---- saved datasets: bottom layer ----
@@ -103,7 +103,7 @@ class DatasetsPage(QWidget):
             + (" — it's staged on disk and ready to train in Docker. "
                if local else
                ", then upload it to a per-dataset Modal volume. ")
-            + "Add a Height-Above-Ground channel last to get a sibling HAG dataset.")
+            + "Optionally compute a Height-Above-Ground channel during tiling.")
         self._reload_known()
 
     # ============================================================= 1. New dataset
@@ -168,7 +168,7 @@ class DatasetsPage(QWidget):
         form = QFormLayout(box)
         self.split_combo = QComboBox()
         self.split_combo.addItems([
-            "Folder of clouds → split by val fraction",
+            "Folder of clouds → tile + split by val fraction",
             "Single cloud → tile & split by val fraction",
             "Separate train + val folders (use as-is)",
         ])
@@ -186,6 +186,28 @@ class DatasetsPage(QWidget):
         form.addRow("Validation fraction", self.val_ratio)
         self.val_edit, self.val_row_w = self._dir_row(self._pick_val)
         form.addRow("Validation folder", self.val_row_w)
+        # Optional: compute HeightAboveGround in the SAME pass as tiling — one
+        # read/write per tile instead of a separate add-HAG reload of every npz.
+        self.hag_chk = QCheckBox("Compute Height-Above-Ground (HAG) during tiling")
+        self.hag_chk.setToolTip("Bakes a per-point HAG channel (PDAL SMRF -> hag) into every "
+                                "tile as it's written. The *_hag models use it; the others "
+                                "ignore the extra channel.")
+        self.hag_chk.toggled.connect(lambda on: self.hag_opts_w.setVisible(on))
+        form.addRow("Height-Above-Ground", self.hag_chk)
+        self.hag_filter = QComboBox()
+        self.hag_filter.addItems(list(pretrain.HAG_FILTERS))
+        self.hag_skip_ground = QCheckBox("ground already classified (class 2) — skip SMRF")
+        hag_row = QHBoxLayout()
+        hag_row.addWidget(QLabel("filter"))
+        hag_row.addWidget(self.hag_filter)
+        hag_row.addWidget(self.hag_skip_ground)
+        hag_row.addStretch()
+        self.hag_opts_w = _wrap(hag_row)
+        self.hag_opts_w.setVisible(False)
+        form.addRow("", self.hag_opts_w)
+        if not pretrain.pdal_available():
+            self.hag_chk.setEnabled(False)
+            self.hag_chk.setText("Compute Height-Above-Ground (HAG) — PDAL not installed")
         self.tile_btn = QPushButton("Start Tiling")
         self.tile_btn.setObjectName("primary")
         self.tile_btn.clicked.connect(self._start_tiling)
@@ -195,73 +217,22 @@ class DatasetsPage(QWidget):
         form.addRow("", _wrap(row))
         return box
 
-    # ============================================================= 4. HAG
-    def _prep_box(self) -> QWidget:
-        box = QGroupBox("4 · Height-Above-Ground — adds a per-tile HAG channel "
-                        "(saved as a separate <name>_hag dataset)")
-        form = QFormLayout(box)
-        self.hag_in = QLineEdit()
-        self.hag_in.setPlaceholderText("a tiled dataset folder (has train/ and val/)")
-        hag_in_row = QHBoxLayout()
-        hag_in_row.addWidget(self.hag_in)
-        fbtn = QPushButton("Folder…")
-        fbtn.clicked.connect(self._pick_hag_in)
-        hag_in_row.addWidget(fbtn)
-        form.addRow("Tiled dataset", _wrap(hag_in_row))
-        self.hag_filter = QComboBox()
-        self.hag_filter.addItems(list(pretrain.HAG_FILTERS))
-        form.addRow("HAG filter", self.hag_filter)
-        # Skip SMRF only when the tiles already carry ground class 2 (rare for
-        # label-remapped tiles — hag_for_cloud re-runs SMRF when no ground exists).
-        self.hag_skip_ground = QCheckBox("Tiles already carry ground class 2 — skip SMRF")
-        self.hag_skip_ground.setToolTip("Most tiled datasets store remapped training labels, "
-                                        "not ASPRS ground; SMRF still runs unless real ground "
-                                        "(class 2) is present in the tile.")
-        form.addRow("", self.hag_skip_ground)
-        self.hag_btn = QPushButton("Start HAG")
-        self.hag_btn.clicked.connect(self._run_hag)
-        row = QHBoxLayout()
-        row.addWidget(self.hag_btn)
-        row.addStretch()
-        form.addRow("", _wrap(row))
-        # Loading bar for the (slow) HAG run — busy/indeterminate, shown only while
-        # it runs, sitting right beneath the Start HAG button.
-        self.hag_busy = QProgressBar()
-        self.hag_busy.setRange(0, 0)
-        self.hag_busy.setTextVisible(False)
-        self.hag_busy.setVisible(False)
-        form.addRow("", self.hag_busy)
-        if not pretrain.pdal_available():
-            self.hag_btn.setEnabled(False)
-            warn = QLabel("PDAL not found — install python-pdal to enable this step.")
-            warn.setWordWrap(True)
-            theme.set_accent(warn, "error")
-            form.addRow("", warn)
-        return box
-
-    # ============================================================= shared status
+    # ============================================================= shared console
     def _status_block(self) -> QVBoxLayout:
-        # A busy/indeterminate bar shown only while an operation runs, plus the
-        # latest one-line message. Errors pop up a dialog (see _on_worker_error).
-        self.busy = QProgressBar()
-        self.busy.setRange(0, 0)
-        self.busy.setTextVisible(False)
-        self.busy.setVisible(False)
-        self.status = QLabel("")
-        self.status.setWordWrap(True)
-        theme.set_accent(self.status, "muted")
+        # A scrolling console log — progress streams here line by line (clearer
+        # than an indeterminate bar). Errors also pop up a dialog (_on_worker_error).
+        self.log = QPlainTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setObjectName("log")
+        self.log.setMinimumHeight(140)
+        self.log.setPlaceholderText("Progress and messages appear here…")
         lay = QVBoxLayout()
-        lay.addWidget(self.busy)
-        lay.addWidget(self.status)
+        lay.addWidget(QLabel("Log"))
+        lay.addWidget(self.log)
         return lay
-
-    def _busy_off(self):
-        self.busy.setVisible(False)
-        self.hag_busy.setVisible(False)
 
     # ------------------------------------------------------------- widgets
     def _dispatch_done(self, result):
-        self._busy_off()
         cb, self._done_cb = self._done_cb, None
         if cb:
             cb(result)
@@ -310,13 +281,6 @@ class DatasetsPage(QWidget):
         txt = self.out_edit.text().strip()
         return Path(txt) if txt else appstate.staging_dir()
 
-    def _pick_hag_in(self):
-        d = QFileDialog.getExistingDirectory(
-            self, "Converted dataset folder (must contain train/ and val/)",
-            self.hag_in.text().strip() or str(appstate.staging_dir()))
-        if d:
-            self.hag_in.setText(d)
-
     def _populate_fields(self, path: str):
         self.field_combo.clear()
         files = dataset.expand_inputs(path)
@@ -344,53 +308,6 @@ class DatasetsPage(QWidget):
                            val_ratio=float(self.val_ratio.value()),
                            tile_m=float(self.tile_m.value()))
 
-    # ------------------------------------------------------------- HAG (per-tile)
-    def _run_hag(self):
-        in_dir = self.hag_in.text().strip() or (str(self._staged_dir) if self._staged_dir else "")
-        if not in_dir or not os.path.isdir(in_dir):
-            self._append("HAG: choose a converted dataset folder (one with train/ and val/).")
-            return
-        if not os.path.isfile(os.path.join(in_dir, "dataset_meta.json")):
-            self._append("HAG: that folder isn't a converted dataset — run Start Tiling first, or "
-                         "pick a folder containing dataset_meta.json.")
-            return
-        if self.worker.running:
-            self._append("A local job is already running — wait for it to finish.")
-            return
-        src = Path(in_dir)
-        out_dir = src.parent / f"{src.name}_hag"
-        skip_ground = self.hag_skip_ground.isChecked()
-        flt = self.hag_filter.currentText()
-        self.hag_btn.setEnabled(False)
-        self.tile_btn.setEnabled(False)
-        self.hag_busy.setVisible(True)
-        self._append(f"Adding per-tile HAG ({flt}) to '{src.name}' -> '{out_dir.name}' …")
-
-        def job(progress):
-            return dataset.add_hag_to_dataset(src, out_dir, skip_ground=skip_ground,
-                                              hag_filter=flt, progress=progress)
-
-        self._done_cb = self._on_hag_done
-        self.worker.start(job)
-
-    def _on_hag_done(self, out_dir):
-        self.tile_btn.setEnabled(True)
-        self.hag_btn.setEnabled(pretrain.pdal_available())
-        out = Path(out_dir)
-        self._staged_dir = out      # a following Upload targets the HAG set
-        appstate.remember_dataset(out.name, {
-            "staged_dir": str(out),
-            "meta_path": str(out / "dataset_meta.json"),
-            "uploaded": False,
-        })
-        self._reload_known()
-        if appstate.get_exec_mode() == "local":
-            self._append(f"✓ HAG dataset '{out.name}' ready — pick it (or a *_hag backbone) "
-                         f"on the Train page.")
-        else:
-            self._append(f"✓ HAG dataset '{out.name}' staged — select it under Saved Datasets "
-                         f"to upload to Modal.")
-
     # ------------------------------------------------------------- scan / analyze
     def _scan_labels(self):
         in_path = self.input_edit.text().strip()
@@ -400,8 +317,6 @@ class DatasetsPage(QWidget):
         spec = self._spec()
         self._append("Scanning label values…")
         self.scan_btn.setEnabled(False)
-        self.busy.setVisible(True)
-
         def job(progress):
             files = dataset.expand_inputs(in_path)
             progress(f"  sampling {min(len(files), 8)} of {len(files)} file(s)")
@@ -440,7 +355,6 @@ class DatasetsPage(QWidget):
             self._append("Choose an input file or folder first.")
             return
         self.analyze_btn.setEnabled(False)
-        self.busy.setVisible(True)
         self._append("Analyzing density…")
 
         def job(progress):
@@ -545,6 +459,9 @@ class DatasetsPage(QWidget):
             "name": name, "in_path": in_path, "split": split, "val_inputs": val_inputs,
             "classes": classes, "ignored": ignored, "spec": self._spec(),
             "out_root": self._output_root(),
+            "compute_hag": pretrain.pdal_available() and self.hag_chk.isChecked(),
+            "skip_ground": self.hag_skip_ground.isChecked(),
+            "hag_filter": self.hag_filter.currentText(),
         }
 
     def _start_tiling(self):
@@ -554,16 +471,17 @@ class DatasetsPage(QWidget):
         name, classes, ignored = plan["name"], plan["classes"], plan["ignored"]
         split, out_root = plan["split"], plan["out_root"]
         self.tile_btn.setEnabled(False)
-        self.hag_btn.setEnabled(False)
-        self.busy.setVisible(True)
-        self._append(f"Tiling '{name}' ({len(classes)} classes, split={split.strategy}, "
+        hag = "  + HAG" if plan["compute_hag"] else ""
+        self._append(f"Tiling '{name}'{hag} ({len(classes)} classes, split={split.strategy}, "
                      f"ignored values: {ignored}) -> {out_root}…")
 
         def job(progress):
             return dataset.convert_dataset(
                 name, [plan["in_path"]], plan["spec"], classes, ignored,
                 out_root, val_inputs=plan["val_inputs"], split=split,
-                intensity_norm="max", progress=progress)
+                intensity_norm="max", compute_hag=plan["compute_hag"],
+                skip_ground=plan["skip_ground"], hag_filter=plan["hag_filter"],
+                progress=progress)
 
         self._done_cb = self._on_converted
         self.worker.start(job)
@@ -571,21 +489,18 @@ class DatasetsPage(QWidget):
     def _on_converted(self, staged: Path):
         self._staged_dir = staged
         self.tile_btn.setEnabled(True)
-        self.hag_btn.setEnabled(pretrain.pdal_available())
-        self.hag_in.setText(str(staged))   # default the HAG step at the dataset just tiled
         appstate.remember_dataset(staged.name, {
             "staged_dir": str(staged),
             "meta_path": str(staged / "dataset_meta.json"),
             "uploaded": False,
         })
         self._reload_known()
+        hag = " (with HAG)" if self.hag_chk.isChecked() and pretrain.pdal_available() else ""
         if appstate.get_exec_mode() == "local":
-            self._append(f"✓ Tiled -> {staged}. Ready — pick '{staged.name}' on the Train page "
-                         f"(bind-mounted at /datasets/{staged.name}). Add HAG below for a "
-                         f"sibling HAG dataset.")
+            self._append(f"✓ Tiled{hag} -> {staged}. Ready — pick '{staged.name}' on the Train "
+                         f"page (bind-mounted at /datasets/{staged.name}).")
         else:
-            self._append(f"✓ Tiled -> {staged}. Select it under Saved Datasets to upload, or "
-                         f"add HAG below for a sibling HAG dataset.")
+            self._append(f"✓ Tiled{hag} -> {staged}. Select it under Saved Datasets to upload.")
 
     def _upload_saved(self):
         """Upload a dataset already listed under Saved Datasets, using its
@@ -624,20 +539,17 @@ class DatasetsPage(QWidget):
         self._uploading = staged
         name = staged.name
         self.upload_saved_btn.setEnabled(False)
-        self.busy.setVisible(True)
         self._append(f"\nCreating + uploading volume '{name}' (-> /{name}) …")
         prog, args = modal_cli.volume_put(name, str(staged), f"/{name}")
         self.uploader.start(prog, args, cwd=self.repo_root,
                             pre=modal_cli.volume_create(name))
 
     def _on_upload_failed(self, err: str):
-        self._busy_off()
         self.upload_saved_btn.setEnabled(True)
         self._append(f"✗ Upload process failed to run: {err}. Is the Modal CLI on PATH "
                      f"and authenticated? (modal token new)")
 
     def _on_upload_done(self, code: int):
-        self._busy_off()
         self.upload_saved_btn.setEnabled(True)
         staged = self._uploading
         if code != 0:
@@ -656,12 +568,10 @@ class DatasetsPage(QWidget):
 
     def _on_worker_error(self, tb: str):
         self._done_cb = None
-        self._busy_off()
         self.scan_btn.setEnabled(True)
         self.analyze_btn.setEnabled(True)
         self.tile_btn.setEnabled(True)
-        self.hag_btn.setEnabled(pretrain.pdal_available())
-        self.status.setText("✗ Error — see the dialog for details.")
+        self._append("✗ Error — see the dialog for details.")
         QMessageBox.critical(self, "Dataset error", tb)
 
     # ------------------------------------------------------------- known list
@@ -706,11 +616,11 @@ class DatasetsPage(QWidget):
 
     # ------------------------------------------------------------- helpers
     def _append(self, text: str, newline: bool = True):
-        # The console is gone — show the latest message on one line (whitespace +
-        # newlines collapsed) in the status label beside the loading bar.
-        msg = " ".join(text.split())
-        if msg:
-            self.status.setText(msg)
+        # Stream into the scrolling console. newline=False for chunked subprocess
+        # output (the uploader); True for one-shot status messages.
+        self.log.moveCursor(QTextCursor.End)
+        self.log.insertPlainText(text + ("\n" if newline else ""))
+        self.log.moveCursor(QTextCursor.End)
 
 
 def _wrap(layout) -> QWidget:

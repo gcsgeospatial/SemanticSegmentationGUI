@@ -11,8 +11,9 @@ The converter is format- and layout-agnostic. The minimal case is: point at one
 file (or one folder) that carries a classification field; everything else (a
 held-out val folder, companion label files, custom intensity normalization) is
 opt-in. When no explicit val split is given the data is split automatically:
-several files -> hold out whole scenes; a single file -> cut it into a coarse
-grid and hold out whole tiles (so train/val don't share neighbouring points).
+several files -> hold out whole scenes (each still tiled into a grid for
+training); a single file -> cut it into a coarse grid and hold out whole tiles
+(so train/val don't share neighbouring points).
 """
 
 from __future__ import annotations
@@ -52,7 +53,8 @@ class SplitConfig:
     """How to derive train/val when the user hasn't pre-split into two folders.
 
     strategy="auto"     1 file -> "tile", many files -> "scene".
-    strategy="scene"    hold out whole files (needs >= 2 files).
+    strategy="scene"    hold out whole files (needs >= 2 files); each file is
+                        still tiled into a grid for training.
     strategy="tile"     cut each file into a grid, hold out whole tiles.
     strategy="provided" caller passes an explicit val set (set via val_inputs).
     """
@@ -224,13 +226,15 @@ def _hag_from_cloud(cloud: Cloud) -> np.ndarray | None:
 
 def _convert_one(cloud: Cloud, raw: np.ndarray | None, value_to_index: dict[int, int],
                  out_path: Path, intensity_norm: str = "max",
-                 compute_hag: bool = False) -> dict:
+                 compute_hag: bool = False, skip_ground: bool = False,
+                 hag_filter: str = "hag_nn") -> dict:
     """Write one (already-read, already-cropped) cloud to a canonical npz.
 
-    compute_hag (inference only): also store a per-point real HeightAboveGround
-    ("hag", SMRF->hag_nn) aligned to xyz, for running *_hag weights trained on real
-    HAG. Silently skipped (the infer loaders fall back to a z-min proxy) when PDAL
-    can't produce an aligned result."""
+    compute_hag: also store a per-point real HeightAboveGround ("hag", SMRF->hag)
+    aligned to xyz — for *_hag weights trained on real HAG, or to bake HAG into a
+    dataset during tiling. Computing it here (points already in RAM) is a single
+    pass — no reload/re-write round trip. Silently skipped (the loaders fall back
+    to a z-min proxy) when PDAL can't produce an aligned result."""
     out: dict[str, np.ndarray] = {"xyz": cloud.xyz.astype(np.float32)}
 
     class_counts: dict[int, int] = {}
@@ -260,7 +264,7 @@ def _convert_one(cloud: Cloud, raw: np.ndarray | None, value_to_index: dict[int,
         out["hag"] = source_hag.astype(np.float32)
     if compute_hag and "hag" not in out:
         from . import pretrain
-        h = pretrain.hag_for_cloud(cloud)
+        h = pretrain.hag_for_cloud(cloud, skip_ground=skip_ground, hag_filter=hag_filter)
         if h is not None and len(h) == cloud.n:
             out["hag"] = h.astype(np.float32)
 
@@ -284,25 +288,30 @@ def _convert_one(cloud: Cloud, raw: np.ndarray | None, value_to_index: dict[int,
 
 def convert_scene(path: Path, spec: LabelSpec | None, value_to_index: dict[int, int],
                   out_path: Path, intensity_norm: str = "max",
-                  compute_hag: bool = False) -> dict:
+                  compute_hag: bool = False, skip_ground: bool = False,
+                  hag_filter: str = "hag_nn") -> dict:
     """Read one source file and convert the whole cloud (no cropping)."""
     cloud = read_points(path)
     raw = read_labels(path, cloud, spec) if spec is not None else None
     return _convert_one(cloud, raw, value_to_index, out_path, intensity_norm,
-                        compute_hag=compute_hag)
+                        compute_hag=compute_hag, skip_ground=skip_ground,
+                        hag_filter=hag_filter)
 
 
 def _plan_and_convert(train_files: list[Path], val_files: list[Path] | None,
                       strategy: str, split: SplitConfig, spec: LabelSpec | None,
                       value_to_index: dict[int, int], out_root: Path,
-                      intensity_norm: str, say) -> dict:
+                      intensity_norm: str, say, *, compute_hag: bool = False,
+                      skip_ground: bool = False, hag_filter: str = "hag_nn") -> dict:
     """Drive conversion per strategy; returns {"train": [stats], "val": [stats]}.
     Each big file is read at most once."""
     stats = {"train": [], "val": []}
 
     def emit(split_name: str, cloud: Cloud, raw, scene_name: str):
         out_path = out_root / split_name / f"{scene_name}.npz"
-        st = _convert_one(cloud, raw, value_to_index, out_path, intensity_norm)
+        st = _convert_one(cloud, raw, value_to_index, out_path, intensity_norm,
+                          compute_hag=compute_hag, skip_ground=skip_ground,
+                          hag_filter=hag_filter)
         st["scene"] = out_path.name
         stats[split_name].append(st)
 
@@ -317,14 +326,27 @@ def _plan_and_convert(train_files: list[Path], val_files: list[Path] | None,
         return stats
 
     if strategy == "scene":
+        # Hold out whole files (so train/val never share a cloud = no leakage), but
+        # TILE each file into grid cells — a folder of large clouds becomes many
+        # training tiles, not one giant scene per file. Every tile inherits its
+        # source file's split.
         tr, va = _ratio_split(train_files, split.val_ratio, split.seed)
-        say(f"scene-split: {len(tr)} train / {len(va)} val scenes")
+        say(f"scene-split: {len(tr)} train / {len(va)} val file(s), each tiled")
         for split_name, files in (("train", tr), ("val", va)):
             for f in files:
-                say(f"  converting {f.name} ...")
+                say(f"  tiling {f.name} ...")
                 cloud = read_points(f)
                 raw = read_labels(f, cloud, spec) if spec is not None else None
-                emit(split_name, cloud, raw, f.stem)
+                kept = 0
+                for cname, bounds in grid_cells(cloud.xyz, split.tile_m):
+                    sub, sub_raw = _crop(cloud, raw, bounds)
+                    if sub.n >= MIN_TILE_PTS:
+                        emit(split_name, sub, sub_raw, f"{f.stem}_{cname}")
+                        kept += 1
+                if kept == 0:        # cloud smaller than one tile -> emit it whole
+                    emit(split_name, cloud, raw, f.stem)
+                    kept = 1
+                say(f"  {f.stem}: {kept} tile(s) -> {split_name}")
         return stats
 
     # strategy == "tile": grid each file, hold out whole tiles.
@@ -363,13 +385,18 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
                     classes: list[dict], ignore_values: list[int],
                     staging_root: Path, *, val_inputs=None,
                     split: SplitConfig | None = None,
-                    intensity_norm: str = "max", progress=None) -> Path:
+                    intensity_norm: str = "max", compute_hag: bool = False,
+                    skip_ground: bool = False, hag_filter: str = "hag_nn",
+                    progress=None) -> Path:
     """Convert `inputs` (files and/or folders) into a staged canonical dataset.
 
     inputs: a path or list of paths (files or folders) to use as the source.
     val_inputs: optional explicit validation source -> "provided" split.
     split: how to derive train/val when val_inputs is None (default: auto).
     classes: [{"index", "source_value", "name"}] — built by the Datasets page.
+    compute_hag: bake a per-tile HeightAboveGround channel (PDAL SMRF->hag) into
+        every tile in the SAME pass as tiling — one read/write per tile instead of
+        a separate add_hag_to_dataset reload. skip_ground/hag_filter tune it.
     """
     from . import analysis
 
@@ -392,8 +419,17 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
         val_files = None
     say(f"source: {len(train_files)} file(s), split strategy = {strategy}")
 
+    if compute_hag:
+        from . import pretrain
+        if pretrain.pdal_available():
+            say("computing per-tile HeightAboveGround inline (PDAL SMRF -> hag) …")
+        else:
+            say("⚠ HAG requested but PDAL isn't installed — tiles written without it.")
+            compute_hag = False
     scene_stats = _plan_and_convert(train_files, val_files, strategy, split, spec,
-                                    value_to_index, out_root, intensity_norm, say)
+                                    value_to_index, out_root, intensity_norm, say,
+                                    compute_hag=compute_hag, skip_ground=skip_ground,
+                                    hag_filter=hag_filter)
     if not scene_stats["train"] or not scene_stats["val"]:
         raise ValueError("Conversion produced an empty train or val split — check "
                          "the split settings or supply an explicit val folder.")
@@ -459,7 +495,8 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
             "label_field": spec.field if spec else "",
             "truth_dir": spec.truth_dir if spec else "",
             "intensity_norm": intensity_norm,
-            "hag_source": "source_dimension" if all(s["has_hag"] for s in all_stats) else "",
+            "hag_source": (("per_tile_smrf" if compute_hag else "source_dimension")
+                           if all(s["has_hag"] for s in all_stats) else ""),
             "ignore_values": [int(v) for v in ignore_values],
         },
         "classes": classes,
@@ -617,14 +654,18 @@ def _selfcheck():
         tr, va = meta["splits"]["train"], meta["splits"]["val"]
         assert tr["scenes"] and va["scenes"], "both splits must be non-empty"
         assert tr["total_points"] + va["total_points"] == n, "points must be conserved"
-        # scene-split path
+        # scene-split path: each file is tiled, but no file spans both splits
         for k in range(3):
             np.savez(td / f"s{k}.npz", xyz=xyz, classification=cls)
         out2 = convert_dataset("selftest2", td, LabelSpec(field="classification"),
                                classes, [], td / "staging",
-                               split=SplitConfig(strategy="scene"))
+                               split=SplitConfig(strategy="scene", tile_m=20.0))
         m2 = json.loads((out2 / "dataset_meta.json").read_text())
-        assert m2["splits"]["train"]["scenes"] and m2["splits"]["val"]["scenes"]
+        tr2, va2 = m2["splits"]["train"]["scenes"], m2["splits"]["val"]["scenes"]
+        assert tr2 and va2, "both splits must be non-empty"
+        assert len(tr2) + len(va2) > 3, "each scene must be tiled into >1 tile"
+        srcs = lambda ss: {s.split("_r")[0] for s in ss}   # tile name -> source file
+        assert not (srcs(tr2) & srcs(va2)), "no source file may span both splits"
     print("dataset self-check OK")
 
 

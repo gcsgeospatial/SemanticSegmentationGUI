@@ -122,6 +122,19 @@ def main():
         check("meta: kpconvx grid clamped to its band",
               0.5 <= meta["recommendations"]["kpconvx_cold"]["grid"] <= 3.0)
 
+        # ---------------- scene split: a folder of clouds is TILED (not kept whole),
+        # but no source file spans both train and val (leak-free hold-out)
+        staged_sc = dataset.convert_dataset(
+            "laz_scene", str(laz_root / "train"), spec, classes, [0], tmp / "staging",
+            split=dataset.SplitConfig(strategy="scene", tile_m=30.0))
+        msc = json.loads((staged_sc / "dataset_meta.json").read_text())
+        tr_sc, va_sc = msc["splits"]["train"]["scenes"], msc["splits"]["val"]["scenes"]
+        check("scene-split: folder of clouds is tiled (more tiles than files)",
+              len(tr_sc) + len(va_sc) > 2)
+        _src = lambda ss: {s.split("_r")[0] for s in ss}
+        check("scene-split: no source file spans both train and val (leak-free)",
+              bool(tr_sc) and bool(va_sc) and not (_src(tr_sc) & _src(va_sc)))
+
         # ---------------- PLY dataset with field labels
         ply_root = tmp / "ply_src"
         for split, k in (("train", 2), ("val", 1)):
@@ -396,6 +409,17 @@ def main():
             check("dataset: hag dataset meta tags per_tile source + keeps classes",
                   mhd["source"]["hag_source"] == "per_tile_smrf"
                   and mhd["num_classes"] == 3 and isinstance(mhd["has_hag"], bool))
+
+            # inline HAG: bake it during tiling in one pass (no separate reload)
+            staged_ih = dataset.convert_dataset(
+                "laz_hag_inline", str(laz_root / "train"), spec, classes, [0], tmp / "staging",
+                val_inputs=[str(laz_root / "val")], compute_hag=True, progress=print)
+            zih = np.load(staged_ih / "train" / "scene0.npz")
+            check("convert_dataset(compute_hag): tiles carry a hag channel inline",
+                  "hag" in zih.files and zih["hag"].shape[0] == zih["xyz"].shape[0])
+            mih = json.loads((staged_ih / "dataset_meta.json").read_text())
+            check("convert_dataset(compute_hag): meta flags has_hag + per_tile source",
+                  mih["has_hag"] is True and mih["source"]["hag_source"] == "per_tile_smrf")
         else:
             print("  - pretrain hag: skipped (pdal not installed)")
 
