@@ -166,7 +166,7 @@ class DatasetsPage(QWidget):
     # ============================================================= 3. Split
     def _tiling_box(self) -> QWidget:
         box = QGroupBox("3 · Train / val / test split")
-        form = QFormLayout(box)
+        self.split_form = form = QFormLayout(box)
         # Two POINT-COUNT fractions (train = remainder); the dataset layer carves the
         # three whole-scene folders ONCE and the training scripts read them verbatim
         # (val = selection holdout, test = final report). No tiling here.
@@ -281,8 +281,8 @@ class DatasetsPage(QWidget):
         # Provided mode reveals the explicit val + test folder rows; otherwise the
         # fractions drive allocation. Keep val% + test% <= 0.90 (train keeps >= 10%).
         provided = self.split_provided_chk.isChecked()
-        self.val_row_w.setEnabled(provided)
-        self.test_row_w.setEnabled(provided)
+        self.split_form.setRowVisible(self.val_row_w, provided)
+        self.split_form.setRowVisible(self.test_row_w, provided)
         if self.val_spin.value() + self.test_spin.value() > 0.90:
             if self.sender() is self.val_spin:
                 spin, val = self.test_spin, 0.90 - self.val_spin.value()

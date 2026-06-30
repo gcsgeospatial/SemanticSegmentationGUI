@@ -709,6 +709,21 @@ def main():
             check("appstate: delete_dataset forgets the entry + deletes its staged dir",
                   "to_delete" not in appstate.known_datasets() and not del_dir.exists())
 
+            # Even when on-disk removal fails (locked files on Windows), the entry
+            # MUST still be forgotten so the GUI list refreshes — forget happens first.
+            import shutil as _sh
+            stuck = tmp / "stuck_ds"
+            stuck.mkdir()
+            appstate.remember_dataset("stuck", {"staged_dir": str(stuck), "uploaded": False})
+            _orig_rmtree = _sh.rmtree
+            _sh.rmtree = lambda *a, **k: (_ for _ in ()).throw(OSError("locked"))
+            try:
+                _, err = appstate.delete_dataset("stuck")
+            finally:
+                _sh.rmtree = _orig_rmtree
+            check("appstate: delete_dataset forgets the entry even when rmtree fails",
+                  "stuck" not in appstate.known_datasets() and err)
+
             # Registry defaults to our GHCR org when never set (pulling works out
             # of the box); TT_REGISTRY/env or an explicit value override it.
             _saved_reg = os.environ.pop("TT_REGISTRY", None)

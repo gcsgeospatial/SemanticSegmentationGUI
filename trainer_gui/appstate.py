@@ -204,25 +204,31 @@ def delete_dataset(name: str) -> tuple[str, str]:
     if info.get("builtin"):
         return ("", "")
     staged = info.get("staged_dir", "")
-    err = ""
-    if staged and os.path.isdir(staged):
-        try:
-            shutil.rmtree(staged)
-        except OSError:
-            # Windows: read-only files block rmtree. Clear the flag and retry once.
-            for p in Path(staged).rglob("*"):
-                try:
-                    os.chmod(p, stat.S_IWRITE)
-                except OSError:
-                    pass
-            try:
-                shutil.rmtree(staged)
-            except OSError as e:
-                err = str(e)
+
+    # Forget the entry + overrides FIRST so the list always reflects the delete,
+    # even if the on-disk cleanup below fails (locked files are common on Windows).
     forget_dataset(name)
     for key in ("dg_config", "palette_overrides", "palette_name_overrides"):
         allc = get(key, {})
         if name in allc:
             allc.pop(name, None)
             put(key, allc)
+
+    # Best-effort disk removal — must NEVER raise (any throw here would skip the
+    # caller's list refresh). rglob/rmtree can both throw if a handle is open.
+    err = ""
+    if staged and os.path.isdir(staged):
+        try:
+            shutil.rmtree(staged)
+        except OSError:
+            # Windows: read-only files block rmtree. Clear the flag and retry once.
+            try:
+                for p in Path(staged).rglob("*"):
+                    try:
+                        os.chmod(p, stat.S_IWRITE)
+                    except OSError:
+                        pass
+                shutil.rmtree(staged)
+            except OSError as e:
+                err = str(e)
     return (staged, err)
