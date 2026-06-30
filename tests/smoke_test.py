@@ -163,6 +163,18 @@ def main():
               and not (set(va_sc) & set(te_sc)))
         check("scene-split: meta records split mode + seed",
               msc["split"]["mode"] == "random" and msc["split"]["seed"] == 42)
+        # Parallel conversion must not change the split: same folder + seed -> same
+        # scene->split mapping (guards the order-preserving map in _convert_many).
+        staged_sc2 = dataset.convert_dataset(
+            "laz_scene2", str(sc_src), spec, classes, [0], tmp / "staging",
+            split=dataset.SplitConfig(val_frac=0.34, test_frac=0.33, mode="random", seed=42))
+        msc2 = json.loads((staged_sc2 / "dataset_meta.json").read_text())
+        check("scene-split: deterministic across runs (parallel-safe)",
+              all(sorted(msc["splits"][sp]["scenes"]) == sorted(msc2["splits"][sp]["scenes"])
+                  for sp in ("train", "val", "test")))
+        # Worker cap stays sane: >=1, never more than the file count (3 here).
+        wc = dataset._worker_cap(list(sc_src.glob("*.laz")))
+        check(f"convert: worker cap RAM/core-clamped (got {wc})", 1 <= wc <= 3)
 
         # ---------------- single-cloud split: one cloud is tile-measured and
         # reassembled into three holey train/val/test clouds (seam_buffer=0 here so

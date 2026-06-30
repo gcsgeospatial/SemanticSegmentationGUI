@@ -26,8 +26,10 @@ train/val/test folders ("provided") bypass allocation for whichever splits exist
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -409,12 +411,95 @@ def convert_scene(path: Path, spec: LabelSpec | None, value_to_index: dict[int, 
                         use_smrf=use_smrf, hag_filter=hag_filter)
 
 
+def _available_ram_bytes() -> int | None:
+    """Best-effort available physical RAM (bytes), stdlib only, cross-platform.
+    None when it can't be determined — caller then falls back to a core-only cap."""
+    try:                                              # Linux: free pages * page size
+        if hasattr(os, "sysconf") and "SC_AVPHYS_PAGES" in os.sysconf_names:
+            return os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    except (ValueError, OSError):
+        pass
+    if os.name == "nt":                               # Windows: GlobalMemoryStatusEx
+        try:
+            import ctypes
+
+            class _MS(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+            m = _MS()
+            m.dwLength = ctypes.sizeof(_MS)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)):
+                return int(m.ullAvailPhys)
+        except Exception:                             # noqa: BLE001 — any ctypes failure = unknown
+            pass
+    return None
+
+
+# A worker decompresses one cloud and makes a few transient copies (a structured
+# array for PDAL, the npz buffer). LAZ inflates ~10-20x; 30x the largest input
+# file is a deliberately fat per-worker estimate — overshooting only costs
+# parallelism, never a crash. Headroom leaves RAM for the OS, Qt, and PDAL itself.
+_RAM_PER_FILE_FACTOR = 30
+_RAM_HEADROOM = 0.7
+
+
+def _worker_cap(files: list[Path]) -> int:
+    """Thread count that won't OOM: min(cores, files, RAM_budget / est-per-cloud).
+    Falls back to the core/file cap when available RAM can't be read."""
+    cap = min(os.cpu_count() or 4, max(len(files), 1))
+    ram = _available_ram_bytes()
+    if ram and files:
+        biggest = max((f.stat().st_size for f in files), default=0)
+        if biggest > 0:
+            mem_cap = int(ram * _RAM_HEADROOM // (biggest * _RAM_PER_FILE_FACTOR))
+            cap = max(1, min(cap, mem_cap))
+    return cap
+
+
+def _convert_many(files: list[Path], dest_for, spec, value_to_index, intensity_norm, say,
+                  *, compute_hag, ground_value, use_smrf, hag_filter,
+                  max_workers: int | None = None) -> list[dict]:
+    """Read + convert each file to its npz CONCURRENTLY; returns the stat dicts in
+    INPUT order. Order matters: the caller feeds it to allocate_splits positionally,
+    so the split must not depend on which scene's PDAL/SMRF finishes first.
+
+    Threads (not processes): read_points, hag_for_cloud's PDAL execute, and
+    savez_compressed all drop the GIL, so this scales with cores. Workers are
+    capped at the file count so we never hold more clouds in RAM than there are
+    scenes. say() is a queued Qt signal (thread-safe), but we only call it from
+    this thread as map yields in order — clean, ordered progress for free."""
+    def work(f: Path) -> dict:
+        cloud = read_points(f)
+        raw = read_labels(f, cloud, spec) if spec is not None else None
+        out_path = dest_for(f)
+        st = _convert_one(cloud, raw, value_to_index, out_path, intensity_norm,
+                          compute_hag=compute_hag, ground_value=ground_value,
+                          use_smrf=use_smrf, hag_filter=hag_filter)
+        st["scene"] = out_path.name
+        return st
+
+    workers = max_workers or _worker_cap(files)       # caller override wins, else RAM/core-safe
+    if workers > 1:
+        say(f"  ({workers} parallel workers)")
+    out = []
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        for f, st in zip(files, ex.map(work, files)):   # map preserves input order
+            say(f"  converted {f.name}")
+            out.append(st)
+    return out
+
+
 def _plan_and_convert(input_files: list[Path], val_files: list[Path] | None,
                       test_files: list[Path] | None, split: SplitConfig,
                       spec: LabelSpec | None, value_to_index: dict[int, int],
                       num_classes: int, out_root: Path, intensity_norm: str, say, *,
                       compute_hag: bool = False, ground_value: int | None = None,
-                      use_smrf: bool = True, hag_filter: str = "hag_nn") -> dict:
+                      use_smrf: bool = True, hag_filter: str = "hag_nn",
+                      max_workers: int | None = None) -> dict:
     """Convert sources into out_root/{train,val,test}/*.npz; returns
     {"train": [stats], "val": [stats], "test": [stats]}.
 
@@ -434,20 +519,21 @@ def _plan_and_convert(input_files: list[Path], val_files: list[Path] | None,
 
     # Explicit folders verbatim; their fractions drop out of the allocation.
     for split_name, files in (("val", val_files), ("test", test_files)):
-        for f in (files or []):
-            say(f"  [{split_name}] {f.name} ...")
-            cloud = read_points(f)
-            raw = read_labels(f, cloud, spec) if spec is not None else None
-            emit(split_name, cloud, raw, f.stem)
+        if files:
+            stats[split_name].extend(_convert_many(
+                files, lambda f, sn=split_name: out_root / sn / f"{f.stem}.npz",
+                spec, value_to_index, intensity_norm, say, compute_hag=compute_hag,
+                ground_value=ground_value, use_smrf=use_smrf, hag_filter=hag_filter,
+                max_workers=max_workers))
     vfrac = 0.0 if val_files else split.val_frac
     tfrac = 0.0 if test_files else split.test_frac
 
     if vfrac <= 0.0 and tfrac <= 0.0:                  # everything explicit -> all train
-        for f in input_files:
-            say(f"  [train] {f.name} ...")
-            cloud = read_points(f)
-            raw = read_labels(f, cloud, spec) if spec is not None else None
-            emit("train", cloud, raw, f.stem)
+        stats["train"].extend(_convert_many(
+            input_files, lambda f: out_root / "train" / f"{f.stem}.npz",
+            spec, value_to_index, intensity_norm, say, compute_hag=compute_hag,
+            ground_value=ground_value, use_smrf=use_smrf, hag_filter=hag_filter,
+            max_workers=max_workers))
         return stats
 
     # Single cloud -> tile as a measurement, allocate tiles, reassemble per split.
@@ -483,18 +569,12 @@ def _plan_and_convert(input_files: list[Path], val_files: list[Path] | None,
 
     # Folder of clouds -> convert all to a pool, allocate WHOLE scenes, move.
     say(f"  converting {len(input_files)} scene(s), then allocating by point count ...")
-    pool = []
-    for f in input_files:
-        say(f"  converting {f.name} ...")
-        cloud = read_points(f)
-        raw = read_labels(f, cloud, spec) if spec is not None else None
-        out_path = out_root / "_pool" / f"{f.stem}.npz"
-        st = _convert_one(cloud, raw, value_to_index, out_path, intensity_norm,
-                          compute_hag=compute_hag, ground_value=ground_value,
-                          use_smrf=use_smrf, hag_filter=hag_filter)
-        st["scene"] = out_path.name
-        st["_pool_path"] = out_path
-        pool.append(st)
+    pool = _convert_many(input_files, lambda f: out_root / "_pool" / f"{f.stem}.npz",
+                         spec, value_to_index, intensity_norm, say, compute_hag=compute_hag,
+                         ground_value=ground_value, use_smrf=use_smrf, hag_filter=hag_filter,
+                         max_workers=max_workers)
+    for st in pool:                                    # map kept input order -> deterministic alloc
+        st["_pool_path"] = out_root / "_pool" / st["scene"]
     pts = [st["n_points"] for st in pool]
     hist = [_hist_from_counts(st["class_counts"], num_classes) for st in pool]
     assign = allocate_splits(pts, hist, vfrac, tfrac, split.mode, split.seed)
@@ -519,7 +599,8 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
                     split: SplitConfig | None = None,
                     intensity_norm: str = "max", compute_hag: bool = False,
                     ground_value: int | None = None, use_smrf: bool = True,
-                    hag_filter: str = "hag_nn", progress=None) -> Path:
+                    hag_filter: str = "hag_nn", max_workers: int | None = None,
+                    progress=None) -> Path:
     """Convert `inputs` (files and/or folders) into a staged canonical dataset with
     materialized train/val/test folders.
 
@@ -572,7 +653,7 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
                                     value_to_index, num_classes, out_root,
                                     intensity_norm, say, compute_hag=compute_hag,
                                     ground_value=ground_value, use_smrf=use_smrf,
-                                    hag_filter=hag_filter)
+                                    hag_filter=hag_filter, max_workers=max_workers)
     for sp in _SPLITS:
         if not scene_stats[sp]:
             raise ValueError(f"Conversion produced an empty {sp} split — lower the "

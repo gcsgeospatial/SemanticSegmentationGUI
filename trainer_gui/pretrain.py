@@ -21,7 +21,6 @@ only `add_hag` needs it. `tile_for_model` is pure numpy/laspy.
 from __future__ import annotations
 
 import json
-import os
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -215,9 +214,9 @@ def add_hag(in_dir: str | Path, out_dir: str | Path, *, ground_class: int | None
             json.dump({"pipeline": stages, **st}, f, indent=2)
         return st
 
-    # ponytail: one worker per file, capped at cpu_count — each SMRF holds its
-    # whole cloud in RAM, so don't oversubscribe past the file count or cores.
-    workers = max_workers or min(os.cpu_count() or 4, len(files))
+    # Each SMRF holds its whole cloud in RAM — clamp by RAM + cores so a big
+    # multi-file run can't OOM (one policy, shared with the converter).
+    workers = max_workers or dataset._worker_cap(files)
     per_file = []
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futs = {ex.submit(_process_one, p): p for p in files}
