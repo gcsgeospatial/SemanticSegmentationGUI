@@ -57,12 +57,42 @@ import os
 from typing import Optional
 
 
+def gpu_name() -> str:
+    """Real CUDA device name for logs/metadata (replaces the old fixed cloud GPU_TYPE)."""
+    import torch
+    return torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
+
+
+def partition_scenes(pool, predefined_test, val_frac, test_frac, seed):
+    """Deterministic scene-level train/val/test split (whole scenes, never tiles).
+
+    pool            : scene names available for train (+ val, + test if none predefined).
+    predefined_test : scene names already forming a dedicated test set (IEEE
+                      Validate-Track4 / a canonical val/ folder). Non-empty -> it wins
+                      and test_frac is ignored (a fixed test set must stay fixed).
+    val_frac/test_frac : fractions of len(pool); each rounds to a whole scene count
+                      (>=1 when positive and the pool has room).
+    Returns (train, val, test) sorted name lists; always leaves >=1 train scene.
+    """
+    import numpy as np
+    pool = sorted(pool)
+    n = len(pool)
+    want = lambda frac, avail: min(max(1, round(frac * n)) if frac > 0 else 0, max(0, avail))
+    order = np.random.RandomState(seed).permutation(n)
+    n_test = 0 if predefined_test else want(test_frac, n - 2)   # leave room for val + train
+    n_val = want(val_frac, n - 1 - n_test)
+    pick = lambda lo, hi: sorted(pool[i] for i in order[lo:hi])
+    test = sorted(predefined_test) if predefined_test else pick(0, n_test)
+    val = pick(n_test, n_test + n_val)
+    train = pick(n_test + n_val, n)
+    return train, val, test
+
+
 # ============================================================================
 # Configuration
 # ============================================================================
 APP_NAME      = "kpconvx-cold-ieee-hag"
 FEATURE_MODE  = "native_hag"  # [1, intensity, return_number, HAG (height above ground)]
-GPU_TYPE      = "A100"
 N_EPOCHS      = 200          # extended from 150 (val mIoU still rising); the
                              # 1-cycle lr keeps decaying smoothly past 150
 EPOCH_STEPS   = 300          # optimizer steps / epoch (KPConvX S3DIS: 300)
@@ -107,7 +137,9 @@ RARE_TILE_PROB  = 0.25       # P(draw the next train tile from a rare-class tile
 
 NUM_CLASSES   = 5            # IEEE: Ground, Trees, Building, Water, Bridge
 INPUT_CHANNELS = 4           # [1, intensity, return_number, HAG]
-N_VAL_HOLDOUT = 10
+VAL_FRAC      = 0.15         # fraction of train scenes held out for in-distribution val
+TEST_FRAC     = 0.15         # fraction held out for test — ONLY when no dedicated test
+                             # set exists (IEEE Validate-Track4 / canonical val/ wins)
 HOLDOUT_SEED  = 42
 
 # Geometry — matches train_LAS.py LASConfig.
@@ -465,26 +497,21 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
 
     def _split_scenes():
         if ds_root:
-            # Canonical: hold out N_VAL_HOLDOUT train scenes by name for val; the
-            # dataset's val/ folder is the test set. cls_path=None flags canonical.
+            # Canonical: VAL_FRAC of the train scenes -> val (by name). The dataset's
+            # val/ folder is the dedicated test set; if it's empty, TEST_FRAC carves a
+            # test set from the train scenes instead. cls_path=None flags canonical.
             train_npz = sorted(glob.glob(f"{ds_root}/train/*.npz"))
             if not train_npz:
                 raise FileNotFoundError(f"No canonical scenes under {ds_root}/train")
-            path_of = {os.path.splitext(os.path.basename(p))[0]: p for p in train_npz}
-            names_all = sorted(path_of)
-            rng = np.random.RandomState(HOLDOUT_SEED)
-            idx = np.arange(len(names_all)); rng.shuffle(idx)
-            n_hold = min(N_VAL_HOLDOUT, max(1, len(names_all) // 5))
-            if len(names_all) >= 6:            # H3: avoid the 1-scene val-mIoU lottery
-                n_hold = max(n_hold, 3)
-            val_names = sorted(names_all[i] for i in idx[:n_hold])
-            train_names = sorted(n for n in names_all if n not in val_names)
             test_npz = sorted(glob.glob(f"{ds_root}/val/*.npz"))
-            return (
-                [(n, path_of[n], None) for n in train_names],
-                [(n, path_of[n], None) for n in val_names],
-                [(os.path.splitext(os.path.basename(p))[0], p, None) for p in test_npz],
-            )
+            stem = lambda p: os.path.splitext(os.path.basename(p))[0]
+            path_of = {stem(p): p for p in train_npz + test_npz}
+            train_names, val_names, test_names = partition_scenes(
+                [stem(p) for p in train_npz], [stem(p) for p in test_npz],
+                VAL_FRAC, TEST_FRAC, HOLDOUT_SEED)
+            return ([(n, path_of[n], None) for n in train_names],
+                    [(n, path_of[n], None) for n in val_names],
+                    [(n, path_of[n], None) for n in test_names])
         train_pc = sorted(glob.glob(f"{TRAIN_PC_DIR}/*_PC3.txt"))
         if not train_pc:
             raise FileNotFoundError(
@@ -492,20 +519,18 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
                 f"ieee-data volume first, e.g.:\n"
                 f"  modal volume put ieee-data "
                 f'"C:\\Users\\OrionHoch\\Desktop\\LabledDatasets\\IEEE" /IEEE')
-        names_all = [os.path.basename(p).replace("_PC3.txt", "") for p in train_pc]
-        rng = np.random.RandomState(HOLDOUT_SEED)
-        idx = np.arange(len(names_all)); rng.shuffle(idx)
-        val_names = sorted(names_all[i] for i in idx[:N_VAL_HOLDOUT])
-        train_names = sorted(n for n in names_all if n not in val_names)
+        name_of = lambda p: os.path.basename(p).replace("_PC3.txt", "")
+        test_pc = sorted(glob.glob(f"{TEST_PC_DIR}/*_PC3.txt"))
+        train_names, val_names, test_names = partition_scenes(
+            [name_of(p) for p in train_pc], [name_of(p) for p in test_pc],
+            VAL_FRAC, TEST_FRAC, HOLDOUT_SEED)
         def _pair(names, pc_dir, cls_dir):
             return [(n, f"{pc_dir}/{n}_PC3.txt", f"{cls_dir}/{n}_CLS.txt") for n in names]
-        test_pc = sorted(glob.glob(f"{TEST_PC_DIR}/*_PC3.txt"))
-        test_names = sorted(os.path.basename(p).replace("_PC3.txt", "") for p in test_pc)
-        return (
-            _pair(train_names, TRAIN_PC_DIR, TRAIN_CLS_DIR),
-            _pair(val_names,   TRAIN_PC_DIR, TRAIN_CLS_DIR),
-            _pair(test_names,  TEST_PC_DIR,  TEST_CLS_DIR),
-        )
+        # carved-from-train test (no dedicated test set) lives in the TRAIN dirs
+        test_dirs = (TEST_PC_DIR, TEST_CLS_DIR) if test_pc else (TRAIN_PC_DIR, TRAIN_CLS_DIR)
+        return (_pair(train_names, TRAIN_PC_DIR, TRAIN_CLS_DIR),
+                _pair(val_names,   TRAIN_PC_DIR, TRAIN_CLS_DIR),
+                _pair(test_names,  *test_dirs))
 
     def _cache_signature():
         # Everything that changes what a cached tile contains. A mismatch means
@@ -517,7 +542,8 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
             "chunk_xy": CHUNK_XY,
             "stride": STRIDE,
             "holdout_seed": HOLDOUT_SEED,
-            "n_val_holdout": N_VAL_HOLDOUT,
+            "val_frac": VAL_FRAC,
+            "test_frac": TEST_FRAC,
             "label_map": None if ds_root else {str(k): v for k, v in sorted(LABEL_MAP.items())},
             "min_pts_mask": 64,
             "min_pts_sub": 32,
@@ -591,7 +617,10 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
         print(f"  [val] {len(val_list)} scenes", flush=True)
         tile_remaining(val_list, f"{PREP_DIR}/val", CHUNK_XY, STRIDE, HAG_TRAIN_DIR)
         print(f"  [test] {len(test_list)} scenes", flush=True)
-        tile_remaining(test_list, f"{PREP_DIR}/test", CHUNK_XY, STRIDE, HAG_TEST_DIR)
+        # carved-from-train test (no dedicated Validate set) is Train-origin -> HAG/Train
+        test_hag_dir = (HAG_TEST_DIR if ds_root or glob.glob(f"{TEST_PC_DIR}/*_PC3.txt")
+                        else HAG_TRAIN_DIR)
+        tile_remaining(test_list, f"{PREP_DIR}/test", CHUNK_XY, STRIDE, test_hag_dir)
         if any_new[0]:
             (datasets_volume if ds_root else data_volume).commit()
             print("  preprocessing committed.", flush=True)
@@ -631,7 +660,7 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
 
     print("=" * 70)
     print(f"  KPConvX-L  IEEE Track 4  COLD/{FEATURE_MODE}  "
-          f"({GPU_TYPE}, {N_EPOCHS} ep, {EPOCH_STEPS} steps, "
+          f"({gpu_name()}, {N_EPOCHS} ep, {EPOCH_STEPS} steps, "
           f"pack {PACK_N} x accum {ACCUM})")
     print("=" * 70)
     print(f"  CUDA: {torch.cuda.is_available()}  device: "
@@ -1086,7 +1115,7 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
             json.dump({"backbone": "KPConvX-L-HAG", "mode": "infer", "weights": weights,
                        "infer_input": infer_input, "num_classes": NUM_CLASSES,
                        "class_names": CLASS_NAMES, "grid": GRID, "chunk_xy": CHUNK_XY,
-                       "hag": "proxy_z_tile_min", "gpu": GPU_TYPE,
+                       "hag": "proxy_z_tile_min", "gpu": gpu_name(),
                        "scenes": [os.path.basename(s) for s in scenes]}, f, indent=2)
         print(f"  [infer] labeling {len(scenes)} scene(s) -> {run_dir}/predictions", flush=True)
         if DG_INFER_ADABN:

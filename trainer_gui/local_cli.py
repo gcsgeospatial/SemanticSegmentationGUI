@@ -152,7 +152,12 @@ def run_script(script: str, flags: dict, backbone, *, repo_root: str,
     overrides the host dir bound to /outputs (the user-picked output folder).
     """
     cfg = appstate.local_config()
-    args = ["run", "--rm", "-w", "/workspace"]
+    # --ipc=host gives the container the host's /dev/shm. Docker's default is 64 MB,
+    # which PyTorch DataLoader workers (num_workers>0) overflow on larger batches ->
+    # "Bus error … insufficient shared memory" SIGBUS at the epoch boundary.
+    # ponytail: host IPC = zero tuning, never too small; if sharing the host IPC
+    # namespace is ever undesirable, swap for ["--shm-size", "8g"].
+    args = ["run", "--rm", "--ipc=host", "-w", "/workspace"]
     if cfg.get("gpus"):
         args += ["--gpus", str(cfg["gpus"])]
     args += _mounts(cfg, repo_root, extra_mounts, outputs_root=outputs_root)

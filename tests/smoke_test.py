@@ -695,8 +695,9 @@ def main():
                 "modal_train_ptv3.py", {"dataset": "myds", "grid": 0.05, "epochs": 250},
                 BB["ptv3"], repo_root="/repo", gpu="A100")
             joined = " ".join(args)
-            check("local_cli: docker run with gpus + workspace/datasets/outputs mounts",
-                  args[0] == "run" and "--gpus" in args and "/repo:/workspace" in args
+            check("local_cli: docker run with ipc=host + gpus + workspace/datasets/outputs mounts",
+                  args[0] == "run" and "--ipc=host" in args and "--gpus" in args
+                  and "/repo:/workspace" in args
                   and ":/datasets" in joined and ":/outputs" in joined)
             check("local_cli: invokes the decoupled scripts/local/local_train_<key>.py with the flags",
                   "scripts/local/local_train_ptv3.py" in args and "local_run.py" not in args

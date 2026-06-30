@@ -70,18 +70,48 @@ Extra flags (see modal_train_ptv3_warm.py for details):
   --grid / --chunk-xy / --epochs / --batch / --steps-per-epoch
   --mode infer --weights runs/<id>/final_model.pth --infer-input <job_id>
 
-GPU type / timeout come from TT_GPU / TT_TIMEOUT_HOURS env vars.
+Timeout comes from the TT_TIMEOUT_HOURS env var.
 """
 
 import os
 from typing import Optional
 
 
+def gpu_name() -> str:
+    """Real CUDA device name for logs/metadata (replaces the old fixed cloud GPU_TYPE)."""
+    import torch
+    return torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
+
+
+def partition_scenes(pool, predefined_test, val_frac, test_frac, seed):
+    """Deterministic scene-level train/val/test split (whole scenes, never tiles).
+
+    pool            : scene names available for train (+ val, + test if none predefined).
+    predefined_test : scene names already forming a dedicated test set (IEEE
+                      Validate-Track4 / a canonical val/ folder). Non-empty -> it wins
+                      and test_frac is ignored (a fixed test set must stay fixed).
+    val_frac/test_frac : fractions of len(pool); each rounds to a whole scene count
+                      (>=1 when positive and the pool has room).
+    Returns (train, val, test) sorted name lists; always leaves >=1 train scene.
+    """
+    import numpy as np
+    pool = sorted(pool)
+    n = len(pool)
+    want = lambda frac, avail: min(max(1, round(frac * n)) if frac > 0 else 0, max(0, avail))
+    order = np.random.RandomState(seed).permutation(n)
+    n_test = 0 if predefined_test else want(test_frac, n - 2)   # leave room for val + train
+    n_val = want(val_frac, n - 1 - n_test)
+    pick = lambda lo, hi: sorted(pool[i] for i in order[lo:hi])
+    test = sorted(predefined_test) if predefined_test else pick(0, n_test)
+    val = pick(n_test, n_test + n_val)
+    train = pick(n_test + n_val, n)
+    return train, val, test
+
+
 # ============================================================================
 # Configuration
 # ============================================================================
 APP_NAME      = "ptv3-ieee-hag"
-GPU_TYPE      = os.environ.get("TT_GPU", "A100")
 N_EPOCHS      = 100            # PTv3 outdoor recipe (Wu et al., CVPR 2024): ~50
                              # epochs x 500 steps. Override per-run with --epochs;
                              # for a cheap end-to-end check pass --epochs 2.
@@ -105,7 +135,9 @@ USE_FLASH_ATTN = False  # ponytail: flash serialized-attn patch-gather OOBs mid-
                         # (the "device-side assert" crash). Off + patch_size 128 is the
                         # documented Pointcept fix. Re-enable w/ patch 128 if you want speed.
 HOLDOUT_SEED   = 42
-N_VAL_HOLDOUT  = 10            # held-out train scenes for val (matches KPConvX cold)
+VAL_FRAC       = 0.15          # fraction of train scenes held out for in-distribution val
+TEST_FRAC      = 0.15          # fraction held out for test — ONLY when no dedicated test
+                               # set exists (IEEE Validate-Track4 / canonical val/ wins)
 
 # ----------------------------------------------------------------------------
 # Regularization / optimizer — PTv3's published outdoor-LiDAR recipe
@@ -687,7 +719,7 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
             json.dump({"backbone": "PTv3", "mode": "infer", "weights": weights,
                        "infer_input": infer_input, "num_classes": num_classes,
                        "class_names": class_names, "grid_size": GRID_SIZE,
-                       "chunk_xy": CHUNK_XY, "gpu": GPU_TYPE,
+                       "chunk_xy": CHUNK_XY, "gpu": gpu_name(),
                        "scenes": [os.path.basename(s) for s in scenes]}, f, indent=2)
 
         predict_scene = make_predict_scene(backbone, head, num_classes)
@@ -707,7 +739,7 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
     # TRAINING MODE
     # ==========================================================================
     print("=" * 70)
-    print(f"  PTv3  {dataset or 'IEEE_Track4'}  ({GPU_TYPE}, {N_EPOCHS} ep, batch {BATCH_SIZE})")
+    print(f"  PTv3  {dataset or 'IEEE_Track4'}  ({gpu_name()}, {N_EPOCHS} ep, batch {BATCH_SIZE})")
     print("=" * 70)
     print(f"  CUDA: {torch.cuda.is_available()}  "
           f"{torch.cuda.get_device_name(0) if torch.cuda.is_available() else ''}")
@@ -759,11 +791,11 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
             json.dump({
                 "backbone": "PTv3", "n_epochs": N_EPOCHS, "batch_size": BATCH_SIZE,
                 "dataset": dataset or "IEEE_Track4",
-                "mode": mode, "gpu": GPU_TYPE,
+                "mode": mode, "gpu": gpu_name(),
                 "comparison_target": None if dataset
                     else "modal_train_kpconvx_cold.py (KPConvX-L) on IEEE Track 4",
                 "label_map_asprs_to_index": None if dataset else LABEL_MAP,
-                "n_val_holdout": None if dataset else N_VAL_HOLDOUT,
+                "val_frac": VAL_FRAC, "test_frac": TEST_FRAC,
                 "num_classes": NUM_CLASSES, "grid_size": GRID_SIZE,
                 "class_names": CLASS_NAMES,
                 "in_channels": 7,
@@ -815,21 +847,26 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
         return b.rsplit("_x", 1)[0]
     all_train_tiles = sorted(glob.glob(f"{PREP_DIR}/train/*.npz"))
     all_test_tiles  = sorted(glob.glob(f"{PREP_DIR}/test/*.npz"))
-    # Both IEEE (default) and canonical datasets use the same split: hold out a
-    # few train scenes by name for in-distribution validation; the test set is
-    # the dedicated test tiles (IEEE Validate-Track4 / the canonical val/ folder).
-    scene_names = sorted({_scene_of(p) for p in all_train_tiles})
-    rng = np.random.RandomState(HOLDOUT_SEED)
-    idx = np.arange(len(scene_names))
-    rng.shuffle(idx)
-    n_hold = min(N_VAL_HOLDOUT, max(1, len(scene_names) // 5))
-    if len(scene_names) >= 6:                  # H3: avoid the 1-scene val-mIoU lottery
-        n_hold = max(n_hold, 3)
-    hold = {scene_names[i] for i in idx[:n_hold]}
-    synth_train_tiles = [f for f in all_train_tiles if _scene_of(f) not in hold]
-    synth_test_tiles  = [f for f in all_train_tiles if _scene_of(f) in hold]
-    real_train_tiles, real_test_tiles = [], all_test_tiles
-    print(f"  train: {len(synth_train_tiles)}   val(holdout {n_hold} scenes): "
+    # Scene-level split (whole scenes, never tiles): VAL_FRAC of the train scenes
+    # -> val. The dedicated test tiles (IEEE Validate-Track4 / canonical val/) are
+    # the test set; if there are none, TEST_FRAC carves test from the train scenes.
+    train_scenes = sorted({_scene_of(p) for p in all_train_tiles})
+    predefined_test_scenes = sorted({_scene_of(p) for p in all_test_tiles})
+    keep_train, hold_val, hold_test = partition_scenes(
+        train_scenes, predefined_test_scenes, VAL_FRAC, TEST_FRAC, HOLDOUT_SEED)
+    hold = set(hold_val)
+    keep = set(keep_train)
+    synth_train_tiles = [f for f in all_train_tiles if _scene_of(f) in keep]
+    synth_test_tiles  = [f for f in all_train_tiles if _scene_of(f) in hold]   # = val
+    real_train_tiles = []
+    if predefined_test_scenes:
+        real_test_tiles = all_test_tiles                        # dedicated test set
+        test_raw_split, test_tile_dir = "test", f"{PREP_DIR}/test"
+    else:                                                       # test carved from train
+        carved = set(hold_test)
+        real_test_tiles = [f for f in all_train_tiles if _scene_of(f) in carved]
+        test_raw_split, test_tile_dir = "val", f"{PREP_DIR}/train"
+    print(f"  train: {len(synth_train_tiles)}   val(holdout {len(hold_val)} scenes): "
           f"{len(synth_test_tiles)}   test: {len(real_test_tiles)}", flush=True)
 
     # --- class balance: scan training tiles for inverse-frequency weights +
@@ -1090,7 +1127,7 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
 
     eval_items = (
         [(n, _raw_loader("val", n), f"{PREP_DIR}/train") for n in sorted(hold)] +
-        [(n, _raw_loader("test", n), f"{PREP_DIR}/test")
+        [(n, _raw_loader(test_raw_split, n), test_tile_dir)
          for n in sorted({_scene_of(p) for p in real_test_tiles})]
     )
     print(f"  eval set: {len(eval_items)} scenes "

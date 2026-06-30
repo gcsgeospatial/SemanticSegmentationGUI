@@ -14,12 +14,13 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QProcess
+from PySide6.QtCore import QProcess, Qt
 from PySide6.QtGui import QColor, QTextCursor
 from PySide6.QtWidgets import (QCheckBox, QColorDialog, QComboBox, QDialog, QDialogButtonBox,
-                               QDoubleSpinBox, QFileDialog, QFormLayout, QGridLayout, QGroupBox,
-                               QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit, QPushButton,
-                               QRadioButton, QSpinBox, QVBoxLayout, QWidget)
+                               QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout,
+                               QHeaderView, QLabel, QLineEdit, QPlainTextEdit, QPushButton,
+                               QRadioButton, QSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout,
+                               QWidget)
 
 from .. import appstate, dataset, local_cli, modal_cli, ui
 from ..backbones import BACKBONES, infer_backbones
@@ -60,6 +61,9 @@ class InferPage(QWidget):
 
         wbox = QGroupBox("Weights")
         wf = self.wf = QFormLayout(wbox)
+        # Let each row's field fill the width so the trailing Browse… button always
+        # sits flush-right with room (never clipped/occluded by a too-narrow field).
+        wf.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
         radio_row = QHBoxLayout()
         self.from_run_radio = QRadioButton("From a training run")
         self.from_run_radio.setChecked(True)
@@ -85,6 +89,17 @@ class InferPage(QWidget):
         rj_row.addWidget(rj_btn)
         self.runjson_row_w = _wrap(rj_row)
         wf.addRow("Run file (run.json)", self.runjson_row_w)
+        # Weights default to the .pth named in run.json (beside it), but can point
+        # anywhere — run.json and weights need NOT be co-located.
+        self.weights_edit = QLineEdit()
+        self.weights_edit.setPlaceholderText("default: the weights named in run.json, beside it")
+        w_row = QHBoxLayout()
+        w_row.addWidget(self.weights_edit)
+        w_btn = QPushButton("Browse…")
+        w_btn.clicked.connect(self._pick_weights)
+        w_row.addWidget(w_btn)
+        self.weights_row_w = _wrap(w_row)
+        wf.addRow("Weights file", self.weights_row_w)
         # MODAL: pick/paste a run id (weights live on the cloud outputs volume).
         self.run_combo = QComboBox()
         self.run_combo.setEditable(True)   # run ids can also be typed/pasted
@@ -105,31 +120,25 @@ class InferPage(QWidget):
 
         ibox = QGroupBox("Input")
         iform = self.iform = QFormLayout(ibox)
+        iform.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
         self.input_edit = QLineEdit()
         in_row = QHBoxLayout()
         in_row.addWidget(self.input_edit)
-        in_btn = QPushButton("Browse…")
-        in_btn.clicked.connect(self._pick_input)
-        in_row.addWidget(in_btn)
-        iform.addRow("Folder of point clouds", _wrap(in_row))
+        fold_btn = QPushButton("Folder…")
+        fold_btn.clicked.connect(self._pick_input)
+        file_btn = QPushButton("File…")
+        file_btn.clicked.connect(self._pick_input_file)
+        in_row.addWidget(fold_btn)
+        in_row.addWidget(file_btn)
+        iform.addRow("Point clouds (folder or file)", _wrap(in_row))
         self.grid_spin = QDoubleSpinBox()
         self.grid_spin.setRange(0.02, 5.0)
         self.grid_spin.setSingleStep(0.05)
         self.grid_spin.setDecimals(2)
         self.grid_spin.setValue(0.30)
         iform.addRow("Grid size (m) — auto-filled from the run", self.grid_spin)
-        # Intensity normalization MUST match what the weights were trained with:
-        # canonical --dataset runs default to max ([0,1]); the IEEE scripts use p95
-        # ([0,2]). convert_infer_job is told which, so the net sees in-distribution
-        # intensity — a mismatch silently wrecks accuracy for EVERY checkpoint.
-        self.inorm_combo = QComboBox()
-        self.inorm_combo.addItem("p95 → [0,2]  (IEEE training scripts)", "p95")
-        self.inorm_combo.addItem("max → [0,1]  (canonical --dataset default)", "max")
-        j = self.inorm_combo.findData(appstate.get("infer_inorm", "p95"))
-        self.inorm_combo.setCurrentIndex(j if j >= 0 else 0)
-        self.inorm_combo.currentIndexChanged.connect(
-            lambda: appstate.put("infer_inorm", self.inorm_combo.currentData()))
-        iform.addRow("Intensity norm — match the training run", self.inorm_combo)
+        # Intensity is p95-normalized end-to-end (build + train + inference), so there
+        # is nothing to match here — convert_infer_job always uses p95.
         self.chunk_spin = QDoubleSpinBox()
         self.chunk_spin.setRange(10.0, 200.0)
         self.chunk_spin.setSingleStep(5.0)
@@ -191,51 +200,34 @@ class InferPage(QWidget):
         self.log.setObjectName("log")
         self.log.setPlaceholderText("Conversion, upload and Modal logs appear here…")
 
-        out_row = QHBoxLayout()
-        out_col = QVBoxLayout()
-        out_col.addWidget(QLabel("Prediction stats (vs ground truth)"))
-        self.stats_box = QPlainTextEdit()
-        self.stats_box.setReadOnly(True)
-        self.stats_box.setMaximumHeight(150)
-        self.stats_box.setPlaceholderText(
-            "Run 'Compare to ground truth…' on a prediction cloud to compute its "
-            "overall accuracy, mIoU and per-class IoU here.")
-        out_col.addWidget(self.stats_box)
-        out_row.addLayout(out_col, 1)
-        btn_col = QVBoxLayout()
-        btn_col.addWidget(QLabel("Class palette (legend)"))
-        self.palette_combo = QComboBox()
-        self.palette_combo.setToolTip(
-            "Class names for the legend + 3D viewer. 'From the loaded run' uses the "
-            "model's OWN trained classes (auto-selected when you pick a run); or pick a "
-            "dataset, or Auto (names in the file, else IEEE). 'Configure Palette…' sets "
-            "each class colour.")
-        self.palette_combo.currentIndexChanged.connect(self._on_palette_change)
-        btn_col.addWidget(self.palette_combo)
-        self.configure_palette_btn = QPushButton("Configure Palette…")
-        self.configure_palette_btn.setToolTip(
-            "Edit the colour shown for each class in the 3D viewer (saved per palette).")
-        self.configure_palette_btn.clicked.connect(self._configure_palette)
-        btn_col.addWidget(self.configure_palette_btn)
-        # Live swatch legend: how each class is coloured in the 3D viewer, for the
-        # selected palette (a Configure-Palette override, else the baked default).
-        self.legend_label = QLabel()
-        self.legend_label.setToolTip("How each class is coloured in the 3D viewer.")
-        btn_col.addWidget(self.legend_label)
+        # Output / view: a single action bar + a compact one-line legend (no stat
+        # box, no crammed side column). Comparison metrics print to the log.
         self.view_btn = QPushButton("View a point cloud…")
         self.view_btn.clicked.connect(self._view_file)
         self.compare_btn = QPushButton("Compare to ground truth…")
         self.compare_btn.clicked.connect(self._compare_gt)
         self.export_btn = QPushButton("Export comparison PLY…")
         self.export_btn.clicked.connect(self._export_gt)
-        btn_col.addWidget(self.view_btn)
-        btn_col.addWidget(self.compare_btn)
-        btn_col.addWidget(self.export_btn)
-        btn_col.addStretch()
-        out_row.addLayout(btn_col)
+        self.palette_btn = QPushButton("Class colours & names…")
+        self.palette_btn.setToolTip("Open the class menu: pick the name source (the run / a "
+                                    "dataset / Auto), rename classes, and set each colour.")
+        self.palette_btn.clicked.connect(self._configure_palette)
+        actions = QHBoxLayout()
+        actions.addWidget(self.view_btn)
+        actions.addWidget(self.compare_btn)
+        actions.addWidget(self.export_btn)
+        actions.addStretch(1)
+        actions.addWidget(self.palette_btn)
+        # Live one-line swatch legend (the exact colours the 3D viewer paints).
+        self.legend_label = QLabel()
+        self.legend_label.setWordWrap(True)
+        self.legend_label.setToolTip("How each class is coloured in the 3D viewer.")
+        out_box = QVBoxLayout()
+        out_box.addLayout(actions)
+        out_box.addWidget(self.legend_label)
 
         root.addWidget(ui.vsplit(ui.scrollable(ui.wrap(forms_col)), self.log,
-                                 ui.wrap(out_row), sizes=[330, 300, 160]), 1)
+                                 ui.wrap(out_box), sizes=[340, 340, 84]), 1)
 
         self.converter.output.connect(self._append)
         self.converter.done.connect(self._on_converted)
@@ -266,6 +258,7 @@ class InferPage(QWidget):
         # download to, so the user always chooses a findable location (not %APPDATA%).
         self.iform.setRowVisible(self.out_row_w, True)
         self.wf.setRowVisible(self.runjson_row_w, local)  # run.json picker = local only
+        self.wf.setRowVisible(self.weights_row_w, local)  # weights override = local only
         self.wf.setRowVisible(self.run_combo, not local)  # run-id combo = modal only
         self.reload_backbones()
 
@@ -283,39 +276,24 @@ class InferPage(QWidget):
         self.backbone_combo.blockSignals(False)
         self._sync_controls()
 
-    # ------------------------------------------------------- class palette
+    # ------------------------------------------------- class palette & names
+    # The class system is a per-class table (name source + editable name + colour)
+    # opened from the "Class colours & names…" button. State lives in appstate:
+    #   infer_palette          -> the chosen name SOURCE key
+    #   palette_name_overrides -> {source_key: [name, …]}  (renames)
+    #   palette_overrides      -> {source_key: [[r,g,b], …]}  (colours)
+    # All keyed by source so a run, a dataset, and Auto keep independent edits.
     def reload_palettes(self):
-        """Offer the loaded run's OWN classes (top, the match for its predictions),
-        then 'Auto', then every known dataset whose class names we can resolve
-        (built-ins, or a converted dataset with a readable dataset_meta.json).
-        Preserves the current pick across reloads."""
-        prev = self.palette_combo.currentData()
-        self.palette_combo.blockSignals(True)
-        self.palette_combo.clear()
-        if self._run_class_names:
-            self.palette_combo.addItem(
-                f"From the loaded run ({len(self._run_class_names)} classes)", "__run__")
-        self.palette_combo.addItem("Auto (from file / IEEE)", None)
-        for nm, info in sorted(appstate.known_datasets().items()):
-            if info.get("builtin") or os.path.exists(info.get("meta_path", "") or ""):
-                self.palette_combo.addItem(nm, nm)
-        i = self.palette_combo.findData(prev)
-        if i < 0:
-            i = self.palette_combo.findData(appstate.get("infer_palette") or None)
-        self.palette_combo.setCurrentIndex(i if i >= 0 else 0)
-        self.palette_combo.blockSignals(False)
+        """Kept for callers (reload_runs / apply_exec_mode) — just refresh legend."""
         self._refresh_legend()
 
     def _set_run_classes(self, names):
-        """Adopt the loaded run's class names for the legend/palette and auto-select
-        that option, so predictions are labelled with the model's OWN trained
-        classes (matched to the run config) rather than a guessed dataset."""
+        """Adopt the loaded run's class names + select that source, so predictions
+        are labelled with the model's OWN trained classes (matched to run config)."""
         self._run_class_names = list(names) if names else None
-        self.reload_palettes()
         if self._run_class_names:
-            i = self.palette_combo.findData("__run__")
-            if i >= 0:
-                self.palette_combo.setCurrentIndex(i)   # fires _on_palette_change -> legend
+            appstate.put("infer_palette", "__run__")
+        self._refresh_legend()
 
     @staticmethod
     def _names_from_manifest(m: dict) -> list | None:
@@ -327,75 +305,91 @@ class InferPage(QWidget):
         n = m.get("num_classes")
         return [f"class {i}" for i in range(int(n))] if n else None
 
-    def _effective_names(self) -> list:
-        """Class names labelling the palette: the selected dataset's, else IEEE."""
-        from ..palette import IEEE_CLASS_NAMES
-        return list(self._selected_class_names() or IEEE_CLASS_NAMES)
+    def _source_options(self) -> list:
+        """(label, key) name-source choices for the class menu: the loaded run, Auto,
+        then every dataset with resolvable class names."""
+        opts = []
+        if self._run_class_names:
+            opts.append((f"The loaded run ({len(self._run_class_names)} classes)", "__run__"))
+        opts.append(("Auto (names in the file, else IEEE)", "__auto__"))
+        for nm, info in sorted(appstate.known_datasets().items()):
+            if info.get("builtin") or os.path.exists(info.get("meta_path", "") or ""):
+                opts.append((nm, nm))
+        return opts
 
-    def _palette_key(self) -> str:
-        """Override-storage key for the current selection ('__auto__' for Auto)."""
-        return self.palette_combo.currentData() or "__auto__"
+    def _current_source_key(self) -> str:
+        k = appstate.get("infer_palette") or ""
+        if k == "__run__" and not self._run_class_names:
+            k = ""
+        return k or ("__run__" if self._run_class_names else "__auto__")
+
+    def _names_for_key(self, key: str) -> list:
+        """Base (un-renamed) class names for a source key."""
+        from ..palette import IEEE_CLASS_NAMES
+        if key == "__run__":
+            return list(self._run_class_names or IEEE_CLASS_NAMES)
+        if key in (None, "", "__auto__"):
+            return list(IEEE_CLASS_NAMES)
+        info = appstate.known_datasets().get(key, {})
+        if not info.get("builtin"):
+            mp = info.get("meta_path", "")
+            if mp and os.path.exists(mp):
+                try:
+                    with open(mp, "r", encoding="utf-8") as f:
+                        return list(json.load(f).get("class_names") or IEEE_CLASS_NAMES)
+                except (OSError, json.JSONDecodeError):
+                    pass
+        return list(IEEE_CLASS_NAMES)
+
+    def _apply_name_overrides(self, key: str, base: list) -> list:
+        ov = appstate.get("palette_name_overrides", {}).get(key)
+        if isinstance(ov, list):
+            return [(ov[i] if i < len(ov) and ov[i] else base[i]) for i in range(len(base))]
+        return list(base)
+
+    def _effective_names(self) -> list:
+        key = self._current_source_key()
+        return self._apply_name_overrides(key, self._names_for_key(key))
 
     def _default_colors(self, n: int) -> list:
         from ..palette import palette_for
         return palette_for(n).tolist()
 
-    def _palette_colors(self) -> list:
-        """Effective per-class [r,g,b] for the selected palette: a saved override
-        (Configure Palette…) when it matches the class count, else the default
-        categorical palette the training scripts bake into predictions."""
-        names = self._effective_names()
-        ov = appstate.get("palette_overrides", {}).get(self._palette_key())
+    def _colors_for(self, key: str, names: list) -> list:
+        ov = appstate.get("palette_overrides", {}).get(key)
         if isinstance(ov, list) and len(ov) == len(names):
             return [[int(x) for x in c] for c in ov]
         return self._default_colors(len(names))
 
+    def _palette_colors(self) -> list:
+        return self._colors_for(self._current_source_key(), self._effective_names())
+
     def _refresh_legend(self):
-        """Swatch-per-class legend for the selected palette — the exact colours the
-        3D viewer paints (a Configure-Palette override, else the baked default)."""
-        names = self._effective_names()
-        rows = "".join(
-            f'<tr><td><span style="font-size:15px; color:#{r:02x}{g:02x}{b:02x}">'
-            f'■</span></td><td>&nbsp;{name}</td></tr>'
-            for name, (r, g, b) in zip(names, self._palette_colors()))
-        self.legend_label.setText(f"<table cellspacing='2'>{rows}</table>")
+        """Compact one-line swatch legend — the exact colours the 3D viewer paints."""
+        parts = "".join(
+            f'<span style="font-size:14px;color:#{r:02x}{g:02x}{b:02x}">■</span>'
+            f'<span>&nbsp;{name}</span>&nbsp;&nbsp;&nbsp;'
+            for name, (r, g, b) in zip(self._effective_names(), self._palette_colors()))
+        self.legend_label.setText(parts)
 
     def _configure_palette(self):
-        """Popup to edit the per-class colour for the selected palette. Saves an
-        override (per palette) and refreshes the legend; the viewer uses it too."""
-        names = self._effective_names()
-        dlg = PaletteDialog(names, self._palette_colors(),
-                            self._default_colors(len(names)), self)
-        if dlg.exec():
-            overrides = dict(appstate.get("palette_overrides", {}))
-            overrides[self._palette_key()] = dlg.colors()
-            appstate.put("palette_overrides", overrides)
-            self._refresh_legend()
-
-    def _on_palette_change(self):
-        appstate.put("infer_palette", self.palette_combo.currentData() or "")
+        """Open the class menu (source + per-class name + colour). Persists the
+        chosen source, renames and colours per source; the viewer uses them too."""
+        dlg = ClassPaletteDialog(self, self)
+        if not dlg.exec():
+            return
+        key = dlg.source_key()
+        appstate.put("infer_palette", "" if key == "__auto__" else key)
+        base = self._names_for_key(key)
+        edited = dlg.names()
+        names_ov = dict(appstate.get("palette_name_overrides", {}))
+        names_ov[key] = [edited[i] if i < len(edited) and edited[i] != base[i] else ""
+                         for i in range(len(base))]
+        appstate.put("palette_name_overrides", names_ov)
+        cols_ov = dict(appstate.get("palette_overrides", {}))
+        cols_ov[key] = dlg.colors()
+        appstate.put("palette_overrides", cols_ov)
         self._refresh_legend()
-
-    def _selected_class_names(self) -> list | None:
-        """Class names for the chosen palette: the loaded run's OWN classes, a
-        dataset's, or None for 'Auto'."""
-        name = self.palette_combo.currentData()
-        if name == "__run__":
-            return self._run_class_names
-        if not name:
-            return None
-        info = appstate.known_datasets().get(name, {})
-        if info.get("builtin"):
-            from ..palette import IEEE_CLASS_NAMES
-            return IEEE_CLASS_NAMES
-        mp = info.get("meta_path", "")
-        if mp and os.path.exists(mp):
-            try:
-                with open(mp, "r", encoding="utf-8") as f:
-                    return json.load(f).get("class_names")
-            except (OSError, json.JSONDecodeError):
-                return None
-        return None
 
     # ------------------------------------------------------------- inputs
     def reload_runs(self):
@@ -508,10 +502,8 @@ class InferPage(QWidget):
             self.grid_spin.setValue(float(m["grid"]))
         if m.get("chunk_xy") is not None and self.chunk_spin.isEnabled():
             self.chunk_spin.setValue(float(m["chunk_xy"]))
-        j = self.inorm_combo.findData(m.get("intensity_norm", "p95"))
-        if j >= 0:
-            self.inorm_combo.setCurrentIndex(j)
         self._local_weights = p.parent / m.get("weights", "final_model.pth")
+        self.weights_edit.setText(str(self._local_weights))   # default; user may override
         # DG settings baked into the weights: logdk changes the input width, so it MUST
         # be re-fed at inference (re-injected as DG_* env below). AdaBN/TTA are separate
         # inference-time toggles in the Input box.
@@ -531,7 +523,24 @@ class InferPage(QWidget):
         from_run = self.from_run_radio.isChecked()
         self.run_combo.setEnabled(from_run)
         self.runjson_row_w.setEnabled(from_run)
+        self.weights_row_w.setEnabled(from_run)
         self.pth_row_w.setEnabled(not from_run)
+
+    def _pick_weights(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Choose model weights (.pth)",
+            self.weights_edit.text().strip() or str(appstate.local_runs_dir()),
+            "PyTorch checkpoints (*.pth *.pt)")
+        if path:
+            self.weights_edit.setText(path)
+
+    def _resolved_weights(self):
+        """Weights for a local from-a-run: the explicit override if set, else the
+        run.json's sibling. The two need NOT be co-located — the GUI passes the
+        run.json's grid/tile/intensity/HAG/log-d_k to the run as flags + env, so
+        accuracy doesn't depend on the .pth sitting next to its run.json."""
+        t = self.weights_edit.text().strip()
+        return Path(t) if t else self._local_weights
 
     def _sync_controls(self):
         """Auto-fill grid + tile size from the selected script's own defaults
@@ -562,6 +571,13 @@ class InferPage(QWidget):
         if d:
             self.input_edit.setText(d)
 
+    def _pick_input_file(self):
+        f, _ = QFileDialog.getOpenFileName(
+            self, "Point-cloud file to label", appstate.get("last_view_dir", ""),
+            "Point clouds (*.ply *.npz *.las *.laz *.txt *.csv *.pcd *.xyz *.pts);;All files (*)")
+        if f:
+            self.input_edit.setText(f)
+
     def _pick_out(self):
         d = QFileDialog.getExistingDirectory(
             self, "Output folder for predictions",
@@ -581,8 +597,8 @@ class InferPage(QWidget):
     # ------------------------------------------------------------- run chain
     def _run(self):
         input_dir = self.input_edit.text().strip()
-        if not os.path.isdir(input_dir):
-            self._append("Choose an input folder first.")
+        if not os.path.exists(input_dir):
+            self._append("Choose an input folder or file first.")
             return
         modal = appstate.get_exec_mode() != "local"
         weights_run_id = ""          # modal from-a-run only; drives the H4 preflight
@@ -597,10 +613,10 @@ class InferPage(QWidget):
             if not (self._manifest and self._manifest_path):
                 self._append("Pick the run's run.json first (Browse…).")
                 return
-            if not (self._local_weights and self._local_weights.is_file()):
-                self._append(f"✗ weights not found next to the run.json "
-                             f"({self._local_weights}). Point at a run.json that sits "
-                             f"beside its final_model.pth.")
+            w = self._resolved_weights()
+            if not (w and w.is_file()):
+                self._append(f"✗ weights file not found ({w}). Set it in the 'Weights "
+                             f"file' box (defaults to the .pth named in run.json, beside it).")
                 return
             bkey = self._manifest.get("backbone")
             if bkey in BACKBONES and not BACKBONES[bkey].folder_infer:
@@ -627,7 +643,6 @@ class InferPage(QWidget):
 
         self._job_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         self._run_id = ""
-        self.stats_box.clear()
         self.log.clear()
         self.run_btn.setEnabled(False)
         # H4: on Modal, a run is added to history at train START, so a crashed/
@@ -645,7 +660,10 @@ class InferPage(QWidget):
         self._start_conversion(input_dir)
 
     def _start_conversion(self, input_dir: str):
-        norm = self.inorm_combo.currentData() or "p95"
+        # Intensity is p95 end-to-end; honor a run.json that recorded a legacy norm
+        # so an old max-trained model still infers in-distribution.
+        norm = (self._manifest or {}).get("intensity_norm", "p95") \
+            if (self.from_run_radio.isChecked() and self._manifest) else "p95"
         want_hag = self._run_wants_real_hag()
         if want_hag:
             from .. import pretrain
@@ -799,7 +817,7 @@ class InferPage(QWidget):
         # Weights = an explicit host file: the picked .pth, or the run.json's sibling
         # (resolved on load). Mount its dir into the container; no searching.
         wpath = Path(self.pth_edit.text().strip()) if self.from_file_radio.isChecked() \
-            else self._local_weights
+            else self._resolved_weights()
         extra_mounts.append((str(wpath.parent), "/outputs/_local_weights"))
         weights = f"_local_weights/{wpath.name}"
         flags = {
@@ -867,8 +885,7 @@ class InferPage(QWidget):
         names = self._effective_names()
         pal = ";".join(f"{r},{g},{b}" for r, g, b in self._palette_colors())
         self._open_viewer(path, "--class-names", ",".join(names), "--palette", pal)
-        self._append(f"Opened viewer for {Path(path).name}  "
-                     f"({self.palette_combo.currentText()} palette)")
+        self._append(f"Opened viewer for {Path(path).name}.")
 
     def _pick_pred_gt(self):
         """Prompt for a prediction cloud then its ground-truth labels.
@@ -901,22 +918,24 @@ class InferPage(QWidget):
                      f"(yellow = predicted class differs from the ground truth).")
 
     def _show_stats(self, pred: str, gt: str):
-        """Compute accuracy + mIoU of the prediction cloud vs ground truth and
-        list them in the stats box (alongside opening the error-map viewer)."""
+        """Compute accuracy + mIoU of the prediction vs ground truth and print them
+        to the log (the side stats box is gone)."""
         from .. import viewer
-        self.stats_box.setPlainText("Computing accuracy + mIoU …")
+        self._append("  computing accuracy + mIoU …")
         try:
             m = viewer.prediction_metrics(pred, gt)
         except Exception as e:  # noqa: BLE001
-            self.stats_box.setPlainText(f"Could not compute stats:\n{e}")
+            self._append(f"  ✗ could not compute stats: {e}")
             return
-        lines = [m["scene"] or Path(pred).stem,
-                 f"accuracy : {m['accuracy']:.4f}",
-                 f"mIoU     : {m['miou']:.4f}   (over {len(m['per_class_iou'])} present classes)",
-                 f"labeled  : {m['labeled']:,} pts",
-                 "per-class IoU:"]
-        lines += [f"  class {c}: {iou:.4f}" for c, iou in sorted(m["per_class_iou"].items())]
-        self.stats_box.setPlainText("\n".join(lines))
+        names = self._effective_names()
+        nm = lambda c: names[c] if 0 <= c < len(names) else f"class {c}"
+        lines = [f"\n── {m['scene'] or Path(pred).stem} vs ground truth ──",
+                 f"  accuracy : {m['accuracy']:.4f}",
+                 f"  mIoU     : {m['miou']:.4f}   (over {len(m['per_class_iou'])} present classes)",
+                 f"  labeled  : {m['labeled']:,} pts",
+                 "  per-class IoU:"]
+        lines += [f"    {nm(c)}: {iou:.4f}" for c, iou in sorted(m["per_class_iou"].items())]
+        self._append("\n".join(lines))
 
     def _export_gt(self):
         """Prompt for a prediction + ground truth and write the error-map cloud
@@ -941,55 +960,94 @@ class InferPage(QWidget):
         self.log.moveCursor(QTextCursor.End)
 
 
-class PaletteDialog(QDialog):
-    """Per-class colour editor. A swatch button per class opens a colour picker;
-    `colors()` returns the chosen [[r,g,b], …] aligned to `names`."""
+class ClassPaletteDialog(QDialog):
+    """The class-matching menu (like the Datasets classes table, plus colour): pick
+    the name SOURCE (the loaded run / a dataset / Auto), rename each class, and set
+    its viewer colour. `source_key()/names()/colors()` are read back on accept.
 
-    def __init__(self, names, colors, defaults, parent=None):
+    Driven by the InferPage (`page`) so it can resolve names per source + read the
+    saved name/colour overrides. Changing the source rebuilds the table."""
+
+    def __init__(self, page, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Configure palette")
-        self._colors = [[int(x) for x in c] for c in colors]
-        self._defaults = [[int(x) for x in c] for c in defaults]
-        self._btns: list[QPushButton] = []
+        self.page = page
+        self.setWindowTitle("Class colours & names")
+        self.resize(440, 440)
 
         lay = QVBoxLayout(self)
-        lay.addWidget(QLabel("Click a swatch to set how that class is coloured in the viewer:"))
-        grid = QGridLayout()
-        for i, name in enumerate(names):
-            grid.addWidget(QLabel(name), i, 0)
-            b = QPushButton()
-            b.setFixedSize(72, 22)
-            b.clicked.connect(lambda _=False, idx=i: self._pick(idx))
-            self._btns.append(b)
-            grid.addWidget(b, i, 1)
-        lay.addLayout(grid)
+        top = QHBoxLayout()
+        top.addWidget(QLabel("Names from:"))
+        self.src = QComboBox()
+        for label, key in page._source_options():
+            self.src.addItem(label, key)
+        i = self.src.findData(page._current_source_key())
+        self.src.setCurrentIndex(i if i >= 0 else 0)
+        self.src.currentIndexChanged.connect(self._rebuild)
+        top.addWidget(self.src, 1)
+        lay.addLayout(top)
+
+        self.table = QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(["Class", "Name", "Colour"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        lay.addWidget(self.table)
 
         foot = QHBoxLayout()
-        reset = QPushButton("Reset to defaults")
-        reset.clicked.connect(self._reset)
+        reset = QPushButton("Reset colours")
+        reset.clicked.connect(self._reset_colors)
         foot.addWidget(reset)
         foot.addStretch()
         lay.addLayout(foot)
-
         box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         box.accepted.connect(self.accept)
         box.rejected.connect(self.reject)
         lay.addWidget(box)
-        self._refresh()
 
-    def _refresh(self):
-        for b, c in zip(self._btns, self._colors):
+        self._colors: list = []
+        self._name_edits: list = []
+        self._color_btns: list = []
+        self._rebuild()
+
+    def _rebuild(self):
+        key = self.src.currentData()
+        names = self.page._apply_name_overrides(key, self.page._names_for_key(key))
+        self._colors = self.page._colors_for(key, names)
+        self._name_edits, self._color_btns = [], []
+        self.table.setRowCount(len(names))
+        for r, nm in enumerate(names):
+            idx = QTableWidgetItem(str(r))
+            idx.setFlags(idx.flags() & ~Qt.ItemIsEditable)
+            self.table.setItem(r, 0, idx)
+            edit = QLineEdit(nm)
+            self._name_edits.append(edit)
+            self.table.setCellWidget(r, 1, edit)
+            btn = QPushButton()
+            btn.setFixedHeight(20)
+            btn.clicked.connect(lambda _=False, i=r: self._pick(i))
+            self._color_btns.append(btn)
+            self.table.setCellWidget(r, 2, btn)
+        self.table.resizeColumnToContents(0)
+        self._refresh_swatches()
+
+    def _refresh_swatches(self):
+        for b, c in zip(self._color_btns, self._colors):
             b.setStyleSheet(f"background-color: rgb({c[0]},{c[1]},{c[2]}); border: 1px solid #888;")
 
     def _pick(self, idx: int):
         col = QColorDialog.getColor(QColor(*self._colors[idx]), self, "Pick a class colour")
         if col.isValid():
             self._colors[idx] = [col.red(), col.green(), col.blue()]
-            self._refresh()
+            self._refresh_swatches()
 
-    def _reset(self):
-        self._colors = [list(c) for c in self._defaults]
-        self._refresh()
+    def _reset_colors(self):
+        self._colors = self.page._default_colors(len(self._colors))
+        self._refresh_swatches()
+
+    def source_key(self) -> str:
+        return self.src.currentData()
+
+    def names(self) -> list:
+        return [e.text().strip() or f"class {i}" for i, e in enumerate(self._name_edits)]
 
     def colors(self) -> list:
         return [list(c) for c in self._colors]

@@ -7,7 +7,8 @@
                    a per-scene Height-Above-Ground channel (PDAL SMRF -> hag)
 
 Labels come from a field in the cloud (companion/sidecar label files are no
-longer offered here). Intensity is normalized by max (i/max -> 0..1) by default.
+longer offered here). Intensity is p95-normalized (i/p95 clipped to 0..2) —
+outlier-robust, and the single norm used end-to-end (build + train + inference).
 Density-generalization controls have moved to the Train and Inference pages.
 """
 
@@ -464,7 +465,7 @@ class DatasetsPage(QWidget):
             return dataset.convert_dataset(
                 name, [plan["in_path"]], plan["spec"], classes, ignored,
                 out_root, val_inputs=plan["val_inputs"], split=split,
-                intensity_norm="max", compute_hag=plan["compute_hag"],
+                intensity_norm="p95", compute_hag=plan["compute_hag"],
                 skip_ground=plan["skip_ground"], hag_filter=plan["hag_filter"],
                 progress=progress)
 
