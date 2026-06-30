@@ -24,9 +24,6 @@ from pathlib import Path
 
 import numpy as np
 
-HOLDOUT_SEED = 42
-N_VAL_HOLDOUT = 10
-
 
 # ---------------------------------------------------------------- loaders
 # These mirror the scripts' load_canonical() functions exactly.
@@ -80,26 +77,17 @@ def estimate_normals(xyz, k=12):
 
 # ---------------------------------------------------------------- splits
 
-def _holdout_split(train_paths: list[str]):
-    """Same deterministic holdout as every warm script's _split_scenes()."""
-    names_all = [os.path.splitext(os.path.basename(p))[0] for p in train_paths]
-    rng = np.random.RandomState(HOLDOUT_SEED)
-    idx = np.arange(len(names_all))
-    rng.shuffle(idx)
-    n_hold = min(N_VAL_HOLDOUT, max(1, len(names_all) // 5))
-    val_names = sorted(names_all[i] for i in idx[:n_hold])
-    train = [(n, p) for n, p in zip(names_all, train_paths) if n not in val_names]
-    val   = [(n, p) for n, p in zip(names_all, train_paths) if n in val_names]
-    return train, val
-
-
 def _scenes(staged_root: Path):
+    """The three materialized whole-scene folders, read verbatim (val = selection
+    holdout, test = final report). The dataset stage owns the split; prep does
+    NOT re-derive val."""
     train = sorted(glob.glob(str(staged_root / "train" / "*.npz")))
-    test  = sorted(glob.glob(str(staged_root / "val" / "*.npz")))
+    val   = sorted(glob.glob(str(staged_root / "val" / "*.npz")))
+    test  = sorted(glob.glob(str(staged_root / "test" / "*.npz")))
     if not train:
         raise FileNotFoundError(f"No canonical scenes under {staged_root}/train — "
                                 f"convert the dataset first.")
-    return train, test
+    return train, val, test
 
 
 # ---------------------------------------------------------------- tilers
@@ -235,18 +223,14 @@ def prep_dataset(backbone_key: str, staged_root: str | Path, params: dict,
     staged_root = Path(staged_root)
     tag = prep_tag(backbone_key, params)
     prep_dir = staged_root / "prep" / tag
-    train_paths, test_paths = _scenes(staged_root)
+    train_paths, val_paths, test_paths = _scenes(staged_root)
 
     warm = backbone_key.endswith("_warm")
-    if warm:
-        train, val = _holdout_split(train_paths)
-        split_items = [("train", train), ("val", val),
-                       ("test", [(Path(p).stem, p) for p in test_paths])]
-    else:
-        # Cold scripts use two prep dirs; the val holdout is selected at tile
-        # level inside the script (same seed), not at prep time.
-        split_items = [("train", [(Path(p).stem, p) for p in train_paths]),
-                       ("test", [(Path(p).stem, p) for p in test_paths])]
+    # The dataset stage already materialized train/val/test; read all three folders
+    # verbatim (val = selection holdout, test = final report) — no val re-derivation.
+    split_items = [("train", [(Path(p).stem, p) for p in train_paths]),
+                   ("val",   [(Path(p).stem, p) for p in val_paths]),
+                   ("test",  [(Path(p).stem, p) for p in test_paths])]
 
     if backbone_key in ("randlanet_warm", "randlanet"):
         grid = float(params["sub-grid"])

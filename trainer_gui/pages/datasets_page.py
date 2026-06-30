@@ -23,15 +23,12 @@ from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
                                QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel,
                                QLineEdit, QListWidget, QMessageBox, QPlainTextEdit, QPushButton,
-                               QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
+                               QSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
 from .. import analysis, appstate, dataset, modal_cli, pretrain, theme
 from ..dataset import LabelSpec, SplitConfig
 from ..jobs import FuncWorker, JobRunner
 from ..readers import list_label_fields
-
-# split combo index -> SplitConfig.strategy
-_SPLIT_STRATEGIES = ["scene", "spatial", "provided"]
 
 
 class DatasetsPage(QWidget):
@@ -74,6 +71,10 @@ class DatasetsPage(QWidget):
         self.upload_saved_btn = QPushButton("Upload selected to Modal")
         self.upload_saved_btn.clicked.connect(self._upload_saved)
         sd_col.addWidget(self.upload_saved_btn)
+        # Forget the selected dataset + delete its staged copy on disk.
+        self.delete_saved_btn = QPushButton("Delete selected")
+        self.delete_saved_btn.clicked.connect(self._delete_saved)
+        sd_col.addWidget(self.delete_saved_btn)
         sd_row.addLayout(sd_col)
         self.stats_label = QLabel("")
         self.stats_label.setWordWrap(True)
@@ -94,8 +95,8 @@ class DatasetsPage(QWidget):
         self.apply_exec_mode(appstate.get_exec_mode() == "local")
 
     def apply_exec_mode(self, local: bool):
-        """Local mode never uploads to Modal — hide the upload button, drop the
-        built-ins from the saved list, and reword the workflow copy."""
+        """Local mode never uploads to Modal — hide the upload button and reword the
+        workflow copy."""
         self.upload_saved_btn.setVisible(not local)
         self.sub.setText(
             "Build a trainable dataset, step by step: point at point clouds "
@@ -164,25 +165,42 @@ class DatasetsPage(QWidget):
 
     # ============================================================= 3. Split
     def _tiling_box(self) -> QWidget:
-        box = QGroupBox("3 · Train / val split")
+        box = QGroupBox("3 · Train / val / test split")
         form = QFormLayout(box)
-        self.split_combo = QComboBox()
-        self.split_combo.addItems([
-            "Folder of clouds → split scenes by val fraction",
-            "Single cloud → spatial train/val split by val fraction",
-            "Separate train + val folders (use as-is)",
-        ])
-        self.split_combo.currentIndexChanged.connect(self._on_split_changed)
-        form.addRow("Train / val split", self.split_combo)
-        # No tiling here — each training script tiles for its own model; the dataset
-        # layer only decides which whole scenes (or scene regions) go to each split.
-        self.val_ratio = QDoubleSpinBox()
-        self.val_ratio.setRange(0.05, 0.5)
-        self.val_ratio.setSingleStep(0.05)
-        self.val_ratio.setValue(0.20)
-        form.addRow("Validation fraction", self.val_ratio)
+        # Two POINT-COUNT fractions (train = remainder); the dataset layer carves the
+        # three whole-scene folders ONCE and the training scripts read them verbatim
+        # (val = selection holdout, test = final report). No tiling here.
+        self.val_spin = QDoubleSpinBox()
+        self.val_spin.setRange(0.05, 0.90)
+        self.val_spin.setSingleStep(0.05)
+        self.val_spin.setValue(0.15)
+        self.val_spin.valueChanged.connect(self._on_split_changed)
+        form.addRow("Validation fraction", self.val_spin)
+        self.test_spin = QDoubleSpinBox()
+        self.test_spin.setRange(0.05, 0.90)
+        self.test_spin.setSingleStep(0.05)
+        self.test_spin.setValue(0.15)
+        self.test_spin.valueChanged.connect(self._on_split_changed)
+        form.addRow("Test fraction", self.test_spin)
+        self.train_label = QLabel("Train: 70%")
+        form.addRow("", self.train_label)
+        # balanced mirrors the global class mix in every split (+ rare-class presence);
+        # random fills by point count alone.
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItems(["Balanced (mirror class mix)", "Random"])
+        form.addRow("Split mode", self.mode_combo)
+        self.seed_spin = QSpinBox()
+        self.seed_spin.setRange(0, 2_000_000_000)
+        self.seed_spin.setValue(42)
+        form.addRow("Split seed", self.seed_spin)
+        # Use-as-is: explicit val + test folders bypass allocation (train = inputs).
+        self.split_provided_chk = QCheckBox("Separate train/val/test folders (use as-is)")
+        self.split_provided_chk.toggled.connect(self._on_split_changed)
+        form.addRow("", self.split_provided_chk)
         self.val_edit, self.val_row_w = self._dir_row(self._pick_val)
         form.addRow("Validation folder", self.val_row_w)
+        self.test_edit, self.test_row_w = self._dir_row(self._pick_test)
+        form.addRow("Test folder", self.test_row_w)
         # Optional: compute HeightAboveGround per scene in the same pass (one read/
         # write per scene). Whole-scene SMRF -> better ground than per-tile.
         self.hag_chk = QCheckBox("Compute Height-Above-Ground (HAG)")
@@ -243,8 +261,21 @@ class DatasetsPage(QWidget):
         return edit, _wrap(row)
 
     def _on_split_changed(self):
-        provided = self.split_combo.currentIndex() == 2
+        # Provided mode reveals the explicit val + test folder rows; otherwise the
+        # fractions drive allocation. Keep val% + test% <= 0.90 (train keeps >= 10%).
+        provided = self.split_provided_chk.isChecked()
         self.val_row_w.setEnabled(provided)
+        self.test_row_w.setEnabled(provided)
+        if self.val_spin.value() + self.test_spin.value() > 0.90:
+            if self.sender() is self.val_spin:
+                spin, val = self.test_spin, 0.90 - self.val_spin.value()
+            else:
+                spin, val = self.val_spin, 0.90 - self.test_spin.value()
+            spin.blockSignals(True)
+            spin.setValue(round(val, 2))
+            spin.blockSignals(False)
+        train = max(0.0, 1.0 - self.val_spin.value() - self.test_spin.value())
+        self.train_label.setText(f"Train: {train:.0%}")
 
     # ------------------------------------------------------------- pickers
     def _pick_input_folder(self):
@@ -267,6 +298,11 @@ class DatasetsPage(QWidget):
         d = QFileDialog.getExistingDirectory(self, "Validation data folder")
         if d:
             self.val_edit.setText(d)
+
+    def _pick_test(self):
+        d = QFileDialog.getExistingDirectory(self, "Test data folder")
+        if d:
+            self.test_edit.setText(d)
 
     def _pick_out(self):
         d = QFileDialog.getExistingDirectory(self, "Local output folder")
@@ -300,8 +336,12 @@ class DatasetsPage(QWidget):
         return LabelSpec(kind="field", field=self.field_combo.currentText().strip())
 
     def _split_config(self) -> SplitConfig:
-        return SplitConfig(strategy=_SPLIT_STRATEGIES[self.split_combo.currentIndex()],
-                           val_ratio=float(self.val_ratio.value()))
+        mode = "balanced" if self.mode_combo.currentIndex() == 0 else "random"
+        return SplitConfig(
+            val_frac=float(self.val_spin.value()),
+            test_frac=float(self.test_spin.value()),
+            mode=mode, seed=int(self.seed_spin.value()),
+            strategy="provided" if self.split_provided_chk.isChecked() else "auto")
 
     # ------------------------------------------------------------- scan / analyze
     def _scan_labels(self):
@@ -427,13 +467,15 @@ class DatasetsPage(QWidget):
             self._append("Need a name and an input file or folder.")
             return None
         split = self._split_config()
-        val_inputs = None
+        val_inputs = test_inputs = None
         if split.strategy == "provided":
             val_dir = self.val_edit.text().strip()
-            if not os.path.isdir(val_dir):
-                self._append("'Separate train + val folders' is selected — choose the val folder.")
+            test_dir = self.test_edit.text().strip()
+            if not os.path.isdir(val_dir) or not os.path.isdir(test_dir):
+                self._append("'Separate train/val/test folders' is selected — choose both the "
+                             "val and test folders.")
                 return None
-            val_inputs = [val_dir]
+            val_inputs, test_inputs = [val_dir], [test_dir]
         if self.class_table.rowCount() == 0:
             self._append("Run 'Scan label values' and name your classes first.")
             return None
@@ -442,7 +484,8 @@ class DatasetsPage(QWidget):
             self._append("All label values are unchecked — nothing to train on.")
             return None
         return {
-            "name": name, "in_path": in_path, "split": split, "val_inputs": val_inputs,
+            "name": name, "in_path": in_path, "split": split,
+            "val_inputs": val_inputs, "test_inputs": test_inputs,
             "classes": classes, "ignored": ignored, "spec": self._spec(),
             "out_root": self._output_root(),
             "compute_hag": pretrain.pdal_available() and self.hag_chk.isChecked(),
@@ -458,13 +501,15 @@ class DatasetsPage(QWidget):
         split, out_root = plan["split"], plan["out_root"]
         self.tile_btn.setEnabled(False)
         hag = "  + HAG" if plan["compute_hag"] else ""
-        self._append(f"Building '{name}'{hag} ({len(classes)} classes, split={split.strategy}, "
-                     f"ignored values: {ignored}) -> {out_root}…")
+        self._append(f"Building '{name}'{hag} ({len(classes)} classes, "
+                     f"val={split.val_frac:.0%} test={split.test_frac:.0%} {split.mode} "
+                     f"seed={split.seed}, ignored values: {ignored}) -> {out_root}…")
 
         def job(progress):
             return dataset.convert_dataset(
                 name, [plan["in_path"]], plan["spec"], classes, ignored,
-                out_root, val_inputs=plan["val_inputs"], split=split,
+                out_root, val_inputs=plan["val_inputs"],
+                test_inputs=plan["test_inputs"], split=split,
                 intensity_norm="p95", compute_hag=plan["compute_hag"],
                 skip_ground=plan["skip_ground"], hag_filter=plan["hag_filter"],
                 progress=progress)
@@ -498,9 +543,6 @@ class DatasetsPage(QWidget):
             return
         name = items[0].text()
         info = appstate.known_datasets().get(name, {})
-        if info.get("builtin"):
-            self._append(f"'{name}' is built-in — it already lives on the ieee-data volume.")
-            return
         staged = Path(info.get("staged_dir", ""))
         if not (str(staged) and staged.exists() and (staged / "dataset_meta.json").exists()):
             picked = QFileDialog.getExistingDirectory(
@@ -518,6 +560,26 @@ class DatasetsPage(QWidget):
                 "uploaded": False,
             })
         self._start_upload(staged)
+
+    def _delete_saved(self):
+        """Forget the selected saved dataset and (best-effort) delete its staged
+        copy on disk, after a confirm."""
+        items = self.known_list.selectedItems()
+        if not items:
+            self._append("Select a saved dataset to delete.")
+            return
+        name = items[0].text()
+        resp = QMessageBox.question(
+            self, "Delete dataset",
+            f"Delete dataset '{name}'? This removes it from the list and deletes its "
+            f"staged folder on disk. This can't be undone.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if resp != QMessageBox.Yes:
+            return
+        appstate.delete_dataset(name)
+        self._reload_known()
+        self.stats_label.setText("")
+        self._append(f"Deleted dataset '{name}'.")
 
     def _start_upload(self, staged: Path):
         # Each dataset gets its own auto-created Modal volume named after it; the
@@ -562,7 +624,6 @@ class DatasetsPage(QWidget):
 
     # ------------------------------------------------------------- known list
     def _reload_known(self):
-        # selectable_datasets() drops built-ins in local mode (no /data pipeline).
         self.known_list.clear()
         for name in sorted(appstate.selectable_datasets()):
             self.known_list.addItem(name)
@@ -572,9 +633,6 @@ class DatasetsPage(QWidget):
         if not items:
             return
         info = appstate.known_datasets().get(items[0].text(), {})
-        if info.get("builtin"):
-            self.stats_label.setText(f"{items[0].text()} (built-in): {info.get('note', '')}")
-            return
         staged = info.get("staged_dir", "")
         on_disk = bool(staged) and os.path.isdir(staged)
         if appstate.get_exec_mode() == "local":
@@ -590,13 +648,16 @@ class DatasetsPage(QWidget):
             with open(meta_path, "r", encoding="utf-8") as f:
                 meta = json.load(f)
             s = meta.get("stats", {})
+            spl = meta.get("splits", {})
+            n_tr = len(spl.get("train", {}).get("scenes", []))
+            n_va = len(spl.get("val", {}).get("scenes", []))
+            n_te = len(spl.get("test", {}).get("scenes", []))
             hag = "  ·  HAG ✓" if meta.get("has_hag") else ""
             self.stats_label.setText(
                 f"{meta['name']}: {meta['num_classes']} classes "
                 f"({', '.join(meta['class_names'])})  ·  "
                 f"{s.get('mean_pts_per_m2', 0):.2f} pts/m²  ·  "
-                f"train {len(meta['splits']['train']['scenes'])}, "
-                f"val {len(meta['splits']['val']['scenes'])} scenes{hag}\n{status}")
+                f"train {n_tr}, val {n_va}, test {n_te} scenes{hag}\n{status}")
         else:
             self.stats_label.setText(f"{items[0].text()}\n{status}")
 

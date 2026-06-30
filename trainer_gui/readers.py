@@ -128,7 +128,7 @@ def _sniff_delimiter(path) -> str | None:
 
 def _read_ascii(path) -> Cloud:
     """Columns: 0-2 = x,y,z; col 3 defaults to intensity, col 4 to return number
-    (the IEEE _PC3.txt convention); every extra column is exposed as a label
+    (a common ASCII LiDAR column order); every extra column is exposed as a label
     candidate ("column 3", "column 4", ...)."""
     arr = np.loadtxt(str(path), delimiter=_sniff_delimiter(path), dtype=np.float64, ndmin=2)
     if arr.shape[1] < 3:

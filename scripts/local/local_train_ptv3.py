@@ -1,59 +1,26 @@
 """
-Modal training script for PointTransformerV3 on IEEE GRSS 2019 DFC Track 4.
+Local training script for PointTransformerV3 on a canonical trainer_gui dataset.
 
-The default (no --dataset) path trains on the same raw IEEE Track 4 airborne
-LiDAR — and uses the same ASPRS->index label map, per-scene p95 intensity
-normalization, and scene holdout — as modal_train_kpconvx_cold.py, so PTv3 can
-be compared head-to-head against KPConvX/KPConv on identical data. (It was
-previously wired to STPLS3D; switched 2026-06-15.)
+Trains on the 3-folder --dataset path: a dataset materialized by the trainer_gui
+app onto the terminal-datasets volume as train/val/test scene folders (.npz) plus
+a dataset_meta.json (num_classes / class_names). NUM_CLASSES / CLASS_NAMES come
+from that metadata; val = in-distribution selection holdout, test = final report.
 
-Uses the standalone PTv3 model.py from testSem/PointTransformerV3 directly
-(no full Pointcept install). The fast path uses FlashAttention; if the GPU
-doesn't support it the script falls back to PTv3 with enable_flash=False.
+Uses the standalone PTv3 model.py from testSem/PointTransformerV3 directly (no
+full Pointcept install). The fast path uses FlashAttention; if the GPU doesn't
+support it the script falls back to PTv3 with enable_flash=False.
 
-----------------------------------------------------------------------------
-ACCURACY / ANTI-OVERFITTING RECIPE (2026-06-15)
-----------------------------------------------------------------------------
-This script carries the same generalization machinery proven out in
-modal_train_kpconvx_cold.py, reconciled with PointTransformerV3's *own*
-published outdoor-LiDAR recipe (Wu et al., CVPR 2024, supp. Tab. 12-16):
-
-  - DATA AUGMENTATION (was completely absent — the biggest overfit driver):
-    PTv3's outdoor suite — full z-rotation, small x/y tilt (±π/64), isotropic
-    scale [0.9,1.1], per-axis flip (p=0.5), gaussian jitter (σ=0.005, clip 0.02).
-  - LOSS = weighted CE (+ optional focal / label smoothing) + Lovász-Softmax.
-    PTv3's outdoor loss is literally CE + Lovász (equal weight); Lovász is a
-    differentiable mIoU surrogate that weights every class equally — the same
-    term added to the KPConvX recipe.
-  - CLASS BALANCE: inverse-sqrt-frequency class weights (mean-normalized,
-    capped) + rare-class tile oversampling (rare classes auto-detected from the
-    training-set frequency histogram for canonical datasets).
-  - OPTIMIZER tuned to PTv3's paper: AdamW lr 2e-3, weight_decay 5e-3 (NOT the
-    0.05 it had — 10x too strong), drop_path 0.3 stochastic depth, ~2-epoch
-    warmup via OneCycle.
-  - PERIODIC HELD-OUT VALIDATION every VAL_EVERY epochs (eval mode, no grad) ->
-    val_metrics.csv, committed mid-run so the train/val gap is watchable live.
-  - OVERLAP-VOTING EVAL: val/test tiles cut at stride CHUNK_XY/2 so each point
-    is covered by up to 4 tiles; per-voxel center-tapered softmax votes are
-    summed before argmax (the old eval took a single-tile argmax and even
-    random-cropped large tiles, dropping points).
-  - RESUMABLE checkpoints (model + optimizer) every CHECKPOINT_GAP epochs; set
-    RESUME=True to continue the latest matching run after a timeout.
+Recipe (PTv3's published outdoor-LiDAR suite — Wu et al., CVPR 2024): full data
+augmentation, loss = weighted CE (+ optional focal / label smoothing) + Lovász-
+Softmax, inverse-sqrt-frequency class weights + rare-class tile oversampling,
+AdamW (lr 2e-3, wd 5e-3) + warmup/cosine, overlap-voting eval scored on raw
+points, periodic held-out validation + resumable checkpoints.
 
 Usage:
-    modal volume create ieee-data
-    modal volume put ieee-data "C:/Users/OrionHoch/Desktop/LabledDatasets/IEEE" /IEEE
-    modal run --detach modal_train_ptv3.py
-    modal app logs ptv3-ieee
-
-----------------------------------------------------------------------------
-Training-terminal integration: running with no flags trains on IEEE Track 4.
-Extra flags (see modal_train_ptv3_warm.py for details):
-
-  --dataset NAME                          canonical trainer_gui dataset on the
-                                          terminal-datasets volume
-  --grid / --chunk-xy / --epochs / --batch / --steps-per-epoch
-  --mode infer --weights runs/<id>/final_model.pth --infer-input <job_id>
+    python local_train_ptv3.py --dataset NAME [--grid G] [--chunk-xy C]
+        [--epochs N] [--batch B] [--steps-per-epoch S]
+    python local_train_ptv3.py --dataset NAME --mode infer
+        --weights runs/<id>/final_model.pth --infer-input <job_id>
 
 Timeout comes from the TT_TIMEOUT_HOURS env var.
 """
@@ -68,57 +35,22 @@ def gpu_name() -> str:
     return torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
 
 
-def partition_scenes(pool, predefined_test, val_frac, test_frac, seed):
-    """Deterministic scene-level train/val/test split (whole scenes, never tiles).
-
-    pool            : scene names available for train (+ val, + test if none predefined).
-    predefined_test : scene names already forming a dedicated test set (IEEE
-                      Validate-Track4 / a canonical val/ folder). Non-empty -> it wins
-                      and test_frac is ignored (a fixed test set must stay fixed).
-    val_frac/test_frac : fractions of len(pool); each rounds to a whole scene count
-                      (>=1 when positive and the pool has room).
-    Returns (train, val, test) sorted name lists; always leaves >=1 train scene.
-    """
-    import numpy as np
-    pool = sorted(pool)
-    n = len(pool)
-    want = lambda frac, avail: min(max(1, round(frac * n)) if frac > 0 else 0, max(0, avail))
-    order = np.random.RandomState(seed).permutation(n)
-    n_test = 0 if predefined_test else want(test_frac, n - 2)   # leave room for val + train
-    n_val = want(val_frac, n - 1 - n_test)
-    pick = lambda lo, hi: sorted(pool[i] for i in order[lo:hi])
-    test = sorted(predefined_test) if predefined_test else pick(0, n_test)
-    val = pick(n_test, n_test + n_val)
-    train = pick(n_test + n_val, n)
-    return train, val, test
-
-
 # ============================================================================
 # Configuration
 # ============================================================================
-APP_NAME      = "ptv3-ieee"
+APP_NAME      = "ptv3"
 N_EPOCHS      = 100             # smoke test; PTv3 outdoor recipe trains ~50 epochs
 BATCH_SIZE    = 4
 TIMEOUT_HOURS = int(os.environ.get("TT_TIMEOUT_HOURS", "24"))
 
-# IEEE GRSS 2019 DFC Track 4 (default, no --dataset). Same data contract as
-# modal_train_kpconvx_cold.py so the two are directly comparable: ASPRS code ->
-# contiguous class index (class 0 ignored), 5 classes.
-NUM_CLASSES   = 5
-CLASS_NAMES   = ["Ground", "Trees", "Building", "Water", "Bridge"]
-LABEL_MAP     = {0: -1, 2: 0, 5: 1, 6: 2, 9: 3, 17: 4}
 GRID_SIZE     = 0.5            # voxel grid (m). PTv3's 0.05 m outdoor default is
-                               # for dense near-sensor LiDAR; IEEE airborne is
+                               # for dense near-sensor LiDAR; airborne ALS is
                                # ~2 pts/m² (~0.7 m spacing), so a 5 cm grid is a
                                # no-op downsample AND leaves PTv3's sparse
                                # positional-encoding conv with empty kernels (no
                                # point falls within a few voxels of another).
                                # 0.5 m ≈ the actual point spacing. Override --grid.
 USE_FLASH_ATTN = False   # PTv3 runs on standard attention; no flash-attn dep
-HOLDOUT_SEED   = 42
-VAL_FRAC       = 0.15          # fraction of train scenes held out for in-distribution val
-TEST_FRAC      = 0.15          # fraction held out for test — ONLY when no dedicated test
-                               # set exists (IEEE Validate-Track4 / canonical val/ wins)
 
 # ----------------------------------------------------------------------------
 # Regularization / optimizer — PTv3's published outdoor-LiDAR recipe
@@ -176,7 +108,6 @@ RARE_TILE_PROB   = 0.25    # P(draw the next train tile from a rare-class tile)
 
 # Periodic held-out validation + checkpoint/resume cadence.
 VAL_EVERY        = 10      # held-out val pass every N epochs (no weight updates)
-VAL_SUBSET       = 200     # tiles in the periodic val pass (seeded random subset)
 CHECKPOINT_GAP   = 3       # checkpoint (model + optimizer) frequency, epochs
 RESUME           = True   # force-resume the latest matching run (see AUTO_RESUME)
 AUTO_RESUME      = False    # auto-continue an unfinished run (no DONE marker) on
@@ -190,13 +121,6 @@ STEM_KERNEL      = 5       # PTv3's faithful 5x5x5 stem. (Shrinking it to 3 was 
                           # the spconv-cu118 build, so the original stem is restored.
                           # Set 3 only if a large-kernel spconv issue ever recurs.)
 
-DATA_ROOT      = "/data/IEEE"
-TRAIN_PC_DIR   = f"{DATA_ROOT}/Train-Track4/Track4"            # *_PC3.txt (x,y,z,intensity,ret)
-TRAIN_CLS_DIR  = f"{DATA_ROOT}/Train-Track4-Truth/Track4-Truth"  # *_CLS.txt (ASPRS codes)
-TEST_PC_DIR    = f"{DATA_ROOT}/Validate-Track4/Track4"
-TEST_CLS_DIR   = f"{DATA_ROOT}/Validate-Track4-Truth"
-PREP_DIR       = f"{DATA_ROOT}/prep/ptv3_ieee_grid05_origin"
-
 DATASETS_ROOT = "/datasets"   # terminal-datasets volume (trainer_gui canonical datasets)
 
 # ============================================================================
@@ -205,14 +129,14 @@ DATASETS_ROOT = "/datasets"   # terminal-datasets volume (trainer_gui canonical 
 
 
 # Local stand-ins for the modal Volumes the body commits to: the data is
-# already on the bind-mounted /data /outputs /datasets, so there is nothing
-# to upload. (The modal shell does the real commits when it runs this.)
+# already on the bind-mounted /outputs /datasets, so there is nothing to
+# upload. (The modal shell does the real commits when it runs this.)
 class _NoVol:
     def commit(self, *a, **k): pass
     def reload(self, *a, **k): pass
 
 
-data_volume, outputs_volume, datasets_volume = _NoVol(), _NoVol(), _NoVol()
+outputs_volume, datasets_volume = _NoVol(), _NoVol()
 
 
 def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
@@ -220,6 +144,9 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                steps_per_epoch: Optional[int] = None, chunk_xy: Optional[float] = None,
                mode: str = "train", weights: Optional[str] = None,
                infer_input: Optional[str] = None):
+    if dataset is None:
+        raise ValueError("--dataset is required: pass a canonical trainer_gui dataset "
+                         "name materialized on the terminal-datasets volume.")
     import os, sys, time, json, csv, glob, traceback
     from datetime import datetime
     import numpy as np
@@ -259,29 +186,18 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
     STEPS       = steps_per_epoch if steps_per_epoch is not None else 500
     CHUNK_XY    = chunk_xy if chunk_xy is not None else 50.0
     STRIDE      = CHUNK_XY / 2.0
-    NUM_CLASSES = globals()["NUM_CLASSES"]
-    CLASS_NAMES = None
 
-    # IEEE ASPRS-code -> contiguous-index lookup (used by the default-path loaders).
-    LABEL_MAP = globals()["LABEL_MAP"]
-    LABEL_LUT = np.full(256, -1, dtype=np.int64)
-    for raw, mapped in LABEL_MAP.items():
-        LABEL_LUT[int(raw)] = mapped
-
-    ds_root = f"{DATASETS_ROOT}/{dataset}" if dataset else None
-    if ds_root:
-        meta_path = f"{ds_root}/dataset_meta.json"
-        if not os.path.exists(meta_path):
-            raise FileNotFoundError(f"{meta_path} not found — upload the dataset "
-                                    f"with the trainer_gui app first.")
-        with open(meta_path) as f:
-            ds_meta = json.load(f)
-        NUM_CLASSES = int(ds_meta["num_classes"])
-        CLASS_NAMES = list(ds_meta["class_names"])
-        PREP_DIR = f"{ds_root}/prep/ptv3_cold_chunk{int(CHUNK_XY)}"
-    else:
-        CLASS_NAMES = list(globals()["CLASS_NAMES"])   # IEEE Track 4 default
-        PREP_DIR = globals()["PREP_DIR"]
+    # NUM_CLASSES / CLASS_NAMES come ONLY from the dataset's dataset_meta.json.
+    ds_root = f"{DATASETS_ROOT}/{dataset}"
+    meta_path = f"{ds_root}/dataset_meta.json"
+    if not os.path.exists(meta_path):
+        raise FileNotFoundError(f"{meta_path} not found — upload the dataset "
+                                f"with the trainer_gui app first.")
+    with open(meta_path) as f:
+        ds_meta = json.load(f)
+    NUM_CLASSES = int(ds_meta["num_classes"])
+    CLASS_NAMES = list(ds_meta["class_names"])
+    PREP_DIR = f"{ds_root}/prep/ptv3_cold_chunk{int(CHUNK_XY)}"
 
     # --- Preprocessing ------------------------------------------------------
     def load_ply(path):
@@ -315,43 +231,10 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
             else np.full(len(xyz), -1, np.int64)
         return xyz, rgb, lab
 
-    def _ieee_xyz_rgb(pc_path):
-        """IEEE PC3.txt -> (xyz, rgb) where rgb carries per-scene p95-normalized
-        intensity as grayscale (the one cue that separates water; same robust
-        normalization as the KPConvX cold script). Intensity rides the 3 color
-        channels so the model's in_channels=6 (coord+color) is unchanged."""
-        pc = np.loadtxt(pc_path, delimiter=",")                 # float64 (full precision)
-        # Subtract a per-scene origin before the float32 cast: projected (UTM)
-        # coords otherwise quantize to ~0.25-0.5 m on the northing axis (float32
-        # has ~7 sig digits). The offset is deterministic (floor of the per-scene
-        # min), so cached tiles and the eval-time raw reload share one frame.
-        xyz = (pc[:, :3] - np.floor(pc[:, :3].min(0))).astype(np.float32)
-        intensity = pc[:, 3].astype(np.float32) if pc.shape[1] > 3 \
-            else np.zeros(len(pc), np.float32)
-        i_p95 = max(float(np.percentile(intensity, 95)), 1.0)
-        i_norm = np.clip(intensity / i_p95, 0.0, 1.0)
-        rgb = np.repeat((i_norm * 255.0)[:, None], 3, axis=1).astype(np.float32)
-        return xyz, rgb
-
-    def load_ieee(pc_path, cls_path):
-        """Labeled IEEE scene -> (xyz, rgb, lab) with ASPRS codes mapped to
-        contiguous indices (unmapped/ignored -> -1)."""
-        xyz, rgb = _ieee_xyz_rgb(pc_path)
-        lab_raw = np.loadtxt(cls_path, dtype=np.int64).reshape(-1)
-        if len(lab_raw) != len(xyz):
-            raise ValueError(f"point/label mismatch in {pc_path}: "
-                             f"{len(xyz)} pts vs {len(lab_raw)} labels")
-        lab = LABEL_LUT[np.clip(lab_raw, 0, 255)].astype(np.int64)
-        return xyz, rgb, lab
-
     def load_scene(path):
-        # canonical .npz -> trainer_gui loader; IEEE PC3.txt (no GT) -> intensity
-        # as grayscale + lab=-1 (for the predict demo); else PLY.
+        # canonical .npz -> trainer_gui loader; else PLY.
         if path.endswith(".npz"):
             return load_canonical(path)
-        if path.endswith("_PC3.txt"):
-            xyz, rgb = _ieee_xyz_rgb(path)
-            return xyz, rgb, np.full(len(xyz), -1, np.int64)
         return load_ply(path)
 
     def tile_and_save(src_paths, out_dir, chunk_xy, stride):
@@ -380,37 +263,10 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                     n_tiles += 1
             print(f"      -> {n_tiles} tiles", flush=True)
 
-    def tile_ieee_scene(name, pc_path, cls_path, out_dir, chunk_xy, stride, min_pts=512):
-        """Tile one labeled IEEE scene into xyz/rgb/lab npz windows. min_pts is
-        deliberately low (vs the 2048 ply/canonical floor): water absorbs LiDAR,
-        so pure-water tiles are sparse and a high cut would delete them — the
-        same lesson the KPConvX cold log records."""
-        os.makedirs(out_dir, exist_ok=True)
-        t0 = time.time()
-        try:
-            xyz, rgb, lab = load_ieee(pc_path, cls_path)
-        except Exception as e:
-            print(f"  skip {pc_path}: {e}", flush=True); return
-        print(f"    {name}: {len(xyz):,} pts loaded in {time.time()-t0:.1f}s, tiling…",
-              flush=True)
-        mins, maxs = xyz[:, :2].min(0), xyz[:, :2].max(0)
-        n_tiles = 0
-        for x0 in np.arange(mins[0], maxs[0], stride):
-            for y0 in np.arange(mins[1], maxs[1], stride):
-                m = ((xyz[:, 0] >= x0) & (xyz[:, 0] < x0 + chunk_xy) &
-                     (xyz[:, 1] >= y0) & (xyz[:, 1] < y0 + chunk_xy))
-                if m.sum() < min_pts:
-                    continue
-                np.savez_compressed(f"{out_dir}/{name}_x{int(x0)}_y{int(y0)}.npz",
-                    xyz=xyz[m].astype(np.float32),
-                    rgb=rgb[m].astype(np.uint8),
-                    lab=lab[m].astype(np.int32))
-                n_tiles += 1
-        print(f"      -> {n_tiles} tiles", flush=True)
-
     def ensure_prep():
         # Per-scene idempotency via prefix-match on existing tiles.
         os.makedirs(f"{PREP_DIR}/train", exist_ok=True)
+        os.makedirs(f"{PREP_DIR}/val",   exist_ok=True)
         os.makedirs(f"{PREP_DIR}/test",  exist_ok=True)
         print(f"  ensuring preprocessed cache -> {PREP_DIR}", flush=True)
         any_new = [False]
@@ -422,42 +278,23 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                 if already_tiled(out_dir, scene): continue
                 tile_and_save([src], out_dir, chunk, stride)
                 any_new[0] = True
-        if ds_root:
-            train_paths = sorted(glob.glob(f"{ds_root}/train/*.npz"))
-            test_paths  = sorted(glob.glob(f"{ds_root}/val/*.npz"))
-            if not train_paths:
-                raise FileNotFoundError(f"No canonical scenes under {ds_root}/train")
-            print(f"  [train] {len(train_paths)} canonical scenes", flush=True)
-            tile_remaining(train_paths, f"{PREP_DIR}/train", CHUNK_XY, STRIDE)
-            print(f"  [test] {len(test_paths)} canonical scenes", flush=True)
-            # stride = STRIDE (not CHUNK_XY) so test tiles overlap and the final
-            # eval can vote per-voxel over the up-to-4 covering tiles.
-            tile_remaining(test_paths, f"{PREP_DIR}/test", CHUNK_XY, STRIDE)
-        else:
-            # IEEE Track 4: tile every train scene (the val holdout is carved out
-            # later by scene name) + every Validate scene; both at stride STRIDE
-            # so train tiles overlap for coverage and val/test tiles can be voted.
-            def _ieee_remaining(pc_dir, cls_dir, out_dir):
-                pcs = sorted(glob.glob(f"{pc_dir}/*_PC3.txt"))
-                for pc in pcs:
-                    name = os.path.basename(pc).replace("_PC3.txt", "")
-                    if already_tiled(out_dir, name):
-                        continue
-                    cls = f"{cls_dir}/{name}_CLS.txt"
-                    tile_ieee_scene(name, pc, cls, out_dir, CHUNK_XY, STRIDE)
-                    any_new[0] = True
-                return len(pcs)
-            n_tr = _ieee_remaining(TRAIN_PC_DIR, TRAIN_CLS_DIR, f"{PREP_DIR}/train")
-            if n_tr == 0:
-                raise FileNotFoundError(
-                    f"No *_PC3.txt under {TRAIN_PC_DIR}. Upload the IEEE dataset to the "
-                    f"ieee-data volume first, e.g.:\n  modal volume put ieee-data "
-                    f'"C:\\Users\\OrionHoch\\Desktop\\LabledDatasets\\IEEE" /IEEE')
-            print(f"  [train] {n_tr} IEEE Train-Track4 scenes", flush=True)
-            n_te = _ieee_remaining(TEST_PC_DIR, TEST_CLS_DIR, f"{PREP_DIR}/test")
-            print(f"  [test] {n_te} IEEE Validate-Track4 scenes", flush=True)
+        # CANONICAL: the dataset stage already materialized the 3-way split;
+        # tile each folder into its own PREP folder verbatim (no re-carving).
+        train_paths = sorted(glob.glob(f"{ds_root}/train/*.npz"))
+        val_paths   = sorted(glob.glob(f"{ds_root}/val/*.npz"))
+        test_paths  = sorted(glob.glob(f"{ds_root}/test/*.npz"))
+        if not train_paths:
+            raise FileNotFoundError(f"No canonical scenes under {ds_root}/train")
+        print(f"  [train] {len(train_paths)} canonical scenes", flush=True)
+        tile_remaining(train_paths, f"{PREP_DIR}/train", CHUNK_XY, STRIDE)
+        # stride = STRIDE (not CHUNK_XY) so val/test tiles overlap and the final
+        # eval can vote per-voxel over the up-to-4 covering tiles.
+        print(f"  [val] {len(val_paths)} canonical scenes", flush=True)
+        tile_remaining(val_paths, f"{PREP_DIR}/val", CHUNK_XY, STRIDE)
+        print(f"  [test] {len(test_paths)} canonical scenes", flush=True)
+        tile_remaining(test_paths, f"{PREP_DIR}/test", CHUNK_XY, STRIDE)
         if any_new[0]:
-            (datasets_volume if ds_root else data_volume).commit()
+            datasets_volume.commit()
             print("  preprocessing committed.", flush=True)
         else:
             print("  all scenes already cached.", flush=True)
@@ -664,13 +501,13 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
     # TRAINING MODE
     # ==========================================================================
     print("=" * 70)
-    print(f"  PTv3  {dataset or 'IEEE_Track4'}  ({gpu_name()}, {N_EPOCHS} ep, batch {BATCH_SIZE})")
+    print(f"  PTv3  {dataset}  ({gpu_name()}, {N_EPOCHS} ep, batch {BATCH_SIZE})")
     print("=" * 70)
     print(f"  CUDA: {torch.cuda.is_available()}  "
           f"{torch.cuda.get_device_name(0) if torch.cuda.is_available() else ''}")
     ensure_prep()
 
-    tag = dataset or "ieee"
+    tag = dataset
     # Namespace runs by stem kernel: shrinking the stem (STEM_KERNEL != 5) changes
     # the architecture, so old 5x5x5-stem checkpoints are incompatible — give them
     # a distinct tag so AUTO_RESUME starts a fresh lineage instead of trying (and
@@ -718,20 +555,15 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
         os.makedirs(f"{run_dir}/checkpoints", exist_ok=True)
         resume_ckpt, start_epoch = None, 0
         with open(f"{run_dir}/run_config.json", "w") as f:
-            json.dump({
+            cfg = {
                 "backbone": "PTv3", "n_epochs": N_EPOCHS, "batch_size": BATCH_SIZE,
-                "dataset": dataset or "IEEE_Track4",
+                "dataset": dataset,
                 "mode": mode, "gpu": gpu_name(),
-                "comparison_target": None if dataset
-                    else "modal_train_kpconvx_cold.py (KPConvX-L) on IEEE Track 4",
-                "label_map_asprs_to_index": None if dataset else LABEL_MAP,
-                "val_frac": VAL_FRAC, "test_frac": TEST_FRAC,
                 "num_classes": NUM_CLASSES, "grid_size": GRID_SIZE,
                 "class_names": CLASS_NAMES,
                 "chunk_xy": CHUNK_XY, "stride": STRIDE,
                 "steps_per_epoch": STEPS,
                 "flash_attn": USE_FLASH_ATTN,
-                "holdout_seed": HOLDOUT_SEED,
                 "drop_path": DROP_PATH,
                 "optimizer": {"type": "AdamW", "base_lr": BASE_LR,
                               "weight_decay": WEIGHT_DECAY, "warmup_pct": WARMUP_PCT,
@@ -750,7 +582,8 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                                   "rare_classes": RARE_CLASSES,
                                   "rare_freq_frac": RARE_FREQ_FRAC,
                                   "rare_tile_prob": RARE_TILE_PROB},
-            }, f, indent=2)
+            }
+            json.dump(cfg, f, indent=2)
 
     # --- Model --------------------------------------------------------------
     backbone, head = build_model(NUM_CLASSES)
@@ -772,28 +605,17 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
     def _scene_of(p):
         b = os.path.basename(p)
         return b.rsplit("_x", 1)[0]
-    all_train_tiles = sorted(glob.glob(f"{PREP_DIR}/train/*.npz"))
-    all_test_tiles  = sorted(glob.glob(f"{PREP_DIR}/test/*.npz"))
-    # Scene-level split (whole scenes, never tiles): VAL_FRAC of the train scenes
-    # -> val. The dedicated test tiles (IEEE Validate-Track4 / canonical val/) are
-    # the test set; if there are none, TEST_FRAC carves test from the train scenes.
-    train_scenes = sorted({_scene_of(p) for p in all_train_tiles})
-    predefined_test_scenes = sorted({_scene_of(p) for p in all_test_tiles})
-    keep_train, hold_val, hold_test = partition_scenes(
-        train_scenes, predefined_test_scenes, VAL_FRAC, TEST_FRAC, HOLDOUT_SEED)
-    hold = set(hold_val)
-    keep = set(keep_train)
-    synth_train_tiles = [f for f in all_train_tiles if _scene_of(f) in keep]
-    synth_test_tiles  = [f for f in all_train_tiles if _scene_of(f) in hold]   # = val
+    # CANONICAL: the dataset stage decided the 3-way split and materialized
+    # train/val/test; read the three PREP folders verbatim and NEVER re-carve.
+    # val = in-distribution selection holdout, test = final-report set.
+    synth_train_tiles = sorted(glob.glob(f"{PREP_DIR}/train/*.npz"))
+    synth_test_tiles  = sorted(glob.glob(f"{PREP_DIR}/val/*.npz"))   # = val tiles
+    real_test_tiles   = sorted(glob.glob(f"{PREP_DIR}/test/*.npz"))
+    hold = {_scene_of(p) for p in synth_test_tiles}
     real_train_tiles = []
-    if predefined_test_scenes:
-        real_test_tiles = all_test_tiles                        # dedicated test set
-        test_raw_split, test_tile_dir = "test", f"{PREP_DIR}/test"
-    else:                                                       # test carved from train
-        carved = set(hold_test)
-        real_test_tiles = [f for f in all_train_tiles if _scene_of(f) in carved]
-        test_raw_split, test_tile_dir = "val", f"{PREP_DIR}/train"
-    print(f"  train: {len(synth_train_tiles)}   val(holdout {len(hold_val)} scenes): "
+    val_tile_dir = f"{PREP_DIR}/val"
+    test_raw_split, test_tile_dir = "test", f"{PREP_DIR}/test"
+    print(f"  train: {len(synth_train_tiles)}   val(holdout {len(hold)} scenes): "
           f"{len(synth_test_tiles)}   test: {len(real_test_tiles)}", flush=True)
 
     # --- class balance: scan training tiles for inverse-frequency weights +
@@ -836,7 +658,7 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
         try:
             np.savez(cache_path, tile_names=pool_names, class_counts=class_counts,
                      present_mask=present_mask, num_classes=np.int64(NUM_CLASSES))
-            (datasets_volume if ds_root else data_volume).commit()
+            datasets_volume.commit()
             print(f"  class balance: cached scan -> {cache_path}", flush=True)
         except Exception as e:
             print(f"  class balance: could not write cache ({e})", flush=True)
@@ -1040,19 +862,12 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
     # tile of every eval scene. Raise VAL_EVERY if it costs too much. -----------
     def _raw_loader(split, name):
         """Closure -> (xyz, rgb, lab) for the ORIGINAL raw scene, so the voted
-        voxel predictions can be reprojected onto raw points + raw GT (the
-        protocol KPConvX/RandLA score on). `name` is a parameter, so each closure
-        binds its own scene (no loop late-binding bug)."""
-        if ds_root:
-            sub = "train" if split == "val" else "val"   # val holdout = train scenes
-            return lambda: load_canonical(f"{ds_root}/{sub}/{name}.npz")
-        if split == "val":
-            return lambda: load_ieee(f"{TRAIN_PC_DIR}/{name}_PC3.txt",
-                                     f"{TRAIN_CLS_DIR}/{name}_CLS.txt")
-        return lambda: load_ieee(f"{TEST_PC_DIR}/{name}_PC3.txt",
-                                 f"{TEST_CLS_DIR}/{name}_CLS.txt")
+        voxel predictions can be reprojected onto raw points + raw GT. `name` is a
+        parameter, so each closure binds its own scene (no loop late-binding bug).
+        split is 'val'|'test' -> the matching materialized dataset folder."""
+        return lambda: load_canonical(f"{ds_root}/{split}/{name}.npz")
 
-    val_items = [(n, _raw_loader("val", n), f"{PREP_DIR}/train") for n in sorted(hold)]
+    val_items = [(n, _raw_loader("val", n), val_tile_dir) for n in sorted(hold)]
     test_items = [(n, _raw_loader(test_raw_split, n), test_tile_dir)
                   for n in sorted({_scene_of(p) for p in real_test_tiles})]
     print(f"  eval set: {len(val_items)} holdout(val) + {len(test_items)} test scenes",
@@ -1320,7 +1135,7 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
 def main():
     import argparse
     ap = argparse.ArgumentParser(description='Local ptv3 trainer/inferencer (no modal).')
-    ap.add_argument('--dataset', default=None)
+    ap.add_argument('--dataset', required=True)
     ap.add_argument('--grid', type=float, default=None)
     ap.add_argument('--epochs', type=int, default=None)
     ap.add_argument('--batch', type=int, default=None)

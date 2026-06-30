@@ -1,46 +1,20 @@
 """
-Modal training script for RandLA-Net (PyTorch) on IEEE GRSS 2019 Track 4 —
-COLD-START variant.
+Local training script for RandLA-Net (PyTorch) — COLD-START variant.
 
-Random initialization — no pretrained weights. Architecture and features are
-identical to the warm sibling (modal_train_randlanet_warm.py), making
-warm-vs-cold a clean initialization comparison.
+Trains on a canonical trainer_gui dataset (--dataset NAME) whose three
+materialized train/val/test scene folders live on the terminal-datasets
+volume. Random initialization (no pretrained weights); the warm sibling
+shares the architecture and feature recipe for a clean init comparison.
 
-IEEE 2019 Track 4 layout:
-  Train-Track4/Track4/JAX_*_PC3.txt, OMA_*_PC3.txt        (110 scenes)
-  Train-Track4-Truth/Track4-Truth/JAX_*_CLS.txt, ...      (per-point labels)
-  Validate-Track4/Track4/*.txt                            (10 scenes)
-  Validate-Track4-Truth/*.txt                             (per-point labels)
-  Test-Track4 has no GT — we ignore it.
+Features are [xyz, intensity, return_number] (5 ch); fc0 is rebuilt 5->8.
+Per-scene p95-clipped intensity normalization, vertical-rotation / x-flip /
+isotropic-scale train augmentation, class-weighted CE (+ optional focal /
+Lovász) with rare-class-centered sphere sampling, a held-out val pass every
+VAL_EVERY epochs (-> val_metrics.csv), and a final full-coverage eval that
+scores every val/test scene on its raw points.
 
-Each PC3.txt row is `x, y, z, intensity, returnNumber` (comma-separated).
-Each CLS.txt is one ASPRS LAS class code per line. We remap
-{0:-1 (ignore), 2:0 Ground, 5:1 Trees, 6:2 Building, 9:3 Water, 17:4 Bridge}.
-
-REVISION 2026-06-12 (ported from the KPConvX cold-run fixes):
-  - features are [xyz, intensity, return_number] (5 ch). Intensity is
-    water's only reliable cue; fc0 is built at 5->8 (cold start, so there is
-    no pretrained-stem constraint).
-  - p95-clipped per-scene intensity normalization (new PREP_DIR)
-  - train augmentation (vertical rotation, x-flip, isotropic scale): was none
-  - class-weighted CE + rare-class-centered sphere sampling (rare = train
-    frequency < 2%, so canonical --dataset runs work too)
-  - held-out val pass every VAL_EVERY epochs -> val_metrics.csv (no weight
-    updates), checkpoints include optimizer state
-  - final eval now covers every subsampled point of every val/test scene in
-    spatially-sorted blocks (the old eval scored ONE random sphere per scene)
-
-Validate-Track4 (10 scenes) is the test set. 10 Train-Track4 scenes picked
-deterministically (seed=42) form an in-distribution validation holdout.
-
-The warm-start sibling script is modal_train_randlanet_warm.py.
-
-----------------------------------------------------------------------------
-Training-terminal integration: running with no flags behaves exactly as the
-original. Extra flags (see modal_train_ptv3_warm.py for details):
-
-  --dataset NAME                          canonical trainer_gui dataset on the
-                                          terminal-datasets volume
+Flags:
+  --dataset NAME    (required) canonical dataset on the terminal-datasets volume
   --sub-grid / --num-points / --epochs / --batch / --steps-per-epoch
   --mode infer --weights runs/<id>/final_model.pth --infer-input <job_id>
 
@@ -57,48 +31,18 @@ def gpu_name() -> str:
     return torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
 
 
-def partition_scenes(pool, predefined_test, val_frac, test_frac, seed):
-    """Deterministic scene-level train/val/test split (whole scenes, never tiles).
-
-    pool            : scene names available for train (+ val, + test if none predefined).
-    predefined_test : scene names already forming a dedicated test set (IEEE
-                      Validate-Track4 / a canonical val/ folder). Non-empty -> it wins
-                      and test_frac is ignored (a fixed test set must stay fixed).
-    val_frac/test_frac : fractions of len(pool); each rounds to a whole scene count
-                      (>=1 when positive and the pool has room).
-    Returns (train, val, test) sorted name lists; always leaves >=1 train scene.
-    """
-    import numpy as np
-    pool = sorted(pool)
-    n = len(pool)
-    want = lambda frac, avail: min(max(1, round(frac * n)) if frac > 0 else 0, max(0, avail))
-    order = np.random.RandomState(seed).permutation(n)
-    n_test = 0 if predefined_test else want(test_frac, n - 2)   # leave room for val + train
-    n_val = want(val_frac, n - 1 - n_test)
-    pick = lambda lo, hi: sorted(pool[i] for i in order[lo:hi])
-    test = sorted(predefined_test) if predefined_test else pick(0, n_test)
-    val = pick(n_test, n_test + n_val)
-    train = pick(n_test + n_val, n)
-    return train, val, test
-
-
 # ============================================================================
 # Configuration
 # ============================================================================
-APP_NAME      = "randlanet-cold-ieee"
+APP_NAME      = "randlanet-cold"
 N_EPOCHS      = 100              # was 5 (smoke test); 250-300 for a full run
 BATCH_SIZE    = 6
 VAL_BATCH     = 12
 TIMEOUT_HOURS = int(os.environ.get("TT_TIMEOUT_HOURS", "24"))
 
-NUM_CLASSES   = 5                # IEEE Track 4: Ground, Trees, Building, Water, Bridge
 NUM_POINTS    = 45056            # 4096*11, RandLA SemKITTI default
-SUB_GRID_SIZE = 0.30             # 30 cm — IEEE LiDAR is sparser (~2 pts/m²) than KITTI
+SUB_GRID_SIZE = 0.30             # 30 cm — sparse aerial LiDAR (~2 pts/m²) vs KITTI
 IN_DIM        = 5                # [x, y, z, intensity, return_number]
-VAL_FRAC      = 0.15             # fraction of train scenes held out for in-distribution val
-TEST_FRAC     = 0.15             # fraction held out for test — ONLY when no dedicated test
-                                 # set exists (IEEE Validate-Track4 / canonical val/ wins)
-HOLDOUT_SEED  = 42
 
 # --- density domain-generalization (scripts/helper/density.py; see DENSITY_DG.md) ---
 # o = rho*g^2; density-invariant for o>=1, breaks for o<1. RandLA's fixed-N absorbs a
@@ -139,19 +83,6 @@ RARE_OVERSAMPLE  = True
 RARE_FREQ_THRESH = 0.02          # classes under 2% of train points count as rare
 RARE_CENTER_PROB = 0.25          # P(center the next train sphere on a rare-class point)
 VAL_EVERY        = 10            # held-out val pass every N epochs (no weight updates)
-VAL_BATCHES      = 16            # batches per periodic val pass
-
-DATA_ROOT      = "/data/IEEE"
-TRAIN_PC_DIR   = f"{DATA_ROOT}/Train-Track4/Track4"
-TRAIN_CLS_DIR  = f"{DATA_ROOT}/Train-Track4-Truth/Track4-Truth"
-TEST_PC_DIR    = f"{DATA_ROOT}/Validate-Track4/Track4"
-TEST_CLS_DIR   = f"{DATA_ROOT}/Validate-Track4-Truth"
-PREP_DIR       = f"{DATA_ROOT}/prep/randlanet_grid30_p95_origin"   # p95 intensity norm
-
-# ASPRS LAS code -> contiguous 0..4 IEEE class index. Class 0 (Unclassified)
-# maps to -1 and is ignored by the CE loss.
-CLASS_NAMES = ["Ground", "Trees", "Building", "Water", "Bridge"]
-LABEL_MAP   = {0: -1, 2: 0, 5: 1, 6: 2, 9: 3, 17: 4}
 
 DATASETS_ROOT = "/datasets"   # terminal-datasets volume (trainer_gui canonical datasets)
 
@@ -176,6 +107,9 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                     batch: Optional[int] = None, steps_per_epoch: Optional[int] = None,
                     mode: str = "train", weights: Optional[str] = None,
                     infer_input: Optional[str] = None):
+    if dataset is None:
+        raise ValueError("--dataset is required: pass a canonical trainer_gui "
+                         "dataset name on the terminal-datasets volume.")
     import os, sys, time, json, csv, glob
     from datetime import datetime
     import numpy as np
@@ -211,23 +145,17 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     N_EPOCHS      = epochs if epochs is not None else globals()["N_EPOCHS"]
     BATCH_SIZE    = batch if batch is not None else globals()["BATCH_SIZE"]
     STEPS         = steps_per_epoch if steps_per_epoch is not None else 500
-    NUM_CLASSES   = globals()["NUM_CLASSES"]
-    CLASS_NAMES   = globals()["CLASS_NAMES"]
-
-    ds_root = f"{DATASETS_ROOT}/{dataset}" if dataset else None
-    if ds_root:
-        meta_path = f"{ds_root}/dataset_meta.json"
-        if not os.path.exists(meta_path):
-            raise FileNotFoundError(f"{meta_path} not found — upload the dataset "
-                                    f"with the trainer_gui app first.")
-        with open(meta_path) as f:
-            ds_meta = json.load(f)
-        NUM_CLASSES = int(ds_meta["num_classes"])
-        CLASS_NAMES = list(ds_meta["class_names"])
-        # No "warm" in the name: the cold sibling shares this cache (identical prep).
-        PREP_DIR = f"{ds_root}/prep/randlanet_grid{int(round(SUB_GRID_SIZE * 100))}_p95"
-    else:
-        PREP_DIR = globals()["PREP_DIR"]
+    ds_root = f"{DATASETS_ROOT}/{dataset}"
+    meta_path = f"{ds_root}/dataset_meta.json"
+    if not os.path.exists(meta_path):
+        raise FileNotFoundError(f"{meta_path} not found — upload the dataset "
+                                f"with the trainer_gui app first.")
+    with open(meta_path) as f:
+        ds_meta = json.load(f)
+    NUM_CLASSES = int(ds_meta["num_classes"])
+    CLASS_NAMES = list(ds_meta["class_names"])
+    # No "warm" in the name: the cold sibling shares this cache (identical prep).
+    PREP_DIR = f"{ds_root}/prep/randlanet_grid{int(round(SUB_GRID_SIZE * 100))}_p95"
 
     # utils/metric.py calls sklearn.metrics.confusion_matrix(y_true, y_pred,
     # np.arange(...)) — the third positional was the `labels` argument in old
@@ -347,36 +275,9 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         saving_path = None
     cfg = Cfg()
 
-    # --- loaders + label remap ----------------------------------------------
-    # Build the ASPRS-code -> contiguous-index LUT once.
-    LABEL_LUT = np.full(256, -1, dtype=np.int32)
-    for raw, mapped in LABEL_MAP.items():
-        LABEL_LUT[raw] = mapped
-
-    def load_ieee(pc_path, cls_path):
-        # PC3.txt: x, y, z, intensity, returnNumber  (CSV)
-        # CLS.txt: one ASPRS class code per line
-        pc = np.loadtxt(pc_path, delimiter=",")                 # float64 (full precision)
-        # Per-scene origin offset before the float32 cast: projected (UTM) coords
-        # otherwise quantize to ~0.25-0.5 m on northing (float32 ~7 sig digits),
-        # corrupting sub-meter geometry. Deterministic offset, so cached tiles and
-        # the eval-time raw reload share one coordinate frame.
-        xyz       = (pc[:, :3] - np.floor(pc[:, :3].min(0))).astype(np.float32)
-        intensity = pc[:, 3].astype(np.float32)
-        ret_num   = pc[:, 4].astype(np.float32) if pc.shape[1] >= 5 else np.zeros(len(pc), np.float32)
-        lab_raw   = np.loadtxt(cls_path, dtype=np.int32).reshape(-1)
-        if len(lab_raw) != len(xyz):
-            raise ValueError(f"point/label mismatch in {pc_path}: "
-                             f"{len(xyz)} pts vs {len(lab_raw)} labels")
-        lab = LABEL_LUT[np.clip(lab_raw, 0, 255)].astype(np.int32)
-        # p95 + clip instead of raw values: one hot return must not rescale the
-        # scene (water's intensity cue has to mean the same thing everywhere).
-        i_p95 = max(float(np.percentile(intensity, 95)), 1.0)
-        intensity = np.clip(intensity / i_p95, 0.0, 2.0).astype(np.float32)
-        return xyz, intensity, ret_num, lab
-
+    # --- canonical scene loader ---------------------------------------------
     def load_canonical(npz_path):
-        """Canonical trainer_gui scene -> the same tuple load_ieee produces.
+        """Canonical trainer_gui scene -> (xyz, intensity, return_number, label).
         RandLA only consumes xyz + labels; the rest is kept for cache parity."""
         z = np.load(npz_path)
         xyz = z["xyz"].astype(np.float32)
@@ -389,9 +290,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         return xyz, intensity, ret_num, lab
 
     def load_scene(pc_path, cls_path=None):
-        if pc_path.endswith(".npz"):
-            return load_canonical(pc_path)
-        return load_ieee(pc_path, cls_path)
+        return load_canonical(pc_path)
 
     def grid_subsample(xyz, intensity, ret_num, lab, grid):
         keys = np.floor(xyz / grid).astype(np.int64)
@@ -399,69 +298,44 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         return xyz[uniq], intensity[uniq], ret_num[uniq], lab[uniq]
 
     def _split_scenes():
-        """Deterministic scene-level split; returns (name, pc_path, cls_path) lists."""
-        if ds_root:
-            # VAL_FRAC of the train scenes -> val; the dataset's val/ folder is the
-            # dedicated test set, or TEST_FRAC carves one from train when val/ is empty.
-            train_npz = sorted(glob.glob(f"{ds_root}/train/*.npz"))
-            if not train_npz:
-                raise FileNotFoundError(f"No canonical scenes under {ds_root}/train")
-            test_npz = sorted(glob.glob(f"{ds_root}/val/*.npz"))
-            stem = lambda p: os.path.splitext(os.path.basename(p))[0]
-            path_of = {stem(p): p for p in train_npz + test_npz}
-            train_names, val_names, test_names = partition_scenes(
-                [stem(p) for p in train_npz], [stem(p) for p in test_npz],
-                VAL_FRAC, TEST_FRAC, HOLDOUT_SEED)
-            return ([(n, path_of[n], None) for n in train_names],
-                    [(n, path_of[n], None) for n in val_names],
-                    [(n, path_of[n], None) for n in test_names])
-        train_pc  = sorted(glob.glob(f"{TRAIN_PC_DIR}/*_PC3.txt"))
-        if not train_pc:
-            raise FileNotFoundError(
-                f"No *_PC3.txt under {TRAIN_PC_DIR}. Upload the IEEE dataset to the "
-                f"ieee-data volume first, e.g.:\n"
-                f"  modal volume put ieee-data "
-                f'"C:\\Users\\OrionHoch\\Desktop\\LabledDatasets\\IEEE" /IEEE\n'
-                f"then verify: modal volume ls ieee-data /IEEE/Train-Track4/Track4")
-        name_of = lambda p: os.path.basename(p).replace("_PC3.txt", "")
-        test_pc = sorted(glob.glob(f"{TEST_PC_DIR}/*_PC3.txt"))
-        train_names, val_names, test_names = partition_scenes(
-            [name_of(p) for p in train_pc], [name_of(p) for p in test_pc],
-            VAL_FRAC, TEST_FRAC, HOLDOUT_SEED)
-        def _pair(names, pc_dir, cls_dir):
-            return [(n, f"{pc_dir}/{n}_PC3.txt", f"{cls_dir}/{n}_CLS.txt")
-                    for n in names]
-        # carved-from-train test (no dedicated test set) lives in the TRAIN dirs
-        test_dirs = (TEST_PC_DIR, TEST_CLS_DIR) if test_pc else (TRAIN_PC_DIR, TRAIN_CLS_DIR)
-        return (
-            _pair(train_names, TRAIN_PC_DIR, TRAIN_CLS_DIR),
-            _pair(val_names,   TRAIN_PC_DIR, TRAIN_CLS_DIR),
-            _pair(test_names,  *test_dirs),
-        )
+        """Read the dataset's three materialized whole-scene folders verbatim
+        (train = fit, val = selection holdout, test = final report) — the split
+        is the dataset's, never re-carved here. Returns (name, pc_path, None)
+        lists."""
+        stem = lambda p: os.path.splitext(os.path.basename(p))[0]
+        def _items(split):
+            return [(stem(p), p, None)
+                    for p in sorted(glob.glob(f"{ds_root}/{split}/*.npz"))]
+        train_items, val_items, test_items = (
+            _items("train"), _items("val"), _items("test"))
+        if not train_items:
+            raise FileNotFoundError(f"No canonical scenes under {ds_root}/train")
+        return train_items, val_items, test_items
 
     def _cache_signature():
         # Everything that changes what a cached scene .npz contains. A mismatch
         # means the cache is stale/leaky and must not be silently reused.
-        return {
+        sig = {
             "format_version": 1,
             "pipeline": "randlanet",
-            "dataset": dataset or "IEEE_Track4",
+            "dataset": dataset,
             "sub_grid_size": SUB_GRID_SIZE,
             "num_classes": NUM_CLASSES,
-            "holdout_seed": HOLDOUT_SEED,
-            "val_frac": VAL_FRAC,
-            "test_frac": TEST_FRAC,
-            "label_map": (None if ds_root
-                          else {str(k): v for k, v in sorted(LABEL_MAP.items())}),
             "feature_recipe": "xyz,intensity,return_number",
         }
+        # The dataset carries the split decision in dataset_meta.json; fold its
+        # seed/mode in so a re-split of the dataset invalidates the cache.
+        sp = ds_meta.get("split", {}) if isinstance(ds_meta, dict) else {}
+        sig["split_seed"] = sp.get("seed")
+        sig["split_mode"] = sp.get("mode")
+        return sig
 
     def _validate_cache(lists):
-        """Refuse to reuse a cache built with different settings (grid, split
-        seed, label map, dataset, feature recipe …) instead of silently mixing
-        incompatible data. Migrate a pre-validation cache by stamping .done
-        markers for already-saved scenes. Returns True if the signature file was
-        newly written (so the caller commits the volume)."""
+        """Refuse to reuse a cache built with different settings (grid, split,
+        dataset, feature recipe …) instead of silently mixing incompatible
+        data. Migrate a pre-validation cache by stamping .done markers for
+        already-saved scenes. Returns True if the signature file was newly
+        written (so the caller commits the volume)."""
         meta_path = f"{PREP_DIR}/cache_meta.json"
         cur = _cache_signature()
         if os.path.exists(meta_path):
@@ -524,7 +398,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                 print(f"    [{i+1}/{len(items)}] {name}: {n_in:,} -> "
                       f"{len(xyz):,} pts in {time.time()-t0:.1f}s", flush=True)
         if any_new:
-            (datasets_volume if ds_root else data_volume).commit()
+            datasets_volume.commit()
             print("  preprocessing committed.", flush=True)
         else:
             print("  all scenes already cached.", flush=True)
@@ -648,7 +522,6 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     # --- Prediction helpers (shared by post-training demo + infer mode) ------
     import traceback
     from scipy.spatial import cKDTree
-    IDX_TO_ASPRS = np.array([2, 5, 6, 9, 17], dtype=np.int32)
     BASE_PALETTE = np.array([
         [139, 90, 43], [34, 160, 34], [200, 60, 60], [40, 110, 220], [235, 225, 60],
         [150, 80, 200], [240, 140, 40], [70, 200, 200], [220, 100, 170], [120, 120, 120],
@@ -677,24 +550,13 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
             # RandLA works on fixed NUM_POINTS samples: grid-subsample the scene,
             # spatially sort it for locality, predict it in NUM_POINTS blocks
             # (reusing the collate), then NN-propagate to all original points.
-            if pc_path.endswith(".npz"):
-                z = np.load(pc_path)
-                xyz0 = z["xyz"].astype(np.float32)
-                itn0 = z["intensity"].astype(np.float32) if "intensity" in z \
-                    else np.full(len(xyz0), 0.5, np.float32)
-                ret0 = z["return_number"].astype(np.float32) if "return_number" in z \
-                    else (z["ret_num"].astype(np.float32) if "ret_num" in z
-                          else np.zeros(len(xyz0), np.float32))
-            else:
-                pc = np.loadtxt(pc_path, delimiter=",")          # float64 (full precision)
-                # Per-scene origin offset before float32 cast (precision fix).
-                xyz0 = (pc[:, :3] - np.floor(pc[:, :3].min(0))).astype(np.float32)
-                itn0 = pc[:, 3].astype(np.float32) if pc.shape[1] >= 4 \
-                    else np.full(len(xyz0), 0.5, np.float32)
-                i_p95 = max(float(np.percentile(itn0, 95)), 1.0)
-                itn0 = np.clip(itn0 / i_p95, 0.0, 2.0).astype(np.float32)
-                ret0 = pc[:, 4].astype(np.float32) if pc.shape[1] >= 5 \
-                    else np.zeros(len(xyz0), np.float32)
+            z = np.load(pc_path)
+            xyz0 = z["xyz"].astype(np.float32)
+            itn0 = z["intensity"].astype(np.float32) if "intensity" in z \
+                else np.full(len(xyz0), 0.5, np.float32)
+            ret0 = z["return_number"].astype(np.float32) if "return_number" in z \
+                else (z["ret_num"].astype(np.float32) if "ret_num" in z
+                      else np.zeros(len(xyz0), np.float32))
             keys = np.floor(xyz0 / SUB_GRID_SIZE).astype(np.int64)
             _, uniq = np.unique(keys, axis=0, return_index=True)
             sub_xyz = xyz0[uniq]
@@ -879,18 +741,18 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     # TRAINING MODE
     # ==========================================================================
     print("=" * 70)
-    print(f"  RandLA-Net  {dataset or 'IEEE Track 4'}  "
+    print(f"  RandLA-Net  {dataset}  "
           f"({gpu_name()}, {N_EPOCHS} ep, batch {BATCH_SIZE})")
     print("=" * 70)
     train_list, val_list, test_list = ensure_prep()
-    tag = dataset or "ieee"
+    tag = dataset
     run_id = datetime.utcnow().strftime(f"%Y%m%d_%H%M%S_{tag}_randlanet_cold")
     run_dir = f"/outputs/runs/{run_id}"
     os.makedirs(f"{run_dir}/checkpoints", exist_ok=True)
     with open(f"{run_dir}/run_config.json", "w") as f:
         json.dump({
             "backbone": "RandLA-Net", "warm_start": False,
-            "dataset": dataset or "IEEE GRSS 2019 DFC Track 4",
+            "dataset": dataset,
             "mode": mode, "gpu": gpu_name(),
             "n_epochs": N_EPOCHS,
             "batch_size": BATCH_SIZE, "num_points": NUM_POINTS,
@@ -908,11 +770,9 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                      "lovasz_softmax_weight": LOVASZ_WEIGHT},
             "num_classes": NUM_CLASSES,
             "class_names": CLASS_NAMES,
-            "label_map_asprs_to_index": None if dataset else LABEL_MAP,
             "train_scenes": [n for n, _, _ in train_list],
             "val_scenes":   [n for n, _, _ in val_list],
             "test_scenes":  [n for n, _, _ in test_list],
-            "holdout_seed": HOLDOUT_SEED,
         }, f, indent=2)
 
     train_files = sorted(glob.glob(f"{PREP_DIR}/train/*.npz"))

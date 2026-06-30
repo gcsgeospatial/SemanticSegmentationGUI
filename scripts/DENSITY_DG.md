@@ -137,8 +137,8 @@ Cheapest first read on how much density hurts today — no retrain: `DG_INFER_AD
 **Plumbing:** `scripts/helper/density.py` `env_*` helpers + per-script env-shadow block;
 `train_common.py` `_dg_block`/`write_run_manifest` (records the `dg` block in run.json) + `infer_meta`
 (reads it back); `trainer_gui/analysis.py` `dg_recommend`/`dg_config_to_env` (train-time only);
-`appstate.get/set_dg_config`; `pages/datasets_page.py` `_density_gen_box` (train-time toggles);
-`pages/train_page.py` injection; `pages/infer_page.py` `_infer_dg_env` (AdaBN/TTA toggles + logdk
+`pages/train_page.py` per-run DG panel + injection (train-time toggles);
+`pages/infer_page.py` `_infer_dg_env` (AdaBN/TTA toggles + logdk
 recovery); `local_cli.run_script(env=)` (used by BOTH train and infer launches).
 Modal note: env lands client-side — the modal shell still needs to forward `DG_*` into the
 container subprocess (local docker already does via `-e`). Modal is frozen (`scripts/modal/DEPRECATED.md`).

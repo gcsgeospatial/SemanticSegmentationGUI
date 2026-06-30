@@ -1,56 +1,41 @@
 """
-Modal training script for KPConvX-L on IEEE GRSS 2019 Track 4 — COLD-START,
-train_LAS-matched, IEEE-NATIVE-FEATURES + HAG variant.
+Local training script for KPConvX-L on a canonical trainer_gui --dataset
+(3-folder train/val/test), COLD-START, native-features + HAG variant.
 
-This is the HAG twin of modal_train_kpconvx_cold.py. EVERYTHING is identical
-except the 4th feature channel: the cold script feeds a crude height proxy
-(z - tile_min_z); this script feeds the real PDAL HeightAboveGround dimension
-computed by the trainer_gui Pretraining tab (SMRF ground-classify -> hag_nn).
-Same 4 input channels, same architecture/param-count -> a clean A/B test of
-"tile-relative height" vs "true height above ground".
+HAG twin of local_train_kpconvx_cold.py: everything is identical except the 4th
+feature channel. The cold script feeds a tile-relative height proxy
+(z - tile_min_z); this script feeds real HeightAboveGround when the dataset
+carries a per-point `hag` (the Datasets page computes it per tile), and falls
+back to the same z-tile-min proxy when it does not. Same 4 input channels and
+architecture/param-count -> a clean A/B test of "tile-relative height" vs
+"true height above ground".
 
-  This file       : 4 features = [1, intensity, return_number, HAG].
-                    HAG is read per-point from /data/IEEE/HAG/{Train,Validate}/
-                    <scene>_PC3.laz (HeightAboveGround dim) and paired to the
-                    raw _PC3.txt points.
-  Cold sibling    : modal_train_kpconvx_cold.py — 4th channel = z - tile_min_z.
-  Geo sibling     : modal_train_kpconvx_cold_geo.py — the train_LAS feature set
-                    [1, Linearity, Planarity, Scattering, Verticality].
+  Features  : 4 = [1, intensity, return_number, HAG].
+  Cold twin : local_train_kpconvx_cold.py — 4th channel = z - tile_min_z.
 
-DATA AND EVALUATION stay train_LAS-faithful (2.0 m grid, conv radius 2.5 cells,
-BN momentum 0.02, the same augmentation suite, IEEE label mapping). The TRAINING
-ENGINE is KPConvX's own recipe (experiments/S3DIS/train_S3DIS.py), not the 2019
-KPConv SGD recipe — the architecture was tuned under it:
+Random init (no warm-start). Geometry: 2.0 m grid, conv radius 2.5 cells, BN
+momentum 0.02, with KPConvX's own training recipe (experiments/S3DIS):
   - AdamW (weight_decay 0.05) + 1-cycle LR (1e-4 -> 5e-3 raise over 30 epochs,
     5-epoch plateau, /10 per 120 epochs) + label smoothing 0.2
   - packed batches: PACK_N tiles concatenated per forward (lengths-aware
     pyramid), x ACCUM grad accumulation -> effective batch 8 clouds/step
-  - 100 m tiles: KPConvX guidance keeps input-region/grid ~ 50; at a 2.0 m grid
-    that is ~100 m. The old 50 m tiles starved the two deepest stages (40/80 m
-    receptive fields) and gave water no shoreline context.
-  - class-weighted smoothed CE + mild rare-tile oversampling (Water/Bridge)
+  - 100 m tiles (input region ~ 50x the 2.0 m grid) at stride 50 so train tiles
+    overlap for coverage and val/test tiles overlap for the voted eval
+  - class-weighted smoothed CE (+ Lovasz) + mild rare-class tile oversampling
   - held-out val pass every VAL_EVERY epochs (eval mode, no weight updates),
     appended to val_metrics.csv so convergence can be watched over time
   - final val/test eval votes over overlapping tiles (stride 50): per-voxel
-    logit sums across up to 4 covering tiles
+    softmax sums across up to 4 covering tiles
 
-RUNTIME: 150 epochs x 300 steps x 8 tiles = 360,000 tile forwards of ~2-5k pts.
-Checkpoints (model+optimizer) every 10 epochs; if the 24 h timeout hits, set
-RESUME=True and relaunch to continue the same run.
-
-ASPRS code -> contiguous class index (class 0 ignored):
-  {0:-1, 2:0 Ground, 5:1 Trees, 6:2 Building, 9:3 Water, 17:4 Bridge}
-
-Prereq: upload the HAGTEST output (the Pretraining tab's LAZ-with-HAG) to the
-ieee-data volume so the loader can find HeightAboveGround per scene:
-    modal volume put ieee-data "C:/Users/OrionHoch/Desktop/HAGTEST/Train"    /IEEE/HAG/Train
-    modal volume put ieee-data "C:/Users/OrionHoch/Desktop/HAGTEST/Validate" /IEEE/HAG/Validate
+Checkpoints (model+optimizer) every CHECKPOINT_GAP epochs; set RESUME=True to
+continue the most recent run.
 
 Usage:
-    modal run modal_train_kpconvx_cold_hag.py
-    modal run modal_train_kpconvx_cold_hag.py --mode eval     # re-score the latest
-        # run's weights with the (center-weighted) voted eval — no training.
-    modal run modal_train_kpconvx_cold_hag.py --mode eval --weights runs/<id>/final_model.pth
+    python local_train_kpconvx_cold_hag.py --dataset <name>
+    python local_train_kpconvx_cold_hag.py --dataset <name> --mode eval \
+        --weights runs/<id>/final_model.pth   # re-score with the voted eval
+    python local_train_kpconvx_cold_hag.py --mode infer --infer-input <job> \
+        --weights runs/<id>/final_model.pth   # label uploaded scenes
 """
 
 import os
@@ -63,35 +48,10 @@ def gpu_name() -> str:
     return torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
 
 
-def partition_scenes(pool, predefined_test, val_frac, test_frac, seed):
-    """Deterministic scene-level train/val/test split (whole scenes, never tiles).
-
-    pool            : scene names available for train (+ val, + test if none predefined).
-    predefined_test : scene names already forming a dedicated test set (IEEE
-                      Validate-Track4 / a canonical val/ folder). Non-empty -> it wins
-                      and test_frac is ignored (a fixed test set must stay fixed).
-    val_frac/test_frac : fractions of len(pool); each rounds to a whole scene count
-                      (>=1 when positive and the pool has room).
-    Returns (train, val, test) sorted name lists; always leaves >=1 train scene.
-    """
-    import numpy as np
-    pool = sorted(pool)
-    n = len(pool)
-    want = lambda frac, avail: min(max(1, round(frac * n)) if frac > 0 else 0, max(0, avail))
-    order = np.random.RandomState(seed).permutation(n)
-    n_test = 0 if predefined_test else want(test_frac, n - 2)   # leave room for val + train
-    n_val = want(val_frac, n - 1 - n_test)
-    pick = lambda lo, hi: sorted(pool[i] for i in order[lo:hi])
-    test = sorted(predefined_test) if predefined_test else pick(0, n_test)
-    val = pick(n_test, n_test + n_val)
-    train = pick(n_test + n_val, n)
-    return train, val, test
-
-
 # ============================================================================
 # Configuration
 # ============================================================================
-APP_NAME      = "kpconvx-cold-ieee-hag"
+APP_NAME      = "kpconvx-cold-hag"
 FEATURE_MODE  = "native_hag"  # [1, intensity, return_number, HAG (height above ground)]
 N_EPOCHS      = 200          # extended from 150 (val mIoU still rising); the
                              # 1-cycle lr keeps decaying smoothly past 150
@@ -100,7 +60,6 @@ PACK_N        = 4            # tiles packed per forward (KPConvX batch_size = 4)
 ACCUM         = 2            # grad-accumulated forwards / step -> effective batch 8 tiles
 CHECKPOINT_GAP = 10          # checkpoint frequency (epochs); saves model + optimizer
 VAL_EVERY     = 10           # held-out val pass every N epochs (no weight updates)
-VAL_SUBSET    = 200          # tiles used in the periodic val pass (evenly spaced)
 TIMEOUT_HOURS = 24
 
 # Resume: when True, continue the most recent AdamW-recipe run in the outputs
@@ -135,12 +94,7 @@ RARE_CLASSES    = [3, 4]     # Water, Bridge (contiguous class indices)
 # 0.5 + cap 10 overcooked (Building 0.74->0.61, rare tiles memorised): dialed back.
 RARE_TILE_PROB  = 0.25       # P(draw the next train tile from a rare-class tile)
 
-NUM_CLASSES   = 5            # IEEE: Ground, Trees, Building, Water, Bridge
 INPUT_CHANNELS = 4           # [1, intensity, return_number, HAG]
-VAL_FRAC      = 0.15         # fraction of train scenes held out for in-distribution val
-TEST_FRAC     = 0.15         # fraction held out for test — ONLY when no dedicated test
-                             # set exists (IEEE Validate-Track4 / canonical val/ wins)
-HOLDOUT_SEED  = 42
 
 # Geometry — matches train_LAS.py LASConfig.
 GRID          = 2.0          # first_subsampling_dl: layer-0 voxel grid (m)
@@ -189,34 +143,20 @@ LABEL_SMOOTH  = 0.2          # KPConvX smooth_labels
 GRAD_CLIP     = 100.0
 BN_MOMENTUM   = 0.02
 
-DATA_ROOT      = "/data/IEEE"
-TRAIN_PC_DIR   = f"{DATA_ROOT}/Train-Track4/Track4"
-TRAIN_CLS_DIR  = f"{DATA_ROOT}/Train-Track4-Truth/Track4-Truth"
-TEST_PC_DIR    = f"{DATA_ROOT}/Validate-Track4/Track4"
-TEST_CLS_DIR   = f"{DATA_ROOT}/Validate-Track4-Truth"
-# Per-point HeightAboveGround from the Pretraining tab (HAGTEST upload). Train +
-# val-holdout scenes come from Train-Track4 (HAG/Train); test from HAG/Validate.
-HAG_TRAIN_DIR  = f"{DATA_ROOT}/HAG/Train"
-HAG_TEST_DIR   = f"{DATA_ROOT}/HAG/Validate"
-PREP_DIR       = f"{DATA_ROOT}/prep/kpconvx_cold_hag_grid20_c100_origin"
-
-CLASS_NAMES = ["Ground", "Trees", "Building", "Water", "Bridge"]
-LABEL_MAP   = {0: -1, 2: 0, 5: 1, 6: 2, 9: 3, 17: 4}
-
 # ============================================================================
 # Modal image
 # ============================================================================
 
 
 # Local stand-ins for the modal Volumes the body commits to: the data is
-# already on the bind-mounted /data /outputs /datasets, so there is nothing
-# to upload. (The modal shell does the real commits when it runs this.)
+# already on the bind-mounted /outputs /datasets, so there is nothing to
+# upload. (The modal shell does the real commits when it runs this.)
 class _NoVol:
     def commit(self, *a, **k): pass
     def reload(self, *a, **k): pass
 
 
-data_volume, outputs_volume, datasets_volume = _NoVol(), _NoVol(), _NoVol()
+outputs_volume, datasets_volume = _NoVol(), _NoVol()
 
 
 def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
@@ -228,7 +168,6 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
     from datetime import datetime
     import numpy as np
     import torch
-    import laspy
     from scipy.spatial import cKDTree
 
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "helper"))
@@ -256,9 +195,13 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
     EVAL_ONLY = (mode == "eval")
     INFER     = (mode == "infer")   # arbitrary-folder inference (trainer_gui)
 
-    LABEL_LUT = np.full(256, -1, dtype=np.int32)
-    for raw, mapped in LABEL_MAP.items():
-        LABEL_LUT[raw] = mapped
+    # --dataset (a canonical 3-folder trainer_gui dataset) is required for
+    # training and eval. Folder inference (--mode infer) is the only dataset-free
+    # path: it labels uploaded scenes from trained weights.
+    if dataset is None and not INFER:
+        raise ValueError("--dataset is required: pass a canonical trainer_gui "
+                         "dataset name (train/val/test folders). The only "
+                         "dataset-free path is --mode infer.")
 
     # --- resolve run config: CLI flags override the module defaults --------------
     # Geometry + schedule knobs the GUI sends as --grid / --chunk-xy / --epochs /
@@ -273,14 +216,10 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
     PACK_N      = batch if batch is not None else globals()["PACK_N"]
 
     # --dataset NAME selects a canonical trainer_gui dataset on the terminal-
-    # datasets volume; default (None) trains on raw IEEE Track 4. Canonical scenes
-    # carry no HAG laz, so the HAG channel falls back to the z-scene-min proxy
-    # (same as the no-GT inference path). NUM_CLASSES / CLASS_NAMES / PREP_DIR are
-    # locals so the whole function tracks the dataset's class layout. IEEE_INFER
-    # flags an IEEE-trained model (ASPRS codes).
-    NUM_CLASSES = globals()["NUM_CLASSES"]
-    CLASS_NAMES = list(globals()["CLASS_NAMES"])
-    IEEE_INFER  = True
+    # datasets volume. Scenes carry a per-point `hag` when the Datasets page
+    # computed it; otherwise the HAG channel falls back to the z-tile-min proxy.
+    # NUM_CLASSES / CLASS_NAMES / PREP_DIR are locals so the whole function tracks
+    # the dataset's class layout.
     HAG_SOURCE  = "pdal_hag_nn"
     ds_root = f"/datasets/{dataset}" if dataset else None
     if ds_root:
@@ -294,72 +233,31 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
         CLASS_NAMES = list(ds_meta["class_names"])
         HAG_SOURCE = "pdal_hag_nn" if ds_meta.get("has_hag") else "z_minus_scene_min_proxy"
         PREP_DIR = f"{ds_root}/prep/kpconvx_cold_hag_grid{GRID:g}_c{int(CHUNK_XY)}"
-    elif INFER and weights:
-        # Infer reproduces the TRAINED geometry + class layout from the run's
-        # run.json (the single self-contained manifest beside the weights; legacy
-        # run_config.json is the fallback), NOT the GUI defaults.
-        import os as _os, sys as _sys
-        _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "helper"))
-        from train_common import infer_meta
-        meta = infer_meta(f"/outputs/{weights}")
-        if meta:
-            if not meta.get("hag_source"):   # M5: a non-HAG run in the +HAG script
-                raise ValueError(
-                    "These weights are from a plain KPConvX-L run (no 'hag_source' in "
-                    "run.json): its 4th input channel is the height proxy, not real "
-                    "HAG. Re-run inference with the plain 'KPConvX-L' backbone.")
-            NUM_CLASSES = int(meta.get("num_classes") or NUM_CLASSES)
-            CLASS_NAMES = list(meta.get("class_names") or CLASS_NAMES)
-            if meta.get("grid") is not None: GRID = float(meta["grid"])
-            if meta.get("chunk_xy") is not None: CHUNK_XY = float(meta["chunk_xy"])
-            STRIDE = CHUNK_XY / 2.0
-            IEEE_INFER = meta.get("label_map_asprs_to_index") is not None
-        PREP_DIR = globals()["PREP_DIR"]
     else:
-        # IEEE default: keep the canonical cache path for the trained defaults; a
-        # custom grid/chunk forks its own cache (the signature check rejects
-        # reusing tiles built at a different geometry).
-        base = globals()["PREP_DIR"]
-        PREP_DIR = base if (GRID == globals()["GRID"] and CHUNK_XY == globals()["CHUNK_XY"]) \
-            else f"{base}_grid{GRID:g}_c{int(CHUNK_XY)}"
-
-    # ------------------------------------------------------------------------
-    # HAG: per-point HeightAboveGround read from the Pretraining-tab .laz files
-    # and paired to the raw _PC3.txt points.
-    # ------------------------------------------------------------------------
-    def _read_hag_laz(laz_path):
-        las = laspy.read(laz_path)
-        names = list(las.point_format.dimension_names)
-        hname = next((n for n in names if n.lower() in ("heightaboveground", "hag")), None)
-        if hname is None:
-            raise KeyError(f"{laz_path}: no HeightAboveGround dim (have {names})")
-        hag = np.asarray(las[hname], dtype=np.float32)
-        laz_xyz = np.column_stack([las.x, las.y, las.z])   # float64: absolute UTM
-        return hag, laz_xyz                                 # needs full precision for pairing
-
-    def load_hag(name, hag_dir, xyz_ref):
-        """HAG aligned to xyz_ref's point order. PDAL preserves point order, so
-        when counts match we index-pair (verified on a sample); otherwise we
-        fall back to nearest-neighbor pairing on xyz. Returns float32 (N,)."""
-        laz_path = f"{hag_dir}/{name}_PC3.laz"
-        if not os.path.exists(laz_path):
-            raise FileNotFoundError(
-                f"HAG file missing: {laz_path}. Upload the Pretraining-tab output:\n"
-                f'  modal volume put ieee-data "<HAGTEST>/Train" /IEEE/HAG/Train\n'
-                f'  modal volume put ieee-data "<HAGTEST>/Validate" /IEEE/HAG/Validate')
-        hag, laz_xyz = _read_hag_laz(laz_path)
-        # xyz_ref is offset to a per-scene origin (precision fix) while the laz
-        # carries absolute coords; subtract each array's own per-axis min so the
-        # index-pair guard and NN fallback compare in a common full-precision frame.
-        ref0 = xyz_ref.astype(np.float64) - xyz_ref.min(0)
-        laz0 = laz_xyz - laz_xyz.min(0)
-        if len(hag) == len(xyz_ref):
-            k = min(2048, len(hag))
-            s = np.random.RandomState(0).choice(len(hag), k, replace=False)
-            if np.allclose(laz0[s], ref0[s], atol=0.05):
-                return hag
-        nn = cKDTree(laz0).query(ref0)[1]
-        return hag[nn].astype(np.float32)
+        # Folder inference (--mode infer): no --dataset. Reproduce the TRAINED
+        # geometry + class layout from the run's run.json (the self-contained
+        # manifest beside the weights; legacy run_config.json is the fallback).
+        # INFER never reads cached tiles, so PREP_DIR is an unused placeholder.
+        NUM_CLASSES = 5
+        CLASS_NAMES = [f"class {i}" for i in range(NUM_CLASSES)]
+        PREP_DIR = "/outputs/_infer_unused"
+        if INFER and weights:
+            import os as _os, sys as _sys
+            _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "helper"))
+            from train_common import infer_meta
+            meta = infer_meta(f"/outputs/{weights}")
+            if meta:
+                if not meta.get("hag_source"):   # M5: a non-HAG run in the +HAG script
+                    raise ValueError(
+                        "These weights are from a plain KPConvX-L run (no 'hag_source' in "
+                        "run.json): its 4th input channel is the height proxy, not real "
+                        "HAG. Re-run inference with the plain 'KPConvX-L' backbone.")
+                NUM_CLASSES = int(meta.get("num_classes") or NUM_CLASSES)
+                CLASS_NAMES = list(meta.get("class_names") or
+                                   [f"class {i}" for i in range(NUM_CLASSES)])
+                if meta.get("grid") is not None: GRID = float(meta["grid"])
+                if meta.get("chunk_xy") is not None: CHUNK_XY = float(meta["chunk_xy"])
+                STRIDE = CHUNK_XY / 2.0
 
     # ------------------------------------------------------------------------
     # Geometry helpers
@@ -400,32 +298,15 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
         return out.astype(np.float32)
 
     # ------------------------------------------------------------------------
-    # IEEE preprocessing -> 2.0 m subsampled .npz chunks (xyz + intensity/ret)
+    # Preprocessing -> 2.0 m subsampled .npz chunks (xyz + intensity/ret/hag)
     # ------------------------------------------------------------------------
-    def load_ieee(pc_path, cls_path):
-        # PC3.txt: x, y, z, intensity, returnNumber  (CSV, no RGB)
-        pc = np.loadtxt(pc_path, delimiter=",")                 # float64 (full precision)
-        # Per-scene origin offset before the float32 cast: projected (UTM) coords
-        # otherwise quantize to ~0.25-0.5 m on northing (float32 ~7 sig digits),
-        # corrupting sub-meter geometry. Deterministic offset, so cached tiles and
-        # the eval-time raw reload share one coordinate frame.
-        xyz       = (pc[:, :3] - np.floor(pc[:, :3].min(0))).astype(np.float32)
-        intensity = pc[:, 3].astype(np.float32)
-        ret_num   = pc[:, 4].astype(np.float32) if pc.shape[1] >= 5 else np.zeros(len(pc), np.float32)
-        lab_raw   = np.loadtxt(cls_path, dtype=np.int32).reshape(-1)
-        if len(lab_raw) != len(xyz):
-            raise ValueError(f"point/label mismatch in {pc_path}: "
-                             f"{len(xyz)} pts vs {len(lab_raw)} labels")
-        lab = LABEL_LUT[np.clip(lab_raw, 0, 255)].astype(np.int32)
-        return xyz, intensity, ret_num, lab
-
     def load_canonical(npz_path):
         """Canonical trainer_gui scene (.npz) -> (xyz, intensity, ret_num, lab).
-        xyz origin-offset like load_ieee; intensity is already GUI-normalized
-        (the p95 renorm below is skipped); no return-number channel (zeros);
-        labels are already contiguous indices (no ASPRS LUT). If the canonical
-        npz carries `hag`, tile_and_save uses it; otherwise it falls back to the
-        z-scene-min proxy."""
+        xyz is origin-offset (per-scene floor-min) before the float32 cast so
+        projected (UTM) coords keep sub-meter precision; intensity is already
+        GUI-normalized (the clip below just bounds it); no return-number channel
+        (zeros); labels are already contiguous indices. If the npz carries `hag`,
+        tile_and_save uses it; otherwise it falls back to the z-tile-min proxy."""
         z = np.load(npz_path)
         xyz = (z["xyz"] - np.floor(z["xyz"].min(0))).astype(np.float32)
         if "intensity" in z.files:
@@ -439,29 +320,19 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
             else np.full(len(xyz), -1, np.int32)
         return xyz, intensity, ret_num, lab
 
-    def tile_and_save(name, pc_path, cls_path, out_dir, chunk_xy, stride, hag_dir):
+    def tile_and_save(name, pc_path, cls_path, out_dir, chunk_xy, stride):
         os.makedirs(out_dir, exist_ok=True)
         t0 = time.time()
-        try:
-            if cls_path is None:          # canonical .npz (label embedded, no HAG laz)
-                xyz, intensity, ret_num, lab = load_canonical(pc_path)
-                z = np.load(pc_path)
-                hag = (z["hag"].astype(np.float32)
-                       if "hag" in z.files and len(z["hag"]) == len(xyz)
-                       else (xyz[:, 2] - xyz[:, 2].min()).astype(np.float32))
-            else:
-                xyz, intensity, ret_num, lab = load_ieee(pc_path, cls_path)
-                hag = load_hag(name, hag_dir, xyz)
+        try:                              # canonical .npz (label + optional hag embedded)
+            xyz, intensity, ret_num, lab = load_canonical(pc_path)
+            z = np.load(pc_path)
+            hag = (z["hag"].astype(np.float32)
+                   if "hag" in z.files and len(z["hag"]) == len(xyz)
+                   else (xyz[:, 2] - xyz[:, 2].min()).astype(np.float32))
         except Exception as e:
             print(f"  skip {pc_path}: {e}", flush=True); return None
-        # IEEE intensity is raw -> robust per-scene p95 normalisation (dividing by
-        # the max lets one hot return rescale the whole scene). Canonical intensity
-        # is already GUI-normalized, so pass it through (just clip).
-        if cls_path is None:
-            intensity_n = np.clip(intensity, 0.0, 2.0).astype(np.float32)
-        else:
-            i_p95 = max(float(np.percentile(intensity, 95)), 1.0)
-            intensity_n = np.clip(intensity / i_p95, 0.0, 2.0).astype(np.float32)
+        # Canonical intensity is already GUI-normalized, so pass it through (just clip).
+        intensity_n = np.clip(intensity, 0.0, 2.0).astype(np.float32)
         print(f"    {name}: {len(xyz):,} pts loaded in {time.time()-t0:.1f}s, "
               f"HAG {hag.min():.1f}..{hag.max():.1f}m, tiling…", flush=True)
         mins = xyz[:, :2].min(0); maxs = xyz[:, :2].max(0)
@@ -496,62 +367,39 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
         return n_tiles
 
     def _split_scenes():
-        if ds_root:
-            # Canonical: VAL_FRAC of the train scenes -> val (by name). The dataset's
-            # val/ folder is the dedicated test set; if it's empty, TEST_FRAC carves a
-            # test set from the train scenes instead. cls_path=None flags canonical.
-            train_npz = sorted(glob.glob(f"{ds_root}/train/*.npz"))
-            if not train_npz:
-                raise FileNotFoundError(f"No canonical scenes under {ds_root}/train")
-            test_npz = sorted(glob.glob(f"{ds_root}/val/*.npz"))
-            stem = lambda p: os.path.splitext(os.path.basename(p))[0]
-            path_of = {stem(p): p for p in train_npz + test_npz}
-            train_names, val_names, test_names = partition_scenes(
-                [stem(p) for p in train_npz], [stem(p) for p in test_npz],
-                VAL_FRAC, TEST_FRAC, HOLDOUT_SEED)
-            return ([(n, path_of[n], None) for n in train_names],
-                    [(n, path_of[n], None) for n in val_names],
-                    [(n, path_of[n], None) for n in test_names])
-        train_pc = sorted(glob.glob(f"{TRAIN_PC_DIR}/*_PC3.txt"))
-        if not train_pc:
-            raise FileNotFoundError(
-                f"No *_PC3.txt under {TRAIN_PC_DIR}. Upload the IEEE dataset to the "
-                f"ieee-data volume first, e.g.:\n"
-                f"  modal volume put ieee-data "
-                f'"C:\\Users\\OrionHoch\\Desktop\\LabledDatasets\\IEEE" /IEEE')
-        name_of = lambda p: os.path.basename(p).replace("_PC3.txt", "")
-        test_pc = sorted(glob.glob(f"{TEST_PC_DIR}/*_PC3.txt"))
-        train_names, val_names, test_names = partition_scenes(
-            [name_of(p) for p in train_pc], [name_of(p) for p in test_pc],
-            VAL_FRAC, TEST_FRAC, HOLDOUT_SEED)
-        def _pair(names, pc_dir, cls_dir):
-            return [(n, f"{pc_dir}/{n}_PC3.txt", f"{cls_dir}/{n}_CLS.txt") for n in names]
-        # carved-from-train test (no dedicated test set) lives in the TRAIN dirs
-        test_dirs = (TEST_PC_DIR, TEST_CLS_DIR) if test_pc else (TRAIN_PC_DIR, TRAIN_CLS_DIR)
-        return (_pair(train_names, TRAIN_PC_DIR, TRAIN_CLS_DIR),
-                _pair(val_names,   TRAIN_PC_DIR, TRAIN_CLS_DIR),
-                _pair(test_names,  *test_dirs))
+        # The dataset stage already materialized three whole-scene folders
+        # (val = selection holdout, test = final report); read them verbatim and
+        # never re-carve a split. The third tuple slot (cls_path) is always None
+        # (labels are embedded in the canonical .npz).
+        stem = lambda p: os.path.splitext(os.path.basename(p))[0]
+        train_npz = sorted(glob.glob(f"{ds_root}/train/*.npz"))
+        if not train_npz:
+            raise FileNotFoundError(f"No canonical scenes under {ds_root}/train")
+        val_npz  = sorted(glob.glob(f"{ds_root}/val/*.npz"))
+        test_npz = sorted(glob.glob(f"{ds_root}/test/*.npz"))
+        return ([(stem(p), p, None) for p in train_npz],
+                [(stem(p), p, None) for p in val_npz],
+                [(stem(p), p, None) for p in test_npz])
 
     def _cache_signature():
         # Everything that changes what a cached tile contains. A mismatch means
-        # the cache is stale/leaky and must not be silently reused.
+        # the cache is stale/leaky and must not be silently reused. The split is a
+        # property of the DATASET (3 materialized folders), so the signature
+        # records the dataset's split identity.
+        sp = ds_meta.get("split", {})
         return {
             "format_version": 1,
             "pipeline": "kpconvx_cold_hag",
             "grid": GRID,
             "chunk_xy": CHUNK_XY,
             "stride": STRIDE,
-            "holdout_seed": HOLDOUT_SEED,
-            "val_frac": VAL_FRAC,
-            "test_frac": TEST_FRAC,
-            "label_map": None if ds_root else {str(k): v for k, v in sorted(LABEL_MAP.items())},
+            "split_seed": sp.get("seed"),
+            "split_mode": sp.get("mode"),
             "min_pts_mask": 64,
             "min_pts_sub": 32,
             "intensity_norm": "p95_clip2",
             "feature_recipe": "bias,intensity,ret_num,hag",
             "hag_source": HAG_SOURCE,
-            "hag_train_dir": HAG_TRAIN_DIR,
-            "hag_test_dir": HAG_TEST_DIR,
         }
 
     def _validate_cache(lists):
@@ -599,37 +447,32 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
             # interrupted mid-scene is re-tiled rather than silently left partial.
             return os.path.exists(f"{out_dir}/{name}.done")
 
-        def tile_remaining(items, out_dir, chunk_xy, stride, hag_dir):
+        def tile_remaining(items, out_dir, chunk_xy, stride):
             for name, pc_path, cls_path in items:
                 if already_tiled(out_dir, name):
                     continue
-                n = tile_and_save(name, pc_path, cls_path, out_dir, chunk_xy, stride, hag_dir)
+                n = tile_and_save(name, pc_path, cls_path, out_dir, chunk_xy, stride)
                 if n is not None:          # None == load failed; leave unmarked to retry
                     open(f"{out_dir}/{name}.done", "w").close()
                 any_new[0] = True
 
-        # Train + val-holdout scenes are Train-Track4 -> HAG/Train; the test
-        # split is Validate-Track4 -> HAG/Validate.
         print(f"  [train] {len(train_list)} scenes", flush=True)
-        tile_remaining(train_list, f"{PREP_DIR}/train", CHUNK_XY, STRIDE, HAG_TRAIN_DIR)
+        tile_remaining(train_list, f"{PREP_DIR}/train", CHUNK_XY, STRIDE)
         # val/test also tile at stride 50 so the final eval can vote over the
         # up-to-4 overlapping tiles covering each point.
         print(f"  [val] {len(val_list)} scenes", flush=True)
-        tile_remaining(val_list, f"{PREP_DIR}/val", CHUNK_XY, STRIDE, HAG_TRAIN_DIR)
+        tile_remaining(val_list, f"{PREP_DIR}/val", CHUNK_XY, STRIDE)
         print(f"  [test] {len(test_list)} scenes", flush=True)
-        # carved-from-train test (no dedicated Validate set) is Train-origin -> HAG/Train
-        test_hag_dir = (HAG_TEST_DIR if ds_root or glob.glob(f"{TEST_PC_DIR}/*_PC3.txt")
-                        else HAG_TRAIN_DIR)
-        tile_remaining(test_list, f"{PREP_DIR}/test", CHUNK_XY, STRIDE, test_hag_dir)
+        tile_remaining(test_list, f"{PREP_DIR}/test", CHUNK_XY, STRIDE)
         if any_new[0]:
-            (datasets_volume if ds_root else data_volume).commit()
+            datasets_volume.commit()
             print("  preprocessing committed.", flush=True)
         else:
             print("  all scenes already cached.", flush=True)
         return train_list, val_list, test_list
 
     def make_run_dir():
-        run_id = datetime.utcnow().strftime("%Y%m%d_%H%M%S_ieee_kpconvx_cold_hag")
+        run_id = datetime.utcnow().strftime("%Y%m%d_%H%M%S_kpconvx_cold_hag")
         run_dir = f"/outputs/runs/{run_id}"
         os.makedirs(f"{run_dir}/checkpoints", exist_ok=True)
         return run_id, run_dir
@@ -659,7 +502,7 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
         return None
 
     print("=" * 70)
-    print(f"  KPConvX-L  IEEE Track 4  COLD/{FEATURE_MODE}  "
+    print(f"  KPConvX-L  {dataset or 'infer'}  COLD/{FEATURE_MODE}  "
           f"({gpu_name()}, {N_EPOCHS} ep, {EPOCH_STEPS} steps, "
           f"pack {PACK_N} x accum {ACCUM})")
     print("=" * 70)
@@ -699,15 +542,12 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
             "warm_start": False,
             "feature_mode": FEATURE_MODE,
             "input_channels": INPUT_CHANNELS,
-            "comparison_target": None if ds_root
-                else "kpconv-pdal/train_LAS.py (deformable KPFCNN)",
-            "dataset": dataset or "IEEE GRSS 2019 DFC Track 4",
+            "dataset": dataset,
             "hag_source": HAG_SOURCE,
             "n_epochs": N_EPOCHS, "epoch_steps": EPOCH_STEPS,
             "pack_n": PACK_N, "accum": ACCUM,
             "grid_m": GRID, "kp_radius": KP_RADIUS, "radius_scaling": RADIUS_SCALING,
             "num_classes": NUM_CLASSES, "class_names": CLASS_NAMES,
-            "label_map_asprs_to_index": None if ds_root else LABEL_MAP,
             "chunk_xy_m": CHUNK_XY, "stride_m": STRIDE,
             "optimizer": {"type": "AdamW", "weight_decay": WEIGHT_DECAY,
                           "cyc_lr0": CYC_LR0, "cyc_lr1": CYC_LR1,
@@ -727,7 +567,6 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
             "train_scenes": [n for n, _, _ in train_list],
             "val_scenes":   [n for n, _, _ in val_list],
             "test_scenes":  [n for n, _, _ in test_list],
-            "holdout_seed": HOLDOUT_SEED,
         }, f, indent=2)
 
     # ------------------------------------------------------------------------
@@ -737,7 +576,7 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
     from models.KPNext import KPNeXt
 
     cfg = init_cfg()
-    cfg.data.name           = "IEEE"
+    cfg.data.name           = dataset or "infer"
     cfg.data.task           = "cloud_segmentation"
     cfg.data.num_classes    = NUM_CLASSES
     cfg.data.dim            = 3
@@ -843,7 +682,7 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
     print(f"  train_tiles: {len(train_tiles)}   val_tiles: {len(val_tiles)}   "
           f"test_tiles: {len(test_tiles)}", flush=True)
     if not train_tiles and not INFER:
-        raise RuntimeError("No training tiles after preprocessing — check the IEEE upload.")
+        raise RuntimeError("No training tiles after preprocessing — check the dataset.")
 
     # --- class-balanced loss + rare-class oversampling ----------------------
     # One pass over the training tiles: count labels for inverse-frequency class
@@ -943,8 +782,8 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
 
     def _hag_of(z, xyz):
         """Per-point HAG for a cached tile. Real HeightAboveGround when present
-        (HAG-prepped tiles); else the z-tile-min proxy (e.g. the Test-Track4
-        predict demo, whose scenes have no HAG laz)."""
+        (HAG-prepped tiles); else the z-tile-min proxy (datasets without a
+        per-point hag)."""
         if "hag" in z.files:
             return z["hag"].astype(np.float32)
         return (xyz[:, 2] - xyz[:, 2].min()).astype(np.float32)
@@ -1025,9 +864,9 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
 
     def _predict_points(xyz, intensity_n, ret_num, hag=None):
         """Sliding-window KPConvX inference over already-normalized features;
-        returns per-raw-point class indices. Shared by --mode infer (npz input)
-        and the Test-Track4 predict demo (txt input). `hag` is per-raw-point real
-        HeightAboveGround (run trained on PDAL HAG); None -> the z-tile-min proxy."""
+        returns per-raw-point class indices (used by --mode infer). `hag` is
+        per-raw-point real HeightAboveGround when the scene carries it; None ->
+        the z-tile-min proxy."""
         pred = np.full(len(xyz), -1, np.int64)
         mins, maxs = xyz[:, :2].min(0), xyz[:, :2].max(0)
         with torch.no_grad():
@@ -1073,9 +912,9 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
     # ------------------------------------------------------------------------
     # Arbitrary-folder inference (trainer_gui): label the npz scenes uploaded to
     # terminal-datasets:/_infer/<job>/scenes/ and write predictions, then stop.
-    # The uploaded scenes carry no HAG laz -> the 4th channel falls back to the
-    # z-tile-min proxy (same as the Test-Track4 demo). KPConvX geometry is fixed
-    # to the trained values; any --grid/--chunk-xy passed is informational only.
+    # Scenes carry real HAG when present; otherwise the 4th channel falls back to
+    # the z-tile-min proxy. KPConvX geometry is fixed to the trained values; any
+    # --grid/--chunk-xy passed is informational only.
     # ------------------------------------------------------------------------
     if INFER:
         if not infer_input:
@@ -1083,13 +922,11 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
         if (grid is not None and grid != GRID) or (chunk_xy is not None and chunk_xy != CHUNK_XY):
             print(f"  [infer] note: KPConvX uses its trained geometry "
                   f"(grid={GRID}, chunk={CHUNK_XY}); --grid/--chunk-xy ignored.", flush=True)
-        print("  [infer] note: uploaded scenes have no HAG laz -> HAG channel uses "
-              "the z-tile-min proxy (folder inference is best-effort vs HAG-prepped data).",
-              flush=True)
+        print("  [infer] note: scenes without a per-point HAG fall back to the "
+              "z-tile-min proxy for the 4th channel.", flush=True)
         net.eval()
-        IDX_TO_ASPRS = np.array([2, 5, 6, 9, 17], dtype=np.int32)   # IEEE models only
-        # Palette tiled to NUM_CLASSES so canonical models (any class count) don't
-        # index past a fixed 5-colour table.
+        # Palette tiled to NUM_CLASSES so models with any class count don't
+        # index past a fixed colour table.
         _BASE_PAL = np.array([[139, 90, 43], [34, 160, 34], [200, 60, 60], [40, 110, 220],
                               [235, 225, 60], [150, 80, 200], [240, 140, 40], [70, 200, 200],
                               [220, 100, 170], [120, 120, 120]], dtype=np.int32)
@@ -1176,9 +1013,7 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
                    if "hag" in z.files and len(z["hag"]) == len(xyz) else None)
             pred = _predict_points(xyz, intensity_n, ret_num, hag=hag)
             _write_ply(f"{pred_dir}/{name}_pred.ply", xyz, pred, intensity_n)
-            # IEEE models emit ASPRS codes; canonical models emit raw class indices.
-            np.savetxt(f"{pred_dir}/{name}_pred_CLS.txt",
-                       IDX_TO_ASPRS[pred] if IEEE_INFER else pred, fmt="%d")
+            np.savetxt(f"{pred_dir}/{name}_pred_CLS.txt", pred, fmt="%d")
             print(f"  [infer] {name}: {len(xyz):,} pts in {time.time()-t0:.1f}s", flush=True)
         datasets_volume.commit()
         print(f"  [infer] done — predictions in _infer/{infer_input}/predictions", flush=True)
@@ -1264,8 +1099,7 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
                 rep_xyz = P[first]                      # one representative coord per voxel
                 # Reproject voxel predictions onto the raw scene cloud + raw GT.
                 try:
-                    raw_xyz, _, _, raw_lab = (load_canonical(pc_path) if cls_path is None
-                                              else load_ieee(pc_path, cls_path))
+                    raw_xyz, _, _, raw_lab = load_canonical(pc_path)
                 except Exception as ex:
                     print(f"  [{label}] skip {name}: raw reload failed: {ex}", flush=True)
                     n_skipped_scenes += 1; continue
@@ -1444,6 +1278,10 @@ def main():
     ap.add_argument('--batch', type=int, default=None)
     ap.add_argument('--steps-per-epoch', type=int, default=None)
     args = ap.parse_args()
+    # --dataset is required for training/eval; only --mode infer may omit it.
+    if args.dataset is None and args.mode != 'infer':
+        ap.error('--dataset is required (a canonical trainer_gui dataset name); '
+                 'only --mode infer may omit it.')
     train_kpconvx(**vars(args))
 
 

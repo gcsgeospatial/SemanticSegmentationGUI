@@ -1,46 +1,13 @@
 """
-Modal training script for RandLA-Net (PyTorch) on IEEE GRSS 2019 Track 4 —
-COLD-START variant.
+Modal shell for RandLA-Net (PyTorch), COLD-START — thin subprocess wrapper.
 
-Random initialization — no pretrained weights. Architecture and features are
-identical to the warm sibling (modal_train_randlanet_warm.py), making
-warm-vs-cold a clean initialization comparison.
+Random initialization (no pretrained weights). Provisions a GPU container + the
+outputs / terminal-datasets volumes, then shells out to the local trainer
+(scripts/local/local_train_randlanet.py) so local and cloud run byte-identical
+code. Trains on a canonical trainer_gui dataset passed via --dataset (staged on
+the terminal-datasets volume).
 
-IEEE 2019 Track 4 layout:
-  Train-Track4/Track4/JAX_*_PC3.txt, OMA_*_PC3.txt        (110 scenes)
-  Train-Track4-Truth/Track4-Truth/JAX_*_CLS.txt, ...      (per-point labels)
-  Validate-Track4/Track4/*.txt                            (10 scenes)
-  Validate-Track4-Truth/*.txt                             (per-point labels)
-  Test-Track4 has no GT — we ignore it.
-
-Each PC3.txt row is `x, y, z, intensity, returnNumber` (comma-separated).
-Each CLS.txt is one ASPRS LAS class code per line. We remap
-{0:-1 (ignore), 2:0 Ground, 5:1 Trees, 6:2 Building, 9:3 Water, 17:4 Bridge}.
-
-REVISION 2026-06-12 (ported from the KPConvX cold-run fixes):
-  - features are [xyz, intensity, return_number] (5 ch). Intensity is
-    water's only reliable cue; fc0 is built at 5->8 (cold start, so there is
-    no pretrained-stem constraint).
-  - p95-clipped per-scene intensity normalization (new PREP_DIR)
-  - train augmentation (vertical rotation, x-flip, isotropic scale): was none
-  - class-weighted CE + rare-class-centered sphere sampling (rare = train
-    frequency < 2%, so canonical --dataset runs work too)
-  - held-out val pass every VAL_EVERY epochs -> val_metrics.csv (no weight
-    updates), checkpoints include optimizer state
-  - final eval now covers every subsampled point of every val/test scene in
-    spatially-sorted blocks (the old eval scored ONE random sphere per scene)
-
-Validate-Track4 (10 scenes) is the test set. 10 Train-Track4 scenes picked
-deterministically (seed=42) form an in-distribution validation holdout.
-
-The warm-start sibling script is modal_train_randlanet_warm.py.
-
-----------------------------------------------------------------------------
-Training-terminal integration: running with no flags behaves exactly as the
-original. Extra flags (see modal_train_ptv3_warm.py for details):
-
-  --dataset NAME                          canonical trainer_gui dataset on the
-                                          terminal-datasets volume
+  --dataset NAME                          canonical trainer_gui dataset
   --sub-grid / --num-points / --epochs / --batch / --steps-per-epoch
   --mode infer --weights runs/<id>/final_model.pth --infer-input <job_id>
 
@@ -55,58 +22,9 @@ import modal
 # ============================================================================
 # Configuration
 # ============================================================================
-APP_NAME      = "randlanet-cold-ieee"
+APP_NAME      = "randlanet-cold"
 GPU_TYPE      = os.environ.get("TT_GPU", "A10G")   # RandLA is light, A10G handles it
-N_EPOCHS      = 100              # was 5 (smoke test); 250-300 for a full run
-BATCH_SIZE    = 6
-VAL_BATCH     = 12
 TIMEOUT_HOURS = int(os.environ.get("TT_TIMEOUT_HOURS", "24"))
-
-NUM_CLASSES   = 5                # IEEE Track 4: Ground, Trees, Building, Water, Bridge
-NUM_POINTS    = 45056            # 4096*11, RandLA SemKITTI default
-SUB_GRID_SIZE = 0.30             # 30 cm — IEEE LiDAR is sparser (~2 pts/m²) than KITTI
-IN_DIM        = 5                # [x, y, z, intensity, return_number]
-N_VAL_HOLDOUT = 10               # number of train scenes held out for val
-HOLDOUT_SEED  = 42
-
-# Class balance (rare classes derived from train frequency, so this also works
-# for canonical --dataset runs with arbitrary class sets).
-CLASS_WEIGHTING  = True
-WEIGHT_BETA      = 0.5           # inverse-frequency exponent. 0.5 == inverse
-                                 # SQRT frequency (w = 1/sqrt(freq)), the
-                                 # RandLA-Net / SemanticKITTI standard: sub-linear
-                                 # so rare classes are boosted without the
-                                 # exploding-gradient instability of raw 1/freq.
-WEIGHT_CAP       = 5.0           # clamp weights to [1/CAP, CAP] after mean-norm
-# Lovász-Softmax: a tractable surrogate that optimizes mIoU (Jaccard) directly
-# and weights every class equally, so it counters CE's majority-class bias on
-# rare classes. Total loss = <pointwise> + LOVASZ_WEIGHT * lovasz_softmax.
-# Set to 0.0 to disable (recovers a pointwise-only loss).
-LOVASZ_WEIGHT    = 1.0
-# Focal loss (Lin et al. 2017): when USE_FOCAL, the pointwise term is
-# alpha-balanced focal loss instead of weighted cross-entropy. alpha reuses the
-# inverse-sqrt class weights; (1-p_t)^gamma down-weights easy/well-classified
-# points so hard + rare points dominate the gradient. gamma=0 == weighted CE.
-# USE_FOCAL=False reverts the pointwise term to weighted CE.
-USE_FOCAL        = False
-FOCAL_GAMMA      = 2.0
-RARE_OVERSAMPLE  = True
-RARE_FREQ_THRESH = 0.02          # classes under 2% of train points count as rare
-RARE_CENTER_PROB = 0.25          # P(center the next train sphere on a rare-class point)
-VAL_EVERY        = 10            # held-out val pass every N epochs (no weight updates)
-VAL_BATCHES      = 16            # batches per periodic val pass
-
-DATA_ROOT      = "/data/IEEE"
-TRAIN_PC_DIR   = f"{DATA_ROOT}/Train-Track4/Track4"
-TRAIN_CLS_DIR  = f"{DATA_ROOT}/Train-Track4-Truth/Track4-Truth"
-TEST_PC_DIR    = f"{DATA_ROOT}/Validate-Track4/Track4"
-TEST_CLS_DIR   = f"{DATA_ROOT}/Validate-Track4-Truth"
-PREP_DIR       = f"{DATA_ROOT}/prep/randlanet_grid30_p95_origin"   # p95 intensity norm
-
-# ASPRS LAS code -> contiguous 0..4 IEEE class index. Class 0 (Unclassified)
-# maps to -1 and is ignored by the CE loss.
-CLASS_NAMES = ["Ground", "Trees", "Building", "Water", "Bridge"]
-LABEL_MAP   = {0: -1, 2: 0, 5: 1, 6: 2, 9: 3, 17: 4}
 
 DATASETS_ROOT = "/datasets"   # terminal-datasets volume (trainer_gui canonical datasets)
 
@@ -179,7 +97,6 @@ image = image.run_commands(
 image = image.add_local_file("scripts/local/local_train_randlanet.py", "/root/local_train_randlanet.py")
 image = image.add_local_file("scripts/helper/train_common.py", "/root/train_common.py")
 
-data_volume     = modal.Volume.from_name("ieee-data",            create_if_missing=True)
 outputs_volume  = modal.Volume.from_name(f"{APP_NAME}-outputs",  create_if_missing=True)
 datasets_volume = modal.Volume.from_name(
     os.environ.get("TT_DATASET_VOLUME", "terminal-datasets"), create_if_missing=True)
@@ -191,8 +108,7 @@ datasets_volume = modal.Volume.from_name(
 @app.function(
     image=image,
     gpu=GPU_TYPE,
-    volumes={"/data": data_volume, "/outputs": outputs_volume,
-             DATASETS_ROOT: datasets_volume},
+    volumes={"/outputs": outputs_volume, DATASETS_ROOT: datasets_volume},
     cpu=8,
     memory=32768,
     timeout=TIMEOUT_HOURS * 3600,
@@ -234,7 +150,6 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
 
     def _commit_loop():
         while not _stop.wait(120):
-            data_volume.commit()
             outputs_volume.commit()
             datasets_volume.commit()
 
@@ -244,7 +159,6 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         subprocess.run(cmd, check=True)
     finally:
         _stop.set()
-        data_volume.commit()
         outputs_volume.commit()
         datasets_volume.commit()
 
@@ -259,7 +173,7 @@ def main(dataset: Optional[str] = None, sub_grid: Optional[float] = None,
     # Pair with `modal run --detach ...` if you want to close the terminal
     # mid-run; you can then reattach with `modal app logs {APP_NAME} -f`
     # while the app is still active.
-    what = f"infer({weights})" if mode == "infer" else f"train({dataset or 'IEEE legacy'})"
+    what = f"infer({weights})" if mode == "infer" else f"train({dataset})"
     print(f"Launching {APP_NAME} [{what}] on {GPU_TYPE} for up to {TIMEOUT_HOURS}h.")
     train_randlanet.remote(dataset=dataset, sub_grid=sub_grid, num_points=num_points,
                            epochs=epochs, batch=batch, steps_per_epoch=steps_per_epoch,

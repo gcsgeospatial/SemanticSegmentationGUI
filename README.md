@@ -36,8 +36,9 @@ trainer-gui          # or: python -m trainer_gui
 1. **Datasets page** — pick a training folder and a validation folder of point
    clouds (`las/laz`, `ply`, ASCII `txt/csv/xyz/pts`, `pcd`, `npy/npz`). Choose
    where the ground-truth labels live: a field inside each file (e.g. LAS
-   `classification`, PLY `label`) or a companion label file per scene (the IEEE
-   `_PC3.txt` / `_CLS.txt` layout). Scan label values, name your classes, and
+   `classification`, PLY `label`) or a companion label file per scene (one label
+   per point, e.g. a `_PC3.txt` cloud paired with a `_CLS.txt` label file). Scan
+   label values, name your classes, and
    uncheck any value that means *unknown* (those become ignore-labels, excluded
    from the loss and mIoU). *Analyze* measures point density and pre-computes
    per-model parameter recommendations. *Convert + Upload* writes the canonical
@@ -89,8 +90,9 @@ trainer-gui          # or: python -m trainer_gui
 | KPConvX-L (cold) | `scripts/modal/modal_train_kpconvx_cold.py` | ready |
 | KPConvX-L + HAG | `scripts/modal/modal_train_kpconvx_cold_hag.py` | ready |
 
-Every script still runs standalone — `modal run scripts/modal/modal_train_X.py`
-with no flags reproduces the original IEEE behavior. The GUI just passes
+Every script runs standalone too — `modal run scripts/modal/modal_train_X.py
+--dataset <name>` trains on a canonical dataset already uploaded to
+`terminal-datasets` (`--dataset` is required). The GUI just fills in the
 `--dataset/--grid/--epochs/...` flags and sets `TT_GPU` / `TT_TIMEOUT_HOURS`.
 
 ## Repo layout
@@ -98,7 +100,7 @@ with no flags reproduces the original IEEE behavior. The GUI just passes
 ```
 scripts/modal/   thin Modal entrypoints (`modal run …`; bake + subprocess the local twin)
 scripts/local/   the actual trainers/inferencers (run directly in Docker, no modal)
-scripts/helper/  shared bits: train_common.py, _modal_shim.py, make_groundtruth_ply.py
+scripts/helper/  shared bits: train_common.py, _modal_shim.py
 trainer_gui/     the PySide6 desktop app (the pip-installed package)
 docker/          generated Dockerfiles + build/pull/push scripts
 tools/           gen_dockerfiles.py (+ the one-shot split_local.py)
@@ -108,14 +110,22 @@ tools/           gen_dockerfiles.py (+ the one-shot split_local.py)
 
 `%APPDATA%/trainer_gui/staging/<name>/` (uploaded to `terminal-datasets:/<name>`):
 
-- `dataset_meta.json` — classes (source value → index → name), counts, density
-  stats, per-model recommendations
-- `train/<scene>.npz`, `val/<scene>.npz` — `xyz` (f32), `label` (i32, −1 =
-  ignored), plus `rgb` (u8), `intensity` (f32, normalized 0–1) and
-  `return_number` (f32) when the source has them
+- `dataset_meta.json` — classes (source value → index → name), per-split counts,
+  density stats, per-model recommendations, and the recorded split (`mode`,
+  `seed`, requested vs. achieved fractions)
+- `train/<scene>.npz`, `val/<scene>.npz`, `test/<scene>.npz` — `xyz` (f32),
+  `label` (i32, −1 = ignored), plus `rgb` (u8), `intensity` (f32, normalized
+  0–1), `return_number` (f32) and `hag` (f32) when the source has them
 
-Your **val/** folder is used as the *test* set; an in-distribution validation
-holdout is carved deterministically from train/.
+The Datasets page materializes **three** whole-scene folders once: **train**,
+**val** (the in-distribution selection holdout) and **test** (the final-report
+set). You set the **val %** and **test %** sliders (each ≥ 5 %; train takes the
+remainder), pick **balanced** (every split mirrors the global class mix) or
+**random** (point-count fill only), and the split **seed** (shown, default 42). A
+folder of clouds splits by whole scenes; a single cloud is tiled as a
+measurement, the tiles allocated and reassembled into one holey npz per split
+with a small **seam buffer** discarded to limit leakage. The training scripts
+read all three folders verbatim and never re-carve a split.
 
 ## Tests
 

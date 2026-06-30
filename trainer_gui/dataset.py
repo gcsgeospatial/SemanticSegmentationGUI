@@ -5,30 +5,36 @@ Canonical layout (staged locally, then `modal volume put terminal-datasets ...`)
     dataset_meta.json
     train/<scene>.npz     # xyz f32, label i32 (-1 = ignore), [rgb u8, intensity f32 0..1,
     val/<scene>.npz       #   return_number f32]
+    test/<scene>.npz
 Inference jobs use the same npz minus `label`, under scenes/.
 
-The converter is format- and layout-agnostic. The minimal case is: point at one
-file (or one folder) that carries a classification field; everything else (a
-held-out val folder, companion label files, custom intensity normalization) is
-opt-in. When no explicit val split is given the data is split automatically:
-several files -> hold out whole scenes (each still tiled into a grid for
-training); a single file -> cut it into a coarse grid and hold out whole tiles
-(so train/val don't share neighbouring points).
+The dataset stage decides a 3-way train/val/test split ONCE and materializes the
+three folders; the training scripts read them verbatim (val = selection holdout,
+test = final report) and never re-carve their own. The split is a property of the
+DATASET, recorded in dataset_meta.json — not a per-script constant.
+
+The split targets are POINT-COUNT fractions for val and test (train = remainder),
+approximated greedily over atoms. A FOLDER of clouds splits by whole scenes; a
+SINGLE cloud is tiled only as a MEASUREMENT tool, the tiles allocated to splits
+and then reassembled into ONE (holey) whole-cloud npz per split with a small seam
+buffer discarded to limit leakage. mode="balanced" mirrors the global class mix in
+every split (and guarantees rare-class presence); mode="random" fills by point
+count alone. The converter is otherwise format-/layout-agnostic; explicit
+train/val/test folders ("provided") bypass allocation for whichever splits exist.
 """
 
 from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass, field
+import shutil
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
 
 from .readers import SUPPORTED_EXTS, Cloud, read_points
-
-MIN_TILE_PTS = 256   # drop grid tiles smaller than this when tile-splitting
 
 
 @dataclass
@@ -37,9 +43,9 @@ class LabelSpec:
 
     kind="field": a named field in the cloud file itself (LAS dim, PLY prop,
         "column N" of an ASCII/npy file). This is the general/default case.
-    kind="file": a companion ASCII file, one label per point — the IEEE layout.
+    kind="file": a companion label file alongside each cloud, one label per point.
         The companion path = truth_dir / scene_name with src_suffix replaced by
-        dst_suffix (e.g. "_PC3.txt" -> "_CLS.txt").
+        dst_suffix (e.g. a "_PC3.txt" cloud paired with a "_CLS.txt" label file).
     """
     kind: str = "field"            # "field" | "file"
     field: str = ""                # for kind="field"
@@ -50,28 +56,31 @@ class LabelSpec:
 
 @dataclass
 class SplitConfig:
-    """How to derive train/val when the user hasn't pre-split into two folders.
+    """How the dataset stage derives the train/val/test split.
 
-    The dataset layer does NOT tile — each training script tiles for its own model
-    (chunk windows / spheres / voxels). Here we only decide which WHOLE scenes (or
-    scene regions) land in each split.
+    The split is decided ONCE here and materialized as three whole-scene folders;
+    the training scripts read those verbatim. val_frac/test_frac are TARGET
+    POINT-COUNT fractions (each >= 0.05 in the UI; train = remainder), approximated
+    greedily over atoms — whole scenes for a folder of clouds, or grid tiles for a
+    single cloud (reassembled into one holey npz per split).
 
-    strategy="auto"     1 file -> "spatial", many files -> "scene".
-    strategy="scene"    hold out whole files (needs >= 2 files); each file is one scene.
-    strategy="spatial"  one cloud -> a single spatial train/val cut by val_ratio.
-    strategy="provided" caller passes an explicit val set (set via val_inputs).
+    mode          : "balanced" (greedy stratification so each split mirrors the
+                    global class mix, + a rare-class presence guarantee) or
+                    "random" (class-blind point-count fill).
+    seed          : RNG seed (shown in the UI; default 42).
+    seam_buffer_m : single-cloud only — discard points within this 2-D distance of
+                    a boundary between atoms assigned to different splits.
+    tile_m        : single-cloud measurement grid size (atoms), metres.
+    strategy      : "auto" (allocate) or "provided" (explicit val/test folders; any
+                    split not provided is allocated from the inputs).
     """
-    strategy: str = "auto"
-    val_ratio: float = 0.2
+    val_frac: float = 0.15
+    test_frac: float = 0.15
+    mode: str = "balanced"        # "balanced" | "random"
     seed: int = 42
-
-
-@dataclass
-class SceneSpec:
-    """One output scene: a source file, optionally cropped to an XY box."""
-    src: Path
-    name: str
-    bounds: tuple | None = None    # (x0, y0, x1, y1) or None for the whole file
+    seam_buffer_m: float = 1.0
+    tile_m: float = 50.0
+    strategy: str = "auto"        # "auto" | "provided"
 
 
 def discover_scenes(folder: str | Path) -> list[Path]:
@@ -82,10 +91,10 @@ def discover_scenes(folder: str | Path) -> list[Path]:
                  if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS)
     if top:
         return top
-    # A converted/tiled dataset has no clouds at the top level — its scenes live
-    # under train/ and val/ (the canonical npz layout). Look there so HAG, Scan
-    # and Analyze accept a tiled dataset folder, not just a flat folder of clouds.
-    sub = [p for split in ("train", "val") if (folder / split).is_dir()
+    # A converted dataset has no clouds at the top level — its scenes live under
+    # train/, val/ and test/ (the canonical npz layout). Look there so HAG, Scan
+    # and Analyze accept a converted dataset folder, not just a flat folder of clouds.
+    sub = [p for split in ("train", "val", "test") if (folder / split).is_dir()
            for p in sorted((folder / split).iterdir())
            if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS]
     return sub
@@ -143,26 +152,11 @@ def sanitize_name(name: str) -> str:
 
 
 # --------------------------------------------------------------------- splitting
+#
+# Atoms (the indivisible units the allocator assigns) are whole scenes for a folder
+# of clouds, or grid tiles for a single cloud. Targets are POINT-COUNT fractions.
 
-def resolve_strategy(strategy: str, n_files: int) -> str:
-    if strategy in ("scene", "spatial", "provided"):
-        return strategy
-    return "spatial" if n_files == 1 else "scene"      # "auto"
-
-
-def _ratio_split(items: list, val_ratio: float, seed: int) -> tuple[list, list]:
-    """Shuffle `items` and split off a val fraction; both sides get >= 1."""
-    n = len(items)
-    if n < 2:
-        raise ValueError("scene-split needs >= 2 files; use tile-split or add a val folder")
-    rng = np.random.RandomState(seed)
-    idx = np.arange(n)
-    rng.shuffle(idx)
-    n_val = min(max(1, round(val_ratio * n)), n - 1)
-    val_pos = set(idx[:n_val].tolist())
-    train = [items[i] for i in range(n) if i not in val_pos]
-    val = [items[i] for i in range(n) if i in val_pos]
-    return train, val
+_SPLITS = ("train", "val", "test")
 
 
 def _subset(cloud: Cloud, raw: np.ndarray | None, mask: np.ndarray):
@@ -177,17 +171,148 @@ def _subset(cloud: Cloud, raw: np.ndarray | None, mask: np.ndarray):
     return sub, (raw[mask] if raw is not None else None)
 
 
-def _spatial_split(cloud: Cloud, raw: np.ndarray | None, val_ratio: float):
-    """Cut one cloud into (train, val) along its longer XY axis at the val_ratio
-    boundary — a single spatial split (NOT tiling), leak-free (disjoint regions).
-    The low end of the axis becomes val. Returns ((train, train_raw), (val, val_raw))."""
+def _hist_of(raw, value_to_index: dict, num_classes: int) -> np.ndarray:
+    """Per-class point counts for one atom's RAW labels (ignored points dropped)."""
+    h = np.zeros(num_classes, dtype=np.int64)
+    if raw is None or num_classes == 0:
+        return h
+    for src_val, idx in value_to_index.items():
+        if 0 <= int(idx) < num_classes:
+            h[int(idx)] += int(np.count_nonzero(raw == src_val))
+    return h
+
+
+def _hist_from_counts(class_counts: dict, num_classes: int) -> np.ndarray:
+    """Per-class counts from a {index: count} dict (the _convert_one stat)."""
+    h = np.zeros(num_classes, dtype=np.int64)
+    for c, cnt in class_counts.items():
+        if 0 <= int(c) < num_classes:
+            h[int(c)] = int(cnt)
+    return h
+
+
+def _guarantee_presence(assign, hist, allowed):
+    """Best-effort (balanced mode): make every globally-present class appear in
+    every ACTIVE split, moving an atom rich in a missing class over."""
+    n, C = hist.shape
+    H = hist.sum(0)
+    for c in range(C):
+        if H[c] <= 0:
+            continue
+        for s in range(3):
+            if not allowed[s]:
+                continue
+            if any(hist[i, c] > 0 and assign[i] == s for i in range(n)):
+                continue
+            cand = [i for i in range(n) if hist[i, c] > 0 and assign[i] != s]
+            if not cand:
+                continue
+            # prefer an atom whose source split keeps class c after it leaves
+            keeps = lambda i: any(hist[j, c] > 0 and assign[j] == assign[i] and j != i
+                                  for j in range(n))
+            cand.sort(key=lambda i: (not keeps(i), -hist[i, c]))
+            assign[cand[0]] = s
+
+
+def _guarantee_nonempty(assign, pts, fr):
+    """Every split with a positive target gets >= 1 atom (steal the smallest atom
+    from the split that has the most)."""
+    pts = np.asarray(pts, dtype=np.float64)
+    for s in range(3):
+        if fr[s] <= 0 or (assign == s).any():
+            continue
+        donor = max(range(3), key=lambda d: int((assign == d).sum()))
+        cand = np.where(assign == donor)[0]
+        if len(cand) <= 1:
+            continue
+        assign[cand[int(np.argmin(pts[cand]))]] = s
+
+
+def allocate_splits(pts, hist, val_frac: float, test_frac: float,
+                    mode: str = "balanced", seed: int = 42) -> np.ndarray:
+    """Assign atoms to train(0)/val(1)/test(2) approximating val_frac/test_frac of
+    TOTAL POINTS. pts[i] = atom point count; hist[i] = per-class point counts.
+
+    mode="random"   : random order; greedily fill the split with the largest
+                      remaining point deficit (class-blind).
+    mode="balanced" : rarity-first order; place each atom in the split whose
+                      resulting per-class point deviation is smallest (each split
+                      mirrors the global class mix), then guarantee every present
+                      class appears in every split where atoms allow.
+    """
+    pts = np.asarray(pts, dtype=np.float64)
+    hist = np.asarray(hist, dtype=np.float64)
+    n = len(pts)
+    C = hist.shape[1] if (hist.ndim == 2 and hist.size) else 0
+    fr = np.array([max(0.0, 1.0 - val_frac - test_frac), val_frac, test_frac])
+    allowed = fr > 0                                   # never assign to a 0-target split
+    rng = np.random.RandomState(int(seed))
+    assign = np.full(n, -1, dtype=np.int64)
+    if n == 0:
+        return assign
+
+    if mode != "balanced" or C == 0:
+        target = fr * float(pts.sum())
+        got = np.zeros(3)
+        for i in rng.permutation(n):
+            deficit = target - got
+            deficit[~allowed] = -np.inf
+            s = int(np.argmax(deficit))
+            assign[i] = s
+            got[s] += pts[i]
+    else:
+        H = hist.sum(0)
+        target = np.outer(fr, H)                       # (3, C) point-count targets
+        got = np.zeros((3, C))
+        # critical class per atom = its rarest globally-present class; place the
+        # atom in the split most STARVED of that class (iterative stratification).
+        crit = np.full(n, -1, dtype=np.int64)
+        for i in range(n):
+            pres = np.where(hist[i] > 0)[0]
+            if len(pres):
+                crit[i] = int(pres[np.argmin(H[pres])])
+        rarest = np.array([H[crit[i]] if crit[i] >= 0 else np.inf for i in range(n)])
+        order = np.lexsort((-pts, rarest))             # rarest class first, big first
+        for i in order:
+            need = target - got                        # remaining desired (3, C)
+            primary = need[:, crit[i]] if crit[i] >= 0 else need.sum(1)
+            key = primary + 1e-9 * need.sum(1) + rng.random_sample(3) * 1e-12
+            key[~allowed] = -np.inf
+            s = int(np.argmax(key))                    # most-starved active split
+            assign[i] = s
+            got[s] += hist[i]
+        _guarantee_presence(assign, hist.astype(np.int64), allowed)
+
+    _guarantee_nonempty(assign, pts, fr)
+    return assign
+
+
+def _atomize(cloud: Cloud, tile_m: float):
+    """Group a single cloud's points into XY grid tiles -> list of index arrays."""
     xy = cloud.xyz[:, :2]
-    mn = xy.min(0)
-    ext = xy.max(0) - mn
-    ax = 0 if ext[0] >= ext[1] else 1
-    cut = mn[ax] + float(val_ratio) * ext[ax]
-    val_mask = cloud.xyz[:, ax] < cut
-    return _subset(cloud, raw, ~val_mask), _subset(cloud, raw, val_mask)
+    keys = np.floor((xy - xy.min(0)) / max(float(tile_m), 1e-6)).astype(np.int64)
+    _, inv = np.unique(keys, axis=0, return_inverse=True)
+    return [np.where(inv == t)[0] for t in range(int(inv.max()) + 1)]
+
+
+def _seam_drop(xyz, split_of_point, seam_buffer_m: float) -> np.ndarray:
+    """Keep-mask: drop points within seam_buffer_m (2-D) of a point that belongs to
+    a DIFFERENT split, so the reassembled per-split clouds don't touch."""
+    keep = np.ones(len(xyz), dtype=bool)
+    if seam_buffer_m <= 0:
+        return keep
+    try:
+        from scipy.spatial import cKDTree
+    except Exception:
+        return keep
+    for s in range(3):
+        mine = np.where(split_of_point == s)[0]
+        others = np.where((split_of_point != s) & (split_of_point >= 0))[0]
+        if len(mine) == 0 or len(others) == 0:
+            continue
+        d, _ = cKDTree(xyz[others, :2]).query(xyz[mine, :2])
+        keep[mine[d < seam_buffer_m]] = False
+    return keep
 
 
 # --------------------------------------------------------------------- conversion
@@ -282,78 +407,125 @@ def convert_scene(path: Path, spec: LabelSpec | None, value_to_index: dict[int, 
                         hag_filter=hag_filter)
 
 
-def _plan_and_convert(train_files: list[Path], val_files: list[Path] | None,
-                      strategy: str, split: SplitConfig, spec: LabelSpec | None,
-                      value_to_index: dict[int, int], out_root: Path,
-                      intensity_norm: str, say, *, compute_hag: bool = False,
-                      skip_ground: bool = False, hag_filter: str = "hag_nn") -> dict:
-    """Drive conversion per strategy; returns {"train": [stats], "val": [stats]}.
-    Each big file is read at most once."""
-    stats = {"train": [], "val": []}
+def _plan_and_convert(input_files: list[Path], val_files: list[Path] | None,
+                      test_files: list[Path] | None, split: SplitConfig,
+                      spec: LabelSpec | None, value_to_index: dict[int, int],
+                      num_classes: int, out_root: Path, intensity_norm: str, say, *,
+                      compute_hag: bool = False, skip_ground: bool = False,
+                      hag_filter: str = "hag_nn") -> dict:
+    """Convert sources into out_root/{train,val,test}/*.npz; returns
+    {"train": [stats], "val": [stats], "test": [stats]}.
 
-    def emit(split_name: str, cloud: Cloud, raw, scene_name: str):
+    Explicit val_files/test_files are used verbatim; whichever of val/test is NOT
+    provided is allocated from input_files by point count (mode-aware). A single
+    input cloud is tiled-as-measurement and reassembled into one holey npz/split."""
+    stats = {sp: [] for sp in _SPLITS}
+
+    def emit(split_name: str, cloud: Cloud, raw, scene_name: str, hag_already=False):
         out_path = out_root / split_name / f"{scene_name}.npz"
+        st = _convert_one(cloud, raw, value_to_index, out_path, intensity_norm,
+                          compute_hag=compute_hag and not hag_already,
+                          skip_ground=skip_ground, hag_filter=hag_filter)
+        st["scene"] = out_path.name
+        stats[split_name].append(st)
+
+    # Explicit folders verbatim; their fractions drop out of the allocation.
+    for split_name, files in (("val", val_files), ("test", test_files)):
+        for f in (files or []):
+            say(f"  [{split_name}] {f.name} ...")
+            cloud = read_points(f)
+            raw = read_labels(f, cloud, spec) if spec is not None else None
+            emit(split_name, cloud, raw, f.stem)
+    vfrac = 0.0 if val_files else split.val_frac
+    tfrac = 0.0 if test_files else split.test_frac
+
+    if vfrac <= 0.0 and tfrac <= 0.0:                  # everything explicit -> all train
+        for f in input_files:
+            say(f"  [train] {f.name} ...")
+            cloud = read_points(f)
+            raw = read_labels(f, cloud, spec) if spec is not None else None
+            emit("train", cloud, raw, f.stem)
+        return stats
+
+    # Single cloud -> tile as a measurement, allocate tiles, reassemble per split.
+    if len(input_files) == 1:
+        f = input_files[0]
+        say(f"  single-cloud split {f.name} (tile-measure -> holey clouds) ...")
+        cloud = read_points(f)
+        raw = read_labels(f, cloud, spec) if spec is not None else None
+        if compute_hag and _hag_from_cloud(cloud) is None:
+            from . import pretrain                      # whole-cloud HAG, ferried via fields
+            h = pretrain.hag_for_cloud(cloud, skip_ground=skip_ground, hag_filter=hag_filter)
+            if h is not None and len(h) == cloud.n:
+                cloud.fields["HeightAboveGround"] = h.astype(np.float32)
+        groups = _atomize(cloud, split.tile_m)
+        pts = [len(g) for g in groups]
+        hist = [_hist_of(raw[g] if raw is not None else None, value_to_index, num_classes)
+                for g in groups]
+        assign = allocate_splits(pts, hist, vfrac, tfrac, split.mode, split.seed)
+        sop = np.full(cloud.n, -1, dtype=np.int64)
+        for g, a in zip(groups, assign):
+            sop[g] = a
+        keep = _seam_drop(cloud.xyz, sop, split.seam_buffer_m)
+        for s, split_name in enumerate(_SPLITS):
+            mask = (sop == s) & keep
+            if not mask.any():
+                continue
+            sub, sub_raw = _subset(cloud, raw, mask)
+            say(f"  {split_name}: {int(mask.sum()):,} pts")
+            emit(split_name, sub, sub_raw, f.stem, hag_already=True)
+        return stats
+
+    # Folder of clouds -> convert all to a pool, allocate WHOLE scenes, move.
+    say(f"  converting {len(input_files)} scene(s), then allocating by point count ...")
+    pool = []
+    for f in input_files:
+        say(f"  converting {f.name} ...")
+        cloud = read_points(f)
+        raw = read_labels(f, cloud, spec) if spec is not None else None
+        out_path = out_root / "_pool" / f"{f.stem}.npz"
         st = _convert_one(cloud, raw, value_to_index, out_path, intensity_norm,
                           compute_hag=compute_hag, skip_ground=skip_ground,
                           hag_filter=hag_filter)
         st["scene"] = out_path.name
+        st["_pool_path"] = out_path
+        pool.append(st)
+    pts = [st["n_points"] for st in pool]
+    hist = [_hist_from_counts(st["class_counts"], num_classes) for st in pool]
+    assign = allocate_splits(pts, hist, vfrac, tfrac, split.mode, split.seed)
+    for st, a in zip(pool, assign):
+        split_name = _SPLITS[a]
+        dest = out_root / split_name / st["scene"]
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(st.pop("_pool_path")), str(dest))
         stats[split_name].append(st)
-
-    if strategy == "provided":
-        for split_name, files in (("train", train_files), ("val", val_files or [])):
-            say(f"[{split_name}] {len(files)} scenes")
-            for f in files:
-                say(f"  converting {f.name} ...")
-                cloud = read_points(f)
-                raw = read_labels(f, cloud, spec) if spec is not None else None
-                emit(split_name, cloud, raw, f.stem)
-        return stats
-
-    if strategy == "scene":
-        # Hold out whole files (train/val never share a cloud = no leakage). Each
-        # file is one whole scene; the training script tiles it for its own model.
-        tr, va = _ratio_split(train_files, split.val_ratio, split.seed)
-        say(f"scene-split: {len(tr)} train / {len(va)} val scene(s) (whole, untiled)")
-        for split_name, files in (("train", tr), ("val", va)):
-            for f in files:
-                say(f"  converting {f.name} ...")
-                cloud = read_points(f)
-                raw = read_labels(f, cloud, spec) if spec is not None else None
-                emit(split_name, cloud, raw, f.stem)
-        return stats
-
-    # strategy == "spatial": one (or each) cloud -> a single spatial train/val cut.
-    for f in train_files:
-        say(f"  spatial-split {f.name} ...")
-        cloud = read_points(f)
-        raw = read_labels(f, cloud, spec) if spec is not None else None
-        (tr_c, tr_r), (va_c, va_r) = _spatial_split(cloud, raw, split.val_ratio)
-        if tr_c.n < MIN_TILE_PTS or va_c.n < MIN_TILE_PTS:
-            raise ValueError(
-                f"{f.name}: spatial split left an almost-empty side (train {tr_c.n}, "
-                f"val {va_c.n} pts). Add more data or supply a separate val folder.")
-        say(f"  {f.stem}: {tr_c.n:,} train / {va_c.n:,} val pts")
-        emit("train", tr_c, tr_r, f"{f.stem}_train")
-        emit("val", va_c, va_r, f"{f.stem}_val")
+    pool_dir = out_root / "_pool"
+    if pool_dir.is_dir():
+        try:
+            pool_dir.rmdir()
+        except OSError:
+            pass
     return stats
 
 
 def convert_dataset(name: str, inputs, spec: LabelSpec | None,
                     classes: list[dict], ignore_values: list[int],
-                    staging_root: Path, *, val_inputs=None,
+                    staging_root: Path, *, val_inputs=None, test_inputs=None,
                     split: SplitConfig | None = None,
                     intensity_norm: str = "max", compute_hag: bool = False,
                     skip_ground: bool = False, hag_filter: str = "hag_nn",
                     progress=None) -> Path:
-    """Convert `inputs` (files and/or folders) into a staged canonical dataset.
+    """Convert `inputs` (files and/or folders) into a staged canonical dataset with
+    materialized train/val/test folders.
 
     inputs: a path or list of paths (files or folders) to use as the source.
-    val_inputs: optional explicit validation source -> "provided" split.
-    split: how to derive train/val when val_inputs is None (default: auto).
+    val_inputs/test_inputs: optional explicit val/test sources -> "provided" split;
+        any split not given is allocated from `inputs` by point count.
+    split: how to allocate train/val/test (fractions, mode, seed) when a split
+        isn't provided explicitly (default: SplitConfig()).
     classes: [{"index", "source_value", "name"}] — built by the Datasets page.
-    compute_hag: bake a per-tile HeightAboveGround channel (PDAL SMRF->hag) into
-        every tile in the SAME pass as tiling — one read/write per tile instead of
-        a separate add_hag_to_dataset reload. skip_ground/hag_filter tune it.
+    compute_hag: bake a per-scene HeightAboveGround channel (PDAL SMRF->hag) into
+        every scene in the SAME pass as conversion. skip_ground/hag_filter tune it.
     """
     from . import analysis
 
@@ -363,48 +535,53 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
     value_to_index = {int(c["source_value"]): int(c["index"]) for c in classes}
     say = progress or (lambda s: None)
 
-    train_files = expand_inputs(inputs)
-    if not train_files:
+    num_classes = (max(value_to_index.values()) + 1) if value_to_index else 0
+    input_files = expand_inputs(inputs)
+    if not input_files:
         raise FileNotFoundError(f"No supported point-cloud files in {inputs}")
-    if val_inputs:
-        strategy = "provided"
-        val_files = expand_inputs(val_inputs)
-        if not val_files:
-            raise FileNotFoundError(f"No supported point-cloud files in {val_inputs}")
-    else:
-        strategy = resolve_strategy(split.strategy, len(train_files))
-        val_files = None
-    say(f"source: {len(train_files)} file(s), split strategy = {strategy}")
+    val_files = expand_inputs(val_inputs) if val_inputs else None
+    test_files = expand_inputs(test_inputs) if test_inputs else None
+    if val_inputs and not val_files:
+        raise FileNotFoundError(f"No supported point-cloud files in {val_inputs}")
+    if test_inputs and not test_files:
+        raise FileNotFoundError(f"No supported point-cloud files in {test_inputs}")
+    strategy = "provided" if (val_files or test_files) else "auto"
+    say(f"source: {len(input_files)} file(s); split={split.mode} "
+        f"val={split.val_frac:.0%} test={split.test_frac:.0%} seed={split.seed}"
+        + (" (+ explicit folders)" if strategy == "provided" else ""))
 
     if compute_hag:
         from . import pretrain
         if pretrain.pdal_available():
-            say("computing per-tile HeightAboveGround inline (PDAL SMRF -> hag) …")
+            say("computing HeightAboveGround inline (PDAL SMRF -> hag) …")
         else:
-            say("⚠ HAG requested but PDAL isn't installed — tiles written without it.")
+            say("⚠ HAG requested but PDAL isn't installed — written without it.")
             compute_hag = False
-    scene_stats = _plan_and_convert(train_files, val_files, strategy, split, spec,
-                                    value_to_index, out_root, intensity_norm, say,
-                                    compute_hag=compute_hag, skip_ground=skip_ground,
-                                    hag_filter=hag_filter)
-    if not scene_stats["train"] or not scene_stats["val"]:
-        raise ValueError("Conversion produced an empty train or val split — check "
-                         "the split settings or supply an explicit val folder.")
+    scene_stats = _plan_and_convert(input_files, val_files, test_files, split, spec,
+                                    value_to_index, num_classes, out_root,
+                                    intensity_norm, say, compute_hag=compute_hag,
+                                    skip_ground=skip_ground, hag_filter=hag_filter)
+    for sp in _SPLITS:
+        if not scene_stats[sp]:
+            raise ValueError(f"Conversion produced an empty {sp} split — lower the "
+                             f"val/test fractions, add more data, or supply explicit folders.")
 
     splits = {sp: {"scenes": [s["scene"] for s in scene_stats[sp]],
-                   "total_points": sum(s["n_points"] for s in scene_stats[sp])}
-              for sp in ("train", "val")}
+                   "total_points": sum(s["n_points"] for s in scene_stats[sp]),
+                   "per_class": {str(i): sum(s["class_counts"].get(i, 0)
+                                             for s in scene_stats[sp])
+                                 for i in range(num_classes)}}
+              for sp in _SPLITS}
 
-    all_stats = scene_stats["train"] + scene_stats["val"]
+    all_stats = [s for sp in _SPLITS for s in scene_stats[sp]]
     total_pts = sum(s["n_points"] for s in all_stats)
     total_area = sum(s["area_m2"] for s in all_stats)
     density = total_pts / max(total_area, 1.0)
     spacing = (total_area / max(total_pts, 1)) ** 0.5
     for c in classes:
-        c["train_count"] = sum(s["class_counts"].get(int(c["index"]), 0)
-                               for s in scene_stats["train"])
-        c["val_count"] = sum(s["class_counts"].get(int(c["index"]), 0)
-                             for s in scene_stats["val"])
+        for sp in _SPLITS:
+            c[f"{sp}_count"] = sum(s["class_counts"].get(int(c["index"]), 0)
+                                   for s in scene_stats[sp])
 
     # Several source values may be combined into one class (same index/name), so
     # the number of classes is the count of UNIQUE indices, not table rows.
@@ -421,8 +598,9 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
         i = int(c["index"])
         e = by_index.get(i)
         if e is None:
-            by_index[i] = {"index": i, "name": c["name"], "source_values": [int(c["source_value"])],
-                           "train_count": int(c["train_count"]), "val_count": int(c["val_count"])}
+            by_index[i] = {"index": i, "name": c["name"],
+                           "source_values": [int(c["source_value"])],
+                           **{f"{sp}_count": int(c[f"{sp}_count"]) for sp in _SPLITS}}
         else:
             e["source_values"].append(int(c["source_value"]))
     classes = [by_index[i] for i in sorted(by_index)]
@@ -439,14 +617,14 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
                               if s["intensity_raw_max"] is not None},
     }
     meta = {
-        "schema_version": 1,
+        "schema_version": 2,
         "name": name,
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "source": {
             "inputs": [str(p) for p in (inputs if isinstance(inputs, (list, tuple)) else [inputs])],
             "val_inputs": [str(p) for p in (val_inputs or [])],
+            "test_inputs": [str(p) for p in (test_inputs or [])],
             "split_strategy": strategy,
-            "val_ratio": split.val_ratio, "split_seed": split.seed,
             "label_kind": spec.kind if spec else None,
             "label_field": spec.field if spec else "",
             "truth_dir": spec.truth_dir if spec else "",
@@ -454,6 +632,16 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
             "hag_source": (("per_tile_smrf" if compute_hag else "source_dimension")
                            if all(s["has_hag"] for s in all_stats) else ""),
             "ignore_values": [int(v) for v in ignore_values],
+        },
+        "split": {
+            "mode": split.mode,
+            "seed": int(split.seed),
+            "seam_buffer_m": float(split.seam_buffer_m),
+            "atom_unit": "scene" if (len(input_files) > 1 or strategy == "provided") else "tile",
+            "requested": {"train": round(1.0 - split.val_frac - split.test_frac, 4),
+                          "val": split.val_frac, "test": split.test_frac},
+            "achieved": {sp: round(splits[sp]["total_points"] / max(total_pts, 1), 4)
+                         for sp in _SPLITS},
         },
         "classes": classes,
         "num_classes": len(idx_to_name),
@@ -477,9 +665,9 @@ def convert_infer_job(job_id: str, input_dir: str, staging_root: Path, progress=
                       intensity_norm: str = "p95", hag: bool = False) -> Path:
     """Label-less conversion for inference-only jobs -> <staging>/_infer/<job_id>/.
 
-    intensity_norm MUST match what the weights were trained with (max -> [0,1] for
-    canonical --dataset runs; p95 -> [0,2] for the IEEE scripts) — a mismatch feeds
-    the net out-of-distribution intensity and tanks accuracy for every checkpoint.
+    intensity_norm MUST match what the weights were trained with (max -> [0,1], or
+    p95 -> [0,2] for weights trained that way) — a mismatch feeds the net
+    out-of-distribution intensity and tanks accuracy for every checkpoint.
     `hag=True` (for *_hag weights trained on real PDAL HeightAboveGround) computes a
     per-point "hag" channel via SMRF->hag_nn when PDAL is available, so inference
     reproduces the trained feature instead of a z-min proxy; falls back to the proxy
@@ -526,7 +714,7 @@ def add_hag_to_dataset(src_dir, out_dir, *, skip_ground: bool = False,
                        hag_filter: str = "hag_nn", progress=None) -> Path:
     """Add a per-tile HeightAboveGround channel to an already-converted dataset.
 
-    Reads each train|val/*.npz, recomputes HAG with PDAL (SMRF -> hag) on the
+    Reads each train|val|test/*.npz, recomputes HAG with PDAL (SMRF -> hag) on the
     tile's OWN points (the inference twin pretrain.hag_for_cloud, kept in RAM),
     and writes a sibling dataset with a `hag` key added to every tile. Returns
     out_dir.
@@ -548,7 +736,7 @@ def add_hag_to_dataset(src_dir, out_dir, *, skip_ground: bool = False,
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
 
     n_tiles = n_hag = 0
-    for split in ("train", "val"):
+    for split in ("train", "val", "test"):
         sdir = src_dir / split
         if not sdir.is_dir():
             continue
@@ -574,7 +762,7 @@ def add_hag_to_dataset(src_dir, out_dir, *, skip_ground: bool = False,
             say(f"  {split}/{npz_path.name}: "
                 f"{'HAG' if 'hag' in data else 'proxy'} ({cloud.n:,} pts)")
     if n_tiles == 0:
-        raise ValueError(f"No npz tiles under {src_dir}/train|val — convert the dataset first.")
+        raise ValueError(f"No npz tiles under {src_dir}/train|val|test — convert the dataset first.")
 
     meta["name"] = sanitize_name(out_dir.name)
     meta["has_hag"] = (n_hag == n_tiles)
@@ -590,40 +778,79 @@ def add_hag_to_dataset(src_dir, out_dir, *, skip_ground: bool = False,
 # --------------------------------------------------------------------- self-check
 
 def _selfcheck():
-    """Synthesize labeled clouds and assert the splits partition the points with no
-    leakage and no tiling (the dataset layer only splits; scripts tile)."""
+    """Assert the 3-way allocator hits point-count targets, mirrors the class mix,
+    and that single-cloud (holey, seam-buffered) and folder (whole-scene) builds
+    materialize three disjoint, non-empty splits."""
     import tempfile
 
+    # allocator: balanced mode hits point targets and spreads a rare class
+    C = 3
+    pts = [1000] * 7 + [400, 400, 400]       # 10 atoms
+    hist = np.zeros((10, C), dtype=np.int64)
+    for i in range(7):
+        hist[i, 0] = 700; hist[i, 1] = 300
+    hist[7, 2] = hist[8, 2] = hist[9, 2] = 400   # rare class: one carrier per split
+    a = allocate_splits(pts, hist, 0.2, 0.2, "balanced", 42)
+    assert set(a.tolist()) == {0, 1, 2}, "all three splits used"
+    got = np.zeros((3, C))
+    for i, s in enumerate(a):
+        got[s] += hist[i]
+    for s in range(3):
+        assert got[s, 2] > 0, "rare class present in every split (presence guarantee)"
+    tot = sum(pts)
+    train_frac = sum(pts[i] for i in range(10) if a[i] == 0) / tot
+    assert 0.45 <= train_frac <= 0.75, f"train point-frac ~0.6, got {train_frac:.2f}"
+    # random mode: no crash, all assigned, three splits non-empty for these sizes
+    ar = allocate_splits(pts, hist, 0.2, 0.2, "random", 1)
+    assert (ar >= 0).all() and set(ar.tolist()) == {0, 1, 2}
+
     rng = np.random.RandomState(0)
-    n = 20000
+    n = 40000
     xyz = rng.uniform(0, 100, size=(n, 3)).astype(np.float64)
     cls = rng.randint(0, 3, size=n).astype(np.float64)
+    classes = [{"index": i, "source_value": i, "name": f"c{i}"} for i in range(3)]
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
+        # single cloud -> 3 holey clouds (tile-measure + seam buffer, points only removed)
         np.savez(td / "scene.npz", xyz=xyz, classification=cls)
-        classes = [{"index": i, "source_value": i, "name": f"c{i}"} for i in range(3)]
-        # single cloud -> ONE spatial train/val cut (not a grid of tiles)
         out = convert_dataset("selftest", td / "scene.npz",
                               LabelSpec(kind="field", field="classification"),
-                              classes, [], td / "staging",
-                              split=SplitConfig(strategy="spatial"))
+                              [dict(c) for c in classes], [], td / "staging",
+                              split=SplitConfig(val_frac=0.2, test_frac=0.2,
+                                                seam_buffer_m=1.0, tile_m=20.0))
         meta = json.loads((out / "dataset_meta.json").read_text())
-        tr, va = meta["splits"]["train"], meta["splits"]["val"]
-        assert len(tr["scenes"]) == 1 and len(va["scenes"]) == 1, "spatial = one train + one val"
-        assert tr["total_points"] + va["total_points"] == n, "points must be conserved"
-        # scene-split path: whole files, no tiling, no file spans both splits
-        multi = td / "multi"
-        multi.mkdir()
-        for k in range(3):
+        assert meta["schema_version"] == 2 and "split" in meta
+        assert set(meta["splits"]) == set(_SPLITS)
+        for sp in _SPLITS:
+            assert meta["splits"][sp]["scenes"], f"{sp} non-empty"
+            assert list((out / sp).glob("*.npz")), f"{sp}/ materialized"
+            assert all(f"{sp}_count" in c for c in meta["classes"])
+        kept = sum(meta["splits"][sp]["total_points"] for sp in _SPLITS)
+        assert kept <= n, "seam buffer only removes points"
+        assert kept >= 0.5 * n, "seam buffer must not delete most points"
+        # folder of clouds -> whole-scene 3-way; no scene in two splits; pool cleaned
+        multi = td / "multi"; multi.mkdir()
+        for k in range(9):
             np.savez(multi / f"s{k}.npz", xyz=xyz, classification=cls)
         out2 = convert_dataset("selftest2", multi, LabelSpec(field="classification"),
-                               classes, [], td / "staging",
-                               split=SplitConfig(strategy="scene"))
+                               [dict(c) for c in classes], [], td / "staging",
+                               split=SplitConfig(val_frac=0.2, test_frac=0.2))
         m2 = json.loads((out2 / "dataset_meta.json").read_text())
-        tr2, va2 = m2["splits"]["train"]["scenes"], m2["splits"]["val"]["scenes"]
-        assert tr2 and va2, "both splits must be non-empty"
-        assert len(tr2) + len(va2) == 3, "scene-split keeps whole scenes (no tiling)"
-        assert not (set(tr2) & set(va2)), "no scene may be in both splits"
+        names = {sp: set(m2["splits"][sp]["scenes"]) for sp in _SPLITS}
+        union = set().union(*names.values())
+        assert len(union) == 9 and sum(len(names[sp]) for sp in _SPLITS) == 9, \
+            "every scene assigned exactly once"
+        assert not (out2 / "_pool").exists(), "pool dir cleaned up"
+        # provided val folder -> test allocated from inputs
+        vdir = td / "vprov"; vdir.mkdir()
+        np.savez(vdir / "v0.npz", xyz=xyz, classification=cls)
+        out3 = convert_dataset("selftest3", multi, LabelSpec(field="classification"),
+                               [dict(c) for c in classes], [], td / "staging",
+                               val_inputs=[str(vdir)],
+                               split=SplitConfig(val_frac=0.2, test_frac=0.2))
+        m3 = json.loads((out3 / "dataset_meta.json").read_text())
+        assert m3["source"]["split_strategy"] == "provided"
+        assert m3["splits"]["val"]["scenes"] == ["v0.npz"] and m3["splits"]["test"]["scenes"]
     print("dataset self-check OK")
 
 

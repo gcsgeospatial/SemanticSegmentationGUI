@@ -7,7 +7,6 @@ the paths the trainer reads:
     /workspace  <- repo root (runs scripts/local/local_train_*.py from here)
     /datasets   <- staging root (canonical datasets + _infer/<job> live here)
     /outputs    <- the chosen output folder (training writes runs/<id>/..., weights read here)
-    /data       <- raw IEEE data (only the built-in no-`--dataset` path needs it)
 
 No upload/download: the data is already on the host, and predictions/checkpoints
 land straight back in the bind-mounted host dirs. Returns (program, args) for
@@ -133,8 +132,6 @@ def _mounts(cfg: dict, repo_root: str, extra_mounts, outputs_root: str = "") -> 
     m = ["-v", f"{_posix(repo_root)}:/workspace",
          "-v", f"{_posix(cfg['datasets_root'])}:/datasets",
          "-v", f"{_posix(outputs_root or cfg['outputs_root'])}:/outputs"]
-    if cfg.get("data_root"):
-        m += ["-v", f"{_posix(cfg['data_root'])}:/data"]
     for host, container in (extra_mounts or []):
         m += ["-v", f"{_posix(host)}:{container}"]
     return m

@@ -97,7 +97,7 @@ def write_run_manifest(run_dir, backbone, dataset=None, weights="final_model.pth
                 rc = json.load(f)
         except (OSError, ValueError):
             rc = {}
-    inorm = "p95"   # the IEEE scripts normalize intensity to p95; canonical = dataset's
+    inorm = "p95"   # default; overridden below by the dataset's recorded intensity_norm
     if dataset:
         mp = f"/datasets/{dataset}/dataset_meta.json"
         try:
@@ -118,7 +118,6 @@ def write_run_manifest(run_dir, backbone, dataset=None, weights="final_model.pth
         "feature_mode": "hag" if "hag" in backbone else "native",
         "hag_source": rc.get("hag_source"),
         # model-specific extras (absent/None when a backbone doesn't use them):
-        "label_map_asprs_to_index": rc.get("label_map_asprs_to_index"),  # ASPRS remap / IEEE flag
         "num_points": rc.get("num_points"),                              # RandLA sample size
         # density-generalization settings baked into the weights. `logdk` changes the
         # model input width, so inference MUST re-set DG_LOGDK_FEAT/_K to rebuild and
@@ -149,8 +148,7 @@ def infer_meta(weights_path):
         except (OSError, ValueError):
             return None
         return {k: m.get(k) for k in ("num_classes", "class_names", "grid", "chunk_xy",
-                                      "hag_source", "label_map_asprs_to_index", "num_points",
-                                      "dg")}
+                                      "hag_source", "num_points", "dg")}
     if os.path.exists(rc_path):
         try:
             with open(rc_path, encoding="utf-8") as f:
@@ -163,7 +161,6 @@ def infer_meta(weights_path):
             "grid": rc.get("grid_size", rc.get("grid_m", rc.get("sub_grid_size"))),
             "chunk_xy": rc.get("chunk_xy", rc.get("chunk_xy_m")),
             "hag_source": rc.get("hag_source"),
-            "label_map_asprs_to_index": rc.get("label_map_asprs_to_index"),
             "num_points": rc.get("num_points"),
         }
     return None

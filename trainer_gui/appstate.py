@@ -87,7 +87,6 @@ _DEFAULT_LOCAL_CONFIG = {
     "registry": "",        # registry prefix, e.g. "ghcr.io/you" -> pull instead of build
     "datasets_root": "",   # host -> /datasets (default: staging_dir())
     "outputs_root": "",    # host -> /outputs  (default: local_runs_dir())
-    "data_root": "",       # host -> /data     (built-in IEEE raw data; optional)
     "gpus": "all",         # docker --gpus value ("all" | "0" | "" to disable)
     "extra_args": [],      # extra `docker run` args
 }
@@ -169,41 +168,14 @@ def put(key: str, value: Any) -> None:
 
 # ---- datasets registry: name -> {meta_path, staged_dir, uploaded: bool} ----
 
-# Built-in datasets that already live on the ieee-data Modal volume. The IEEE
-# training scripts read them via their no-`--dataset` default (real data, real
-# per-point HAG for the HAG variants). These are virtual registry entries — never
-# written to state.json, so they always appear and can't be forgotten. `builtin`
-# makes the Train page skip `--dataset` (run that default); `backbones` restricts
-# the model list to the scripts whose default path actually targets this data.
-BUILTIN_DATASETS = {
-    "IEEE": {
-        "builtin": True, "uploaded": True, "meta_path": "",
-        "backbones": ["ptv3", "randlanet", "kpconvx_cold"],
-        "note": "Raw IEEE GRSS 2019 Track 4 (ieee-data volume) — the scripts' "
-                "default. 5 classes: Ground/Trees/Building/Water/Bridge.",
-    },
-    "IEEE HAG": {
-        "builtin": True, "uploaded": True, "meta_path": "",
-        "backbones": ["ptv3_hag", "randlanet_hag", "kpconvx_cold_hag"],
-        "note": "Raw IEEE Track 4 + real per-point HeightAboveGround "
-                "(ieee-data:/IEEE/HAG) — trains the HAG model variants.",
-    },
-}
-
-
 def known_datasets() -> dict:
-    # Builtins last so the reserved IEEE names always resolve to the builtin entry.
-    return {**get("datasets", {}), **BUILTIN_DATASETS}
+    return get("datasets", {})
 
 
 def selectable_datasets() -> dict:
-    """Datasets offered for a job. Built-ins read raw IEEE data from a remote
-    /data volume the local backend doesn't provision, so they're hidden in local
-    mode — convert your own dataset on the Datasets page instead."""
-    ds = known_datasets()
-    if get_exec_mode() == "local":
-        return {k: v for k, v in ds.items() if not v.get("builtin")}
-    return ds
+    """Datasets offered for a job — the saved registry (every dataset is converted
+    on the Datasets page, so all of them are selectable)."""
+    return known_datasets()
 
 
 def remember_dataset(name: str, info: dict) -> None:
@@ -218,18 +190,21 @@ def forget_dataset(name: str) -> None:
     put("datasets", ds)
 
 
-# ---- per-dataset density-generalization config (Datasets page "Advanced" panel) ----
-# Kept in its own state key (not the dataset registry entry) so it works for the
-# built-in IEEE datasets too and never collides with the registry write path.
-
-def get_dg_config(name: str) -> dict:
-    return get("dg_config", {}).get(name, {})
-
-
-def set_dg_config(name: str, cfg: dict) -> None:
-    allc = get("dg_config", {})
-    if cfg:
-        allc[name] = cfg
-    else:
-        allc.pop(name, None)
-    put("dg_config", allc)
+def delete_dataset(name: str) -> None:
+    """Forget a saved dataset AND delete its staged copy on disk, plus any per-
+    dataset overrides keyed by name. Best-effort: a missing/empty staged_dir or a
+    failed rmtree is ignored so the registry entry still goes away. Never touches a
+    builtin (none remain, but guard anyway)."""
+    info = known_datasets().get(name, {})
+    if info.get("builtin"):
+        return
+    staged = info.get("staged_dir", "")
+    if staged and os.path.isdir(staged):
+        import shutil
+        shutil.rmtree(staged, ignore_errors=True)
+    forget_dataset(name)
+    for key in ("dg_config", "palette_overrides", "palette_name_overrides"):
+        allc = get(key, {})
+        if name in allc:
+            allc.pop(name, None)
+            put(key, allc)

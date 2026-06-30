@@ -80,9 +80,11 @@ def main():
     tmp = Path(tempfile.mkdtemp(prefix="trainer_gui_smoke_"))
     print(f"workdir: {tmp}")
     try:
-        # ---------------- LAZ dataset with field labels (ASPRS-ish: 0 ignored)
+        # ---------------- LAZ dataset with field labels (value 0 ignored)
+        # Provide explicit val + test folders so the three materialized splits are
+        # deterministic (train keeps scene0/scene1; val + test come verbatim).
         laz_root = tmp / "laz_src"
-        for split, k in (("train", 2), ("val", 1)):
+        for split, k in (("train", 2), ("val", 1), ("test", 1)):
             d = laz_root / split
             d.mkdir(parents=True)
             for i in range(k):
@@ -101,7 +103,8 @@ def main():
                    {"index": 2, "source_value": 6, "name": "Building"}]
         staged = dataset.convert_dataset("laz_demo", str(laz_root / "train"), spec, classes,
                                          [0], tmp / "staging",
-                                         val_inputs=[str(laz_root / "val")], progress=print)
+                                         val_inputs=[str(laz_root / "val")],
+                                         test_inputs=[str(laz_root / "test")], progress=print)
         z = np.load(staged / "train" / "scene0.npz")
         check("laz npz: keys", {"xyz", "label", "rgb", "intensity"}.issubset(z.files))
         check("laz npz: xyz f32 (N,3)", z["xyz"].dtype == np.float32 and z["xyz"].shape[1] == 3)
@@ -113,7 +116,16 @@ def main():
         meta = json.loads((staged / "dataset_meta.json").read_text())
         check("meta: num_classes 3", meta["num_classes"] == 3)
         check("meta: class names ordered", meta["class_names"] == ["Ground", "Veg", "Building"])
-        check("meta: counts populated", meta["classes"][0]["train_count"] > 0)
+        check("meta: schema v2 + split block",
+              meta["schema_version"] == 2
+              and {"mode", "seed", "requested", "achieved"} <= set(meta.get("split", {})))
+        check("meta: three materialized splits (train/val/test)",
+              set(meta["splits"]) == {"train", "val", "test"}
+              and all(meta["splits"][sp]["scenes"] for sp in ("train", "val", "test"))
+              and all(sorted((staged / sp).glob("*.npz")) for sp in ("train", "val", "test")))
+        check("meta: per-class train/val/test counts populated",
+              meta["classes"][0]["train_count"] > 0
+              and all(f"{sp}_count" in meta["classes"][0] for sp in ("train", "val", "test")))
         check("meta: recommendations for all backbones",
               "ptv3" in meta["recommendations"] and "kpconvx_cold" in meta["recommendations"])
         grid = meta["recommendations"]["ptv3"]["grid"]
@@ -122,29 +134,49 @@ def main():
         check("meta: kpconvx grid clamped to its band",
               0.5 <= meta["recommendations"]["kpconvx_cold"]["grid"] <= 3.0)
 
-        # ---------------- scene split: a folder of clouds is kept WHOLE (no tiling),
-        # whole files held out to train/val (the scripts tile for their own model)
+        # ---------------- scene split: a folder of clouds is split by WHOLE scenes
+        # (no tiling) into three disjoint train/val/test folders.
+        sc_src = tmp / "scene_src"
+        sc_src.mkdir()
+        for i in range(3):
+            xyz = make_xyz()
+            labels = RNG.choice([0, 2, 5, 6], len(xyz), p=[0.1, 0.5, 0.3, 0.1])
+            write_laz(sc_src / f"region{i}.laz", xyz, labels, RNG.uniform(0, 4000, len(xyz)))
         staged_sc = dataset.convert_dataset(
-            "laz_scene", str(laz_root / "train"), spec, classes, [0], tmp / "staging",
-            split=dataset.SplitConfig(strategy="scene"))
+            "laz_scene", str(sc_src), spec, classes, [0], tmp / "staging",
+            split=dataset.SplitConfig(val_frac=0.34, test_frac=0.33, mode="random", seed=42))
         msc = json.loads((staged_sc / "dataset_meta.json").read_text())
-        tr_sc, va_sc = msc["splits"]["train"]["scenes"], msc["splits"]["val"]["scenes"]
+        tr_sc = msc["splits"]["train"]["scenes"]
+        va_sc = msc["splits"]["val"]["scenes"]
+        te_sc = msc["splits"]["test"]["scenes"]
         check("scene-split: whole scenes, no tiling (one npz per source file)",
-              len(tr_sc) + len(va_sc) == 2 and bool(tr_sc) and bool(va_sc))
-        check("scene-split: no scene in both train and val (leak-free)",
-              not (set(tr_sc) & set(va_sc)))
+              len(tr_sc) + len(va_sc) + len(te_sc) == 3
+              and bool(tr_sc) and bool(va_sc) and bool(te_sc))
+        check("scene-split: no scene shared across splits (leak-free)",
+              not (set(tr_sc) & set(va_sc)) and not (set(tr_sc) & set(te_sc))
+              and not (set(va_sc) & set(te_sc)))
+        check("scene-split: meta records split mode + seed",
+              msc["split"]["mode"] == "random" and msc["split"]["seed"] == 42)
 
-        # ---------------- spatial split: one cloud -> ONE train + ONE val region (no grid)
+        # ---------------- single-cloud split: one cloud is tile-measured and
+        # reassembled into three holey train/val/test clouds (seam_buffer=0 here so
+        # points are conserved; a positive buffer would drop a seam to limit leakage).
         staged_sp = dataset.convert_dataset(
             "laz_spatial", str(laz_root / "train" / "scene0.laz"), spec, classes, [0],
-            tmp / "staging", split=dataset.SplitConfig(strategy="spatial"))
+            tmp / "staging", split=dataset.SplitConfig(val_frac=0.3, test_frac=0.3,
+                                                       mode="random", seed=42,
+                                                       seam_buffer_m=0.0, tile_m=20.0))
         msp = json.loads((staged_sp / "dataset_meta.json").read_text())
-        nt = len(msp["splits"]["train"]["scenes"]); nv = len(msp["splits"]["val"]["scenes"])
-        check("spatial-split: single cloud -> 1 train + 1 val region (not a grid)",
-              nt == 1 and nv == 1)
-        check("spatial-split: points conserved across the cut (20k in -> 20k out)",
+        nt = len(msp["splits"]["train"]["scenes"])
+        nv = len(msp["splits"]["val"]["scenes"])
+        nte = len(msp["splits"]["test"]["scenes"])
+        check("single-cloud split: one holey cloud per split (train/val/test)",
+              nt == 1 and nv == 1 and nte == 1)
+        check("single-cloud split: points conserved (seam_buffer=0 -> 20k in -> 20k out)",
               msp["splits"]["train"]["total_points"]
-              + msp["splits"]["val"]["total_points"] == 20_000)
+              + msp["splits"]["val"]["total_points"]
+              + msp["splits"]["test"]["total_points"] == 20_000)
+        check("single-cloud split: meta marks tile atoms", msp["split"]["atom_unit"] == "tile")
 
         # ---------------- PLY dataset with field labels
         ply_root = tmp / "ply_src"
@@ -160,11 +192,11 @@ def main():
         staged_ply = dataset.convert_dataset("ply_demo", str(ply_root / "train"), spec_ply,
                                              classes_ply, [], tmp / "staging",
                                              val_inputs=[str(ply_root / "val")])
-        zp = np.load(staged_ply / "train" / "tile0.npz")
+        zp = np.load(sorted((staged_ply / "train").glob("*.npz"))[0])
         check("ply npz: rgb present u8", zp["rgb"].dtype == np.uint8)
         check("ply npz: all labels mapped", set(np.unique(zp["label"])) == {0, 1, 2})
 
-        # ---------------- ASCII dataset with companion label files (IEEE layout)
+        # ---------------- ASCII dataset with companion label files (per-scene)
         txt_root = tmp / "txt_src"
         truth = txt_root / "truth"
         truth.mkdir(parents=True)
@@ -185,7 +217,7 @@ def main():
         staged_txt = dataset.convert_dataset("txt_demo", str(txt_root / "train"), spec_txt,
                                              classes_txt, [0], tmp / "staging",
                                              val_inputs=[str(txt_root / "val")])
-        zt = np.load(staged_txt / "train" / "JAX_train0_PC3.npz")
+        zt = np.load(sorted((staged_txt / "train").glob("*.npz"))[0])
         check("ascii npz: intensity + return_number captured",
               "intensity" in zt.files and "return_number" in zt.files)
 
@@ -194,20 +226,12 @@ def main():
         zi = np.load(job / "scenes" / "JAX_val0_PC3.npz")
         check("infer npz: no label key", "label" not in zi.files)
         check("infer: job_meta written", (job / "job_meta.json").exists())
-        check("infer npz: p95 intensity clipped to [0,2] (matches IEEE training)",
+        check("infer npz: p95 intensity clipped to [0,2]",
               0.0 <= zi["intensity"].min() and zi["intensity"].max() <= 2.0)
 
-        # ---------------- built-in IEEE / IEEE HAG known datasets
+        # ---------------- backbones + appstate (imports used below)
         from trainer_gui import appstate
         from trainer_gui.backbones import BACKBONES, infer_backbones
-        kd = appstate.known_datasets()
-        check("appstate: IEEE + IEEE HAG are built-in known datasets",
-              kd.get("IEEE", {}).get("builtin") is True
-              and kd.get("IEEE HAG", {}).get("backbones")
-                  == ["ptv3_hag", "randlanet_hag", "kpconvx_cold_hag"])
-        check("appstate: built-in dataset backbones all exist + are trainable",
-              all(k in BACKBONES and BACKBONES[k].ready
-                  for ds in ("IEEE", "IEEE HAG") for k in kd[ds]["backbones"]))
 
         # intensity normalization modes differ: p95 scales hotter than max
         one = dataset.discover_scenes(txt_root / "val")[0]
@@ -219,7 +243,7 @@ def main():
               ip95.max() >= imax.max() and ip95.max() <= 2.0)
 
         # ---------------- backbones: infer-readiness contracts
-        check("backbones: folder-infer set = the 6 IEEE cold/hag scripts",
+        check("backbones: folder-infer set = the 6 cold/hag scripts",
               set(infer_backbones()) == {"ptv3", "randlanet", "ptv3_hag", "randlanet_hag",
                                          "kpconvx_cold", "kpconvx_cold_hag"})
         check("backbones: randlanet uses --sub-grid and has no --chunk-xy",
@@ -231,10 +255,10 @@ def main():
               BACKBONES["kpconvx_cold"].folder_infer and BACKBONES["kpconvx_cold"].ready
               and BACKBONES["kpconvx_cold_hag"].folder_infer
               and BACKBONES["kpconvx_cold_hag"].ready)
-        check("backbones: IEEE outputs volumes (not stale stpls3d)",
-              BACKBONES["ptv3"].outputs_volume == "ptv3-ieee-outputs"
-              and BACKBONES["randlanet"].outputs_volume == "randlanet-cold-ieee-outputs"
-              and BACKBONES["ptv3_hag"].outputs_volume == "ptv3-ieee-hag-outputs")
+        check("backbones: outputs volumes follow the renamed apps",
+              BACKBONES["ptv3"].outputs_volume == "ptv3-outputs"
+              and BACKBONES["randlanet"].outputs_volume == "randlanet-cold-outputs"
+              and BACKBONES["ptv3_hag"].outputs_volume == "ptv3-hag-outputs")
         check("backbones: each carries a recommended GPU + min VRAM (Train specs bar)",
               all(b.rec_gpu and b.min_vram_gb > 0 for b in BACKBONES.values())
               and BACKBONES["kpconvx_cold"].min_vram_gb >= BACKBONES["randlanet"].min_vram_gb)
@@ -306,7 +330,7 @@ def main():
         (run / "metrics.csv").write_text(
             "epoch,train_loss,train_iou\n0,0.90,0.30\n1,0.50,0.60\n", encoding="utf-8")
         (run / "run_config.json").write_text(json.dumps(
-            {"backbone": "PTv3", "dataset": "IEEE", "class_names": ["Ground", "Trees"]}),
+            {"backbone": "PTv3", "dataset": "demo", "class_names": ["Ground", "Trees"]}),
             encoding="utf-8")
         (run / "test_metrics.json").write_text(json.dumps(
             {"val": {"overall_mIoU": 0.55, "per_class_iou": {"Ground": 0.8, "Trees": 0.5}},
@@ -332,14 +356,16 @@ def main():
         # ---------------- local prep caches (live cold backbones: ptv3, randlanet)
         from trainer_gui import prep
 
-        # ptv3 (cold): rgb tiles, train + test only — the cold script picks its val
-        # holdout at tile level in-script, so prep writes no val dir.
+        # ptv3 (cold): rgb tiles. prep mirrors the dataset's three materialized
+        # splits verbatim (val = selection holdout, test = final report) — it does
+        # NOT re-derive its own val.
         pd = prep.prep_dataset("ptv3", staged, {"chunk-xy": 50.0}, progress=print)
         check("prep ptv3: dir name", pd.name == "ptv3_cold_chunk50")
         train_tiles = sorted((pd / "train").glob("*.npz"))
+        val_tiles = sorted((pd / "val").glob("*.npz"))
         test_tiles = sorted((pd / "test").glob("*.npz"))
-        check("prep ptv3: tiles in train + test", bool(train_tiles) and bool(test_tiles))
-        check("prep ptv3: no val dir (cold splits val at tile level)", not (pd / "val").exists())
+        check("prep ptv3: tiles in train + val + test",
+              bool(train_tiles) and bool(val_tiles) and bool(test_tiles))
         check("prep ptv3: cold tile keys (rgb layout)",
               set(np.load(train_tiles[0]).files) == {"xyz", "rgb", "lab"})
 
@@ -428,6 +454,8 @@ def main():
             zhd = np.load(hag_ds / "train" / "scene0.npz")
             check("dataset: add_hag_to_dataset adds a per-tile hag channel",
                   "hag" in zhd.files and zhd["hag"].shape[0] == zhd["xyz"].shape[0])
+            check("dataset: add_hag covers the test split too",
+                  "hag" in np.load(hag_ds / "test" / "scene0.npz").files)
             mhd = json.loads((hag_ds / "dataset_meta.json").read_text())
             check("dataset: hag dataset meta tags per_tile source + keeps classes",
                   mhd["source"]["hag_source"] == "per_tile_smrf"
@@ -436,7 +464,8 @@ def main():
             # inline HAG: bake it during tiling in one pass (no separate reload)
             staged_ih = dataset.convert_dataset(
                 "laz_hag_inline", str(laz_root / "train"), spec, classes, [0], tmp / "staging",
-                val_inputs=[str(laz_root / "val")], compute_hag=True, progress=print)
+                val_inputs=[str(laz_root / "val")], test_inputs=[str(laz_root / "test")],
+                compute_hag=True, progress=print)
             zih = np.load(staged_ih / "train" / "scene0.npz")
             check("convert_dataset(compute_hag): tiles carry a hag channel inline",
                   "hag" in zih.files and zih["hag"].shape[0] == zih["xyz"].shape[0])
@@ -477,16 +506,17 @@ def main():
               and all(isinstance(lab, str) and len(col) == 3 for lab, col in key))
 
         # canonical dataset tile (xyz + label, -1=ignore) must colour by class too
+        from trainer_gui.palette import palette_for
         lbl_path = tmp / "scene_label.npz"
         lab = np.array([-1, 0, 1, 2, 0], np.int32)
         np.savez_compressed(lbl_path, xyz=make_xyz(5).astype(np.float32), label=lab)
         _, rgb_l, key_l = _load(lbl_path)
-        from trainer_gui.palette import IEEE_PALETTE
-        check("viewer: label npz colours by IEEE class, -1 stays grey",
+        pal3 = palette_for(3)
+        check("viewer: label npz colours by class, -1 stays grey",
               rgb_l is not None
-              and np.allclose(rgb_l[1], IEEE_PALETTE[0] / 255.0)
-              and np.allclose(rgb_l[0], 0.55)               # ignore -> grey
-              and [lab for lab, _ in key_l] == ["Ground", "Trees", "Building"])
+              and np.allclose(rgb_l[1], pal3[0] / 255.0)     # class 0 -> palette[0]
+              and np.allclose(rgb_l[0], 0.55)                # ignore -> grey
+              and len(key_l) == 3)
 
         # ---------------- existing repo prediction as a viewer fixture
         jax = Path(__file__).resolve().parents[2] / "JAX_066_pred.ply"
@@ -496,13 +526,13 @@ def main():
                   len(xyz2) > 0 and rgb2 is not None)
 
         # ---------------- ground-truth comparison (error map)
-        from trainer_gui import palette
+        from trainer_gui.palette import class_from_rgb, palette_for
         from trainer_gui.viewer import compare_clouds, error_colors
+        # class_from_rgb losslessly inverts the categorical palette used to colour
+        # prediction PLYs (so a class-coloured cloud decodes back to class indices).
         cls = np.array([0, 1, 2, 3, 4, 0, 2], np.int64)
-        check("palette: class_from_rgb inverts IEEE_PALETTE colors",
-              list(palette.class_from_rgb(palette.IEEE_PALETTE[cls])) == list(cls))
-        check("palette: asprs_to_index maps codes + 0->unlabeled",
-              list(palette.asprs_to_index(np.array([2, 5, 6, 9, 17, 0]))) == [0, 1, 2, 3, 4, -1])
+        check("palette: class_from_rgb inverts palette_for colours",
+              list(class_from_rgb(palette_for(5)[cls])) == list(cls))
         ec = error_colors(np.array([0, 1, 2, 3]), np.array([0, 2, 2, -1]))
         check("viewer: error_colors yellow on mismatch, grey on correct + no-GT",
               tuple(ec[1]) == (1.0, 1.0, 0.0)        # wrong -> yellow
@@ -517,33 +547,26 @@ def main():
               and ec_i[0][0] != ec_i[1][0]                   # wrong brightness varies w/ intensity
               and ec_i[2][2] > 0.0 and ec_i[3][2] > 0.0      # correct -> grey (has blue)
               and ec_i[2][0] != ec_i[3][0])                  # correct brightness varies
-        # end-to-end: synthetic IEEE prediction PLY (palette-coloured) + GT CLS.txt
+        # end-to-end: a palette-coloured prediction PLY vs a class-coloured .ply GT
         cmp = tmp / "cmp"
         cmp.mkdir()
-        ply_cls = np.array([0, 1, 2, 3, 4, 0, 2], np.int64)
-        arr = np.column_stack([make_xyz(7).astype(np.float32), palette.IEEE_PALETTE[ply_cls]])
+        pal5 = palette_for(5)
         hdr = ("ply\nformat ascii 1.0\nelement vertex 7\nproperty float x\nproperty float y\n"
                "property float z\nproperty uchar red\nproperty uchar green\n"
                "property uchar blue\nend_header")
-        np.savetxt(cmp / "JAX_900_pred.ply", arr, fmt=["%.3f"] * 3 + ["%d"] * 3,
-                   header=hdr, comments="")
-        np.savetxt(cmp / "JAX_900_CLS.txt", np.array([2, 5, 6, 9, 17, 2, 5]), fmt="%d")
-        _, vc, ckey = compare_clouds(cmp / "JAX_900_pred.ply", cmp)   # only pt 6 (pred 2 vs GT 1) differs
-        n_yellow = int((np.abs(vc - np.array([1.0, 1.0, 0.0])).sum(1) < 1e-9).sum())
-        check("viewer: compare_clouds flags exactly the mismatched point yellow", n_yellow == 1)
-        # GT can also be a class-coloured .ply (e.g. make_groundtruth_ply output)
-        gt_cls = palette.asprs_to_index(np.array([2, 5, 6, 9, 17, 2, 5]))   # -> [0,1,2,3,4,0,1]
-        np.savetxt(cmp / "JAX_900_gt.ply",
-                   np.column_stack([make_xyz(7).astype(np.float32), palette.IEEE_PALETTE[gt_cls]]),
+        pred_cls = np.array([0, 1, 2, 3, 4, 0, 2], np.int64)
+        np.savetxt(cmp / "scene900_pred.ply",
+                   np.column_stack([make_xyz(7).astype(np.float32), pal5[pred_cls]]),
                    fmt=["%.3f"] * 3 + ["%d"] * 3, header=hdr, comments="")
-        _, vc_ply, _ = compare_clouds(cmp / "JAX_900_pred.ply", cmp / "JAX_900_gt.ply")
-        check("viewer: compare accepts a class-coloured .ply ground truth",
+        gt_cls = np.array([0, 1, 2, 3, 4, 0, 1], np.int64)   # only pt 6 differs (pred 2 vs gt 1)
+        np.savetxt(cmp / "scene900_gt.ply",
+                   np.column_stack([make_xyz(7).astype(np.float32), pal5[gt_cls]]),
+                   fmt=["%.3f"] * 3 + ["%d"] * 3, header=hdr, comments="")
+        _, vc_ply, ckey = compare_clouds(cmp / "scene900_pred.ply", cmp / "scene900_gt.ply")
+        check("viewer: compare_clouds flags exactly the mismatched point yellow",
               int((np.abs(vc_ply - np.array([1.0, 1.0, 0.0])).sum(1) < 1e-9).sum()) == 1)
         check("viewer: compare key is just wrong (yellow) + correct (grey)",
               ckey == [("wrong prediction", (1.0, 1.0, 0.0)), ("correct", (0.55, 0.55, 0.55))])
-        from trainer_gui.viewer import _ieee_key
-        check("viewer: _ieee_key lists all 5 classes (Water + Bridge included)",
-              [n for n, _ in _ieee_key()] == ["Ground", "Trees", "Building", "Water", "Bridge"])
 
         # chosen-dataset palette (Inference menu): a prediction coloured with the
         # shared categorical palette is labelled with the picked class names, and a
@@ -664,15 +687,23 @@ def main():
         os.environ["APPDATA"] = str(tmp / "appdata_local")
         try:
             check("appstate: exec mode defaults to modal", appstate.get_exec_mode() == "modal")
-            check("appstate: modal mode offers built-in datasets",
-                  "IEEE" in appstate.selectable_datasets()
-                  and "IEEE HAG" in appstate.selectable_datasets())
             appstate.set_exec_mode("local")
             check("appstate: exec mode persists to local", appstate.get_exec_mode() == "local")
-            check("appstate: local mode hides built-in datasets (known_datasets still has them)",
-                  "IEEE" not in appstate.selectable_datasets()
-                  and "IEEE HAG" not in appstate.selectable_datasets()
-                  and "IEEE" in appstate.known_datasets())
+            check("appstate: selectable_datasets == the saved registry (no builtins)",
+                  appstate.selectable_datasets() == appstate.known_datasets())
+
+            # delete_dataset: forget a saved entry AND remove its staged copy on disk
+            del_dir = tmp / "to_delete_ds"
+            del_dir.mkdir()
+            (del_dir / "dataset_meta.json").write_text("{}", encoding="utf-8")
+            appstate.remember_dataset("to_delete", {"staged_dir": str(del_dir),
+                                                    "uploaded": False})
+            check("appstate: dataset registered before delete",
+                  "to_delete" in appstate.known_datasets())
+            appstate.delete_dataset("to_delete")
+            check("appstate: delete_dataset forgets the entry + deletes its staged dir",
+                  "to_delete" not in appstate.known_datasets() and not del_dir.exists())
+
             # Registry defaults to our GHCR org when never set (pulling works out
             # of the box); TT_REGISTRY/env or an explicit value override it.
             _saved_reg = os.environ.pop("TT_REGISTRY", None)

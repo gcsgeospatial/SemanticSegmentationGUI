@@ -28,6 +28,10 @@ from ..jobs import FuncWorker, JobRunner, LogParser
 
 PROJECT_DIR = str(Path(__file__).resolve().parents[2])
 
+# How many generic 'class i' names to show when neither the loaded run nor a
+# dataset supplies class names (the Auto source before a labelled file is opened).
+_FALLBACK_NUM_CLASSES = 5
+
 
 class InferPage(QWidget):
     def __init__(self, repo_root: str):
@@ -311,9 +315,9 @@ class InferPage(QWidget):
         opts = []
         if self._run_class_names:
             opts.append((f"The loaded run ({len(self._run_class_names)} classes)", "__run__"))
-        opts.append(("Auto (names in the file, else IEEE)", "__auto__"))
+        opts.append(("Auto (names in the file, else class i)", "__auto__"))
         for nm, info in sorted(appstate.known_datasets().items()):
-            if info.get("builtin") or os.path.exists(info.get("meta_path", "") or ""):
+            if os.path.exists(info.get("meta_path", "") or ""):
                 opts.append((nm, nm))
         return opts
 
@@ -324,22 +328,26 @@ class InferPage(QWidget):
         return k or ("__run__" if self._run_class_names else "__auto__")
 
     def _names_for_key(self, key: str) -> list:
-        """Base (un-renamed) class names for a source key."""
-        from ..palette import IEEE_CLASS_NAMES
+        """Base (un-renamed) class names for a source key. Falls back to generic
+        'class i' names when neither the run nor the dataset supplies any."""
+        from ..palette import generic_names
         if key == "__run__":
-            return list(self._run_class_names or IEEE_CLASS_NAMES)
+            return list(self._run_class_names or generic_names(_FALLBACK_NUM_CLASSES))
         if key in (None, "", "__auto__"):
-            return list(IEEE_CLASS_NAMES)
+            return generic_names(_FALLBACK_NUM_CLASSES)
         info = appstate.known_datasets().get(key, {})
-        if not info.get("builtin"):
-            mp = info.get("meta_path", "")
-            if mp and os.path.exists(mp):
-                try:
-                    with open(mp, "r", encoding="utf-8") as f:
-                        return list(json.load(f).get("class_names") or IEEE_CLASS_NAMES)
-                except (OSError, json.JSONDecodeError):
-                    pass
-        return list(IEEE_CLASS_NAMES)
+        mp = info.get("meta_path", "")
+        if mp and os.path.exists(mp):
+            try:
+                with open(mp, "r", encoding="utf-8") as f:
+                    meta = json.load(f)
+                if meta.get("class_names"):
+                    return list(meta["class_names"])
+                if meta.get("num_classes"):
+                    return generic_names(int(meta["num_classes"]))
+            except (OSError, json.JSONDecodeError):
+                pass
+        return generic_names(_FALLBACK_NUM_CLASSES)
 
     def _apply_name_overrides(self, key: str, base: list) -> list:
         ov = appstate.get("palette_name_overrides", {}).get(key)
@@ -897,12 +905,12 @@ class InferPage(QWidget):
             return None
         appstate.put("last_view_dir", str(Path(pred).parent))
         gt, _ = QFileDialog.getOpenFileName(
-            self, "Ground truth for this scene (.ply, .npz, or <scene>_CLS.txt)",
-            appstate.get("ieee_truth_file", ""),
-            "Ground truth (*.ply *.npz *.txt *.csv);;All files (*)")
+            self, "Ground truth for this scene (.ply or .npz)",
+            appstate.get("truth_file", ""),
+            "Ground truth (*.ply *.npz);;All files (*)")
         if not gt:
             return None
-        appstate.put("ieee_truth_file", gt)
+        appstate.put("truth_file", gt)
         return pred, gt
 
     def _compare_gt(self):

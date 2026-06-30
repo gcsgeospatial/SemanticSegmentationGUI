@@ -60,16 +60,10 @@ def recommend(meta: dict) -> dict:
     recs: dict[str, dict] = {}
     for key, b in BACKBONES.items():
         rec: dict[str, float] = {"chunk_xy": float(chunk)}
-        if b.grid_kind == "octree_depth":
-            grid = max(b.grid_mult * spacing, 0.01)
-            depth = math.ceil(math.log2(max(chunk / grid, 2.0)))
-            rec["octree_depth"] = int(min(max(depth, b.grid_clamp[0]), b.grid_clamp[1]))
-            est_cells = (chunk / grid) ** 2 * 0.25
-        else:
-            lo, hi = b.grid_clamp
-            grid = round(min(max(b.grid_mult * spacing, lo), hi), 2)
-            rec["grid"] = grid
-            est_cells = (chunk / grid) ** 2 * 0.25  # ~25% of 2D cells occupied
+        lo, hi = b.grid_clamp
+        grid = round(min(max(b.grid_mult * spacing, lo), hi), 2)
+        rec["grid"] = grid
+        est_cells = (chunk / grid) ** 2 * 0.25  # ~25% of 2D cells occupied
 
         batch_default = next((p.default for p in b.params if p.flag == "batch"), 4)
         rec["batch"] = int(max(1, batch_default // 2)) if est_cells > 120_000 else int(batch_default)
@@ -81,8 +75,8 @@ def warnings_for(meta: dict) -> list[str]:
     """Human-readable cautions shown next to the recommendations."""
     warns = []
     if not meta.get("has_rgb", False) and not meta.get("has_intensity", False):
-        warns.append("Dataset has neither RGB nor intensity — warm-started encoders "
-                     "expecting color/intensity inputs will run with degraded features.")
+        warns.append("Dataset has neither RGB nor intensity — models expecting "
+                     "color/intensity inputs will run with degraded features.")
     # Dedupe by class index: a combined class can appear once per source value in
     # older metas (same index, each carrying the full count), which would inflate
     # the total and warn about the class twice. Keep one entry per index.

@@ -2,9 +2,10 @@
 `docker run`, with live logs + epoch metrics.
 
 Modal is gone from this page — runs execute locally on your GPU. The dataset
-check verifies the train/val standard (a staged folder with train/ and val/ npz)
-rather than a remote volume. The per-model Docker image (present? pull it?) lives
-in a small popup that mirrors the selected model. Domain-generalization training
+check verifies the train/val/test standard (a staged folder with train/, val/
+and test/ npz) rather than a remote volume. The per-model Docker image (present?
+pull it?) lives in a small popup that mirrors the selected model.
+Domain-generalization training
 knobs are set per run here; inference-time DG (AdaBN/TTA) stays on the Infer page.
 """
 
@@ -42,7 +43,7 @@ class TrainPage(QWidget):
         self._pending: dict | None = None
         self._last_statuses: dict = {}         # key -> status dict from all_statuses
         self._cfg_dialog: QDialog | None = None  # the per-model popup, when open
-        self._ds_ready = False                 # train/val standard met for the selected dataset
+        self._ds_ready = False                 # train/val/test standard met for the selected dataset
 
         root = QVBoxLayout(self)
         title = QLabel("Train")
@@ -296,11 +297,9 @@ class TrainPage(QWidget):
         self._reload_backbones()
 
     def _local_split_status(self, info: dict):
-        """(text, role, ready) — verify the train/val standard locally instead of a
-        remote volume. Built-ins read raw data from /data, so they're trusted."""
-        if info.get("builtin"):
-            return ("Built-in IEEE — trains from /data/IEEE (set local_config data_root).",
-                    "muted", True)
+        """(text, role, ready) — verify the train/val/test standard locally instead
+        of a remote volume. val (in-distribution selection holdout) and test (final
+        report) are both launch-critical."""
         staged = info.get("staged_dir", "")
         if not staged or not os.path.isdir(staged):
             return ("No local copy on this machine — convert it on the Datasets page first.",
@@ -308,11 +307,12 @@ class TrainPage(QWidget):
         root = Path(staged)
         tr = list((root / "train").glob("*.npz")) if (root / "train").is_dir() else []
         va = list((root / "val").glob("*.npz")) if (root / "val").is_dir() else []
-        if not tr or not va:
-            return (f"train/val standard not met — train {len(tr)}, val {len(va)} tile(s). "
-                    f"Re-tile it on the Datasets page.", "warn", False)
-        return (f"✓ train/val standard met — {len(tr)} train / {len(va)} val tile(s).",
-                "ok", True)
+        te = list((root / "test").glob("*.npz")) if (root / "test").is_dir() else []
+        if not tr or not va or not te:
+            return (f"train/val/test standard not met — train {len(tr)}, val {len(va)}, "
+                    f"test {len(te)} scene(s). Re-build it on the Datasets page.", "warn", False)
+        return (f"✓ train/val/test standard met — {len(tr)} train / {len(va)} val / "
+                f"{len(te)} test scene(s).", "ok", True)
 
     def _set_ds_status(self, text: str, role: str = "muted"):
         theme.set_accent(self.ds_status, role)
@@ -336,16 +336,11 @@ class TrainPage(QWidget):
                 w.setEnabled(not on)
 
     def _reload_backbones(self):
-        """Populate the model dropdown. Built-in IEEE datasets restrict it to the
-        scripts whose no-`--dataset` default trains on that data; otherwise all."""
-        allowed = appstate.known_datasets().get(
-            self.dataset_combo.currentText(), {}).get("backbones")
+        """Populate the model dropdown with every backbone."""
         prev = self.backbone_combo.currentData()
         self.backbone_combo.blockSignals(True)
         self.backbone_combo.clear()
         for key, b in BACKBONES.items():
-            if allowed and key not in allowed:
-                continue
             self.backbone_combo.addItem(
                 b.label + ("" if b.ready else "  (script not wired yet)"), key)
         i = self.backbone_combo.findData(prev)
@@ -568,17 +563,15 @@ class TrainPage(QWidget):
             self._append("Create a dataset on the Datasets page first.")
             return
         if not self._ds_ready:
-            self._append("This dataset doesn't meet the train/val standard — fix it on the "
-                         "Datasets page before training.")
+            self._append("This dataset doesn't meet the train/val/test standard — fix it on "
+                         "the Datasets page before training.")
             return
         if self.runner.running:
             self._append("A training process is already running.")
             return
 
         info = appstate.known_datasets().get(name, {})
-        # Built-in IEEE datasets run the script's no-`--dataset` default (real data
-        # already on /data — real HAG for the HAG variants).
-        flags = {} if info.get("builtin") else {"dataset": name}
+        flags = {"dataset": name}
         for spec in b.params:
             flags[spec.flag] = self._param_widgets[spec.flag].value()
         if self.smoke_chk.isChecked():
@@ -607,17 +600,12 @@ class TrainPage(QWidget):
         os.makedirs(out_root, exist_ok=True)
         appstate.put("local_train_out", self.out_edit.text().strip())
         extra_mounts = []
-        if info.get("builtin"):
-            if not appstate.local_config().get("data_root"):
-                self._append("[local] ⚠ Built-in IEEE training reads /data/IEEE — set "
-                             "local_config['data_root'] (host → /data) or the run will fail.")
+        staged = info.get("staged_dir", "")
+        if staged and os.path.isdir(staged):
+            extra_mounts.append((staged, f"/datasets/{name}"))
         else:
-            staged = info.get("staged_dir", "")
-            if staged and os.path.isdir(staged):
-                extra_mounts.append((staged, f"/datasets/{name}"))
-            else:
-                self._append(f"[local] ⚠ No local staged copy of '{name}' on this machine — "
-                             f"the container won't find /datasets/{name}.")
+            self._append(f"[local] ⚠ No local staged copy of '{name}' on this machine — "
+                         f"the container won't find /datasets/{name}.")
         prog, args = local_cli.run_script(b.script, flags, b, repo_root=self.repo_root,
                                           extra_mounts=extra_mounts, outputs_root=out_root,
                                           env=p.get("env", {}))

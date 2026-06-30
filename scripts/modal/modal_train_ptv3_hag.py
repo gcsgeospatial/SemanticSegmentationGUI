@@ -1,72 +1,16 @@
 """
-Modal training script for PointTransformerV3 on IEEE GRSS 2019 DFC Track 4 —
-HAG variant.
+Modal shell for PointTransformerV3 — HAG variant, thin subprocess wrapper.
 
-This is the HAG twin of modal_train_ptv3.py. Identical in every way except it
-appends a real PDAL HeightAboveGround feature (computed by the trainer_gui
-Pretraining tab: SMRF ground-classify -> hag_nn) as an extra input channel:
-in_channels 6 -> 7 ([xyz, rgb(=intensity grayscale), HAG]). HAG is read per
-point from /data/IEEE/HAG/{Train,Validate}/<scene>_PC3.laz and paired to the
-raw _PC3.txt points. Run it head-to-head against modal_train_ptv3.py to measure
-HAG's contribution.
+HAG twin of modal_train_ptv3.py: the local trainer appends an extra HAG channel
+(in_channels 6 -> 7). Canonical --dataset runs without a real HAG feature fall
+back to a z-scene-min proxy for the 7th channel (handled in the local trainer).
 
-The default (no --dataset) path trains on the same raw IEEE Track 4 airborne
-LiDAR — and uses the same ASPRS->index label map, per-scene p95 intensity
-normalization, and scene holdout — as modal_train_kpconvx_cold.py, so PTv3 can
-be compared head-to-head against KPConvX/KPConv on identical data. (It was
-previously wired to STPLS3D; switched 2026-06-15.)
+Provisions a GPU container + the outputs / terminal-datasets volumes, then shells
+out to the local trainer (scripts/local/local_train_ptv3_hag.py) so local and
+cloud run byte-identical code. Trains on a canonical trainer_gui dataset passed
+via --dataset (staged on the terminal-datasets volume).
 
-Prereq: upload the HAGTEST output (Pretraining tab) to the ieee-data volume:
-    modal volume put ieee-data "C:/Users/OrionHoch/Desktop/HAGTEST/Train"    /IEEE/HAG/Train
-    modal volume put ieee-data "C:/Users/OrionHoch/Desktop/HAGTEST/Validate" /IEEE/HAG/Validate
-The --dataset (canonical trainer_gui) path has no HAG laz, so it falls back to a
-z-scene-min proxy for the 7th channel (keeps in_channels fixed at 7).
-
-Uses the standalone PTv3 model.py from testSem/PointTransformerV3 directly
-(no full Pointcept install). The fast path uses FlashAttention; if the GPU
-doesn't support it the script falls back to PTv3 with enable_flash=False.
-
-----------------------------------------------------------------------------
-ACCURACY / ANTI-OVERFITTING RECIPE (2026-06-15)
-----------------------------------------------------------------------------
-This script carries the same generalization machinery proven out in
-modal_train_kpconvx_cold.py, reconciled with PointTransformerV3's *own*
-published outdoor-LiDAR recipe (Wu et al., CVPR 2024, supp. Tab. 12-16):
-
-  - DATA AUGMENTATION (was completely absent — the biggest overfit driver):
-    PTv3's outdoor suite — full z-rotation, small x/y tilt (±π/64), isotropic
-    scale [0.9,1.1], per-axis flip (p=0.5), gaussian jitter (σ=0.005, clip 0.02).
-  - LOSS = weighted CE (+ optional focal / label smoothing) + Lovász-Softmax.
-    PTv3's outdoor loss is literally CE + Lovász (equal weight); Lovász is a
-    differentiable mIoU surrogate that weights every class equally — the same
-    term added to the KPConvX recipe.
-  - CLASS BALANCE: inverse-sqrt-frequency class weights (mean-normalized,
-    capped) + rare-class tile oversampling (rare classes auto-detected from the
-    training-set frequency histogram for canonical datasets).
-  - OPTIMIZER tuned to PTv3's paper: AdamW lr 2e-3, weight_decay 5e-3 (NOT the
-    0.05 it had — 10x too strong), drop_path 0.3 stochastic depth, ~2-epoch
-    warmup via OneCycle.
-  - PERIODIC HELD-OUT VALIDATION every VAL_EVERY epochs (eval mode, no grad) ->
-    val_metrics.csv, committed mid-run so the train/val gap is watchable live.
-  - OVERLAP-VOTING EVAL: val/test tiles cut at stride CHUNK_XY/2 so each point
-    is covered by up to 4 tiles; per-voxel center-tapered softmax votes are
-    summed before argmax (the old eval took a single-tile argmax and even
-    random-cropped large tiles, dropping points).
-  - RESUMABLE checkpoints (model + optimizer) every CHECKPOINT_GAP epochs; set
-    RESUME=True to continue the latest matching run after a timeout.
-
-Usage:
-    modal volume create ieee-data
-    modal volume put ieee-data "C:/Users/OrionHoch/Desktop/LabledDatasets/IEEE" /IEEE
-    modal run --detach modal_train_ptv3.py
-    modal app logs ptv3-ieee
-
-----------------------------------------------------------------------------
-Training-terminal integration: running with no flags trains on IEEE Track 4.
-Extra flags (see modal_train_ptv3_warm.py for details):
-
-  --dataset NAME                          canonical trainer_gui dataset on the
-                                          terminal-datasets volume
+  --dataset NAME                          canonical trainer_gui dataset
   --grid / --chunk-xy / --epochs / --batch / --steps-per-epoch
   --mode infer --weights runs/<id>/final_model.pth --infer-input <job_id>
 
@@ -81,92 +25,9 @@ import modal
 # ============================================================================
 # Configuration
 # ============================================================================
-APP_NAME      = "ptv3-ieee-hag"
+APP_NAME      = "ptv3-hag"
 GPU_TYPE      = os.environ.get("TT_GPU", "A100")
-N_EPOCHS      = 100            # PTv3 outdoor recipe (Wu et al., CVPR 2024): ~50
-                             # epochs x 500 steps. Override per-run with --epochs;
-                             # for a cheap end-to-end check pass --epochs 2.
-BATCH_SIZE    = 4
 TIMEOUT_HOURS = int(os.environ.get("TT_TIMEOUT_HOURS", "24"))
-
-# IEEE GRSS 2019 DFC Track 4 (default, no --dataset). Same data contract as
-# modal_train_kpconvx_cold.py so the two are directly comparable: ASPRS code ->
-# contiguous class index (class 0 ignored), 5 classes.
-NUM_CLASSES   = 5
-CLASS_NAMES   = ["Ground", "Trees", "Building", "Water", "Bridge"]
-LABEL_MAP     = {0: -1, 2: 0, 5: 1, 6: 2, 9: 3, 17: 4}
-GRID_SIZE     = 0.5            # voxel grid (m). PTv3's 0.05 m outdoor default is
-                               # for dense near-sensor LiDAR; IEEE airborne is
-                               # ~2 pts/m² (~0.7 m spacing), so a 5 cm grid is a
-                               # no-op downsample AND leaves PTv3's sparse
-                               # positional-encoding conv with empty kernels (no
-                               # point falls within a few voxels of another).
-                               # 0.5 m ≈ the actual point spacing. Override --grid.
-USE_FLASH_ATTN = False  # ponytail: flash serialized-attn patch-gather OOBs mid-train
-                        # (the "device-side assert" crash). Off + patch_size 128 is the
-                        # documented Pointcept fix. Re-enable w/ patch 128 if you want speed.
-HOLDOUT_SEED   = 42
-N_VAL_HOLDOUT  = 10            # held-out train scenes for val (matches KPConvX cold)
-
-# ----------------------------------------------------------------------------
-# Regularization / optimizer — PTv3's published outdoor-LiDAR recipe
-# (Wu et al., CVPR 2024, supplementary Tab. 13). The original script used a
-# generic AdamW + OneCycle with weight_decay 0.05; the paper uses 5e-3.
-# ----------------------------------------------------------------------------
-DROP_PATH     = 0.3      # stochastic depth (PTv3 outdoor default)
-BASE_LR       = 2e-3     # PTv3 outdoor base lr (also OneCycle peak here)
-WEIGHT_DECAY  = 5e-3     # PTv3 outdoor AdamW wd (NOT 0.05)
-WARMUP_PCT    = 0.04     # ~2 epochs of 50 warmup (PTv3 uses a 2-epoch warmup)
-GRAD_CLIP     = 1.0
-
-# Augmentation — PTv3 outdoor suite. The original to_ptv3_batch did NONE; for a
-# transformer on a handful of large scenes that is the dominant overfit cause.
-AUG_ENABLE       = True
-AUG_ROT_Z        = 1.0          # z angle ~ U(-pi, pi) * AUG_ROT_Z (full yaw)
-AUG_ROT_XY       = 1.0 / 64.0   # x,y tilt ~ U(-pi, pi) * this (gentle ±~2.8 deg)
-AUG_SCALE_MIN    = 0.9
-AUG_SCALE_MAX    = 1.1
-AUG_FLIP_P       = 0.5          # per-axis (x, y) coordinate flip probability
-AUG_JITTER_SIGMA = 0.005        # gaussian per-point noise (m)
-AUG_JITTER_CLIP  = 0.02         # clip jitter to +/- this (m)
-
-# Loss = weighted CE (+ optional focal / label smoothing) + Lovász-Softmax,
-# mirroring modal_train_kpconvx_cold.py. PTv3's own outdoor loss is CE + Lovász.
-CLASS_WEIGHTING  = True
-WEIGHT_BETA      = 0.5     # 0.5 = inverse-SQRT-frequency (sub-linear, stable)
-WEIGHT_CAP       = 5.0     # clamp each weight to [1/CAP, CAP] after mean-norm
-LABEL_SMOOTH     = 0.0     # PTv3 leans on Lovász, not smoothing (KPConvX used 0.2)
-LOVASZ_WEIGHT    = 1.0     # total = <pointwise> + LOVASZ_WEIGHT * lovasz_softmax
-USE_FOCAL        = False   # True -> alpha-balanced focal instead of weighted CE
-FOCAL_GAMMA      = 2.0
-
-# Rare-class tile oversampling. RARE_CLASSES=None auto-detects rare classes from
-# the train-set frequency histogram (classes below RARE_FREQ_FRAC x median freq).
-RARE_OVERSAMPLE  = True
-RARE_CLASSES     = None
-RARE_FREQ_FRAC   = 0.5
-RARE_TILE_PROB   = 0.25    # P(draw the next train tile from a rare-class tile)
-
-# Periodic held-out validation + checkpoint/resume cadence.
-VAL_EVERY        = 10      # FULL voted eval over the combined eval set every N
-                          # epochs (no weight updates). Heavier than the old
-                          # subset val pass — raise this if it costs too much.
-CHECKPOINT_GAP   = 3       # checkpoint (model + optimizer) frequency, epochs
-RESUME           = False   # force-resume the latest matching run (see AUTO_RESUME)
-AUTO_RESUME      = False    # auto-continue an unfinished run (no DONE marker) on
-                          # relaunch / Modal auto-retry, so an intermittent crash
-                          # never loses the run — only epochs since last checkpoint
-
-DATA_ROOT      = "/data/IEEE"
-TRAIN_PC_DIR   = f"{DATA_ROOT}/Train-Track4/Track4"            # *_PC3.txt (x,y,z,intensity,ret)
-TRAIN_CLS_DIR  = f"{DATA_ROOT}/Train-Track4-Truth/Track4-Truth"  # *_CLS.txt (ASPRS codes)
-TEST_PC_DIR    = f"{DATA_ROOT}/Validate-Track4/Track4"
-TEST_CLS_DIR   = f"{DATA_ROOT}/Validate-Track4-Truth"
-# Per-point HeightAboveGround from the Pretraining tab (HAGTEST upload). Train +
-# val-holdout scenes -> HAG/Train; the test split (Validate-Track4) -> HAG/Validate.
-HAG_TRAIN_DIR  = f"{DATA_ROOT}/HAG/Train"
-HAG_TEST_DIR   = f"{DATA_ROOT}/HAG/Validate"
-PREP_DIR       = f"{DATA_ROOT}/prep/ptv3_ieee_hag_grid05_origin"
 
 DATASETS_ROOT = "/datasets"   # terminal-datasets volume (trainer_gui canonical datasets)
 
@@ -230,7 +91,6 @@ image = image.run_commands("touch /opt/ptv3/__init__.py")
 image = image.add_local_file("scripts/local/local_train_ptv3_hag.py", "/root/local_train_ptv3_hag.py")
 image = image.add_local_file("scripts/helper/train_common.py", "/root/train_common.py")
 
-data_volume     = modal.Volume.from_name("ieee-data",           create_if_missing=True)
 outputs_volume  = modal.Volume.from_name(f"{APP_NAME}-outputs", create_if_missing=True)
 datasets_volume = modal.Volume.from_name(
     os.environ.get("TT_DATASET_VOLUME", "terminal-datasets"), create_if_missing=True)
@@ -242,8 +102,7 @@ datasets_volume = modal.Volume.from_name(
 @app.function(
     image=image,
     gpu=GPU_TYPE,
-    volumes={"/data": data_volume, "/outputs": outputs_volume,
-             DATASETS_ROOT: datasets_volume},
+    volumes={"/outputs": outputs_volume, DATASETS_ROOT: datasets_volume},
     cpu=8,
     memory=49152,
     timeout=TIMEOUT_HOURS * 3600,
@@ -290,7 +149,6 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
 
     def _commit_loop():
         while not _stop.wait(120):
-            data_volume.commit()
             outputs_volume.commit()
             datasets_volume.commit()
 
@@ -300,7 +158,6 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
         subprocess.run(cmd, check=True)
     finally:
         _stop.set()
-        data_volume.commit()
         outputs_volume.commit()
         datasets_volume.commit()
 
@@ -311,7 +168,7 @@ def main(dataset: Optional[str] = None, grid: Optional[float] = None,
          steps_per_epoch: Optional[int] = None, chunk_xy: Optional[float] = None,
          mode: str = "train", weights: Optional[str] = None,
          infer_input: Optional[str] = None):
-    what = f"infer({weights})" if mode == "infer" else f"train({dataset or 'IEEE Track 4'})"
+    what = f"infer({weights})" if mode == "infer" else f"train({dataset})"
     print(f"Launching {APP_NAME} [{what}] on {GPU_TYPE} for up to {TIMEOUT_HOURS}h.")
     train_ptv3.remote(dataset=dataset, grid=grid, epochs=epochs, batch=batch,
                       steps_per_epoch=steps_per_epoch, chunk_xy=chunk_xy, mode=mode,

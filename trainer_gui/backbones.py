@@ -29,7 +29,6 @@ class Backbone:
     label: str
     script: str             # filename at repo root
     app_name: str
-    warm: bool
     ready: bool = False                # can train via --dataset + param flags
     folder_infer: bool = False         # supports `--mode infer --infer-input <job>`
     grid_kind: str = "grid"            # "grid" | "octree_depth" — drives recommendation math
@@ -74,7 +73,7 @@ def _common(epochs_default: int, batch_default: int, steps_default: int = 500,
 BACKBONES: dict[str, Backbone] = {b.key: b for b in [
     Backbone(
         key="ptv3", label="PTv3", script="scripts/modal/modal_train_ptv3.py",
-        app_name="ptv3-ieee", warm=False, ready=True, folder_infer=True,
+        app_name="ptv3", ready=True, folder_infer=True,
         rec_gpu="A100", min_vram_gb=16,
         grid_clamp=(0.05, 0.6),
         params=[ParamSpec("grid", "Grid size (m)", "float", 0.05, 0.02, 3.0,
@@ -83,7 +82,7 @@ BACKBONES: dict[str, Backbone] = {b.key: b for b in [
     ),
     Backbone(
         key="randlanet", label="RandLA-Net", script="scripts/modal/modal_train_randlanet.py",
-        app_name="randlanet-cold-ieee", warm=False, ready=True, folder_infer=True,
+        app_name="randlanet-cold", ready=True, folder_infer=True,
         rec_gpu="A10G", min_vram_gb=8,
         grid_clamp=(0.06, 0.5),
         params=[ParamSpec("sub-grid", "Sub-grid size (m)", "float", 0.12, 0.02, 2.0,
@@ -93,7 +92,7 @@ BACKBONES: dict[str, Backbone] = {b.key: b for b in [
     ),
     Backbone(
         key="kpconvx_cold", label="KPConvX-L", script="scripts/modal/modal_train_kpconvx_cold.py",
-        app_name="kpconvx-cold-ieee", warm=False, ready=True, folder_infer=True,
+        app_name="kpconvx-cold", ready=True, folder_infer=True,
         rec_gpu="A100-80GB", min_vram_gb=24,
         grid_clamp=(0.5, 3.0),
         params=[ParamSpec("grid", "Grid size (m)", "float", 2.0, 0.1, 5.0,
@@ -103,7 +102,7 @@ BACKBONES: dict[str, Backbone] = {b.key: b for b in [
     # --- HAG variants (real PDAL HeightAboveGround as an extra input channel) ---
     Backbone(
         key="ptv3_hag", label="PTv3_hag", script="scripts/modal/modal_train_ptv3_hag.py",
-        app_name="ptv3-ieee-hag", warm=False, ready=True, folder_infer=True,
+        app_name="ptv3-hag", ready=True, folder_infer=True,
         rec_gpu="A100", min_vram_gb=16,
         grid_clamp=(0.05, 0.6),
         params=[ParamSpec("grid", "Grid size (m)", "float", 0.05, 0.02, 3.0,
@@ -113,7 +112,7 @@ BACKBONES: dict[str, Backbone] = {b.key: b for b in [
     Backbone(
         key="randlanet_hag", label="RandLA-Net_hag",
         script="scripts/modal/modal_train_randlanet_hag.py",
-        app_name="randlanet-cold-ieee-hag", warm=False, ready=True, folder_infer=True,
+        app_name="randlanet-cold-hag", ready=True, folder_infer=True,
         rec_gpu="A10G", min_vram_gb=8,
         grid_clamp=(0.06, 0.5),
         params=[ParamSpec("sub-grid", "Sub-grid size (m)", "float", 0.12, 0.02, 2.0,
@@ -127,7 +126,7 @@ BACKBONES: dict[str, Backbone] = {b.key: b for b in [
     Backbone(
         key="kpconvx_cold_hag", label="KPConvX-L_hag",
         script="scripts/modal/modal_train_kpconvx_cold_hag.py",
-        app_name="kpconvx-cold-ieee-hag", warm=False, ready=True, folder_infer=True,
+        app_name="kpconvx-cold-hag", ready=True, folder_infer=True,
         rec_gpu="A100-80GB", min_vram_gb=24,
         grid_clamp=(0.5, 3.0),
         params=[ParamSpec("grid", "Grid size (m)", "float", 2.0, 0.1, 5.0,
@@ -137,10 +136,6 @@ BACKBONES: dict[str, Backbone] = {b.key: b for b in [
 ]}
 
 GPU_CHOICES = ["A10G", "L4", "L40S", "A100", "A100-80GB", "H100"]
-
-
-def ready_backbones() -> dict[str, Backbone]:
-    return {k: b for k, b in BACKBONES.items() if b.ready}
 
 
 def infer_backbones() -> dict[str, Backbone]:

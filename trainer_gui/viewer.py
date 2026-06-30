@@ -4,11 +4,11 @@ Usage:
   python -m trainer_gui.viewer <cloud>          one .ply/.npz/.las/.txt/... file
   python -m trainer_gui.viewer <folder>         every cloud in a folder, in a grid
   python -m trainer_gui.viewer <pred.ply> --gt <truth>   error map vs ground truth
-      (truth = a class-coloured .ply, an .npz, a <scene>_CLS.txt, or a folder
-      searched by scene name). Points whose predicted class differs from the
-      ground truth are coloured YELLOW; correct points are greyscale, shaded by
-      intensity (from the prediction npz or a sibling scene; `--intensity FILE`
-      to point at it) so structure stays visible.
+      (truth = a class-coloured .ply, an .npz, or a folder searched by scene
+      name). Points whose predicted class differs from the ground truth are
+      coloured YELLOW; correct points are greyscale, shaded by intensity (from the
+      prediction npz or a sibling scene; `--intensity FILE` to point at it) so
+      structure stays visible.
 
 Points are coloured strictly by class (Open3D's point_color_option is forced to
 Color, never the Z gradient). The colour key is printed to stdout; the matplotlib
@@ -30,27 +30,25 @@ GREY = 0.55
 # A "key" is a list of (label, rgb01) pairs driving the on-screen colour legend.
 
 
-def _ieee_key() -> list[tuple[str, tuple]]:
-    """The full IEEE 5-class colour key — always all five, so Water and Bridge
-    appear in the legend even in a scene that happens to contain none of them."""
-    from .palette import IEEE_CLASS_NAMES, IEEE_PALETTE
-    return [(name, tuple((IEEE_PALETTE[i] / 255.0).tolist()))
-            for i, name in enumerate(IEEE_CLASS_NAMES)]
-
-
 def _key_from_rgb(rgb_u8: np.ndarray) -> list[tuple[str, tuple]]:
-    """Full IEEE key when the cloud is palette-coloured (any point matches the
-    palette), else no key."""
-    from .palette import class_from_rgb
-    return _ieee_key() if np.any(class_from_rgb(rgb_u8) >= 0) else []
+    """Colour key for a palette-coloured cloud that carries no class names: label
+    each matched class index generically ('class i'). [] when nothing matches (a
+    raw RGB scene gets no spurious legend)."""
+    from .palette import class_from_rgb, palette_for
+    cls = class_from_rgb(rgb_u8)
+    present = sorted({int(c) for c in np.unique(cls) if c >= 0})
+    if not present:
+        return []
+    pal = palette_for(max(present) + 1).astype(np.float64) / 255.0
+    return [(f"class {i}", tuple(pal[i].tolist())) for i in present]
 
 
 def _key_for_names(rgb_u8: np.ndarray, names: list) -> list[tuple[str, tuple]]:
     """Colour key for a prediction coloured with palette_for(len(names)) — the exact
     palette the training scripts bake into prediction PLYs. Returns the full class
-    list (like the IEEE key) when any point matches that palette, so a chosen
-    dataset's scheme labels even a non-IEEE prediction; [] if nothing matches (a raw
-    RGB scene), so plain clouds get no spurious legend."""
+    list when any point matches that palette, so a chosen dataset's class scheme
+    labels the prediction; [] if nothing matches (a raw RGB scene), so plain clouds
+    get no spurious legend."""
     from .palette import palette_for
     pal = palette_for(len(names))
     matched = any(
@@ -78,10 +76,10 @@ def _load(path: Path, names: list | None = None):
         z = np.load(str(path), allow_pickle=False)
         cls, _ = _npz_class(z)
         if cls is not None and "xyz" in z:
-            from .palette import IEEE_CLASS_NAMES, palette_for
+            from .palette import generic_names, palette_for
             xyz = np.asarray(z["xyz"], np.float64)
             names_used = ([str(n) for n in z["class_names"]] if "class_names" in z
-                          else (names or IEEE_CLASS_NAMES))
+                          else (names or generic_names(int(cls.max()) + 1)))
             pal = palette_for(max(int(cls.max()) + 1, len(names_used))).astype(np.float64) / 255.0
             colors = np.full((len(xyz), 3), GREY)          # -1/ignore -> grey
             ok = cls >= 0
@@ -192,7 +190,7 @@ def _autofind_intensity(pred_path: Path, scene: str) -> np.ndarray | None:
     """Find the scene's input cloud (which carries intensity) near the prediction
     by matching its name — predictions live in predictions/, the inputs usually in
     a sibling scenes/. Returns intensity or None (grading is optional)."""
-    names = [f"{scene}.npz", f"{scene}_PC3.npz", f"{scene}.txt", f"{scene}_PC3.txt"]
+    names = [f"{scene}.npz", f"{scene}.txt"]
     dirs = [pred_path.parent] + [p / "scenes" for p in list(pred_path.parents)[:4]]
     for d in dirs:
         for nm in names:
@@ -205,14 +203,13 @@ def _autofind_intensity(pred_path: Path, scene: str) -> np.ndarray | None:
 
 def _read_gt(gt_path: Path, scene: str) -> np.ndarray:
     """Ground-truth class indices for a scene. gt_path is either a file —
-    a class-coloured .ply, an .npz with label/pred, or a <scene>_CLS.txt of
-    ASPRS codes — or a folder searched by scene name (CLS.txt / _gt.ply / .ply)."""
-    from .palette import asprs_to_index, class_from_rgb
+    a class-coloured .ply or an .npz with label/pred — or a folder searched by
+    scene name (_gt.ply / .ply)."""
+    from .palette import class_from_rgb
     from .readers import read_points
 
     if gt_path.is_dir():
-        for cand in (f"{scene}_CLS.txt", f"{scene}_gt.ply", f"{scene}.ply",
-                     f"{scene}_pred.ply"):
+        for cand in (f"{scene}_gt.ply", f"{scene}.ply", f"{scene}_pred.ply"):
             if (gt_path / cand).exists():
                 gt_path = gt_path / cand
                 break
@@ -232,7 +229,8 @@ def _read_gt(gt_path: Path, scene: str) -> np.ndarray:
         if g is None:
             raise ValueError(f"{gt_path.name}: npz has no 'label'/'pred'")
         return g
-    return asprs_to_index(np.loadtxt(str(gt_path)).astype(np.int64).reshape(-1))
+    raise ValueError(f"{gt_path.name}: unsupported ground-truth file — use a "
+                     f"class-coloured .ply or an .npz with 'label'/'pred'")
 
 
 def _load_pred(pred_path: Path):
@@ -259,7 +257,7 @@ def _load_pred(pred_path: Path):
         inten = None if cloud.intensity is None else np.asarray(cloud.intensity, np.float64)
 
     scene = pred_path.stem
-    for suffix in ("_pred", "_PC3", "_CLS", "_gt"):
+    for suffix in ("_pred", "_gt"):
         scene = scene.replace(suffix, "")
     return xyz, pred, inten, scene
 
@@ -293,7 +291,7 @@ def compare_clouds(pred_path: Path, gt_path: Path, intensity_path: Path | None =
     against ground truth. Correct points are shaded by intensity (so structure
     stays visible), wrong points are YELLOW.
     gt_path: a folder (matched by scene name) or a single file — a class-coloured
-    .ply, an .npz, or an IEEE <scene>_CLS.txt.
+    .ply or an .npz.
     intensity_path: optional cloud to read intensity from; otherwise it's taken
     from the prediction npz, or auto-found from a sibling scene. -> (xyz, colors, key)."""
     xyz, pred, inten, scene = _load_pred(pred_path)
@@ -455,9 +453,8 @@ def main(argv=None) -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("path", help="a cloud file, or a folder of clouds")
     ap.add_argument("--gt", default=None,
-                    help="ground truth (a class-coloured .ply, an .npz, a *_CLS.txt, "
-                         "or a folder) — turns PATH into a prediction and shows an "
-                         "error map vs this GT")
+                    help="ground truth (a class-coloured .ply, an .npz, or a folder) "
+                         "— turns PATH into a prediction and shows an error map vs this GT")
     ap.add_argument("--intensity", default=None,
                     help="with --gt: cloud to read per-point intensity from, used to "
                          "shade the correct points (default: the prediction's own "
