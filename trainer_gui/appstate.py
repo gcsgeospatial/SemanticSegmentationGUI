@@ -196,13 +196,11 @@ def delete_dataset(name: str) -> tuple[str, str]:
     when the on-disk folder is gone (or there was none), else the reason it
     couldn't be removed (locked/in-use file — common on Windows). The registry
     entry + overrides are dropped regardless, so the list stays consistent even
-    if files linger. Never touches a builtin (none remain, but guard anyway)."""
+    if files linger. Every dataset is deletable — there is no protected kind."""
     import shutil
     import stat
 
     info = known_datasets().get(name, {})
-    if info.get("builtin"):
-        return ("", "")
     staged = info.get("staged_dir", "")
 
     # Forget the entry + overrides FIRST so the list always reflects the delete,

@@ -6,10 +6,11 @@ import shutil
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, Qt
+from PySide6.QtCore import QByteArray, QEvent, QObject, Qt
 from PySide6.QtGui import QIcon
-from PySide6.QtWidgets import (QApplication, QComboBox, QHBoxLayout, QLabel, QListWidget,
-                               QListWidgetItem, QMessageBox, QStackedWidget, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QAbstractSpinBox, QApplication, QComboBox, QHBoxLayout, QLabel,
+                               QListWidget, QListWidgetItem, QMessageBox, QStackedWidget, QVBoxLayout,
+                               QWidget)
 
 # Repo root = the project dir holding scripts/ (one level up from this trainer_gui/
 # package). modal runs are launched with cwd=REPO_ROOT, so this must be where
@@ -18,6 +19,25 @@ from PySide6.QtWidgets import (QApplication, QComboBox, QHBoxLayout, QLabel, QLi
 REPO_ROOT = str(Path(__file__).resolve().parents[1])
 
 PAGES = ["Datasets", "Train", "Inference", "Plotting"]
+
+
+class _NoWheelEdit(QObject):
+    """App-wide guard: a mouse wheel must never change a spin box / combo value.
+    Scrolling a page used to silently bump whatever number/dropdown the cursor
+    passed over (fractions, local↔modal, appearance, …). We eat wheel events on
+    spin boxes and combos *unless* they have keyboard focus, so deliberate
+    scroll-to-adjust still works once you click in, but casual page scrolling
+    never mutates a value. Open combo popups (a separate list view) are untouched.
+    ponytail: covers QAbstractSpinBox + QComboBox; add QSlider here if any slider
+    becomes a scroll victim too."""
+
+    def eventFilter(self, obj, event):
+        if (event.type() == QEvent.Wheel
+                and isinstance(obj, (QAbstractSpinBox, QComboBox))
+                and not obj.hasFocus()):
+            event.ignore()
+            return True
+        return super().eventFilter(obj, event)
 
 
 class MainWindow(QWidget):
@@ -186,6 +206,7 @@ def main() -> int:
         except Exception:  # noqa: BLE001
             pass
     app = QApplication(sys.argv)
+    app.installEventFilter(_NoWheelEdit(app))  # wheel never changes a value (see class)
     app.setApplicationName("trainer_gui")
     app.setWindowIcon(_app_icon())
     theme.apply(app, appstate.get("ui_theme", "system"))
