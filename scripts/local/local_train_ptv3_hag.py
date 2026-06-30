@@ -1125,13 +1125,11 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
         return lambda: load_ieee(f"{TEST_PC_DIR}/{name}_PC3.txt",
                                  f"{TEST_CLS_DIR}/{name}_CLS.txt")
 
-    eval_items = (
-        [(n, _raw_loader("val", n), f"{PREP_DIR}/train") for n in sorted(hold)] +
-        [(n, _raw_loader(test_raw_split, n), test_tile_dir)
-         for n in sorted({_scene_of(p) for p in real_test_tiles})]
-    )
-    print(f"  eval set: {len(eval_items)} scenes "
-          f"({len(hold)} holdout + {len(eval_items) - len(hold)} test)", flush=True)
+    val_items = [(n, _raw_loader("val", n), f"{PREP_DIR}/train") for n in sorted(hold)]
+    test_items = [(n, _raw_loader(test_raw_split, n), test_tile_dir)
+                  for n in sorted({_scene_of(p) for p in real_test_tiles})]
+    print(f"  eval set: {len(val_items)} holdout(val) + {len(test_items)} test scenes",
+          flush=True)
 
     def evaluate(scene_items, label):
         """Per-SCENE overlap voting scored on the ORIGINAL raw points — the
@@ -1278,22 +1276,24 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
     write_run_manifest(run_dir, "ptv3_hag", dataset)   # the single inference manifest (run.json)
 
     def run_eval(ep, write_json=False):
+        # Periodic pass scores the held-out VAL scenes only (no test peeking) and
+        # selects the best checkpoint on val present-class mIoU. The final pass
+        # (write_json) also scores the TEST set and writes both, separately.
         backbone.eval(); head.eval()
-        m = evaluate(eval_items, f"eval@ep{ep}")
+        m = evaluate(val_items, f"val@ep{ep}")
         ious = [m["per_class_iou"][_name(c)] for c in range(NUM_CLASSES)]
         with open(val_csv, "a", newline="") as f:
             csv.writer(f).writerow([ep, f"{m['overall_acc']:.4f}",
-                                    f"{m['overall_mIoU']:.4f}"] + [f"{x:.4f}" for x in ious])
-        if best.update(m["overall_mIoU"]):
+                                    f"{m['present_classes_mIoU']:.4f}"] + [f"{x:.4f}" for x in ious])
+        if best.update(m["present_classes_mIoU"]):
             torch.save({"backbone": backbone.state_dict(),
                         "head": head.state_dict(), "epoch": ep}, best.final)
         if write_json:
-            # val + test are one combined set now; write the same metrics under
-            # both keys so the trainer_gui (which reads test_metrics["val"] and
-            # ["test"]) keeps rendering without changes.
+            mt = evaluate(test_items, f"test@ep{ep}")
             with open(f"{run_dir}/test_metrics.json", "w") as fj:
-                json.dump({"val": m, "test": m,
-                           "eval_scenes": [n for n, _, _ in eval_items]}, fj, indent=2)
+                json.dump({"val": m, "test": mt,
+                           "val_scenes": [n for n, _, _ in val_items],
+                           "test_scenes": [n for n, _, _ in test_items]}, fj, indent=2)
         outputs_volume.commit()
         backbone.train(); head.train()
         return m

@@ -1201,8 +1201,8 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         ious = [m["per_class_iou"][CLASS_NAMES[c]] for c in range(NUM_CLASSES)]
         with open(val_csv, "a", newline="") as f:
             csv.writer(f).writerow([ep, f"{m['overall_acc']:.4f}",
-                                    f"{m['overall_mIoU']:.4f}"] + [f"{x:.4f}" for x in ious])
-        if best.update(m["overall_mIoU"]):
+                                    f"{m['present_classes_mIoU']:.4f}"] + [f"{x:.4f}" for x in ious])
+        if best.update(m["present_classes_mIoU"]):
             torch.save({"model": net.state_dict(), "epoch": ep}, best.final)
         if write_json:
             m_test = evaluate(test_ds, {n: (p, c) for n, p, c in test_list}, "test")

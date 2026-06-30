@@ -1112,12 +1112,13 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
             csv.writer(f).writerow(["epoch", "val_acc", "val_miou"] +
                                    [f"iou_{n}" for n in CLASS_NAMES])
 
-    # Combined holdout-val + Validate-Track4 eval set, scored with the REAL voted
-    # eval below every VAL_EVERY epochs (each item carries its tile split_dir).
-    eval_items = ([(n, p, c, f"{PREP_DIR}/val")  for n, p, c in val_list] +
-                  [(n, p, c, f"{PREP_DIR}/test") for n, p, c in test_list])
-    print(f"  eval set: {len(eval_items)} scenes "
-          f"({len(val_list)} holdout + {len(test_list)} test)", flush=True)
+    # Held-out VAL + Validate-Track4 TEST sets, scored with the REAL voted eval
+    # below (each item carries its tile split_dir). The periodic pass scores VAL
+    # only (no test peeking); the final pass also scores TEST, written separately.
+    val_items  = [(n, p, c, f"{PREP_DIR}/val")  for n, p, c in val_list]
+    test_items = [(n, p, c, f"{PREP_DIR}/test") for n, p, c in test_list]
+    print(f"  eval set: {len(val_items)} holdout(val) + {len(test_items)} test scenes",
+          flush=True)
 
     def evaluate(scene_items, label):
         """Final eval scored on the ORIGINAL raw points (official protocol).
@@ -1223,18 +1224,23 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
     write_run_manifest(run_dir, "kpconvx_cold", dataset)   # the single inference manifest (run.json)
 
     def run_eval(ep, write_json=False):
+        # Periodic pass scores the held-out VAL scenes only (no test peeking) and
+        # selects the best checkpoint on val present-class mIoU. The final pass
+        # (write_json) also scores the TEST set and writes both, separately.
         net.eval()
-        m = evaluate(eval_items, f"eval@ep{ep}")
+        m = evaluate(val_items, f"val@ep{ep}")
         ious = [m["per_class_iou"][CLASS_NAMES[c]] for c in range(NUM_CLASSES)]
         with open(val_csv, "a", newline="") as f:
             csv.writer(f).writerow([ep, f"{m['overall_acc']:.4f}",
-                                    f"{m['overall_mIoU']:.4f}"] + [f"{x:.4f}" for x in ious])
-        if not EVAL_ONLY and best.update(m["overall_mIoU"]):
+                                    f"{m['present_classes_mIoU']:.4f}"] + [f"{x:.4f}" for x in ious])
+        if not EVAL_ONLY and best.update(m["present_classes_mIoU"]):
             torch.save({"model": net.state_dict(), "epoch": ep}, best.final)
         if write_json:
+            mt = evaluate(test_items, f"test@ep{ep}")
             with open(f"{run_dir}/test_metrics.json", "w") as fj:
-                json.dump({"val": m, "test": m,
-                           "eval_scenes": [it[0] for it in eval_items]}, fj, indent=2)
+                json.dump({"val": m, "test": mt,
+                           "val_scenes": [n for n, _, _ in val_list],
+                           "test_scenes": [n for n, _, _ in test_list]}, fj, indent=2)
         outputs_volume.commit()
         net.train()
         return m
