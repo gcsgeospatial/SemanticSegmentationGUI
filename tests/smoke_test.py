@@ -418,8 +418,8 @@ def main():
             labels = np.where(xyz[:, 2] < 0.5, 2, 6).astype(np.uint8)
             write_laz(hag_src / "scene_h.las", xyz, labels, RNG.uniform(0, 4000, len(xyz)))
             hag_out = tmp / "hag_out"
-            summary = pretrain.add_hag(str(hag_src), hag_out, skip_ground=True,
-                                       hag_filter="hag_nn", progress=print)
+            summary = pretrain.add_hag(str(hag_src), hag_out, ground_class=2,
+                                       use_smrf=False, hag_filter="hag_nn", progress=print)
             check("pretrain hag: output laz written", (hag_out / "scene_h.laz").exists())
             sidecar = hag_out / "scene_h.json"
             check("pretrain hag: json sidecar written", sidecar.exists())
@@ -441,7 +441,7 @@ def main():
                                   np.ones(len(gxyz))])             # x,y,z,intensity,ret
             np.savetxt(txt_hag / "scene_t_PC3.txt", pc, delimiter=",", fmt="%.3f")
             txt_out = tmp / "hag_txt_out"
-            pretrain.add_hag(str(txt_hag), txt_out, skip_ground=False,
+            pretrain.add_hag(str(txt_hag), txt_out, use_smrf=True,
                              hag_filter="hag_nn", progress=print)
             check("pretrain hag: txt input -> laz", (txt_out / "scene_t_PC3.laz").exists())
             zt_hag = json.loads((txt_out / "scene_t_PC3.json").read_text())
@@ -461,17 +461,22 @@ def main():
                   mhd["source"]["hag_source"] == "per_tile_smrf"
                   and mhd["num_classes"] == 3 and isinstance(mhd["has_hag"], bool))
 
-            # inline HAG: bake it during tiling in one pass (no separate reload)
+            # inline HAG: bake it during tiling in one pass (no separate reload).
+            # ground_value=2 (the "Ground" source value) + use_smrf -> labeled
+            # ground UNIONed with SMRF, so SMRF fills holes the labels miss.
             staged_ih = dataset.convert_dataset(
                 "laz_hag_inline", str(laz_root / "train"), spec, classes, [0], tmp / "staging",
                 val_inputs=[str(laz_root / "val")], test_inputs=[str(laz_root / "test")],
-                compute_hag=True, progress=print)
+                compute_hag=True, ground_value=2, use_smrf=True, progress=print)
             zih = np.load(staged_ih / "train" / "scene0.npz")
             check("convert_dataset(compute_hag): tiles carry a hag channel inline",
                   "hag" in zih.files and zih["hag"].shape[0] == zih["xyz"].shape[0])
             mih = json.loads((staged_ih / "dataset_meta.json").read_text())
-            check("convert_dataset(compute_hag): meta flags has_hag + per_tile source",
-                  mih["has_hag"] is True and mih["source"]["hag_source"] == "per_tile_smrf")
+            check("convert_dataset(compute_hag): meta records labeled+smrf ground + has_hag",
+                  mih["has_hag"] is True
+                  and mih["source"]["hag_source"] == "labeled+smrf"
+                  and mih["source"]["hag_ground_value"] == 2
+                  and mih["source"]["hag_use_smrf"] is True)
         else:
             print("  - pretrain hag: skipped (pdal not installed)")
 

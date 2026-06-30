@@ -190,21 +190,39 @@ def forget_dataset(name: str) -> None:
     put("datasets", ds)
 
 
-def delete_dataset(name: str) -> None:
+def delete_dataset(name: str) -> tuple[str, str]:
     """Forget a saved dataset AND delete its staged copy on disk, plus any per-
-    dataset overrides keyed by name. Best-effort: a missing/empty staged_dir or a
-    failed rmtree is ignored so the registry entry still goes away. Never touches a
-    builtin (none remain, but guard anyway)."""
+    dataset overrides keyed by name. Returns (staged_dir, error): error is ""
+    when the on-disk folder is gone (or there was none), else the reason it
+    couldn't be removed (locked/in-use file — common on Windows). The registry
+    entry + overrides are dropped regardless, so the list stays consistent even
+    if files linger. Never touches a builtin (none remain, but guard anyway)."""
+    import shutil
+    import stat
+
     info = known_datasets().get(name, {})
     if info.get("builtin"):
-        return
+        return ("", "")
     staged = info.get("staged_dir", "")
+    err = ""
     if staged and os.path.isdir(staged):
-        import shutil
-        shutil.rmtree(staged, ignore_errors=True)
+        try:
+            shutil.rmtree(staged)
+        except OSError:
+            # Windows: read-only files block rmtree. Clear the flag and retry once.
+            for p in Path(staged).rglob("*"):
+                try:
+                    os.chmod(p, stat.S_IWRITE)
+                except OSError:
+                    pass
+            try:
+                shutil.rmtree(staged)
+            except OSError as e:
+                err = str(e)
     forget_dataset(name)
     for key in ("dg_config", "palette_overrides", "palette_name_overrides"):
         allc = get(key, {})
         if name in allc:
             allc.pop(name, None)
             put(key, allc)
+    return (staged, err)

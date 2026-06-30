@@ -3,10 +3,11 @@
 Two standalone functions backing the Pretraining tab:
 
 - `add_hag`: run PDAL on each LAS/LAZ cloud to compute HeightAboveGround and
-  write it back out as a new dimension (georeferencing preserved). Ground is
-  auto-classified with SMRF first (hag_nn needs ground points), unless the
-  caller says it's already classified. Each cloud gets a `.json` sidecar with
-  the executed pipeline + HAG stats; the folder gets a `pretrain_summary.json`.
+  write it back out as a new dimension (georeferencing preserved). Ground can
+  come from SMRF (use_smrf), from a labeled ground class (ground_class), or both
+  unioned so SMRF fills the holes the labels miss (e.g. under buildings). Each
+  cloud gets a `.json` sidecar with the executed pipeline + HAG stats; the folder
+  gets a `pretrain_summary.json`.
 
 - `tile_for_model`: produce train-ready tiles for a chosen backbone by staging
   the folder to the canonical npz layout (`dataset.convert_scene`) and running
@@ -93,34 +94,50 @@ def _structured_from_cloud(cloud) -> np.ndarray:
             dt.append((dim, "f8"))
             cols[dim] = arr0.astype(np.float64)
         used.add(dim.lower())
+    # Always carry a Classification dim so SMRF / ground-assignment have somewhere
+    # to write (0 = unclassified when the source had no classification field).
+    if "classification" not in used:
+        dt.append(("Classification", "u1"))
+        cols["Classification"] = np.zeros(n, dtype=np.uint8)
     arr = np.empty(n, dtype=dt)
     for k, v in cols.items():
         arr[k] = v
     return arr
 
 
-def _hag_pipeline(reader_stage, out_path: str, skip_ground: bool,
-                  hag_filter: str, has_header: bool,
-                  preserve_class_as: str | None = None) -> list:
-    """[reader] -> [ferry] -> [filters.smrf] -> filters.<hag> -> writers.las.
+def _hag_pipeline(reader_stage, out_path: str, *, ground_class: int | None = None,
+                  use_smrf: bool = True, hag_filter: str = "hag_nn",
+                  has_header: bool = True, preserve_class_as: str | None = None) -> list:
+    """[reader] -> [ferry] -> [smrf] -> [assign ground] -> filters.<hag> -> writers.las.
+
+    Ground for the HAG filter is built from, in combination:
+      - use_smrf: PDAL SMRF detects ground (sets Classification=2).
+      - ground_class: the cloud's OWN label value for ground is re-asserted as
+        Classification=2 AFTER SMRF — so labeled ground is UNIONed with SMRF's,
+        and SMRF fills the holes the labels miss (missing ground returns, e.g.
+        under buildings) without discarding the trusted labels.
+    SMRF overwrites Classification, so when a ground_class is trusted its original
+    values are stashed first (preserve_class_as, else HAG_PRESERVED_CLASS_DIM) and
+    the assign reads ground back from that stash.
 
     `reader_stage` is the readers.las dict for LAS/LAZ inputs, or None when the
-    points are injected as a numpy array (the first stage is then the filter).
-    `preserve_class_as` copies Classification into that extra dim before SMRF can
-    overwrite it (used when the user's labels live in Classification).
-    writers.las options mirror kpconv-pdal/utils/las.py:write_las — write every
-    extra dim (incl. HeightAboveGround), LAS 1.4; forward the header only when
-    there is a LAS reader to forward it from.
+    points are injected as a numpy array. writers.las writes every extra dim
+    (incl. HeightAboveGround), LAS 1.4; the header is forwarded only when there is
+    a LAS reader to forward it from.
     """
+    # Stash original Classification when we need to read a labeled ground back
+    # after SMRF clobbers it (and/or when the caller wants labels preserved).
+    stash = preserve_class_as or (HAG_PRESERVED_CLASS_DIM if ground_class is not None else None)
     stages: list = [reader_stage] if reader_stage else []
-    if preserve_class_as:
-        # SMRF rewrites Classification (ground->2); copy the user's labels aside
-        # first so the converter can read them back after HAG.
+    if stash:
         stages.append({"type": "filters.ferry",
-                       "dimensions": f"Classification=>{preserve_class_as}"})
-    if not skip_ground:
-        # SMRF sets Classification=2 on ground; hag_nn/hag_delaunay use it.
+                       "dimensions": f"Classification=>{stash}"})
+    if use_smrf:
         stages.append({"type": "filters.smrf"})
+    if ground_class is not None:
+        # Re-assert the labeled ground as class 2 (union with SMRF when it ran).
+        stages.append({"type": "filters.assign",
+                       "value": f"Classification = 2 WHERE {stash} == {int(ground_class)}"})
     stages.append({"type": f"filters.{hag_filter}"})
     writer = {"type": "writers.las", "filename": out_path,
               "minor_version": 4, "extra_dims": "all"}
@@ -130,9 +147,9 @@ def _hag_pipeline(reader_stage, out_path: str, skip_ground: bool,
     return stages
 
 
-def add_hag(in_dir: str | Path, out_dir: str | Path, *, skip_ground: bool = False,
-            hag_filter: str = "hag_nn", preserve_class_as: str | None = None,
-            progress=None) -> dict:
+def add_hag(in_dir: str | Path, out_dir: str | Path, *, ground_class: int | None = None,
+            use_smrf: bool = True, hag_filter: str = "hag_nn",
+            preserve_class_as: str | None = None, progress=None) -> dict:
     """Add a HeightAboveGround dim to every cloud in `in_dir` -> `out_dir`.
 
     LAS/LAZ are read by PDAL directly (CRS + dims preserved). Other supported
@@ -155,7 +172,8 @@ def add_hag(in_dir: str | Path, out_dir: str | Path, *, skip_ground: bool = Fals
         raise FileNotFoundError(f"No supported point-cloud files in {in_dir}")
 
     say(f"{len(files)} cloud(s) -> {out_dir}"
-        + ("" if skip_ground else "   (SMRF ground-classify first)"))
+        + ("   (SMRF ground-classify)" if use_smrf else "")
+        + (f"   (+ labeled ground = class {ground_class})" if ground_class is not None else ""))
     per_file = []
     for path in files:
         out_path = out_dir / (path.stem + ".laz")
@@ -168,7 +186,8 @@ def add_hag(in_dir: str | Path, out_dir: str | Path, *, skip_ground: bool = Fals
         else:
             reader = None
             arrays = [_structured_from_cloud(read_points(path))]
-        stages = _hag_pipeline(reader, str(out_path), skip_ground, hag_filter,
+        stages = _hag_pipeline(reader, str(out_path), ground_class=ground_class,
+                               use_smrf=use_smrf, hag_filter=hag_filter,
                                has_header=is_las, preserve_class_as=preserve_class_as)
         pipe = (pdal.Pipeline(json.dumps(stages), arrays=arrays) if arrays
                 else pdal.Pipeline(json.dumps(stages)))
@@ -195,7 +214,8 @@ def add_hag(in_dir: str | Path, out_dir: str | Path, *, skip_ground: bool = Fals
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "input_dir": str(in_dir),
         "output_dir": str(out_dir),
-        "skip_ground": skip_ground,
+        "ground_class": ground_class,
+        "use_smrf": use_smrf,
         "hag_filter": hag_filter,
         "n_files": len(per_file),
         "total_points": sum(s["n_points"] for s in per_file),
@@ -207,43 +227,61 @@ def add_hag(in_dir: str | Path, out_dir: str | Path, *, skip_ground: bool = Fals
     return summary
 
 
-def hag_for_cloud(cloud, skip_ground: bool = False,
+def hag_for_cloud(cloud, *, ground_mask=None, use_smrf: bool = True,
                   hag_filter: str = "hag_nn") -> "np.ndarray | None":
-    """Per-point HeightAboveGround (SMRF -> hag) aligned 1:1 to cloud.xyz, for
-    INFERENCE and per-tile HAG (the twin of add_hag's per-file laz output — same
-    stages, kept in RAM).
+    """Per-point HeightAboveGround aligned 1:1 to cloud.xyz, for INFERENCE and
+    per-tile HAG (the in-RAM twin of add_hag's per-file laz output).
 
-    `skip_ground` drops the SMRF stage, but ONLY when the cloud already carries
-    ground (a Classification field with value 2) — hag_nn needs ground points, so
-    a tile with no ground is always SMRF'd regardless of the flag (safe default).
+    Ground for the HAG filter is built from, in combination:
+      - ground_mask: a boolean array (len cloud.n) marking the points the dataset
+        LABELS as ground (the caller builds it from its own label field, e.g.
+        raw == the ground class). Used verbatim — no dependence on a dimension
+        being named "Classification".
+      - use_smrf: also run PDAL SMRF to DETECT ground and UNION it with the
+        labeled ground, filling holes the labels miss (missing ground returns,
+        e.g. under buildings) without discarding the trusted labels.
+    The HAG filter (hag_nn / hag_delaunay) then interpolates a ground elevation
+    for every point from that ground set (it spans the true holes — a building
+    footprint with no ground returns — by nearest-neighbour / TIN).
 
-    Returns float32 of length cloud.n, or None if PDAL is unavailable or the
-    pipeline drops/reorders points (the caller then falls back to a z-min proxy, so
-    a missing/odd PDAL is never worse than today's behaviour). smrf+hag are
-    point-wise filters that preserve input order; the length + first/last-X guard
-    rejects the pathological case where they don't."""
+    Returns float32 length cloud.n, or None when: PDAL is unavailable; there is no
+    ground source at all (no mask and use_smrf is False, or SMRF found nothing and
+    no labels); or the pipeline drops/reorders points (caller falls back to a
+    z-min proxy — never worse than before). smrf+hag preserve input order; the
+    length + first/last-X guard rejects the pathological case where they don't."""
     if not pdal_available():
         return None
     if hag_filter not in HAG_FILTERS:
         raise ValueError(f"hag_filter must be one of {HAG_FILTERS}, got {hag_filter!r}")
+    if ground_mask is None and not use_smrf:
+        return None                                   # nothing to anchor HAG to
     import pdal
     try:
-        arr_in = _structured_from_cloud(cloud)
-        names = arr_in.dtype.names or ()
-        have_ground = "Classification" in names and bool((arr_in["Classification"] == 2).any())
-        stages = []
-        if not (skip_ground and have_ground):
-            stages.append({"type": "filters.smrf"})   # classify ground; hag needs it
-        stages.append({"type": f"filters.{hag_filter}"})
-        pipe = pdal.Pipeline(json.dumps(stages), arrays=[arr_in])
+        arr = _structured_from_cloud(cloud)           # always has a Classification dim
+        ground = np.zeros(cloud.n, dtype=bool)
+        if ground_mask is not None:
+            ground_mask = np.asarray(ground_mask, dtype=bool).reshape(-1)
+            if len(ground_mask) != cloud.n:
+                return None
+            ground |= ground_mask
+        if use_smrf:                                  # detect ground, union with labels
+            smrf = pdal.Pipeline(json.dumps([{"type": "filters.smrf"}]), arrays=[arr])
+            smrf.execute()
+            sarr = smrf.arrays[0]
+            if len(sarr) == cloud.n:
+                ground |= (np.asarray(sarr["Classification"]) == 2)
+        if not ground.any():
+            return None                               # no ground points -> no HAG
+        arr["Classification"] = np.where(ground, 2, 1).astype(arr["Classification"].dtype)
+        pipe = pdal.Pipeline(json.dumps([{"type": f"filters.{hag_filter}"}]), arrays=[arr])
         pipe.execute()
-        arr = pipe.arrays[0]
-        if len(arr) != cloud.n or "HeightAboveGround" not in (arr.dtype.names or ()):
+        out = pipe.arrays[0]
+        if len(out) != cloud.n or "HeightAboveGround" not in (out.dtype.names or ()):
             return None
-        ax = np.asarray(arr["X"], np.float64)
+        ax = np.asarray(out["X"], np.float64)
         if not (np.isclose(ax[0], cloud.xyz[0, 0]) and np.isclose(ax[-1], cloud.xyz[-1, 0])):
             return None   # PDAL reordered the points -> can't pair, fall back to proxy
-        return np.asarray(arr["HeightAboveGround"], np.float32)
+        return np.asarray(out["HeightAboveGround"], np.float32)
     except Exception:  # noqa: BLE001
         return None
 
@@ -296,8 +334,8 @@ def tile_for_model(in_dir: str | Path, out_dir: str | Path, backbone_key: str,
 
 def _selfcheck():
     """_hag_pipeline stage ordering (no PDAL needed): ferry-before-smrf when
-    preserving labels, smrf skipped when ground is given, writer always last."""
-    s = _hag_pipeline({"type": "readers.las"}, "/x.laz", skip_ground=False,
+    preserving labels, ground re-asserted AFTER smrf (union), writer always last."""
+    s = _hag_pipeline({"type": "readers.las"}, "/x.laz", use_smrf=True,
                       hag_filter="hag_nn", has_header=True,
                       preserve_class_as=HAG_PRESERVED_CLASS_DIM)
     assert [st["type"] for st in s] == [
@@ -305,10 +343,19 @@ def _selfcheck():
         "filters.hag_nn", "writers.las"], s
     assert s[1]["dimensions"] == f"Classification=>{HAG_PRESERVED_CLASS_DIM}"
     assert s[-1]["forward"] == "all"          # LAS reader -> forward the header
-    skip = _hag_pipeline(None, "/x.laz", skip_ground=True, hag_filter="hag_nn",
-                         has_header=False)
-    assert [st["type"] for st in skip] == ["filters.hag_nn", "writers.las"]
-    assert "forward" not in skip[-1]          # array input -> no header to forward
+    # labeled ground + SMRF fill: stash labels, smrf, re-assert ground=class, hag
+    u = _hag_pipeline(None, "/x.laz", ground_class=6, use_smrf=True,
+                      hag_filter="hag_nn", has_header=False)
+    assert [st["type"] for st in u] == [
+        "filters.ferry", "filters.smrf", "filters.assign",
+        "filters.hag_nn", "writers.las"], u
+    assert u[2]["value"] == f"Classification = 2 WHERE {HAG_PRESERVED_CLASS_DIM} == 6"
+    # labeled ground only (no smrf), array input -> no header to forward
+    only = _hag_pipeline(None, "/x.laz", ground_class=2, use_smrf=False,
+                         hag_filter="hag_nn", has_header=False)
+    assert [st["type"] for st in only] == [
+        "filters.ferry", "filters.assign", "filters.hag_nn", "writers.las"], only
+    assert "forward" not in only[-1]          # array input -> no header to forward
     print("pretrain self-check OK")
 
 

@@ -335,8 +335,8 @@ def _hag_from_cloud(cloud: Cloud) -> np.ndarray | None:
 
 def _convert_one(cloud: Cloud, raw: np.ndarray | None, value_to_index: dict[int, int],
                  out_path: Path, intensity_norm: str = "max",
-                 compute_hag: bool = False, skip_ground: bool = False,
-                 hag_filter: str = "hag_nn") -> dict:
+                 compute_hag: bool = False, ground_value: int | None = None,
+                 use_smrf: bool = True, hag_filter: str = "hag_nn") -> dict:
     """Write one (already-read, already-cropped) cloud to a canonical npz.
 
     compute_hag: also store a per-point real HeightAboveGround ("hag", SMRF->hag)
@@ -373,7 +373,9 @@ def _convert_one(cloud: Cloud, raw: np.ndarray | None, value_to_index: dict[int,
         out["hag"] = source_hag.astype(np.float32)
     if compute_hag and "hag" not in out:
         from . import pretrain
-        h = pretrain.hag_for_cloud(cloud, skip_ground=skip_ground, hag_filter=hag_filter)
+        gmask = (raw == int(ground_value)) if (raw is not None and ground_value is not None) else None
+        h = pretrain.hag_for_cloud(cloud, ground_mask=gmask, use_smrf=use_smrf,
+                                   hag_filter=hag_filter)
         if h is not None and len(h) == cloud.n:
             out["hag"] = h.astype(np.float32)
 
@@ -397,22 +399,22 @@ def _convert_one(cloud: Cloud, raw: np.ndarray | None, value_to_index: dict[int,
 
 def convert_scene(path: Path, spec: LabelSpec | None, value_to_index: dict[int, int],
                   out_path: Path, intensity_norm: str = "max",
-                  compute_hag: bool = False, skip_ground: bool = False,
-                  hag_filter: str = "hag_nn") -> dict:
+                  compute_hag: bool = False, ground_value: int | None = None,
+                  use_smrf: bool = True, hag_filter: str = "hag_nn") -> dict:
     """Read one source file and convert the whole cloud (no cropping)."""
     cloud = read_points(path)
     raw = read_labels(path, cloud, spec) if spec is not None else None
     return _convert_one(cloud, raw, value_to_index, out_path, intensity_norm,
-                        compute_hag=compute_hag, skip_ground=skip_ground,
-                        hag_filter=hag_filter)
+                        compute_hag=compute_hag, ground_value=ground_value,
+                        use_smrf=use_smrf, hag_filter=hag_filter)
 
 
 def _plan_and_convert(input_files: list[Path], val_files: list[Path] | None,
                       test_files: list[Path] | None, split: SplitConfig,
                       spec: LabelSpec | None, value_to_index: dict[int, int],
                       num_classes: int, out_root: Path, intensity_norm: str, say, *,
-                      compute_hag: bool = False, skip_ground: bool = False,
-                      hag_filter: str = "hag_nn") -> dict:
+                      compute_hag: bool = False, ground_value: int | None = None,
+                      use_smrf: bool = True, hag_filter: str = "hag_nn") -> dict:
     """Convert sources into out_root/{train,val,test}/*.npz; returns
     {"train": [stats], "val": [stats], "test": [stats]}.
 
@@ -425,7 +427,8 @@ def _plan_and_convert(input_files: list[Path], val_files: list[Path] | None,
         out_path = out_root / split_name / f"{scene_name}.npz"
         st = _convert_one(cloud, raw, value_to_index, out_path, intensity_norm,
                           compute_hag=compute_hag and not hag_already,
-                          skip_ground=skip_ground, hag_filter=hag_filter)
+                          ground_value=ground_value, use_smrf=use_smrf,
+                          hag_filter=hag_filter)
         st["scene"] = out_path.name
         stats[split_name].append(st)
 
@@ -455,7 +458,9 @@ def _plan_and_convert(input_files: list[Path], val_files: list[Path] | None,
         raw = read_labels(f, cloud, spec) if spec is not None else None
         if compute_hag and _hag_from_cloud(cloud) is None:
             from . import pretrain                      # whole-cloud HAG, ferried via fields
-            h = pretrain.hag_for_cloud(cloud, skip_ground=skip_ground, hag_filter=hag_filter)
+            gmask = (raw == int(ground_value)) if (raw is not None and ground_value is not None) else None
+            h = pretrain.hag_for_cloud(cloud, ground_mask=gmask, use_smrf=use_smrf,
+                                       hag_filter=hag_filter)
             if h is not None and len(h) == cloud.n:
                 cloud.fields["HeightAboveGround"] = h.astype(np.float32)
         groups = _atomize(cloud, split.tile_m)
@@ -485,8 +490,8 @@ def _plan_and_convert(input_files: list[Path], val_files: list[Path] | None,
         raw = read_labels(f, cloud, spec) if spec is not None else None
         out_path = out_root / "_pool" / f"{f.stem}.npz"
         st = _convert_one(cloud, raw, value_to_index, out_path, intensity_norm,
-                          compute_hag=compute_hag, skip_ground=skip_ground,
-                          hag_filter=hag_filter)
+                          compute_hag=compute_hag, ground_value=ground_value,
+                          use_smrf=use_smrf, hag_filter=hag_filter)
         st["scene"] = out_path.name
         st["_pool_path"] = out_path
         pool.append(st)
@@ -513,8 +518,8 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
                     staging_root: Path, *, val_inputs=None, test_inputs=None,
                     split: SplitConfig | None = None,
                     intensity_norm: str = "max", compute_hag: bool = False,
-                    skip_ground: bool = False, hag_filter: str = "hag_nn",
-                    progress=None) -> Path:
+                    ground_value: int | None = None, use_smrf: bool = True,
+                    hag_filter: str = "hag_nn", progress=None) -> Path:
     """Convert `inputs` (files and/or folders) into a staged canonical dataset with
     materialized train/val/test folders.
 
@@ -524,8 +529,12 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
     split: how to allocate train/val/test (fractions, mode, seed) when a split
         isn't provided explicitly (default: SplitConfig()).
     classes: [{"index", "source_value", "name"}] — built by the Datasets page.
-    compute_hag: bake a per-scene HeightAboveGround channel (PDAL SMRF->hag) into
-        every scene in the SAME pass as conversion. skip_ground/hag_filter tune it.
+    compute_hag: bake a per-scene HeightAboveGround channel into every scene in
+        the SAME pass as conversion. ground_value names the source label value
+        that means GROUND (None = none); use_smrf runs PDAL SMRF and unions it
+        with that labeled ground so SMRF fills holes the labels miss (e.g. under
+        buildings). With no ground_value, use_smrf is the sole ground source;
+        hag_filter picks nn/delaunay.
     """
     from . import analysis
 
@@ -553,14 +562,17 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
     if compute_hag:
         from . import pretrain
         if pretrain.pdal_available():
-            say("computing HeightAboveGround inline (PDAL SMRF -> hag) …")
+            src = (f"ground=class {ground_value}" + (" + SMRF fill" if use_smrf else "")
+                   if ground_value is not None else "SMRF")
+            say(f"computing HeightAboveGround inline (PDAL {src} -> {hag_filter}) …")
         else:
             say("⚠ HAG requested but PDAL isn't installed — written without it.")
             compute_hag = False
     scene_stats = _plan_and_convert(input_files, val_files, test_files, split, spec,
                                     value_to_index, num_classes, out_root,
                                     intensity_norm, say, compute_hag=compute_hag,
-                                    skip_ground=skip_ground, hag_filter=hag_filter)
+                                    ground_value=ground_value, use_smrf=use_smrf,
+                                    hag_filter=hag_filter)
     for sp in _SPLITS:
         if not scene_stats[sp]:
             raise ValueError(f"Conversion produced an empty {sp} split — lower the "
@@ -616,6 +628,15 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
         "intensity_raw_max": {s["scene"]: s["intensity_raw_max"] for s in all_stats
                               if s["intensity_raw_max"] is not None},
     }
+    # How every scene's HAG was produced (recorded for the GUI + reproducibility).
+    if not all(s["has_hag"] for s in all_stats):
+        hag_src = ""
+    elif not compute_hag:
+        hag_src = "source_dimension"          # HAG came from a dim already in the cloud
+    elif ground_value is None:
+        hag_src = "smrf"
+    else:
+        hag_src = "labeled+smrf" if use_smrf else "labeled"
     meta = {
         "schema_version": 2,
         "name": name,
@@ -629,8 +650,9 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
             "label_field": spec.field if spec else "",
             "truth_dir": spec.truth_dir if spec else "",
             "intensity_norm": intensity_norm,
-            "hag_source": (("per_tile_smrf" if compute_hag else "source_dimension")
-                           if all(s["has_hag"] for s in all_stats) else ""),
+            "hag_source": hag_src,
+            "hag_ground_value": (int(ground_value) if ground_value is not None else None),
+            "hag_use_smrf": bool(use_smrf),
             "ignore_values": [int(v) for v in ignore_values],
         },
         "split": {
@@ -710,14 +732,16 @@ def convert_infer_job(job_id: str, input_dir: str, staging_root: Path, progress=
     return out_root
 
 
-def add_hag_to_dataset(src_dir, out_dir, *, skip_ground: bool = False,
+def add_hag_to_dataset(src_dir, out_dir, *, use_smrf: bool = True,
                        hag_filter: str = "hag_nn", progress=None) -> Path:
     """Add a per-tile HeightAboveGround channel to an already-converted dataset.
 
     Reads each train|val|test/*.npz, recomputes HAG with PDAL (SMRF -> hag) on the
     tile's OWN points (the inference twin pretrain.hag_for_cloud, kept in RAM),
     and writes a sibling dataset with a `hag` key added to every tile. Returns
-    out_dir.
+    out_dir. Ground here is SMRF only — the converted tiles carry remapped label
+    indices, not the source ground value; use the inline HAG in convert_dataset
+    (ground_value=…) when you want labeled ground unioned with SMRF.
 
     Per-tile ground is weaker than whole-cloud SMRF on tiles with little bare
     earth; tiles where PDAL can't return an aligned result keep no `hag` key and
@@ -751,7 +775,7 @@ def add_hag_to_dataset(src_dir, out_dir, *, skip_ground: bool = False,
                 intensity=data.get("intensity"),
                 return_number=data.get("return_number"),
             )
-            h = pretrain.hag_for_cloud(cloud, skip_ground=skip_ground, hag_filter=hag_filter)
+            h = pretrain.hag_for_cloud(cloud, use_smrf=use_smrf, hag_filter=hag_filter)
             if h is not None and len(h) == cloud.n:
                 data["hag"] = h.astype(np.float32)
                 n_hag += 1

@@ -204,18 +204,35 @@ class DatasetsPage(QWidget):
         # Optional: compute HeightAboveGround per scene in the same pass (one read/
         # write per scene). Whole-scene SMRF -> better ground than per-tile.
         self.hag_chk = QCheckBox("Compute Height-Above-Ground (HAG)")
-        self.hag_chk.setToolTip("Bakes a per-point HAG channel (PDAL SMRF -> hag) into every "
-                                "scene as it's written. The *_hag models use it; the others "
-                                "ignore the extra channel.")
+        self.hag_chk.setToolTip("Bakes a per-point HAG channel into every scene as it's "
+                                "written. Ground comes from SMRF, from a labeled ground class, "
+                                "or both unioned (SMRF fills holes under buildings). The *_hag "
+                                "models use it; the others ignore the extra channel.")
         self.hag_chk.toggled.connect(lambda on: self.hag_opts_w.setVisible(on))
         form.addRow("Height-Above-Ground", self.hag_chk)
         self.hag_filter = QComboBox()
         self.hag_filter.addItems(list(pretrain.HAG_FILTERS))
-        self.hag_skip_ground = QCheckBox("ground already classified (class 2) — skip SMRF")
+        # Which class is GROUND (the raw Source value from the Classes table). Blank
+        # = no ground class, so SMRF is the only source.
+        self.hag_ground = QLineEdit()
+        self.hag_ground.setPlaceholderText("blank = none")
+        self.hag_ground.setMaximumWidth(90)
+        self.hag_ground.setToolTip("The raw class value that means GROUND (a Source value "
+                                   "from the Classes table, e.g. 2). Blank = no ground class — "
+                                   "SMRF detects ground on its own.")
+        # Run SMRF too and union it with the labeled ground, to fill holes the labels
+        # miss (missing ground returns, e.g. under buildings).
+        self.hag_fill_smrf = QCheckBox("fill ground gaps with SMRF")
+        self.hag_fill_smrf.setChecked(True)
+        self.hag_fill_smrf.setToolTip("Also run SMRF and union it with the labeled ground so "
+                                      "holes (no ground returns, e.g. under buildings) get "
+                                      "filled. With no ground class set, SMRF is used regardless.")
         hag_row = QHBoxLayout()
         hag_row.addWidget(QLabel("filter"))
         hag_row.addWidget(self.hag_filter)
-        hag_row.addWidget(self.hag_skip_ground)
+        hag_row.addWidget(QLabel("ground class"))
+        hag_row.addWidget(self.hag_ground)
+        hag_row.addWidget(self.hag_fill_smrf)
         hag_row.addStretch()
         self.hag_opts_w = _wrap(hag_row)
         self.hag_opts_w.setVisible(False)
@@ -483,13 +500,23 @@ class DatasetsPage(QWidget):
         if not classes:
             self._append("All label values are unchecked — nothing to train on.")
             return None
+        gtxt = self.hag_ground.text().strip()
+        try:
+            gv = int(gtxt) if gtxt else None
+        except ValueError:
+            gv = None
+        if gtxt and gv is None:
+            self._append(f"Ground class '{gtxt}' isn't an integer — clear it or enter a "
+                         f"Source value from the Classes table.")
+            return None
         return {
             "name": name, "in_path": in_path, "split": split,
             "val_inputs": val_inputs, "test_inputs": test_inputs,
             "classes": classes, "ignored": ignored, "spec": self._spec(),
             "out_root": self._output_root(),
             "compute_hag": pretrain.pdal_available() and self.hag_chk.isChecked(),
-            "skip_ground": self.hag_skip_ground.isChecked(),
+            "ground_value": gv,
+            "use_smrf": (gv is None) or self.hag_fill_smrf.isChecked(),
             "hag_filter": self.hag_filter.currentText(),
         }
 
@@ -511,7 +538,8 @@ class DatasetsPage(QWidget):
                 out_root, val_inputs=plan["val_inputs"],
                 test_inputs=plan["test_inputs"], split=split,
                 intensity_norm="p95", compute_hag=plan["compute_hag"],
-                skip_ground=plan["skip_ground"], hag_filter=plan["hag_filter"],
+                ground_value=plan["ground_value"], use_smrf=plan["use_smrf"],
+                hag_filter=plan["hag_filter"],
                 progress=progress)
 
         self._done_cb = self._on_converted
@@ -576,10 +604,16 @@ class DatasetsPage(QWidget):
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if resp != QMessageBox.Yes:
             return
-        appstate.delete_dataset(name)
+        staged, err = appstate.delete_dataset(name)
         self._reload_known()
         self.stats_label.setText("")
-        self._append(f"Deleted dataset '{name}'.")
+        if err:
+            self._append(f"Removed '{name}' from the list, but its files at {staged} "
+                         f"couldn't be deleted:\n  {err}\n  Close anything using them "
+                         f"(viewer, training run) and delete the folder manually.")
+        else:
+            self._append(f"Deleted dataset '{name}' — removed from the list and deleted "
+                         f"{staged or 'nothing on disk'}.")
 
     def _start_upload(self, staged: Path):
         # Each dataset gets its own auto-created Modal volume named after it; the
