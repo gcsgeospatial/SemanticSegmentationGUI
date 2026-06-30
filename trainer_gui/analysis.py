@@ -53,9 +53,11 @@ def recommend(meta: dict) -> dict:
     spacing = float(stats.get("mean_spacing_m", 0.3))
     density = float(stats.get("mean_pts_per_m2", 10.0))
 
-    # tile size targeting ~250k raw points per tile, in [25, 100] m, rounded to 5
+    # tile size targeting ~250k raw points per tile, rounded to 5 m. No upper
+    # cap — at low density that's a few big tiles, not thousands of small ones.
+    # Floor 25 m only stops dense data from suggesting a no-context sub-25 m tile.
     chunk = math.sqrt(250_000 / max(density, 0.01))
-    chunk = min(max(5 * round(chunk / 5), 25), 100)
+    chunk = max(5 * round(chunk / 5), 25)
 
     recs: dict[str, dict] = {}
     for key, b in BACKBONES.items():

@@ -21,7 +21,9 @@ only `add_hag` needs it. `tile_for_model` is pure numpy/laspy.
 from __future__ import annotations
 
 import json
+import os
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -107,7 +109,8 @@ def _structured_from_cloud(cloud) -> np.ndarray:
 
 def _hag_pipeline(reader_stage, out_path: str, *, ground_class: int | None = None,
                   use_smrf: bool = True, hag_filter: str = "hag_nn",
-                  has_header: bool = True, preserve_class_as: str | None = None) -> list:
+                  has_header: bool = True, preserve_class_as: str | None = None,
+                  smrf_cell: float = 2.0) -> list:
     """[reader] -> [ferry] -> [smrf] -> [assign ground] -> filters.<hag> -> writers.las.
 
     Ground for the HAG filter is built from, in combination:
@@ -133,7 +136,9 @@ def _hag_pipeline(reader_stage, out_path: str, *, ground_class: int | None = Non
         stages.append({"type": "filters.ferry",
                        "dimensions": f"Classification=>{stash}"})
     if use_smrf:
-        stages.append({"type": "filters.smrf"})
+        # cell = ground-raster resolution; coarser than PDAL's 1.0 m default is
+        # ~(1.0/cell)^2 cheaper in SMRF and fine for a HAG reference surface.
+        stages.append({"type": "filters.smrf", "cell": smrf_cell})
     if ground_class is not None:
         # Re-assert the labeled ground as class 2 (union with SMRF when it ran).
         stages.append({"type": "filters.assign",
@@ -148,8 +153,9 @@ def _hag_pipeline(reader_stage, out_path: str, *, ground_class: int | None = Non
 
 
 def add_hag(in_dir: str | Path, out_dir: str | Path, *, ground_class: int | None = None,
-            use_smrf: bool = True, hag_filter: str = "hag_nn",
-            preserve_class_as: str | None = None, progress=None) -> dict:
+            use_smrf: bool = True, hag_filter: str = "hag_nn", smrf_cell: float = 2.0,
+            preserve_class_as: str | None = None, max_workers: int | None = None,
+            progress=None) -> dict:
     """Add a HeightAboveGround dim to every cloud in `in_dir` -> `out_dir`.
 
     LAS/LAZ are read by PDAL directly (CRS + dims preserved). Other supported
@@ -157,7 +163,10 @@ def add_hag(in_dir: str | Path, out_dir: str | Path, *, ground_class: int | None
     transformed to LAS/LAZ on the way through the HAG pipeline. Outputs are
     `.laz` with a HeightAboveGround dim + a per-file `.json` sidecar.
 
-    Returns a summary dict (also written to out_dir/pretrain_summary.json).
+    Files are processed concurrently (PDAL drops the GIL in execute), so this
+    scales with cores when there's more than one scene; smrf_cell trades ground
+    resolution for SMRF speed. Returns a summary dict (also written to
+    out_dir/pretrain_summary.json).
     """
     import pdal
 
@@ -174,12 +183,10 @@ def add_hag(in_dir: str | Path, out_dir: str | Path, *, ground_class: int | None
     say(f"{len(files)} cloud(s) -> {out_dir}"
         + ("   (SMRF ground-classify)" if use_smrf else "")
         + (f"   (+ labeled ground = class {ground_class})" if ground_class is not None else ""))
-    per_file = []
-    for path in files:
+
+    def _process_one(path: Path) -> dict:
         out_path = out_dir / (path.stem + ".laz")
         is_las = path.suffix.lower() in LAS_EXTS
-        say(f"  {path.name} -> {out_path.name}"
-            + ("" if is_las else "   (txt/other -> LAZ)") + " …")
         if is_las:
             reader = {"type": "readers.las", "filename": str(path)}
             arrays = None
@@ -187,7 +194,7 @@ def add_hag(in_dir: str | Path, out_dir: str | Path, *, ground_class: int | None
             reader = None
             arrays = [_structured_from_cloud(read_points(path))]
         stages = _hag_pipeline(reader, str(out_path), ground_class=ground_class,
-                               use_smrf=use_smrf, hag_filter=hag_filter,
+                               use_smrf=use_smrf, hag_filter=hag_filter, smrf_cell=smrf_cell,
                                has_header=is_las, preserve_class_as=preserve_class_as)
         pipe = (pdal.Pipeline(json.dumps(stages), arrays=arrays) if arrays
                 else pdal.Pipeline(json.dumps(stages)))
@@ -204,11 +211,22 @@ def add_hag(in_dir: str | Path, out_dir: str | Path, *, ground_class: int | None
             "hag_mean": float(hag.mean()),
             "hag_max": float(hag.max()),
         }
-        per_file.append(st)
         with open(out_dir / (path.stem + ".json"), "w", encoding="utf-8") as f:
             json.dump({"pipeline": stages, **st}, f, indent=2)
-        say(f"    {n:,} pts, {n_ground:,} ground, "
-            f"HAG {st['hag_min']:.2f}..{st['hag_max']:.2f} m")
+        return st
+
+    # ponytail: one worker per file, capped at cpu_count — each SMRF holds its
+    # whole cloud in RAM, so don't oversubscribe past the file count or cores.
+    workers = max_workers or min(os.cpu_count() or 4, len(files))
+    per_file = []
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(_process_one, p): p for p in files}
+        for fut in as_completed(futs):
+            st = fut.result()
+            per_file.append(st)
+            say(f"  ✓ {st['scene']} -> {st['output']}: {st['n_points']:,} pts, "
+                f"{st['n_ground']:,} ground, HAG {st['hag_min']:.2f}..{st['hag_max']:.2f} m")
+    per_file.sort(key=lambda s: s["scene"])   # completion order -> stable report
 
     summary = {
         "created_utc": datetime.now(timezone.utc).isoformat(),
@@ -228,7 +246,7 @@ def add_hag(in_dir: str | Path, out_dir: str | Path, *, ground_class: int | None
 
 
 def hag_for_cloud(cloud, *, ground_mask=None, use_smrf: bool = True,
-                  hag_filter: str = "hag_nn") -> "np.ndarray | None":
+                  hag_filter: str = "hag_nn", smrf_cell: float = 2.0) -> "np.ndarray | None":
     """Per-point HeightAboveGround aligned 1:1 to cloud.xyz, for INFERENCE and
     per-tile HAG (the in-RAM twin of add_hag's per-file laz output).
 
@@ -265,7 +283,7 @@ def hag_for_cloud(cloud, *, ground_mask=None, use_smrf: bool = True,
                 return None
             ground |= ground_mask
         if use_smrf:                                  # detect ground, union with labels
-            smrf = pdal.Pipeline(json.dumps([{"type": "filters.smrf"}]), arrays=[arr])
+            smrf = pdal.Pipeline(json.dumps([{"type": "filters.smrf", "cell": smrf_cell}]), arrays=[arr])
             smrf.execute()
             sarr = smrf.arrays[0]
             if len(sarr) == cloud.n:

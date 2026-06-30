@@ -136,7 +136,7 @@ class InferPage(QWidget):
         in_row.addWidget(file_btn)
         iform.addRow("Point clouds (folder or file)", _wrap(in_row))
         self.grid_spin = QDoubleSpinBox()
-        self.grid_spin.setRange(0.02, 5.0)
+        self.grid_spin.setRange(0.02, 1_000_000.0)
         self.grid_spin.setSingleStep(0.05)
         self.grid_spin.setDecimals(2)
         self.grid_spin.setValue(0.30)
@@ -144,7 +144,7 @@ class InferPage(QWidget):
         # Intensity is p95-normalized end-to-end (build + train + inference), so there
         # is nothing to match here — convert_infer_job always uses p95.
         self.chunk_spin = QDoubleSpinBox()
-        self.chunk_spin.setRange(10.0, 200.0)
+        self.chunk_spin.setRange(10.0, 1_000_000.0)
         self.chunk_spin.setSingleStep(5.0)
         self.chunk_spin.setDecimals(0)
         self.chunk_spin.setValue(50.0)
@@ -559,7 +559,7 @@ class InferPage(QWidget):
         b = self._backbone()
         gp = next((p for p in b.params if p.recommend_key == "grid"), None)
         if gp:
-            self.grid_spin.setRange(gp.lo, gp.hi)
+            self.grid_spin.setRange(gp.lo, 1_000_000.0)
             self.grid_spin.setDecimals(gp.decimals)
             self.grid_spin.setSingleStep(gp.step)
             self.grid_spin.setValue(gp.default)

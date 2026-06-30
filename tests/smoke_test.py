@@ -35,7 +35,7 @@ CHECKS = []
 
 def check(name, cond):
     CHECKS.append((name, bool(cond)))
-    print(("  ✓ " if cond else "  ✗ ") + name)
+    print(("  [ok]  " if cond else "  [FAIL] ") + name)
 
 
 def make_xyz(n=20_000, extent=100.0):
@@ -77,6 +77,12 @@ def write_ascii(pc_path, cls_path, xyz, labels, intensity):
 
 
 def main():
+    # Windows consoles default to cp1252; any non-ASCII in test or progress
+    # output (✓, …, ²) would otherwise crash the run on the print, not the logic.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
     tmp = Path(tempfile.mkdtemp(prefix="trainer_gui_smoke_"))
     print(f"workdir: {tmp}")
     try:

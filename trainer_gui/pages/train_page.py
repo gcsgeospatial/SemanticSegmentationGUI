@@ -370,11 +370,11 @@ class TrainPage(QWidget):
                 w = ui.NoWheelDoubleSpinBox()
                 w.setDecimals(spec.decimals)
                 w.setSingleStep(spec.step)
-                w.setRange(spec.lo, spec.hi)
+                w.setRange(spec.lo, 1_000_000.0)   # spec.hi is a reco band, not a cap
                 w.setValue(float(value))
             else:
                 w = ui.NoWheelSpinBox()
-                w.setRange(int(spec.lo), int(spec.hi))
+                w.setRange(int(spec.lo), 100_000_000)
                 w.setValue(int(value))
             label = spec.label + ("  ★" if spec.recommend_key and spec.recommend_key in recs else "")
             self.params_form.addRow(label, w)
