@@ -240,6 +240,18 @@ class DatasetsPage(QWidget):
         if not pretrain.pdal_available():
             self.hag_chk.setEnabled(False)
             self.hag_chk.setText("Compute Height-Above-Ground (HAG) — PDAL not installed")
+        # How many scenes to convert concurrently. 0 = Auto (clamp to cores + free
+        # RAM); a positive value is a hard override the safety clamp won't touch.
+        self.workers_spin = QSpinBox()
+        self.workers_spin.setRange(0, max((os.cpu_count() or 4) * 2, 16))
+        self.workers_spin.setSpecialValueText("Auto")
+        self.workers_spin.setValue(0)
+        self.workers_spin.setMaximumWidth(110)
+        self.workers_spin.setToolTip(
+            f"Scenes converted in parallel. Auto clamps to cores and free RAM "
+            f"(this machine: {os.cpu_count()} cores). A number forces exactly that many — "
+            f"faster, but each worker holds a whole cloud in RAM, so too many can OOM.")
+        form.addRow("Parallel workers", self.workers_spin)
         self.tile_btn = QPushButton("Build dataset")
         self.tile_btn.setObjectName("primary")
         self.tile_btn.clicked.connect(self._start_tiling)
@@ -518,6 +530,7 @@ class DatasetsPage(QWidget):
             "ground_value": gv,
             "use_smrf": (gv is None) or self.hag_fill_smrf.isChecked(),
             "hag_filter": self.hag_filter.currentText(),
+            "max_workers": self.workers_spin.value() or None,   # 0 -> Auto (None)
         }
 
     def _start_tiling(self):
@@ -539,7 +552,7 @@ class DatasetsPage(QWidget):
                 test_inputs=plan["test_inputs"], split=split,
                 intensity_norm="p95", compute_hag=plan["compute_hag"],
                 ground_value=plan["ground_value"], use_smrf=plan["use_smrf"],
-                hag_filter=plan["hag_filter"],
+                hag_filter=plan["hag_filter"], max_workers=plan["max_workers"],
                 progress=progress)
 
         self._done_cb = self._on_converted

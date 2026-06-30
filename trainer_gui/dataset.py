@@ -447,17 +447,27 @@ _RAM_PER_FILE_FACTOR = 30
 _RAM_HEADROOM = 0.7
 
 
-def _worker_cap(files: list[Path]) -> int:
-    """Thread count that won't OOM: min(cores, files, RAM_budget / est-per-cloud).
-    Falls back to the core/file cap when available RAM can't be read."""
-    cap = min(os.cpu_count() or 4, max(len(files), 1))
+def _worker_cap_detail(files: list[Path]) -> tuple[int, str]:
+    """(thread count that won't OOM, human reason). Cap = min(cores, files,
+    RAM_budget / est-per-cloud); reason names the binding constraint for the log."""
+    cores = os.cpu_count() or 4
+    cap = min(cores, max(len(files), 1))
+    reason = f"cores={cores}, files={len(files)}"
     ram = _available_ram_bytes()
     if ram and files:
         biggest = max((f.stat().st_size for f in files), default=0)
         if biggest > 0:
-            mem_cap = int(ram * _RAM_HEADROOM // (biggest * _RAM_PER_FILE_FACTOR))
-            cap = max(1, min(cap, mem_cap))
-    return cap
+            mem_cap = max(1, int(ram * _RAM_HEADROOM // (biggest * _RAM_PER_FILE_FACTOR)))
+            if mem_cap < cap:
+                cap = mem_cap
+                reason = (f"RAM-limited: {ram / 1e9:.1f} GB free, "
+                          f"~{biggest * _RAM_PER_FILE_FACTOR / 1e9:.1f} GB/worker")
+    return cap, reason
+
+
+def _worker_cap(files: list[Path]) -> int:
+    """Thread count that won't OOM. Falls back to the core/file cap when RAM is unreadable."""
+    return _worker_cap_detail(files)[0]
 
 
 def _convert_many(files: list[Path], dest_for, spec, value_to_index, intensity_norm, say,
@@ -482,9 +492,12 @@ def _convert_many(files: list[Path], dest_for, spec, value_to_index, intensity_n
         st["scene"] = out_path.name
         return st
 
-    workers = max_workers or _worker_cap(files)       # caller override wins, else RAM/core-safe
-    if workers > 1:
-        say(f"  ({workers} parallel workers)")
+    if max_workers is not None:                       # caller override wins
+        workers, why = max_workers, "forced"
+    else:
+        workers, why = _worker_cap_detail(files)       # RAM/core-safe Auto
+    mode = "PARALLEL" if workers > 1 else "SERIAL"
+    say(f"  {mode}: {workers} worker(s) [{why}]")
     out = []
     with ThreadPoolExecutor(max_workers=workers) as ex:
         for f, st in zip(files, ex.map(work, files)):   # map preserves input order
