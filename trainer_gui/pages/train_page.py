@@ -1,12 +1,7 @@
-"""Train page (local Docker): dataset + model + recommended params -> a local
-`docker run`, with live logs + epoch metrics.
-
-Modal is gone from this page — runs execute locally on your GPU. The dataset
-check verifies the train/val/test standard (a staged folder with train/, val/
-and test/ npz) rather than a remote volume. The per-model Docker image (present?
-pull it?) lives in a small popup that mirrors the selected model.
-Domain-generalization training
-knobs are set per run here; inference-time DG (AdaBN/TTA) stays on the Infer page.
+"""Train page (local Docker): dataset + model + params -> a local docker run,
+with live logs and epoch metrics. Dataset check verifies the train/val/test
+standard; per-model image status/pull live in a popup; DG training knobs are
+per run (inference-time DG is on the Infer page).
 """
 
 from __future__ import annotations
@@ -28,13 +23,13 @@ from ..jobs import FuncWorker, JobRunner, LogParser
 
 
 class TrainPage(QWidget):
-    models_changed = Signal()   # kept for main.py's Inference-page hookup (no longer emitted)
+    models_changed = Signal()   # kept for main.py; no longer emitted
 
     def __init__(self, repo_root: str):
         super().__init__()
         self.repo_root = repo_root
-        self.runner = JobRunner(self)          # the training docker process
-        self.pull_runner = JobRunner(self)     # docker pull, streamed to the log
+        self.runner = JobRunner(self)          # training docker process
+        self.pull_runner = JobRunner(self)     # docker pull, streamed to log
         self.status_worker = FuncWorker(self)  # off-thread image-presence check
         self.parser = LogParser(self)
         self._param_widgets: dict[str, QWidget] = {}
@@ -42,8 +37,8 @@ class TrainPage(QWidget):
         self._last_run_id: str | None = None
         self._pending: dict | None = None
         self._last_statuses: dict = {}         # key -> status dict from all_statuses
-        self._cfg_dialog: QDialog | None = None  # the per-model popup, when open
-        self._ds_ready = False                 # train/val/test standard met for the selected dataset
+        self._cfg_dialog: QDialog | None = None  # per-model popup when open
+        self._ds_ready = False                 # train/val/test standard met
 
         root = QVBoxLayout(self)
         title = QLabel("Train")
@@ -63,20 +58,19 @@ class TrainPage(QWidget):
         self.ds_status.setWordWrap(True)
         theme.set_accent(self.ds_status, "muted")
         form.addRow("", self.ds_status)
-        self.backbone_combo = QComboBox()      # populated per-dataset in _reload_backbones
+        self.backbone_combo = QComboBox()      # populated in _reload_backbones
         self.backbone_combo.currentIndexChanged.connect(self._rebuild_params)
         model_row = QHBoxLayout()
         model_row.addWidget(self.backbone_combo, 1)
         self.cfg_btn = QPushButton("Configure model…")
-        self.cfg_btn.setToolTip("Docker image status + pull for the selected model.")
+        self.cfg_btn.setToolTip("Docker image status + pull.")
         self.cfg_btn.clicked.connect(self._open_model_config)
         model_row.addWidget(self.cfg_btn)
         form.addRow("Model", _wrap(model_row))
         self.smoke_chk = QCheckBox("Smoke run (2 epochs × 50 steps)")
         self.smoke_chk.toggled.connect(self._apply_smoke)
         form.addRow("Options", self.smoke_chk)
-        # Output folder (bind-mounted to /outputs): runs/<id>/... land here. Nothing
-        # is uploaded — checkpoints/metrics are written straight to the host.
+        # Output folder bind-mounted to /outputs; runs/<id>/ land here on the host.
         self.out_edit = QLineEdit()
         self.out_edit.setText(appstate.get("local_train_out", ""))
         self.out_edit.setPlaceholderText(
@@ -88,7 +82,7 @@ class TrainPage(QWidget):
         out_row.addWidget(out_btn)
         form.addRow("Output folder", _wrap(out_row))
 
-        self.params_box = QGroupBox("Parameters (recommended values pre-filled)")
+        self.params_box = QGroupBox("Parameters (pre-filled)")
         self.params_form = QFormLayout(self.params_box)
         self.warn_label = QLabel("")
         self.warn_label.setWordWrap(True)
@@ -107,7 +101,9 @@ class TrainPage(QWidget):
         config_col = QVBoxLayout()
         config_col.addWidget(form_box)
         config_col.addWidget(self.params_box)
-        config_col.addWidget(self._dg_box())
+        # TODO(not ready): domain-generalization UI hidden until reviewed. The
+        # _dg_* methods stay defined but unused; no DG env is sent (see _launch).
+        # config_col.addWidget(self._dg_box())
         config_col.addWidget(self._loss_box())
         config_col.addWidget(self.warn_label)
         config_col.addLayout(run_row)
@@ -116,7 +112,7 @@ class TrainPage(QWidget):
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setObjectName("log")
-        self.log.setPlaceholderText("Training logs appear here…")
+        self.log.setPlaceholderText("Training logs…")
 
         metrics_col = QVBoxLayout()
         metrics_col.addWidget(QLabel("Live epoch metrics"))
@@ -141,16 +137,15 @@ class TrainPage(QWidget):
         self.parser.epoch.connect(self._on_epoch)
         self.parser.run_id.connect(self._on_run_id)
 
-        self.apply_exec_mode(True)   # this page is local-only
+        self.apply_exec_mode(True)   # local-only page
         self._rebuild_params()
         self.refresh_images()
 
     def apply_exec_mode(self, local: bool):
-        """Local-only page — kept for main.py's call. Just refresh copy + lists."""
+        """Local-only page, kept for main.py's call. Refresh copy and lists."""
         self.sub.setText(
-            "Pick a dataset and a model. Parameters are pre-filled from the dataset's "
-            "density analysis — edit anything before launching. Runs execute locally "
-            "in Docker on your GPU.")
+            "Pick a dataset and model. Parameters are pre-filled from density analysis; "
+            "edit before launching. Runs locally in Docker on your GPU.")
         self.reload_datasets()
 
     # ------------------------------------------------- per-model Docker popup
@@ -237,7 +232,7 @@ class TrainPage(QWidget):
     def _on_registry_change(self):
         cfg = {**appstate.get("local_config", {}), "registry": self.registry_edit.text().strip()}
         appstate.set_local_config(cfg)
-        self.refresh_images()        # pullability changed with the registry
+        self.refresh_images()        # registry change affects pullability
 
     def _pull_current(self):
         b = self._backbone()
@@ -245,8 +240,8 @@ class TrainPage(QWidget):
             return
         s = self._last_statuses.get(b.key)
         if not (s and s["docker"] and s["pullable"] and not s["present"]):
-            self._append("[local] Nothing to pull — image is present or not pullable "
-                         "(set a registry, and `docker login` if it's private).")
+            self._append("[local] Nothing to pull - image present or not pullable "
+                         "(set a registry; `docker login` if private).")
             return
         if self.pull_runner.running:
             return
@@ -257,11 +252,11 @@ class TrainPage(QWidget):
 
     def _on_pull_finished(self, code: int):
         self._append("[local] ✓ pulled." if code == 0
-                     else f"[local] ✗ pull failed (exit {code}). `docker login` first if private.")
+                     else f"[local] ✗ pull failed (exit {code}). `docker login` if private.")
         self.refresh_images()
 
     def _on_pull_failed(self, err: str):
-        self._append(f"\n[local] ✗ couldn't start docker pull: {err}")
+        self._append(f"\n[local] ✗ docker pull failed to start: {err}")
         self._update_cfg_dialog()
 
     # ------------------------------------------------------------- datasets
@@ -293,25 +288,24 @@ class TrainPage(QWidget):
             text, role, ready = self._local_split_status(info)
             self._set_ds_status(text, role)
             self._ds_ready = ready
-        self._dg_bind_density()
+        # self._dg_bind_density()   # TODO(not ready): DG UI hidden
         self._reload_backbones()
 
     def _local_split_status(self, info: dict):
-        """(text, role, ready) — verify the train/val/test standard locally instead
-        of a remote volume. val (in-distribution selection holdout) and test (final
-        report) are both launch-critical."""
+        """(text, role, ready). Verify the train/val/test standard locally; val and
+        test are both required to launch."""
         staged = info.get("staged_dir", "")
         if not staged or not os.path.isdir(staged):
-            return ("No local copy on this machine — convert it on the Datasets page first.",
+            return ("No local copy - convert it on the Datasets page.",
                     "warn", False)
         root = Path(staged)
         tr = list((root / "train").glob("*.npz")) if (root / "train").is_dir() else []
         va = list((root / "val").glob("*.npz")) if (root / "val").is_dir() else []
         te = list((root / "test").glob("*.npz")) if (root / "test").is_dir() else []
         if not tr or not va or not te:
-            return (f"train/val/test standard not met — train {len(tr)}, val {len(va)}, "
-                    f"test {len(te)} scene(s). Re-build it on the Datasets page.", "warn", False)
-        return (f"✓ train/val/test standard met — {len(tr)} train / {len(va)} val / "
+            return (f"train/val/test standard not met - train {len(tr)}, val {len(va)}, "
+                    f"test {len(te)} scene(s). Re-build on the Datasets page.", "warn", False)
+        return (f"✓ train/val/test met - {len(tr)} train / {len(va)} val / "
                 f"{len(te)} test scene(s).", "ok", True)
 
     def _set_ds_status(self, text: str, role: str = "muted"):
@@ -320,13 +314,13 @@ class TrainPage(QWidget):
 
     def _pick_out(self):
         d = QFileDialog.getExistingDirectory(
-            self, "Output folder for training runs (runs/<id>/… land here)",
+            self, "Output folder for runs",
             self.out_edit.text() or str(appstate.default_download_dir()))
         if d:
             self.out_edit.setText(d)
 
     def _apply_smoke(self):
-        """Lock epochs=2 / steps=50 while the smoke box is checked (visible, not silent)."""
+        """Lock epochs=2, steps=50 while the smoke box is checked."""
         on = self.smoke_chk.isChecked()
         for flag, val in (("epochs", 2), ("steps-per-epoch", 50)):
             w = self._param_widgets.get(flag)
@@ -342,7 +336,7 @@ class TrainPage(QWidget):
         self.backbone_combo.clear()
         for key, b in BACKBONES.items():
             self.backbone_combo.addItem(
-                b.label + ("" if b.ready else "  (script not wired yet)"), key)
+                b.label + ("" if b.ready else "  (not wired yet)"), key)
         i = self.backbone_combo.findData(prev)
         if i >= 0:
             self.backbone_combo.setCurrentIndex(i)
@@ -384,16 +378,16 @@ class TrainPage(QWidget):
             self.warn_label.setText("\n".join("⚠ " + w for w in warns))
         else:
             self.warn_label.setText("")
-        self._apply_smoke()          # re-lock epochs/steps if a smoke run is selected
-        self._update_cfg_dialog()    # keep the popup in sync with the model
+        self._apply_smoke()          # re-lock epochs/steps for smoke runs
+        self._update_cfg_dialog()    # sync popup with model
 
     # ------------------------------------------------- domain generalization (per run)
     def _dg_box(self) -> QGroupBox:
-        box = QGroupBox("Domain generalization (training) — applied to this run")
-        box.setToolTip("Make the model robust to inference at a different point density "
-                       "than it trained on. Set per run; not saved.")
+        box = QGroupBox("Domain generalization (training) - this run")
+        box.setToolTip("Robustness to a different inference point density than trained on. "
+                       "Set per run; not saved.")
         lay = QVBoxLayout(box)
-        self.dg_train_lbl = QLabel("Pick a dataset to see its training density.")
+        self.dg_train_lbl = QLabel("Pick a dataset to see training density.")
         theme.set_accent(self.dg_train_lbl, "muted")
         lay.addWidget(self.dg_train_lbl)
 
@@ -415,7 +409,7 @@ class TrainPage(QWidget):
         theme.set_accent(self.dg_rationale, "muted")
         lay.addWidget(self.dg_rationale)
 
-        self.dg_aug = QCheckBox("Density augmentation — train across the density range")
+        self.dg_aug = QCheckBox("Density augmentation - train across the range")
         self.dg_coarsen = ui.NoWheelDoubleSpinBox()
         self.dg_coarsen.setRange(1.0, 6.0)
         self.dg_coarsen.setSingleStep(0.1)
@@ -433,7 +427,7 @@ class TrainPage(QWidget):
         r1.addStretch(1)
         lay.addLayout(r1)
 
-        self.dg_logdk = QCheckBox("log d_k density channel — changes input dim")
+        self.dg_logdk = QCheckBox("log d_k density channel - changes input dim")
         self.dg_k = ui.NoWheelSpinBox()
         self.dg_k.setRange(1, 64)
         self.dg_k.setValue(8)
@@ -444,8 +438,8 @@ class TrainPage(QWidget):
         r2.addStretch(1)
         lay.addLayout(r2)
 
-        hint = QLabel("AdaBN & density-TTA are inference-time (no retrain) — set them "
-                      "per-run on the Inference page.")
+        hint = QLabel("AdaBN & density-TTA are inference-time (no retrain) - set them "
+                      "on the Inference page.")
         hint.setWordWrap(True)
         theme.set_accent(hint, "muted")
         lay.addWidget(hint)
@@ -456,15 +450,15 @@ class TrainPage(QWidget):
         if d:
             self.dg_train_lbl.setText(f"Training density: {d:.1f} pts/m²")
         else:
-            self.dg_train_lbl.setText("This dataset has no stored density — set DG features "
-                                      "manually (Recommend needs a density).")
+            self.dg_train_lbl.setText("No stored density - set DG features manually "
+                                      "(Recommend needs a density).")
         self.dg_reco_btn.setEnabled(bool(d))
         self.dg_rationale.setText("")
 
     def _dg_recommend(self):
         d = float((self._meta or {}).get("stats", {}).get("mean_pts_per_m2") or 0) or None
         if not d:
-            self.dg_rationale.setText("This dataset has no stored density to recommend from.")
+            self.dg_rationale.setText("No stored density to recommend from.")
             return
         rec = analysis.dg_recommend(d, self.dg_infer.value())
         self.dg_aug.setChecked(rec["density_aug"])
@@ -494,18 +488,18 @@ class TrainPage(QWidget):
         outer.addWidget(inner)
         box.toggled.connect(inner.setVisible)
         inner.setVisible(False)
-        self.loss_box = box      # unchecked = section off (use script defaults)
+        self.loss_box = box      # unchecked = off, use script defaults
 
-        hint = QLabel("Defaults already fight class imbalance: inverse-sqrt class "
-                      "weighting + Lovász-Softmax + auto rare-class oversampling. Tweak "
-                      "per run here (recorded in the run's run_config.json).")
+        hint = QLabel("Defaults handle class imbalance (inverse-sqrt weighting + "
+                      "Lovász-Softmax + rare-class oversampling). Tweak per run; "
+                      "recorded in run_config.json.")
         hint.setWordWrap(True)
         theme.set_accent(hint, "muted")
         lay.addWidget(hint)
 
         self.loss_focal = QCheckBox("Use focal loss instead of weighted cross-entropy")
-        self.loss_focal.setToolTip("Focal down-weights easy points so training focuses on hard / "
-                                   "rare ones. Off by default (weighted CE + Lovász).")
+        self.loss_focal.setToolTip("Down-weights easy points to focus on hard/rare ones. "
+                                   "Off by default (weighted CE + Lovász).")
         self.loss_gamma = ui.NoWheelDoubleSpinBox()
         self.loss_gamma.setRange(0.0, 5.0)
         self.loss_gamma.setSingleStep(0.5)
@@ -525,8 +519,8 @@ class TrainPage(QWidget):
         self.loss_beta.setRange(0.0, 1.0)
         self.loss_beta.setSingleStep(0.05)
         self.loss_beta.setValue(0.5)
-        self.loss_beta.setToolTip("0 = no weighting, 0.5 = inverse-sqrt (default), 1 = full "
-                                  "inverse-frequency (most aggressive toward rare classes).")
+        self.loss_beta.setToolTip("0 = none, 0.5 = inverse-sqrt (default), "
+                                  "1 = full inverse-frequency (most aggressive).")
         self.loss_cw.toggled.connect(self.loss_beta.setEnabled)
         r2 = QHBoxLayout()
         r2.addWidget(self.loss_cw)
@@ -535,13 +529,13 @@ class TrainPage(QWidget):
         r2.addStretch(1)
         lay.addLayout(r2)
 
-        self.loss_rare = QCheckBox("Oversample rare-class tiles (auto-detected from the data)")
+        self.loss_rare = QCheckBox("Oversample rare-class tiles (auto-detected)")
         self.loss_rare.setChecked(True)
         lay.addWidget(self.loss_rare)
         return box
 
     def _loss_collect(self) -> dict:
-        if not self.loss_box.isChecked():       # section collapsed/off -> script defaults
+        if not self.loss_box.isChecked():       # off -> script defaults
             return {}
         return {"focal": self.loss_focal.isChecked(),
                 "focal_gamma": round(self.loss_gamma.value(), 2),
@@ -556,15 +550,15 @@ class TrainPage(QWidget):
             self._append("Pick a model first.")
             return
         if not b.ready:
-            self._append(f"{b.label} isn't wired for CLI args yet — pick a ready model.")
+            self._append(f"{b.label} isn't wired yet - pick a ready model.")
             return
         name = self.dataset_combo.currentText()
         if not name:
             self._append("Create a dataset on the Datasets page first.")
             return
         if not self._ds_ready:
-            self._append("This dataset doesn't meet the train/val/test standard — fix it on "
-                         "the Datasets page before training.")
+            self._append("Dataset doesn't meet the train/val/test standard - fix it on "
+                         "the Datasets page.")
             return
         if self.runner.running:
             self._append("A training process is already running.")
@@ -578,7 +572,7 @@ class TrainPage(QWidget):
             flags["epochs"] = 2
             flags["steps-per-epoch"] = 50
 
-        dg_env = analysis.dg_config_to_env(self._dg_collect())
+        dg_env = {}   # TODO(not ready): DG UI hidden; was analysis.dg_config_to_env(self._dg_collect())
         loss_env = analysis.loss_config_to_env(self._loss_collect())
         env = {**dg_env, **loss_env}
         self.log.clear()
@@ -586,7 +580,7 @@ class TrainPage(QWidget):
         self._last_run_id = None
         self.launch_btn.setEnabled(False)
         if dg_env:
-            self._append("[dg] density-generalization on: "
+            self._append("[dg] on: "
                          + " ".join(f"{k}={v}" for k, v in sorted(dg_env.items())))
         if loss_env:
             self._append("[loss] overrides: "
@@ -604,17 +598,17 @@ class TrainPage(QWidget):
         if staged and os.path.isdir(staged):
             extra_mounts.append((staged, f"/datasets/{name}"))
         else:
-            self._append(f"[local] ⚠ No local staged copy of '{name}' on this machine — "
-                         f"the container won't find /datasets/{name}.")
+            self._append(f"[local] ⚠ No staged copy of '{name}' - "
+                         f"container won't find /datasets/{name}.")
         prog, args = local_cli.run_script(b.script, flags, b, repo_root=self.repo_root,
                                           extra_mounts=extra_mounts, outputs_root=out_root,
                                           env=p.get("env", {}))
         self._append(f"\n[local] $ {local_cli.preview(prog, args)}\n")
         if not local_cli.have_docker():
             self._append(
-                "[local] docker not found on PATH — printed the exact command instead of "
-                "running it. On a Docker+GPU host, build the images (docker/build_all), "
-                f"then launch: training writes to {out_root}/runs/<id>.")
+                "[local] docker not found on PATH - printed the command instead of running "
+                "it. On a Docker+GPU host, build the images (docker/build_all), then launch: "
+                f"training writes to {out_root}/runs/<id>.")
             self.launch_btn.setEnabled(True)
             return
         ok_gpu, msg_gpu = local_cli.gpu_preflight()
@@ -632,14 +626,14 @@ class TrainPage(QWidget):
         self.runner.start(prog, args, cwd=self.repo_root)
 
     def _on_runner_failed(self, err: str):
-        # QProcess FailedToStart fires `failed`, not `finished` — re-enable here.
+        # FailedToStart fires failed not finished; re-enable here.
         self.launch_btn.setEnabled(True)
-        self._append(f"\n✗ Failed to start process: {err}")
+        self._append(f"\n✗ Failed to start: {err}")
 
     def _stop(self):
         if self.runner.running:
             self.runner.terminate()
-            self._append("\n[stopped the local training process]")
+            self._append("\n[stopped]")
         else:
             self._append("\n[no process running]")
 
@@ -652,9 +646,9 @@ class TrainPage(QWidget):
         self.launch_btn.setEnabled(True)
         if code == 0:
             extra = (f" Run id: {self._last_run_id}." if self._last_run_id else "")
-            self._append(f"\n✓ Process finished.{extra} See the Runs/Plotting page for artifacts.")
+            self._append(f"\n✓ Done.{extra} See the Runs/Plotting page for artifacts.")
         else:
-            self._append(f"\n✗ Process exited with code {code}.")
+            self._append(f"\n✗ Exited with code {code}.")
 
     def _on_epoch(self, m: dict):
         r = self.metrics_table.rowCount()

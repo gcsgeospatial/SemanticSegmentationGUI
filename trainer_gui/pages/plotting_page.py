@@ -1,8 +1,7 @@
-"""Plotting page: point at run folders and chart validation metrics per epoch.
+"""Plotting page: chart per-epoch validation metrics from run folders.
 
-Select one or more runs, pick a metric (val mIoU / accuracy / a class IoU), and
-the embedded chart overlays every selected run (the "differences") plus their
-mean ± std band (the "average"). The matplotlib toolbar saves the figure to PNG.
+Select runs, pick a metric (val mIoU / accuracy / class IoU); the chart overlays
+each run plus their mean ± std band. The toolbar saves a PNG.
 """
 
 from __future__ import annotations
@@ -31,9 +30,8 @@ class PlottingPage(QWidget):
         title = QLabel("Plotting")
         title.setObjectName("pageTitle")
         root.addWidget(title)
-        sub = QLabel("Chart validation metrics per epoch from one or more runs. Overlaid curves "
-                     "show how runs differ; the bold line is their average (± std). Use the "
-                     "toolbar to zoom or save a PNG.")
+        sub = QLabel("Chart per-epoch validation metrics across runs. The bold line is their "
+                     "average (± std). Use the toolbar to zoom or save a PNG.")
         sub.setWordWrap(True)
         sub.setObjectName("pageSub")
         root.addWidget(sub)
@@ -49,7 +47,7 @@ class PlottingPage(QWidget):
         btn_row.addWidget(refresh_btn)
         left.addLayout(btn_row)
 
-        left.addWidget(QLabel("Runs (ctrl/shift-click to compare several)"))
+        left.addWidget(QLabel("Runs (ctrl/shift-click to compare)"))
         self.run_list = QListWidget()
         self.run_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.run_list.setMinimumHeight(220)
@@ -84,9 +82,8 @@ class PlottingPage(QWidget):
 
     # ------------------------------------------------------------- run discovery
     def _default_roots(self) -> list[Path]:
-        """Where local-training runs actually land — the user's chosen output folder
-        (the Train page's field, default Downloads), plus the repo's own runs/ folder.
-        No hidden app dir: runs go where the user can find them."""
+        """Run output roots: the Train page's output folder (default Downloads) plus
+        the repo's runs/ folder."""
         out = appstate.get("local_train_out", "") or str(appstate.default_download_dir())
         return [Path(out) / "runs", Path(self.repo_root) / "runs"]
 

@@ -77,7 +77,7 @@ def warnings_for(meta: dict) -> list[str]:
     """Human-readable cautions shown next to the recommendations."""
     warns = []
     if not meta.get("has_rgb", False) and not meta.get("has_intensity", False):
-        warns.append("Dataset has neither RGB nor intensity — models expecting "
+        warns.append("Dataset has neither RGB nor intensity - models expecting "
                      "color/intensity inputs will run with degraded features.")
     # Dedupe by class index: a combined class can appear once per source value in
     # older metas (same index, each carrying the full count), which would inflate
@@ -91,7 +91,7 @@ def warnings_for(meta: dict) -> list[str]:
         share = int(c.get("train_count", 0)) / total
         if 0 < share < 0.005:
             warns.append(f"Class '{c.get('name')}' is only {share * 100:.2f}% of training "
-                         f"points — consider rare-class oversampling / focal loss.")
+                         f"points - consider rare-class oversampling / focal loss.")
     return warns
 
 
@@ -118,7 +118,7 @@ def dg_recommend(train_density: float, infer_density: float) -> dict:
 
     if gap < 1.2:
         rec["rationale"] = (f"Train {train_density:.1f} vs infer {infer_density:.1f} pts/m² are "
-                            f"within {(gap - 1) * 100:.0f}% — no density adaptation needed.")
+                            f"within {(gap - 1) * 100:.0f}% - no density adaptation needed.")
         return rec
 
     rec["adabn"] = True                            # label-free, cheap insurance either way
@@ -129,14 +129,14 @@ def dg_recommend(train_density: float, infer_density: float) -> dict:
         rec["logdk"] = gap > 2.5
         rec["rationale"] = (
             f"Inference ({infer_density:.1f}) is {gap:.1f}x SPARSER than training "
-            f"({train_density:.1f} pts/m^2) — the hard direction. Train with density aug "
+            f"({train_density:.1f} pts/m^2) - the hard direction. Train with density aug "
             f"(coarsen x{rec['coarsen_max']}) to reach the sparse end"
             + ("; add the log-d_k channel for the large gap" if rec["logdk"] else "")
             + ". AdaBN + TTA patch the rest at inference (no retrain).")
     else:                                          # inference DENSER -> the easy direction
         rec["rationale"] = (
             f"Inference ({infer_density:.1f}) is {gap:.1f}x DENSER than training "
-            f"({train_density:.1f} pts/m^2) — the easy direction: the grid subsample "
+            f"({train_density:.1f} pts/m^2) - the easy direction: the grid subsample "
             f"canonicalizes it down for free, so AdaBN + TTA suffice (no train aug).")
     return rec
 

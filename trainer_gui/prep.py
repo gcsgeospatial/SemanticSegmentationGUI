@@ -85,7 +85,7 @@ def _scenes(staged_root: Path):
     val   = sorted(glob.glob(str(staged_root / "val" / "*.npz")))
     test  = sorted(glob.glob(str(staged_root / "test" / "*.npz")))
     if not train:
-        raise FileNotFoundError(f"No canonical scenes under {staged_root}/train — "
+        raise FileNotFoundError(f"No canonical scenes under {staged_root}/train - "
                                 f"convert the dataset first.")
     return train, val, test
 

@@ -229,7 +229,7 @@ def _read_gt(gt_path: Path, scene: str) -> np.ndarray:
         if g is None:
             raise ValueError(f"{gt_path.name}: npz has no 'label'/'pred'")
         return g
-    raise ValueError(f"{gt_path.name}: unsupported ground-truth file — use a "
+    raise ValueError(f"{gt_path.name}: unsupported ground-truth file - use a "
                      f"class-coloured .ply or an .npz with 'label'/'pred'")
 
 
@@ -252,7 +252,7 @@ def _load_pred(pred_path: Path):
         cloud = read_points(pred_path)
         if cloud.rgb is None:
             raise ValueError(f"{pred_path.name}: no colours, so the predicted class "
-                             f"can't be read — pass a prediction .ply or .npz")
+                             f"can't be read - pass a prediction .ply or .npz")
         xyz, pred = cloud.xyz, class_from_rgb(cloud.rgb)
         inten = None if cloud.intensity is None else np.asarray(cloud.intensity, np.float64)
 
@@ -304,7 +304,7 @@ def compare_clouds(pred_path: Path, gt_path: Path, intensity_path: Path | None =
     n = min(len(xyz), len(pred), len(gt))
     if not (len(xyz) == len(pred) == len(gt)):
         print(f"  warning: point counts differ (cloud {len(xyz):,}, "
-              f"gt {len(gt):,}) — comparing the first {n:,}")
+              f"gt {len(gt):,}) - comparing the first {n:,}")
     xyz, pred, gt = xyz[:n], pred[:n], gt[:n]
     inten_n = inten[:n] if inten is not None and len(inten) >= n else None
     colors = error_colors(pred, gt, inten_n)
@@ -373,7 +373,7 @@ def _recolor_to_palette(rgb01: np.ndarray, names: list, palette: list):
 
 def _print_key(title, key):
     if key:
-        print(f"{title} — colour key:")
+        print(f"{title} - colour key:")
         for label, (r, g, b) in key:
             print(f"  {label:<18} rgb({int(r*255)},{int(g*255)},{int(b*255)})")
 
@@ -386,7 +386,7 @@ def _show(xyz, rgb, key, title, max_points):
         print(f"(subsampled to {max_points:,} of the original points)")
     _print_key(title, key)
     if rgb is None:
-        print("⚠ no class/colour data in this file — drawing it uniform grey, NOT by class. "
+        print("⚠ no class/colour data in this file - drawing it uniform grey, NOT by class. "
               "(An input/raw scene carries no labels; class colours come from a prediction "
               "PLY or an npz with a 'pred'/'label' key.)")
     print(f"{len(xyz):,} points. Drag to rotate, scroll to zoom, close window to exit.")
@@ -395,7 +395,7 @@ def _show(xyz, rgb, key, title, max_points):
     try:
         import open3d as o3d
     except Exception as e:   # not just ImportError: a libstdc++/GL load failure too
-        print(f"  (open3d unavailable: {e} — falling back to the matplotlib viewer)")
+        print(f"  (open3d unavailable: {e} - falling back to the matplotlib viewer)")
         o3d = None
 
     if o3d is not None:
@@ -426,10 +426,10 @@ def _show_mpl(xyz, rgb, key, title):
         import matplotlib.patches as mpatches
         import matplotlib.pyplot as plt
     except Exception as e:   # e.g. libstdc++ CXXABI mismatch on Linux
-        print(f"\n⚠ No 3D viewer available — open3d couldn't load and matplotlib "
+        print(f"\n⚠ No 3D viewer available - open3d couldn't load and matplotlib "
               f"failed too ({e}).\n  The colour key above tells you how each class "
               f"is coloured; the prediction file is at the path in the title. On "
-              f"Linux this is usually a libstdc++ mismatch — launch via `pixi run "
+              f"Linux this is usually a libstdc++ mismatch - launch via `pixi run "
               f"gui` (or `pixi run python -m trainer_gui.viewer …`) so the env's "
               f"libstdc++ is used.")
         return
@@ -454,7 +454,7 @@ def main(argv=None) -> int:
     ap.add_argument("path", help="a cloud file, or a folder of clouds")
     ap.add_argument("--gt", default=None,
                     help="ground truth (a class-coloured .ply, an .npz, or a folder) "
-                         "— turns PATH into a prediction and shows an error map vs this GT")
+                         "- turns PATH into a prediction and shows an error map vs this GT")
     ap.add_argument("--intensity", default=None,
                     help="with --gt: cloud to read per-point intensity from, used to "
                          "shade the correct points (default: the prediction's own "
@@ -470,7 +470,7 @@ def main(argv=None) -> int:
     ap.add_argument("--max-points", type=int, default=8_000_000,
                     help="random subsample cap for display")
     ap.add_argument("--save", default=None,
-                    help="write the cloud (with the colours that would be shown — e.g. "
+                    help="write the cloud (with the colours that would be shown - e.g. "
                          "the --gt error map) to this .ply and exit, instead of opening a window")
     args = ap.parse_args(argv)
 

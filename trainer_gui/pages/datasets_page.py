@@ -1,15 +1,12 @@
-"""Datasets page — the dataset workflow, top to bottom:
+"""Datasets page workflow, top to bottom:
 
-  1. New dataset   point at a file/folder, name it, say which field holds labels
+  1. New dataset   point at a file/folder, name it, pick the label field
   2. Classes       scan label values, name them, mark ignored, check density
-  3. Split         train/val split (whole scenes; the dataset layer does NOT tile —
-                   each training script tiles for its own model) + optionally compute
-                   a per-scene Height-Above-Ground channel (PDAL SMRF -> hag)
+  3. Split         train/val split (whole scenes; scripts tile per model) +
+                   optional per-scene Height-Above-Ground channel (PDAL SMRF -> hag)
 
-Labels come from a field in the cloud (companion/sidecar label files are no
-longer offered here). Intensity is p95-normalized (i/p95 clipped to 0..2) —
-outlier-robust, and the single norm used end-to-end (build + train + inference).
-Density-generalization controls have moved to the Train and Inference pages.
+Labels come from a field in the cloud. Intensity is p95-normalized (i/p95
+clipped to 0..2); the single norm used across build + train + inference.
 """
 
 from __future__ import annotations
@@ -38,7 +35,7 @@ class DatasetsPage(QWidget):
         self.worker = FuncWorker(self)
         self.uploader = JobRunner(self)
         self._staged_dir: Path | None = None
-        self._uploading: Path | None = None   # dir currently being uploaded
+        self._uploading: Path | None = None   # dir being uploaded
         self._label_values: dict[int, int] = {}
         self._done_cb = None
 
@@ -51,11 +48,11 @@ class DatasetsPage(QWidget):
         self.sub.setObjectName("pageSub")
         root.addWidget(self.sub)
 
-        # The whole page scrolls, so each section keeps its natural height.
+        # Page scrolls, so each section keeps its natural height.
         root.addWidget(self._new_dataset_box())   # 1
         root.addWidget(self._classes_box())        # 2
-        root.addWidget(self._tiling_box())         # 3  (incl. optional HAG + Start Tiling)
-        root.addLayout(self._status_block())       # shared busy bar + status line
+        root.addWidget(self._tiling_box())         # 3  (incl. optional HAG)
+        root.addLayout(self._status_block())       # shared console
 
         # ---- saved datasets: bottom layer ----
         root.addWidget(QLabel("Saved Datasets"))
@@ -66,12 +63,12 @@ class DatasetsPage(QWidget):
         self.known_list.setMaximumWidth(360)
         self.known_list.itemSelectionChanged.connect(self._show_known)
         sd_col.addWidget(self.known_list)
-        # Re-upload a previously converted dataset without re-converting — works
-        # after a restart (the staged_dir is remembered in state.json).
+        # Re-upload a converted dataset without re-converting; survives restart
+        # (staged_dir is remembered in state.json).
         self.upload_saved_btn = QPushButton("Upload selected to Modal")
         self.upload_saved_btn.clicked.connect(self._upload_saved)
         sd_col.addWidget(self.upload_saved_btn)
-        # Forget the selected dataset + delete its staged copy on disk.
+        # Forget the dataset + delete its staged copy on disk.
         self.delete_saved_btn = QPushButton("Delete selected")
         self.delete_saved_btn.clicked.connect(self._delete_saved)
         sd_col.addWidget(self.delete_saved_btn)
@@ -95,16 +92,14 @@ class DatasetsPage(QWidget):
         self.apply_exec_mode(appstate.get_exec_mode() == "local")
 
     def apply_exec_mode(self, local: bool):
-        """Local mode never uploads to Modal — hide the upload button and reword the
-        workflow copy."""
+        """Local mode never uploads to Modal; hide the upload button, reword the copy."""
         self.upload_saved_btn.setVisible(not local)
         self.sub.setText(
-            "Build a trainable dataset, step by step: point at point clouds "
-            "(las/laz, ply, txt/csv, pcd, npy/npz), name the classes, split "
-            "train/val and Build dataset"
-            + (" — it's staged on disk and ready to train in Docker."
+            "Point at clouds (las/laz, ply, txt/csv, pcd, npy/npz), name classes, "
+            "split train/val, Build."
+            + (" Staged on disk, ready to train in Docker."
                if local else
-               ", then upload it to a per-dataset Modal volume."))
+               " Then upload to a per-dataset Modal volume."))
         self._reload_known()
 
     # ============================================================= 1. New dataset
@@ -115,7 +110,7 @@ class DatasetsPage(QWidget):
         self.name_edit.setPlaceholderText("my_city_lidar")
         form.addRow("Name", self.name_edit)
         self.input_edit = QLineEdit()
-        self.input_edit.setPlaceholderText("a .laz file, or a folder of clouds")
+        self.input_edit.setPlaceholderText(".laz file or a folder of clouds")
         in_row = QHBoxLayout()
         in_row.addWidget(self.input_edit)
         for text, slot in (("Folder…", self._pick_input_folder), ("File…", self._pick_input_file)):
@@ -133,8 +128,8 @@ class DatasetsPage(QWidget):
 
     # ============================================================= 2. Classes
     def _classes_box(self) -> QWidget:
-        box = QGroupBox("2 · Classes — uncheck 'Train' to ignore a value; select rows + "
-                        "Combine to merge them into one class")
+        box = QGroupBox("2 · Classes - uncheck 'Train' to ignore a value; select rows + "
+                        "Combine to merge into one class")
         cl = QVBoxLayout(box)
         btn_row = QHBoxLayout()
         self.scan_btn = QPushButton("Scan label values")
@@ -167,9 +162,8 @@ class DatasetsPage(QWidget):
     def _tiling_box(self) -> QWidget:
         box = QGroupBox("3 · Train / val / test split")
         self.split_form = form = QFormLayout(box)
-        # Two POINT-COUNT fractions (train = remainder); the dataset layer carves the
-        # three whole-scene folders ONCE and the training scripts read them verbatim
-        # (val = selection holdout, test = final report). No tiling here.
+        # Two point-count fractions (train = remainder); carve three whole-scene
+        # folders once, scripts read them verbatim. No tiling here.
         self.val_spin = QDoubleSpinBox()
         self.val_spin.setRange(0.05, 0.90)
         self.val_spin.setSingleStep(0.05)
@@ -184,16 +178,18 @@ class DatasetsPage(QWidget):
         form.addRow("Test fraction", self.test_spin)
         self.train_label = QLabel("Train: 70%")
         form.addRow("", self.train_label)
-        # balanced mirrors the global class mix in every split (+ rare-class presence);
-        # random fills by point count alone.
+        # balanced mirrors the global class mix in every split; random fills by
+        # point count alone.
         self.mode_combo = QComboBox()
         self.mode_combo.addItems(["Balanced (mirror class mix)", "Random"])
         form.addRow("Split mode", self.mode_combo)
-        self.seed_spin = QSpinBox()
-        self.seed_spin.setRange(0, 2_000_000_000)
-        self.seed_spin.setValue(42)
-        form.addRow("Split seed", self.seed_spin)
-        # Use-as-is: explicit val + test folders bypass allocation (train = inputs).
+        # TODO(not ready): split-seed UI hidden until reviewed; seed is fixed at 42
+        # in _split_config for now.
+        # self.seed_spin = QSpinBox()
+        # self.seed_spin.setRange(0, 2_000_000_000)
+        # self.seed_spin.setValue(42)
+        # form.addRow("Split seed", self.seed_spin)
+        # Explicit val + test folders bypass allocation (train = inputs).
         self.split_provided_chk = QCheckBox("Separate train/val/test folders (use as-is)")
         self.split_provided_chk.toggled.connect(self._on_split_changed)
         form.addRow("", self.split_provided_chk)
@@ -201,32 +197,30 @@ class DatasetsPage(QWidget):
         form.addRow("Validation folder", self.val_row_w)
         self.test_edit, self.test_row_w = self._dir_row(self._pick_test)
         form.addRow("Test folder", self.test_row_w)
-        # Optional: compute HeightAboveGround per scene in the same pass (one read/
-        # write per scene). Whole-scene SMRF -> better ground than per-tile.
+        # Optional: compute HeightAboveGround per scene in the same pass. Whole-scene
+        # SMRF gives better ground than per-tile.
         self.hag_chk = QCheckBox("Compute Height-Above-Ground (HAG)")
-        self.hag_chk.setToolTip("Bakes a per-point HAG channel into every scene as it's "
-                                "written. Ground comes from SMRF, from a labeled ground class, "
-                                "or both unioned (SMRF fills holes under buildings). The *_hag "
-                                "models use it; the others ignore the extra channel.")
+        self.hag_chk.setToolTip("Bakes a per-point HAG channel into every scene. Ground comes "
+                                "from SMRF, a labeled ground class, or both unioned. The *_hag "
+                                "models use it; others ignore the extra channel.")
         self.hag_chk.toggled.connect(lambda on: self.hag_opts_w.setVisible(on))
         form.addRow("Height-Above-Ground", self.hag_chk)
         self.hag_filter = QComboBox()
         self.hag_filter.addItems(list(pretrain.HAG_FILTERS))
-        # Which class is GROUND (the raw Source value from the Classes table). Blank
-        # = no ground class, so SMRF is the only source.
+        # Which class is ground (raw Source value from the Classes table). Blank =
+        # no ground class, so SMRF is the only source.
         self.hag_ground = QLineEdit()
         self.hag_ground.setPlaceholderText("blank = none")
         self.hag_ground.setMaximumWidth(90)
-        self.hag_ground.setToolTip("The raw class value that means GROUND (a Source value "
-                                   "from the Classes table, e.g. 2). Blank = no ground class — "
-                                   "SMRF detects ground on its own.")
-        # Run SMRF too and union it with the labeled ground, to fill holes the labels
-        # miss (missing ground returns, e.g. under buildings).
+        self.hag_ground.setToolTip("Source value that means ground (from the Classes table, "
+                                   "e.g. 2). Blank = no ground class; SMRF detects ground.")
+        # Also run SMRF and union with labeled ground to fill holes (missing ground
+        # returns, e.g. under buildings).
         self.hag_fill_smrf = QCheckBox("fill ground gaps with SMRF")
         self.hag_fill_smrf.setChecked(True)
-        self.hag_fill_smrf.setToolTip("Also run SMRF and union it with the labeled ground so "
-                                      "holes (no ground returns, e.g. under buildings) get "
-                                      "filled. With no ground class set, SMRF is used regardless.")
+        self.hag_fill_smrf.setToolTip("Union SMRF with the labeled ground to fill holes (no "
+                                      "ground returns, e.g. under buildings). With no ground "
+                                      "class set, SMRF is used regardless.")
         hag_row = QHBoxLayout()
         hag_row.addWidget(QLabel("filter"))
         hag_row.addWidget(self.hag_filter)
@@ -239,19 +233,21 @@ class DatasetsPage(QWidget):
         form.addRow("", self.hag_opts_w)
         if not pretrain.pdal_available():
             self.hag_chk.setEnabled(False)
-            self.hag_chk.setText("Compute Height-Above-Ground (HAG) — PDAL not installed")
-        # How many scenes to convert concurrently. 0 = Auto (clamp to cores + free
-        # RAM); a positive value is a hard override the safety clamp won't touch.
-        self.workers_spin = QSpinBox()
-        self.workers_spin.setRange(0, max((os.cpu_count() or 4) * 2, 16))
-        self.workers_spin.setSpecialValueText("Auto")
-        self.workers_spin.setValue(0)
-        self.workers_spin.setMaximumWidth(110)
-        self.workers_spin.setToolTip(
-            f"Scenes converted in parallel. Auto clamps to cores and free RAM "
-            f"(this machine: {os.cpu_count()} cores). A number forces exactly that many — "
-            f"faster, but each worker holds a whole cloud in RAM, so too many can OOM.")
-        form.addRow("Parallel workers", self.workers_spin)
+            self.hag_chk.setText("Compute Height-Above-Ground (HAG) - PDAL not installed")
+        # TODO(not ready): parallel-worker UI hidden until reviewed; conversion runs
+        # single-process (max_workers=1 forced in _conversion_plan).
+        # Scenes to convert concurrently. 0 = Auto (clamp to cores + free RAM); a
+        # positive value is a hard override.
+        # self.workers_spin = QSpinBox()
+        # self.workers_spin.setRange(0, max((os.cpu_count() or 4) * 2, 16))
+        # self.workers_spin.setSpecialValueText("Auto")
+        # self.workers_spin.setValue(0)
+        # self.workers_spin.setMaximumWidth(110)
+        # self.workers_spin.setToolTip(
+        #     f"Scenes converted in parallel. Auto clamps to cores and free RAM "
+        #     f"(this machine: {os.cpu_count()} cores). A number forces exactly that many; "
+        #     f"each worker holds a whole cloud in RAM, so too many can OOM.")
+        # form.addRow("Parallel workers", self.workers_spin)
         self.tile_btn = QPushButton("Build dataset")
         self.tile_btn.setObjectName("primary")
         self.tile_btn.clicked.connect(self._start_tiling)
@@ -263,8 +259,7 @@ class DatasetsPage(QWidget):
 
     # ============================================================= shared console
     def _status_block(self) -> QVBoxLayout:
-        # A scrolling console log — progress streams here line by line (clearer
-        # than an indeterminate bar). Errors also pop up a dialog (_on_worker_error).
+        # Scrolling console log; errors also pop a dialog (_on_worker_error).
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setObjectName("log")
@@ -290,8 +285,8 @@ class DatasetsPage(QWidget):
         return edit, _wrap(row)
 
     def _on_split_changed(self):
-        # Provided mode reveals the explicit val + test folder rows; otherwise the
-        # fractions drive allocation. Keep val% + test% <= 0.90 (train keeps >= 10%).
+        # Provided mode reveals the val + test folder rows; else fractions drive
+        # allocation. Keep val% + test% <= 0.90 (train keeps >= 10%).
         provided = self.split_provided_chk.isChecked()
         self.split_form.setRowVisible(self.val_row_w, provided)
         self.split_form.setRowVisible(self.test_row_w, provided)
@@ -346,7 +341,7 @@ class DatasetsPage(QWidget):
         self.field_combo.clear()
         files = dataset.expand_inputs(path)
         if not files:
-            self._append(f"No supported point-cloud files in {path}")
+            self._append(f"No supported point clouds in {path}")
             return
         try:
             fields = list_label_fields(files[0])
@@ -369,14 +364,14 @@ class DatasetsPage(QWidget):
         return SplitConfig(
             val_frac=float(self.val_spin.value()),
             test_frac=float(self.test_spin.value()),
-            mode=mode, seed=int(self.seed_spin.value()),
+            mode=mode, seed=42,   # TODO(not ready): split-seed UI hidden; fixed at 42
             strategy="provided" if self.split_provided_chk.isChecked() else "auto")
 
     # ------------------------------------------------------------- scan / analyze
     def _scan_labels(self):
         in_path = self.input_edit.text().strip()
         if not os.path.exists(in_path):
-            self._append("Choose an input file or folder first.")
+            self._append("Pick an input file or folder first.")
             return
         spec = self._spec()
         self._append("Scanning label values…")
@@ -392,8 +387,8 @@ class DatasetsPage(QWidget):
     def _on_scanned(self, counts):
         self.scan_btn.setEnabled(True)
         self._label_values = counts
-        # Only default-ignore value 0 when the label clearly follows the ASPRS
-        # classification convention; otherwise class 0 may be a real class.
+        # Default-ignore value 0 only for ASPRS-style classification fields; else
+        # class 0 may be real.
         ignore_zero = "class" in self._spec().field.lower()
         self.class_table.setRowCount(len(counts))
         for r, (val, cnt) in enumerate(counts.items()):
@@ -410,13 +405,13 @@ class DatasetsPage(QWidget):
                 item.setFlags(item.flags() & ~Qt.ItemIsEditable)
                 self.class_table.setItem(r, col, item)
             self.class_table.setItem(r, 3, QTableWidgetItem(f"class_{val}"))
-        self._append(f"Found {len(counts)} distinct label values. Name the classes, "
-                     f"uncheck any that mean 'unknown', then Build dataset.")
+        self._append(f"Found {len(counts)} label values. Name them, uncheck any "
+                     f"'unknown', then Build.")
 
     def _analyze(self):
         in_path = self.input_edit.text().strip()
         if not os.path.exists(in_path):
-            self._append("Choose an input file or folder first.")
+            self._append("Pick an input file or folder first.")
             return
         self.analyze_btn.setEnabled(False)
         self._append("Analyzing density…")
@@ -437,16 +432,15 @@ class DatasetsPage(QWidget):
             f"Density: {stats['mean_pts_per_m2']:.2f} pts/m²  ·  "
             f"spacing {stats['mean_spacing_m']:.2f} m  ·  "
             f"largest scene {stats['max_scene_points']:,} pts  ·  "
-            f"suggested training tile {chunk:.0f} m (set per model on the Train page).")
+            f"suggested tile {chunk:.0f} m (set per model on the Train page).")
 
     # ------------------------------------------------------------- convert/upload
     def _combine_selected(self):
-        """Collapse the selected rows into ONE row whose Source value lists every
-        merged value (e.g. "5,6") and whose Points seen is their total, under a
-        shared name — so a combine reads as one class, not duplicated rows."""
+        """Collapse selected rows into one whose Source value lists every merged
+        value ("5,6") and Points seen is their total, under a shared name."""
         rows = sorted({i.row() for i in self.class_table.selectedItems()})
         if len(rows) < 2:
-            self._append("Combine: select 2+ class rows first (click rows; Ctrl/Shift for many).")
+            self._append("Combine: select 2+ rows first (Ctrl/Shift for many).")
             return
         first = self.class_table.item(rows[0], 3)
         base = first.text().strip() if first else ""
@@ -455,8 +449,8 @@ class DatasetsPage(QWidget):
         name = name.strip()
         if not ok or not name:
             return
-        # Gather every source value across the selected rows (a row may already be
-        # a combined "5,6"), dedupe + sort, sum their point counts.
+        # Gather every source value across the rows (may already be a "5,6"),
+        # dedupe + sort, sum point counts.
         vals: list[int] = []
         for r in rows:
             vals += _parse_values(self.class_table.item(r, 1).text())
@@ -472,8 +466,8 @@ class DatasetsPage(QWidget):
         self._append(f"Combined source values [{', '.join(map(str, vals))}] into class '{name}'.")
 
     def _classes_from_table(self):
-        """One class per row. A row's Source value may list several values (a
-        combine, e.g. "5,6") — each maps to the SAME class index/name."""
+        """One class per row. A row's Source value may list several values ("5,6");
+        each maps to the same class index/name."""
         name_to_index: dict[str, int] = {}
         classes, ignored = [], []
         for r in range(self.class_table.rowCount()):
@@ -501,16 +495,15 @@ class DatasetsPage(QWidget):
             val_dir = self.val_edit.text().strip()
             test_dir = self.test_edit.text().strip()
             if not os.path.isdir(val_dir) or not os.path.isdir(test_dir):
-                self._append("'Separate train/val/test folders' is selected — choose both the "
-                             "val and test folders.")
+                self._append("Pick both the val and test folders.")
                 return None
             val_inputs, test_inputs = [val_dir], [test_dir]
         if self.class_table.rowCount() == 0:
-            self._append("Run 'Scan label values' and name your classes first.")
+            self._append("Run 'Scan label values' and name classes first.")
             return None
         classes, ignored = self._classes_from_table()
         if not classes:
-            self._append("All label values are unchecked — nothing to train on.")
+            self._append("All values unchecked - nothing to train on.")
             return None
         gtxt = self.hag_ground.text().strip()
         try:
@@ -518,7 +511,7 @@ class DatasetsPage(QWidget):
         except ValueError:
             gv = None
         if gtxt and gv is None:
-            self._append(f"Ground class '{gtxt}' isn't an integer — clear it or enter a "
+            self._append(f"Ground class '{gtxt}' isn't an integer - clear it or enter a "
                          f"Source value from the Classes table.")
             return None
         return {
@@ -530,7 +523,7 @@ class DatasetsPage(QWidget):
             "ground_value": gv,
             "use_smrf": (gv is None) or self.hag_fill_smrf.isChecked(),
             "hag_filter": self.hag_filter.currentText(),
-            "max_workers": self.workers_spin.value() or None,   # 0 -> Auto (None)
+            "max_workers": 1,   # TODO(not ready): parallel UI hidden; force single-process
         }
 
     def _start_tiling(self):
@@ -569,15 +562,15 @@ class DatasetsPage(QWidget):
         self._reload_known()
         hag = " (with HAG)" if self.hag_chk.isChecked() and pretrain.pdal_available() else ""
         if appstate.get_exec_mode() == "local":
-            self._append(f"✓ Built{hag} -> {staged}. Ready — pick '{staged.name}' on the Train "
+            self._append(f"✓ Built{hag} -> {staged}. Pick '{staged.name}' on the Train "
                          f"page (bind-mounted at /datasets/{staged.name}).")
         else:
             self._append(f"✓ Built{hag} -> {staged}. Select it under Saved Datasets to upload.")
 
     def _upload_saved(self):
-        """Upload a dataset already listed under Saved Datasets, using its
-        remembered staged_dir — no re-conversion. If that folder has moved or was
-        deleted, ask where the converted folder is now (must hold dataset_meta.json)."""
+        """Upload a saved dataset from its remembered staged_dir, no re-conversion.
+        If that folder moved or was deleted, ask where it is now (must hold
+        dataset_meta.json)."""
         items = self.known_list.selectedItems()
         if not items:
             self._append("Select a saved dataset to upload.")
@@ -593,7 +586,7 @@ class DatasetsPage(QWidget):
                 return
             staged = Path(picked)
             if not (staged / "dataset_meta.json").exists():
-                self._append(f"✗ {staged} has no dataset_meta.json — not a converted dataset.")
+                self._append(f"✗ {staged} has no dataset_meta.json - not a dataset.")
                 return
             appstate.remember_dataset(staged.name, {
                 "staged_dir": str(staged),
@@ -603,8 +596,7 @@ class DatasetsPage(QWidget):
         self._start_upload(staged)
 
     def _delete_saved(self):
-        """Forget the selected saved dataset and (best-effort) delete its staged
-        copy on disk, after a confirm."""
+        """Forget the selected dataset and best-effort delete its staged copy, after confirm."""
         items = self.known_list.selectedItems()
         if not items:
             self._append("Select a saved dataset to delete.")
@@ -612,8 +604,8 @@ class DatasetsPage(QWidget):
         name = items[0].text()
         resp = QMessageBox.question(
             self, "Delete dataset",
-            f"Delete dataset '{name}'? This removes it from the list and deletes its "
-            f"staged folder on disk. This can't be undone.",
+            f"Delete '{name}'? Removes it from the list and deletes its staged folder. "
+            f"Can't be undone.",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if resp != QMessageBox.Yes:
             return
@@ -621,16 +613,16 @@ class DatasetsPage(QWidget):
         self._reload_known()
         self.stats_label.setText("")
         if err:
-            self._append(f"Removed '{name}' from the list, but its files at {staged} "
+            self._append(f"Removed '{name}' from the list, but files at {staged} "
                          f"couldn't be deleted:\n  {err}\n  Close anything using them "
                          f"(viewer, training run) and delete the folder manually.")
         else:
-            self._append(f"Deleted dataset '{name}' — removed from the list and deleted "
+            self._append(f"Deleted '{name}' - removed from the list and deleted "
                          f"{staged or 'nothing on disk'}.")
 
     def _start_upload(self, staged: Path):
-        # Each dataset gets its own auto-created Modal volume named after it; the
-        # training script mounts it at /datasets, so the remote path stays /<name>.
+        # Each dataset gets its own Modal volume named after it; mounted at
+        # /datasets, so the remote path stays /<name>.
         self._uploading = staged
         name = staged.name
         self.upload_saved_btn.setEnabled(False)
@@ -641,14 +633,14 @@ class DatasetsPage(QWidget):
 
     def _on_upload_failed(self, err: str):
         self.upload_saved_btn.setEnabled(True)
-        self._append(f"✗ Upload process failed to run: {err}. Is the Modal CLI on PATH "
-                     f"and authenticated? (modal token new)")
+        self._append(f"✗ Upload failed to run: {err}. Modal CLI on PATH and "
+                     f"authenticated? (modal token new)")
 
     def _on_upload_done(self, code: int):
         self.upload_saved_btn.setEnabled(True)
         staged = self._uploading
         if code != 0:
-            self._append(f"\n✗ Upload failed (exit {code}). Is the Modal CLI installed and "
+            self._append(f"\n✗ Upload failed (exit {code}). Modal CLI installed and "
                          f"authenticated? (modal token new)")
             return
         name = staged.name
@@ -659,14 +651,14 @@ class DatasetsPage(QWidget):
             "volume": name,
         })
         self._reload_known()
-        self._append(f"\n✓ Dataset '{name}' uploaded to volume '{name}'. Head to the Train page.")
+        self._append(f"\n✓ Uploaded '{name}' to volume '{name}'. Go to the Train page.")
 
     def _on_worker_error(self, tb: str):
         self._done_cb = None
         self.scan_btn.setEnabled(True)
         self.analyze_btn.setEnabled(True)
         self.tile_btn.setEnabled(True)
-        self._append("✗ Error — see the dialog for details.")
+        self._append("✗ Error - see the dialog.")
         QMessageBox.critical(self, "Dataset error", tb)
 
     # ------------------------------------------------------------- known list
@@ -683,11 +675,11 @@ class DatasetsPage(QWidget):
         staged = info.get("staged_dir", "")
         on_disk = bool(staged) and os.path.isdir(staged)
         if appstate.get_exec_mode() == "local":
-            status = ("staged on disk ✓ — ready to train" if on_disk
-                      else "local copy missing — re-convert it on this machine")
+            status = ("staged ✓ - ready to train" if on_disk
+                      else "local copy missing - re-convert on this machine")
         else:
             status = ("uploaded ✓ (re-upload to refresh)" if info.get("uploaded")
-                      else "not uploaded — click “Upload selected to Modal”")
+                      else "not uploaded - click “Upload selected to Modal”")
             if not on_disk:
                 status += "  ·  local copy missing (upload will ask where it is)"
         meta_path = info.get("meta_path", "")
@@ -710,16 +702,15 @@ class DatasetsPage(QWidget):
 
     # ------------------------------------------------------------- helpers
     def _append(self, text: str, newline: bool = True):
-        # Stream into the scrolling console. newline=False for chunked subprocess
-        # output (the uploader); True for one-shot status messages.
+        # Stream into the console. newline=False for chunked subprocess output
+        # (uploader); True for one-shot status messages.
         self.log.moveCursor(QTextCursor.End)
         self.log.insertPlainText(text + ("\n" if newline else ""))
         self.log.moveCursor(QTextCursor.End)
 
 
 def _parse_values(text: str) -> list[int]:
-    """Source-value cell -> ints. A cell may hold one value ("5") or a combined
-    list ("5,6" / "5 6"); both parse to a list of ints."""
+    """Source-value cell -> ints. Handles one value ("5") or a list ("5,6" / "5 6")."""
     return [int(t) for t in text.replace(",", " ").split() if t]
 
 

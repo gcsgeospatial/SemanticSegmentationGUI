@@ -104,11 +104,11 @@ def image_preflight(backbone) -> tuple[bool, str]:
         return True, ""
     tag = image_for(backbone)
     if is_pullable(backbone):
-        return True, (f"[local] '{tag}' not present locally — docker will pull it from the "
+        return True, (f"[local] '{tag}' not present locally - docker will pull it from the "
                       f"registry now (run `docker login` first if it's private).")
     return False, (f"[local] image '{tag}' isn't built on this host. Build it "
-                   f"(bash docker/build_all.sh) — or set a registry (TT_REGISTRY or "
-                   f"local_config['registry']) and `docker pull` it — then run again.")
+                   f"(bash docker/build_all.sh) - or set a registry (TT_REGISTRY or "
+                   f"local_config['registry']) and `docker pull` it - then run again.")
 
 
 def gpu_preflight() -> tuple[bool, str]:
@@ -122,7 +122,7 @@ def gpu_preflight() -> tuple[bool, str]:
                        "models require CUDA. Set gpus='all' (or a device id) and install "
                        "the NVIDIA Container Toolkit, then run again.")
     if shutil.which("nvidia-smi") is None:
-        return True, ("[local] ⚠ no 'nvidia-smi' on PATH — if this host lacks an NVIDIA GPU "
+        return True, ("[local] ⚠ no 'nvidia-smi' on PATH - if this host lacks an NVIDIA GPU "
                       "+ Container Toolkit the run will fail ('could not select device "
                       "driver'). These models are CUDA-only (no CPU fallback).")
     return True, ""

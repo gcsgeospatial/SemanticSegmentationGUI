@@ -660,7 +660,7 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
                    if ground_value is not None else "SMRF")
             say(f"computing HeightAboveGround inline (PDAL {src} -> {hag_filter}) …")
         else:
-            say("⚠ HAG requested but PDAL isn't installed — written without it.")
+            say("⚠ HAG requested but PDAL isn't installed - written without it.")
             compute_hag = False
     scene_stats = _plan_and_convert(input_files, val_files, test_files, split, spec,
                                     value_to_index, num_classes, out_root,
@@ -669,7 +669,7 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
                                     hag_filter=hag_filter, max_workers=max_workers)
     for sp in _SPLITS:
         if not scene_stats[sp]:
-            raise ValueError(f"Conversion produced an empty {sp} split — lower the "
+            raise ValueError(f"Conversion produced an empty {sp} split - lower the "
                              f"val/test fractions, add more data, or supply explicit folders.")
 
     splits = {sp: {"scenes": [s["scene"] for s in scene_stats[sp]],
@@ -795,7 +795,7 @@ def convert_infer_job(job_id: str, input_dir: str, staging_root: Path, progress=
         if pretrain.pdal_available():
             say("  computing real PDAL HeightAboveGround (SMRF -> hag_nn) per scene …")
         else:
-            say("  ⚠ HAG requested but PDAL isn't installed here — using a z-min proxy "
+            say("  ⚠ HAG requested but PDAL isn't installed here - using a z-min proxy "
                 "(degraded for a model trained on real HAG).")
             hag = False
     out_root = staging_root / "_infer" / job_id
@@ -850,7 +850,7 @@ def add_hag_to_dataset(src_dir, out_dir, *, use_smrf: bool = True,
     if not meta_path.exists():
         raise FileNotFoundError(f"{src_dir} is not a converted dataset (no dataset_meta.json)")
     if not pretrain.pdal_available():
-        raise RuntimeError("PDAL is not installed — cannot compute HeightAboveGround.")
+        raise RuntimeError("PDAL is not installed - cannot compute HeightAboveGround.")
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
 
     n_tiles = n_hag = 0
@@ -880,7 +880,7 @@ def add_hag_to_dataset(src_dir, out_dir, *, use_smrf: bool = True,
             say(f"  {split}/{npz_path.name}: "
                 f"{'HAG' if 'hag' in data else 'proxy'} ({cloud.n:,} pts)")
     if n_tiles == 0:
-        raise ValueError(f"No npz tiles under {src_dir}/train|val|test — convert the dataset first.")
+        raise ValueError(f"No npz tiles under {src_dir}/train|val|test - convert the dataset first.")
 
     meta["name"] = sanitize_name(out_dir.name)
     meta["has_hag"] = (n_hag == n_tiles)

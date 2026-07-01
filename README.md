@@ -1,135 +1,211 @@
 # Training Terminal
 
-Desktop GUI (PySide6) that unifies the `modal_train_*.py` point-cloud training
-scripts: bring your own dataset, pick a model, train or run inference on Modal,
-and view the predicted point cloud — all in one place.
+Desktop GUI (PySide6) for training and running point-cloud semantic-segmentation
+models. Bring a folder of point clouds, pick a model, train it, run inference,
+view the predicted cloud — all in one window.
 
-## Install + run (pixi — recommended)
+Two execution backends: **Local (Docker)** — the live path — and **Modal
+(cloud)**, which is **paused** (see `scripts/modal/DEPRECATED.md`). Everything
+below is the local path.
 
-The env is pinned to Python 3.11 because Open3D ships no wheels for 3.13
-(which is what a current base conda gives you). [pixi](https://pixi.sh) handles
-all of it on **Windows and Linux** (`win-64` + `linux-64`) — the commands are
-identical on both (the block below is PowerShell; use any shell):
+## Run it
 
 ```powershell
 cd trainer_gui
-pixi install        # one-time: creates .pixi env with python 3.11 + open3d
-pixi run gui        # launch the app
-pixi run test       # local pipeline checks
+pixi install     # one-time: builds .pixi env (python 3.11 + open3d + pdal + qt)
+pixi run gui     # launch
+pixi run test    # smoke checks, no Docker/Modal needed
 ```
 
-First launch only: authenticate Modal inside the env with
-`pixi run modal token new` (or reuse an existing `modal` on PATH — the GUI
-calls whichever it finds first).
+Python is pinned to 3.11 (Open3D has no 3.13 wheels). [pixi](https://pixi.sh)
+does the rest on win-64 and linux-64. In the sidebar, set **Execution backend →
+Local (Docker)**.
 
-<details><summary>pip alternative (needs Python 3.10–3.12)</summary>
+<details><summary>pip alternative (Python 3.10–3.12)</summary>
 
 ```powershell
 cd trainer_gui
 pip install -e .
-trainer-gui          # or: python -m trainer_gui
+trainer-gui        # or: python -m trainer_gui
 ```
 </details>
 
-## Workflow
+## How it runs training/inference
 
-1. **Datasets page** — pick a training folder and a validation folder of point
-   clouds (`las/laz`, `ply`, ASCII `txt/csv/xyz/pts`, `pcd`, `npy/npz`). Choose
-   where the ground-truth labels live: a field inside each file (e.g. LAS
-   `classification`, PLY `label`) or a companion label file per scene (one label
-   per point, e.g. a `_PC3.txt` cloud paired with a `_CLS.txt` label file). Scan
-   label values, name your classes, and
-   uncheck any value that means *unknown* (those become ignore-labels, excluded
-   from the loss and mIoU). *Analyze* measures point density and pre-computes
-   per-model parameter recommendations. *Convert + Upload* writes the canonical
-   dataset and pushes it to the `terminal-datasets` Modal volume.
+The GUI never trains in-process. It builds a `docker run` command and executes
+it. One Docker image per model, each with the CUDA stack + model source **baked
+in** — the image is self-contained.
 
-1b. **Pretraining page** *(optional pre-step)* — prepare raw clouds before you
-   convert a dataset. **Add HAG**: point at a folder of clouds (`las/laz`, or
-   `txt/csv/xyz/pts/ply/pcd/npy/npz` — non-LAS inputs are transformed to LAZ on
-   the way through) and PDAL computes *HeightAboveGround* (SMRF
-   ground-classification → `hag_nn`), writing each cloud back out as `.laz` with
-   a new `HeightAboveGround` dimension plus a `.json` sidecar (pipeline + HAG
-   stats). **Tile for a
-   model**: point at a folder, pick a backbone, and it produces train-ready
-   tiles using the same tiling logic the Train page expects. Everything writes
-   to a local folder you then point the Datasets page at.
+```
+docker run --rm --gpus all --ipc=host -w /workspace \
+  -v <repo>:/workspace  -v <staging>:/datasets  -v <output>:/outputs \
+  trainer-local-<model>  python scripts/local/local_train_<model>.py --flags...
+```
 
-2. **Train page** — pick the dataset + model. Grid size, tile size and batch are
-   pre-filled from the density analysis (★ = recommended); everything stays
-   editable. "Smoke run" does 2 epochs × 50 steps on an A10G (~pennies) to
-   validate a new dataset end-to-end. Logs stream live; per-epoch loss/acc/mIoU
-   fill the metrics table. Detached runs survive closing the app — re-attach
-   any time with the button (runs `modal app logs <app>`).
+Three host dirs are bind-mounted; nothing is uploaded or downloaded — inputs are
+already on the host, and checkpoints/predictions land straight back in `/outputs`:
 
-   **Prep tiles locally** (on by default): tiling, grid subsampling and
-   OctFormer's normal estimation run on your machine, and the finished cache is
-   uploaded to `terminal-datasets:/<dataset>/prep/<tag>/` before launch. The
-   script's remote `ensure_prep()` finds everything cached and skips straight
-   to training — no Modal CPU time spent preprocessing. Needs the dataset's
-   local staged copy (i.e. converted on this machine); otherwise it falls back
-   to remote prep automatically. Note: prep depends on the tile/grid size, so
-   changing those params re-preps under a new cache tag.
-
-3. **Runs page** — list runs on each model's outputs volume, download artifacts,
-   inspect per-class IoU, render the metrics dashboard (via the repo's
-   `plot_run_metrics.py`), and open predictions in the 3D viewer.
-
-4. **Inference page** — pick weights (a finished run, or a local `.pth` which
-   gets uploaded), point at a folder of new clouds, run `--mode infer` on
-   Modal, and the predictions download automatically for viewing.
-
-## Wired models
-
-| Model | Script | Status |
+| Mount | Host dir | Holds |
 |---|---|---|
-| PTv3 (cold) | `scripts/modal/modal_train_ptv3.py` | ready |
-| PTv3 + HAG | `scripts/modal/modal_train_ptv3_hag.py` | ready |
-| RandLA-Net (cold) | `scripts/modal/modal_train_randlanet.py` | ready |
-| RandLA-Net + HAG | `scripts/modal/modal_train_randlanet_hag.py` | ready |
-| KPConvX-L (cold) | `scripts/modal/modal_train_kpconvx_cold.py` | ready |
-| KPConvX-L + HAG | `scripts/modal/modal_train_kpconvx_cold_hag.py` | ready |
+| `/workspace` | repo root | the `scripts/local/*.py` that run |
+| `/datasets` | staging root | canonical datasets + `_infer/<job>` inputs |
+| `/outputs` | your chosen folder | `runs/<id>/` weights + predictions |
 
-Every script runs standalone too — `modal run scripts/modal/modal_train_X.py
---dataset <name>` trains on a canonical dataset already uploaded to
-`terminal-datasets` (`--dataset` is required). The GUI just fills in the
-`--dataset/--grid/--epochs/...` flags and sets `TT_GPU` / `TT_TIMEOUT_HOURS`.
+Code lives in `trainer_gui/local_cli.py`. **No Docker on PATH → the GUI prints
+the exact command instead of running it** (dry-run — this dev box is Intel Arc,
+no CUDA).
+
+## The scripts
+
+```
+scripts/local/    the real trainers/inferencers — plain argparse, no modal.
+                  Edit these. Run standalone: python scripts/local/local_train_ptv3.py --dataset X
+scripts/modal/    PAUSED thin shells that bake the local twin into a modal.Image
+                  and subprocess it in the cloud. Frozen — don't touch.
+scripts/helper/   train_common.py (shared training/manifest logic),
+                  density.py, _modal_shim.py (used only by gen_dockerfiles.py)
+```
+
+Each `local_train_<model>.py` takes the same kebab-case flags the GUI fills in
+(`--dataset --grid --epochs --batch ...`) and one `--mode infer` path.
+
+## The Docker images
+
+One image per model, generated — never hand-write a Dockerfile:
+
+```bash
+python tools/gen_dockerfiles.py          # regenerate docker/*.Dockerfile + build/pull/push scripts
+                                          # RE-RUN after editing any script's image recipe
+bash docker/build_all.sh                  # build (needs the model repos + NVIDIA GPU + Buildx)
+```
+
+Model source is pulled in at **build** time via `--build-context` (edit the paths
+in `build_all.sh`). Only the build machine needs the model repos; every other
+machine just needs the built image.
+
+**Distribute build-once-run-anywhere:**
+
+```bash
+TT_REGISTRY=ghcr.io/<you> bash docker/push_all.sh   # build machine
+TT_REGISTRY=ghcr.io/<you> bash docker/pull_all.sh   # any other machine
+```
+
+Set `TT_REGISTRY` (or `local_config["registry"]` in the app state JSON) before
+launching and `docker run` auto-pulls missing images. Registry = the images;
+use Hugging Face / S3 for the `.pth` weights. Full details: `docker/README.md`.
+
+## Models
+
+| Model | key | Local script |
+|---|---|---|
+| PTv3 | `ptv3` | `scripts/local/local_train_ptv3.py` |
+| PTv3 + HAG | `ptv3_hag` | `scripts/local/local_train_ptv3_hag.py` |
+| RandLA-Net | `randlanet` | `scripts/local/local_train_randlanet.py` |
+| RandLA-Net + HAG | `randlanet_hag` | `scripts/local/local_train_randlanet_hag.py` |
+| KPConvX-L | `kpconvx_cold` | `scripts/local/local_train_kpconvx_cold.py` |
+| KPConvX-L + HAG | `kpconvx_cold_hag` | `scripts/local/local_train_kpconvx_cold_hag.py` |
+
+`_hag` = an extra **HeightAboveGround** input channel (PDAL SMRF ground → `hag_nn`).
+
+## The normal path: Datasets → Train → Inference
+
+Three pages, front to back. Each one fills one of the bind-mounts above.
+
+### 1. Datasets — turn raw clouds into a trainable dataset
+
+Builds `/datasets/<name>` (the canonical `.npz` splits). Three numbered sections,
+top to bottom:
+
+1. **New dataset** — give it a **Name**, point **Input** at a file or a folder of
+   clouds (`las/laz`, `ply`, ASCII `txt/csv/xyz/pts`, `pcd`, `npy/npz`). The
+   **Label field** dropdown auto-probes the first file for label fields (e.g.
+   `classification`, `scalar_label`) — pick which one holds the class. **Output
+   folder** defaults to the app staging dir.
+2. **Classes** — click **Scan label values**: every distinct label value shows up
+   as a row (value, points seen, editable class name, a **Train** checkbox).
+   Rename classes, **uncheck** any value that means "unknown" (→ ignore-label,
+   dropped from loss + mIoU), select rows + **Combine** to merge several values
+   into one class. **Analyze density** prints pts/m², spacing and a suggested tile
+   size, and pre-computes the per-model param recommendations the Train page uses.
+3. **Train / val / test split** — set **Validation** and **Test** fractions
+   (train = the remainder), **Split mode** (Balanced mirrors the class mix /
+   Random fills by point count), and the **seed** (default 42). Already have
+   split folders? Tick **Separate train/val/test folders (use as-is)**. Optional
+   **Compute Height-Above-Ground (HAG)** bakes a per-point HAG channel (PDAL SMRF
+   ground, optional labeled-ground class) — only the `_hag` models read it.
+
+Hit **Build dataset**. It writes `train/ val/ test/` `.npz` to staging; progress
+streams in the console. Done → the dataset appears under **Saved Datasets** and is
+ready to pick on the Train page.
+
+### 2. Train — run a model on the dataset
+
+Writes `/outputs/runs/<id>/` (weights + logs + `run.json`).
+
+- Pick the **Dataset** (the status line confirms *✓ train/val/test standard met*)
+  and a **Model**. **Configure model…** opens a popup showing that model's Docker
+  image status, a **Pull** button, and the registry field.
+- **Parameters** are pre-filled from the density analysis (**★** = recommended) —
+  grid/sub-grid, epochs, batch, steps/epoch, tile size. All editable.
+- **Smoke run** (2 epochs × 50 steps) validates a new dataset end-to-end fast.
+- Optional: per-run **Domain generalization** (train robust to a different
+  inference density) and **Loss & class balance** knobs.
+- Set the **Output folder** (bound to `/outputs`), hit **Launch training**. The
+  exact `docker run` is echoed to the log; then logs stream live and per-epoch
+  **Loss / Acc / mIoU** fill the metrics table. **Stop process** kills it.
+
+On finish, each run dir has the weights and a **`run.json`** — the single file
+Inference needs.
+
+### 3. Inference — label new clouds with a trained model
+
+Reads a run's `run.json` + weights, writes predictions to a host folder.
+
+- **Weights → From a training run**: **Browse** to the run's **`run.json`**. It
+  auto-fills the backbone, grid, tile size, intensity norm and HAG settings, and
+  points **Weights file** at the sibling `.pth` (override if you want). (Or pick
+  **Local .pth file** and choose the architecture yourself.)
+- **Input**: a folder or single cloud to label. Grid/tile come from the run.
+  Optional label-free **density adapt (AdaBN)** / **density TTA** for inference at
+  a different density than training. Set the **Output folder** for predictions.
+- **Run inference** converts the input to canonical scenes, then `docker run
+  --mode infer` with the scenes bind-mounted and predictions written straight to
+  your output folder (no upload/download).
+- View results in place: **View a point cloud…**, **Compare to ground truth…**
+  (prints accuracy + per-class mIoU, paints mismatches), **Export comparison
+  PLY…**, and **Class colours & names…** to set the legend.
+
+## Canonical dataset format
+
+`<staging>/<name>/` (bind-mounted to `/datasets/<name>`):
+
+- `dataset_meta.json` — classes (source value → index → name), per-split counts,
+  density stats, per-model recommendations, and the recorded split (mode, seed,
+  fractions).
+- `train/<scene>.npz`, `val/<scene>.npz`, `test/<scene>.npz` — `xyz` (f32),
+  `label` (i32, −1 = ignored), plus `rgb`/`intensity`/`return_number`/`hag` when
+  the source has them.
+
+The Datasets page carves all three splits **once** (val % / test % sliders each
+≥ 5 %, train takes the rest; balanced or random; seeded, default 42). A folder
+splits by whole scenes; a single cloud is tiled and reassembled per split with a
+seam buffer discarded to limit leakage. Trainers read the three folders verbatim
+and never re-split.
 
 ## Repo layout
 
 ```
-scripts/modal/   thin Modal entrypoints (`modal run …`; bake + subprocess the local twin)
-scripts/local/   the actual trainers/inferencers (run directly in Docker, no modal)
-scripts/helper/  shared bits: train_common.py, _modal_shim.py
-trainer_gui/     the PySide6 desktop app (the pip-installed package)
+trainer_gui/     the PySide6 app (pip/pixi package) — pages/, local_cli.py, ...
+scripts/local/   the real trainers/inferencers (run in Docker)
+scripts/modal/   paused thin shells + DEPRECATED.md
+scripts/helper/  train_common.py, density.py, _modal_shim.py
 docker/          generated Dockerfiles + build/pull/push scripts
-tools/           gen_dockerfiles.py (+ the one-shot split_local.py)
+tools/           gen_dockerfiles.py
 ```
-
-## Canonical dataset format
-
-`%APPDATA%/trainer_gui/staging/<name>/` (uploaded to `terminal-datasets:/<name>`):
-
-- `dataset_meta.json` — classes (source value → index → name), per-split counts,
-  density stats, per-model recommendations, and the recorded split (`mode`,
-  `seed`, requested vs. achieved fractions)
-- `train/<scene>.npz`, `val/<scene>.npz`, `test/<scene>.npz` — `xyz` (f32),
-  `label` (i32, −1 = ignored), plus `rgb` (u8), `intensity` (f32, normalized
-  0–1), `return_number` (f32) and `hag` (f32) when the source has them
-
-The Datasets page materializes **three** whole-scene folders once: **train**,
-**val** (the in-distribution selection holdout) and **test** (the final-report
-set). You set the **val %** and **test %** sliders (each ≥ 5 %; train takes the
-remainder), pick **balanced** (every split mirrors the global class mix) or
-**random** (point-count fill only), and the split **seed** (shown, default 42). A
-folder of clouds splits by whole scenes; a single cloud is tiled as a
-measurement, the tiles allocated and reassembled into one holey npz per split
-with a small **seam buffer** discarded to limit leakage. The training scripts
-read all three folders verbatim and never re-carve a split.
 
 ## Tests
 
 ```powershell
 cd trainer_gui
-python tests/smoke_test.py
+python tests/smoke_test.py     # or: pixi run test
 ```

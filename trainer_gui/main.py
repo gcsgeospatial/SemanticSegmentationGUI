@@ -137,7 +137,7 @@ class MainWindow(QWidget):
             page.apply_exec_mode(local)
 
     def _apply_mode_tag(self, mode: str):
-        self.tag.setText("point-cloud training — local (Docker)" if mode == "local"
+        self.tag.setText("point-cloud training - local (Docker)" if mode == "local"
                          else "point-cloud training on Modal")
 
     def _on_theme_change(self):
