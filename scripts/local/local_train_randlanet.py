@@ -107,9 +107,10 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                     batch: Optional[int] = None, steps_per_epoch: Optional[int] = None,
                     mode: str = "train", weights: Optional[str] = None,
                     infer_input: Optional[str] = None):
-    if dataset is None:
+    if dataset is None and mode != "infer":
         raise ValueError("--dataset is required: pass a canonical trainer_gui "
-                         "dataset name on the terminal-datasets volume.")
+                         "dataset name on the terminal-datasets volume. The only "
+                         "dataset-free path is --mode infer.")
     import os, sys, time, json, csv, glob
     from datetime import datetime
     import numpy as np
@@ -145,17 +146,23 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     N_EPOCHS      = epochs if epochs is not None else globals()["N_EPOCHS"]
     BATCH_SIZE    = batch if batch is not None else globals()["BATCH_SIZE"]
     STEPS         = steps_per_epoch if steps_per_epoch is not None else 500
-    ds_root = f"{DATASETS_ROOT}/{dataset}"
-    meta_path = f"{ds_root}/dataset_meta.json"
-    if not os.path.exists(meta_path):
-        raise FileNotFoundError(f"{meta_path} not found — upload the dataset "
-                                f"with the trainer_gui app first.")
-    with open(meta_path) as f:
-        ds_meta = json.load(f)
-    NUM_CLASSES = int(ds_meta["num_classes"])
-    CLASS_NAMES = list(ds_meta["class_names"])
-    # No "warm" in the name: the cold sibling shares this cache (identical prep).
-    PREP_DIR = f"{ds_root}/prep/randlanet_grid{int(round(SUB_GRID_SIZE * 100))}_p95"
+    if dataset:
+        ds_root = f"{DATASETS_ROOT}/{dataset}"
+        meta_path = f"{ds_root}/dataset_meta.json"
+        if not os.path.exists(meta_path):
+            raise FileNotFoundError(f"{meta_path} not found — upload the dataset "
+                                    f"with the trainer_gui app first.")
+        with open(meta_path) as f:
+            ds_meta = json.load(f)
+        NUM_CLASSES = int(ds_meta["num_classes"])
+        CLASS_NAMES = list(ds_meta["class_names"])
+        # No "warm" in the name: the cold sibling shares this cache (identical prep).
+        PREP_DIR = f"{ds_root}/prep/randlanet_grid{int(round(SUB_GRID_SIZE * 100))}_p95"
+    else:
+        # --mode infer: dataset-free. The real class count/names come from the
+        # checkpoint (+ its run.json) in the inference branch; these are placeholders
+        # so the inline `class Cfg` (num_classes = NUM_CLASSES) below has a value.
+        ds_meta, NUM_CLASSES, CLASS_NAMES, PREP_DIR = {}, 0, [], None
 
     # utils/metric.py calls sklearn.metrics.confusion_matrix(y_true, y_pred,
     # np.arange(...)) — the third positional was the `labels` argument in old

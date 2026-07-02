@@ -144,9 +144,10 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                steps_per_epoch: Optional[int] = None, chunk_xy: Optional[float] = None,
                mode: str = "train", weights: Optional[str] = None,
                infer_input: Optional[str] = None):
-    if dataset is None:
+    if dataset is None and mode != "infer":
         raise ValueError("--dataset is required: pass a canonical trainer_gui dataset "
-                         "name materialized on the terminal-datasets volume.")
+                         "name materialized on the terminal-datasets volume. The only "
+                         "dataset-free path is --mode infer.")
     import os, sys, time, json, csv, glob, traceback
     from datetime import datetime
     import numpy as np
@@ -188,16 +189,19 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
     STRIDE      = CHUNK_XY / 2.0
 
     # NUM_CLASSES / CLASS_NAMES come ONLY from the dataset's dataset_meta.json.
-    ds_root = f"{DATASETS_ROOT}/{dataset}"
-    meta_path = f"{ds_root}/dataset_meta.json"
-    if not os.path.exists(meta_path):
-        raise FileNotFoundError(f"{meta_path} not found — upload the dataset "
-                                f"with the trainer_gui app first.")
-    with open(meta_path) as f:
-        ds_meta = json.load(f)
-    NUM_CLASSES = int(ds_meta["num_classes"])
-    CLASS_NAMES = list(ds_meta["class_names"])
-    PREP_DIR = f"{ds_root}/prep/ptv3_cold_chunk{int(CHUNK_XY)}"
+    # --mode infer is dataset-free: the inference branch below reads the class
+    # count/names straight from the checkpoint (+ its run.json), so skip the meta.
+    if dataset:
+        ds_root = f"{DATASETS_ROOT}/{dataset}"
+        meta_path = f"{ds_root}/dataset_meta.json"
+        if not os.path.exists(meta_path):
+            raise FileNotFoundError(f"{meta_path} not found — upload the dataset "
+                                    f"with the trainer_gui app first.")
+        with open(meta_path) as f:
+            ds_meta = json.load(f)
+        NUM_CLASSES = int(ds_meta["num_classes"])
+        CLASS_NAMES = list(ds_meta["class_names"])
+        PREP_DIR = f"{ds_root}/prep/ptv3_cold_chunk{int(CHUNK_XY)}"
 
     # --- Preprocessing ------------------------------------------------------
     def load_ply(path):
@@ -1135,7 +1139,7 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
 def main():
     import argparse
     ap = argparse.ArgumentParser(description='Local ptv3 trainer/inferencer (no modal).')
-    ap.add_argument('--dataset', required=True)
+    ap.add_argument('--dataset', default=None)   # required to train; omitted for --mode infer
     ap.add_argument('--grid', type=float, default=None)
     ap.add_argument('--epochs', type=int, default=None)
     ap.add_argument('--batch', type=int, default=None)

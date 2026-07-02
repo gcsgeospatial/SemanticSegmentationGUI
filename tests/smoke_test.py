@@ -663,6 +663,21 @@ def main():
             if fn is None or type(lm.outputs_volume).__name__ != "_NoVol":
                 local_ok = False
         check("local: all 6 local_train_*.py import + expose train fn + no-op volumes", local_ok)
+        # --mode infer labels arbitrary clouds from weights, so it must NOT demand a
+        # --dataset (the class count/names come from the checkpoint + its run.json).
+        # Calling with dataset=None must fault PAST the dataset gate (missing weights /
+        # Docker-only deps), never with the old "--dataset is required" error.
+        infer_gate_ok = True
+        for nm in LOCAL:
+            lm = importlib.import_module(nm)
+            fn = next((getattr(lm, n) for n in dir(lm) if n.startswith("train_")), None)
+            try:
+                fn(dataset=None, mode="infer")   # no weights -> should fault in the infer branch
+                infer_gate_ok = False            # must raise (never silently proceed)
+            except Exception as e:               # noqa: BLE001
+                if "dataset is required" in str(e).lower():
+                    infer_gate_ok = False
+        check("local: --mode infer runs dataset-free (all 6 backbones)", infer_gate_ok)
         with open(importlib.import_module("local_train_ptv3").__file__, encoding="utf-8") as f:
             _lt_src = f.read()
         check("local: local_train_ptv3.py has no 'import modal' (source is decoupled)",
