@@ -492,7 +492,7 @@ class TrainPage(QWidget):
 
         hint = QLabel("Defaults handle class imbalance (inverse-sqrt weighting + "
                       "Lovász-Softmax + rare-class oversampling). Tweak per run; "
-                      "recorded in run_config.json.")
+                      "recorded in run.json.")
         hint.setWordWrap(True)
         theme.set_accent(hint, "muted")
         lay.addWidget(hint)

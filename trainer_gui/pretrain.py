@@ -33,7 +33,8 @@ from .dataset import LabelSpec
 from .readers import SUPPORTED_EXTS, read_points
 
 LAS_EXTS = {".las", ".laz"}
-HAG_FILTERS = ("hag_nn", "hag_delaunay")
+HAG_FILTERS = ("hag_nn", "hag_delaunay")     # PDAL filters (add_hag + the accurate path)
+HAG_METHODS = ("grid",) + HAG_FILTERS        # hag_for_cloud methods; "grid" = fast default
 
 # SMRF overwrites Classification (ground->2). When the label lives in that dim,
 # add_hag(preserve_class_as=...) ferries it here BEFORE SMRF so a downstream
@@ -171,6 +172,8 @@ def add_hag(in_dir: str | Path, out_dir: str | Path, *, ground_class: int | None
 
     if hag_filter not in HAG_FILTERS:
         raise ValueError(f"hag_filter must be one of {HAG_FILTERS}, got {hag_filter!r}")
+    if ground_class is not None:
+        use_smrf = False              # trusted labels -> SMRF never runs
     say = progress or (lambda s: None)
     in_dir, out_dir = Path(in_dir), Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -244,32 +247,131 @@ def add_hag(in_dir: str | Path, out_dir: str | Path, *, ground_class: int | None
     return summary
 
 
+# Grid-HAG knobs. cell = ground-raster resolution (error ~ cell x slope);
+# open window = largest structure whose roof-only cells get rejected; relief =
+# terrain rise the opening may flatten before a cell counts as non-ground.
+# ponytail: fixed heuristics sized for buildings on gentle terrain — promote to
+# parameters if a dataset's terrain/structures fight them.
+GRID_HAG_CELL_M = 2.0
+GRID_HAG_OPEN_M = 35.0
+GRID_HAG_RELIEF_M = 2.5
+_GRID_HAG_MAX_DIM = 4096          # grow the cell instead of allocating a huge raster
+
+
+def hag_grid_for_cloud(cloud, *, ground_mask=None,
+                       cell: float = GRID_HAG_CELL_M) -> "np.ndarray | None":
+    """Approximate per-point HeightAboveGround from a rasterized ground surface.
+    Pure numpy/scipy, no PDAL, a few O(n) passes — the fast default method.
+
+    ground_mask given (trusted labels): the raster is the per-cell mean Z of the
+    labeled ground points; label-less cells (e.g. under buildings) are filled
+    from the NEAREST labeled cell — this replaces the old SMRF union as the
+    hole-filler, so SMRF never runs when a ground class exists.
+    No mask (detection): per-cell low-percentile Z, then a grey opening rejects
+    cells whose lowest return sits on a structure (roofs); rejected + empty
+    cells are nearest-filled the same way.
+
+    HAG = z - bilinear(raster). Error is ~cell x slope: a feature channel, not
+    survey ground — the trainers' accepted fallback is z-scene-min, far cruder.
+    Returns float32 aligned 1:1 to cloud.xyz, or None when it can't produce one
+    (caller falls back to that proxy)."""
+    try:
+        from scipy import ndimage
+    except Exception:  # noqa: BLE001
+        return None
+    n = cloud.n
+    if n == 0:
+        return None
+    xy = cloud.xyz[:, :2].astype(np.float64)
+    z = cloud.xyz[:, 2].astype(np.float64)
+    mn = xy.min(0)
+    ext = xy.max(0) - mn
+    cell = max(float(cell), float(ext.max()) / _GRID_HAG_MAX_DIM, 1e-6)
+    ij = np.floor((xy - mn) / cell).astype(np.int64)
+    dims = (int(ij[:, 0].max()) + 1, int(ij[:, 1].max()) + 1)
+    flat = ij[:, 0] * dims[1] + ij[:, 1]
+    ncell = dims[0] * dims[1]
+
+    gm = None
+    if ground_mask is not None:
+        gm = np.asarray(ground_mask, dtype=bool).reshape(-1)
+        if len(gm) != n or not gm.any():
+            gm = None                              # unusable mask -> detection
+
+    grid = np.zeros(ncell, np.float64)
+    if gm is not None:                             # labeled: mean ground Z per cell
+        cnt = np.bincount(flat[gm], minlength=ncell)
+        zsum = np.bincount(flat[gm], weights=z[gm], minlength=ncell)
+        valid = cnt > 0
+        grid[valid] = zsum[valid] / cnt[valid]
+        g2, v2 = grid.reshape(dims), valid.reshape(dims)
+    else:                                          # detect: low-percentile Z + opening
+        # One int64 argsort instead of a two-key lexsort (~2.5x faster): pack
+        # cell id with 20-bit-quantized Z (<= mm resolution), so sorting the key
+        # orders by cell, Z ascending within.
+        zq = ((z - z.min()) * ((1 << 20) - 1) / max(float(z.max() - z.min()), 1e-9))
+        order = np.argsort((flat << 20) | zq.astype(np.int64))
+        counts = np.bincount(flat, minlength=ncell)
+        starts = np.concatenate(([0], np.cumsum(counts)[:-1]))
+        valid = counts > 0
+        pick = starts[valid] + (0.05 * (counts[valid] - 1)).astype(np.int64)
+        grid[valid] = z[order][pick]               # 5th-pctile resists low noise
+        g2, v2 = grid.reshape(dims), valid.reshape(dims)
+        # Nearest-fill empties FIRST so the opening sees a full surface, then
+        # reject cells the opening lowered by more than the relief tolerance:
+        # their lowest return sits on a structure, not the ground.
+        if (~v2).any():
+            near = ndimage.distance_transform_edt(~v2, return_distances=False,
+                                                  return_indices=True)
+            g2 = g2[tuple(near)]
+        size = max(int(round(GRID_HAG_OPEN_M / cell)), 3)
+        opened = ndimage.grey_opening(g2, size=size, mode="nearest")
+        v2 = v2 & ((g2 - opened) <= GRID_HAG_RELIEF_M)
+        if not v2.any():
+            return None                            # nothing survives -> no ground
+
+    if (~v2).any():                                # nearest-fill holes (final surface)
+        near = ndimage.distance_transform_edt(~v2, return_distances=False,
+                                              return_indices=True)
+        g2 = np.where(v2, g2, 0.0)[tuple(near)]
+    coords = np.ascontiguousarray(((xy - mn) / cell - 0.5).T)
+    ground_at = ndimage.map_coordinates(g2, coords, order=1, mode="nearest")
+    return (z - ground_at).astype(np.float32)
+
+
 def hag_for_cloud(cloud, *, ground_mask=None, use_smrf: bool = True,
-                  hag_filter: str = "hag_nn", smrf_cell: float = 2.0) -> "np.ndarray | None":
-    """Per-point HeightAboveGround aligned 1:1 to cloud.xyz, for INFERENCE and
-    per-tile HAG (the in-RAM twin of add_hag's per-file laz output).
+                  hag_filter: str = "grid", smrf_cell: float = 2.0) -> "np.ndarray | None":
+    """Per-point HeightAboveGround aligned 1:1 to cloud.xyz — the ONE engine
+    behind dataset builds, per-tile HAG and inference (so train and infer can't
+    diverge in method).
 
-    Ground for the HAG filter is built from, in combination:
-      - ground_mask: a boolean array (len cloud.n) marking the points the dataset
-        LABELS as ground (the caller builds it from its own label field, e.g.
-        raw == the ground class). Used verbatim — no dependence on a dimension
-        being named "Classification".
-      - use_smrf: also run PDAL SMRF to DETECT ground and UNION it with the
-        labeled ground, filling holes the labels miss (missing ground returns,
-        e.g. under buildings) without discarding the trusted labels.
-    The HAG filter (hag_nn / hag_delaunay) then interpolates a ground elevation
-    for every point from that ground set (it spans the true holes — a building
-    footprint with no ground returns — by nearest-neighbour / TIN).
+    hag_filter picks the method: "grid" (default, hag_grid_for_cloud — fast
+    raster approximation, no PDAL) or a PDAL filter ("hag_nn"/"hag_delaunay",
+    the accurate path). Ground comes from ONE source, never a union:
+      - ground_mask: points the dataset LABELS as ground. Trusted labels win —
+        SMRF NEVER runs when a usable mask exists (holes the labels miss are
+        spanned by the grid's nearest-fill / the PDAL filter's interpolation).
+      - use_smrf (PDAL filters only, no mask): SMRF detects ground. The grid
+        method does its own detection and ignores use_smrf.
 
-    Returns float32 length cloud.n, or None when: PDAL is unavailable; there is no
-    ground source at all (no mask and use_smrf is False, or SMRF found nothing and
-    no labels); or the pipeline drops/reorders points (caller falls back to a
-    z-min proxy — never worse than before). smrf+hag preserve input order; the
-    length + first/last-X guard rejects the pathological case where they don't."""
+    Returns float32 length cloud.n, or None when no method can produce an
+    aligned result (caller falls back to a z-min proxy — never worse than
+    before). smrf+hag preserve input order; the length + first/last-X guard
+    rejects the pathological case where they don't."""
+    if hag_filter not in HAG_METHODS:
+        raise ValueError(f"hag_filter must be one of {HAG_METHODS}, got {hag_filter!r}")
+    if ground_mask is not None:
+        ground_mask = np.asarray(ground_mask, dtype=bool).reshape(-1)
+        if len(ground_mask) != cloud.n:
+            return None
+        if not ground_mask.any():
+            ground_mask = None                        # unusable mask -> detection
+        else:
+            use_smrf = False                          # trusted labels -> no SMRF, ever
+    if hag_filter == "grid":
+        return hag_grid_for_cloud(cloud, ground_mask=ground_mask)
     if not pdal_available():
         return None
-    if hag_filter not in HAG_FILTERS:
-        raise ValueError(f"hag_filter must be one of {HAG_FILTERS}, got {hag_filter!r}")
     if ground_mask is None and not use_smrf:
         return None                                   # nothing to anchor HAG to
     import pdal
@@ -277,11 +379,8 @@ def hag_for_cloud(cloud, *, ground_mask=None, use_smrf: bool = True,
         arr = _structured_from_cloud(cloud)           # always has a Classification dim
         ground = np.zeros(cloud.n, dtype=bool)
         if ground_mask is not None:
-            ground_mask = np.asarray(ground_mask, dtype=bool).reshape(-1)
-            if len(ground_mask) != cloud.n:
-                return None
             ground |= ground_mask
-        if use_smrf:                                  # detect ground, union with labels
+        if use_smrf:                                  # detect ground (no labels case)
             smrf = pdal.Pipeline(json.dumps([{"type": "filters.smrf", "cell": smrf_cell}]), arrays=[arr])
             smrf.execute()
             sarr = smrf.arrays[0]
@@ -373,6 +472,24 @@ def _selfcheck():
     assert [st["type"] for st in only] == [
         "filters.ferry", "filters.assign", "filters.hag_nn", "writers.las"], only
     assert "forward" not in only[-1]          # array input -> no header to forward
+
+    # grid HAG numerics (no PDAL needed): flat ground at z=0 with a 10x10 m
+    # "roof" at z=10 and no ground returns beneath it. Detection must reject the
+    # roof cells (opening) and nearest-fill them; the labeled path must get the
+    # same answer from the mask alone.
+    from .readers import Cloud
+    g = np.mgrid[0:60, 0:60].reshape(2, -1).T.astype(np.float64)
+    on_roof = (g[:, 0] >= 25) & (g[:, 0] < 35) & (g[:, 1] >= 25) & (g[:, 1] < 35)
+    xyz = np.vstack([np.column_stack([g[~on_roof], np.zeros((~on_roof).sum())]),
+                     np.column_stack([g[on_roof], np.full(on_roof.sum(), 10.0)])])
+    ng = int((~on_roof).sum())
+    for h in (hag_grid_for_cloud(Cloud(xyz=xyz)),                       # detection
+              hag_grid_for_cloud(Cloud(xyz=xyz),                        # labeled
+                                 ground_mask=np.arange(len(xyz)) < ng)):
+        assert h is not None and len(h) == len(xyz)
+        assert abs(float(h[:ng].mean())) < 0.3, "ground HAG ~0"
+        assert float(h[ng:].min()) > 8.0, "roof HAG ~10 (cells rejected + filled)"
+    assert hag_for_cloud(Cloud(xyz=xyz), hag_filter="grid") is not None
     print("pretrain self-check OK")
 
 

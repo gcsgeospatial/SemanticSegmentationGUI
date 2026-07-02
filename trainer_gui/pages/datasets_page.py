@@ -3,7 +3,7 @@
   1. New dataset   point at a file/folder, name it, pick the label field
   2. Classes       scan label values, name them, mark ignored, check density
   3. Split         train/val split (whole scenes; scripts tile per model) +
-                   optional per-scene Height-Above-Ground channel (PDAL SMRF -> hag)
+                   optional per-scene Height-Above-Ground channel (grid raster or PDAL)
 
 Labels come from a field in the cloud. Intensity is p95-normalized (i/p95
 clipped to 0..2); the single norm used across build + train + inference.
@@ -197,43 +197,43 @@ class DatasetsPage(QWidget):
         form.addRow("Validation folder", self.val_row_w)
         self.test_edit, self.test_row_w = self._dir_row(self._pick_test)
         form.addRow("Test folder", self.test_row_w)
-        # Optional: compute HeightAboveGround per scene in the same pass. Whole-scene
-        # SMRF gives better ground than per-tile.
+        # Optional: compute HeightAboveGround per scene in the same pass.
         self.hag_chk = QCheckBox("Compute Height-Above-Ground (HAG)")
         self.hag_chk.setToolTip("Bakes a per-point HAG channel into every scene. Ground comes "
-                                "from SMRF, a labeled ground class, or both unioned. The *_hag "
-                                "models use it; others ignore the extra channel.")
+                                "from the labeled ground class when one is set, else it's "
+                                "detected. The *_hag models use it; others ignore the extra "
+                                "channel.")
         self.hag_chk.toggled.connect(lambda on: self.hag_opts_w.setVisible(on))
         form.addRow("Height-Above-Ground", self.hag_chk)
+        # grid = fast raster approximation (no PDAL); hag_nn/hag_delaunay = the
+        # accurate PDAL path (SMRF ground detection when no ground class is set).
         self.hag_filter = QComboBox()
-        self.hag_filter.addItems(list(pretrain.HAG_FILTERS))
-        # Which class is ground (raw Source value from the Classes table). Blank =
-        # no ground class, so SMRF is the only source.
+        self.hag_filter.addItems(list(pretrain.HAG_METHODS))
+        self.hag_filter.setToolTip("grid: fast raster approximation, no PDAL needed. "
+                                   "hag_nn / hag_delaunay: accurate PDAL filters (SMRF "
+                                   "detects ground when no ground class is set).")
+        # Which class is ground (raw Source value from the Classes table). When set,
+        # the labels are the ONLY ground source — SMRF never runs.
         self.hag_ground = QLineEdit()
-        self.hag_ground.setPlaceholderText("blank = none")
+        self.hag_ground.setPlaceholderText("blank = detect")
         self.hag_ground.setMaximumWidth(90)
         self.hag_ground.setToolTip("Source value that means ground (from the Classes table, "
-                                   "e.g. 2). Blank = no ground class; SMRF detects ground.")
-        # Also run SMRF and union with labeled ground to fill holes (missing ground
-        # returns, e.g. under buildings).
-        self.hag_fill_smrf = QCheckBox("fill ground gaps with SMRF")
-        self.hag_fill_smrf.setChecked(True)
-        self.hag_fill_smrf.setToolTip("Union SMRF with the labeled ground to fill holes (no "
-                                      "ground returns, e.g. under buildings). With no ground "
-                                      "class set, SMRF is used regardless.")
+                                   "e.g. 2). When set, those labels are the only ground source "
+                                   "(gaps are nearest-filled). Blank = detect ground instead.")
         hag_row = QHBoxLayout()
-        hag_row.addWidget(QLabel("filter"))
+        hag_row.addWidget(QLabel("method"))
         hag_row.addWidget(self.hag_filter)
         hag_row.addWidget(QLabel("ground class"))
         hag_row.addWidget(self.hag_ground)
-        hag_row.addWidget(self.hag_fill_smrf)
         hag_row.addStretch()
         self.hag_opts_w = _wrap(hag_row)
         self.hag_opts_w.setVisible(False)
         form.addRow("", self.hag_opts_w)
         if not pretrain.pdal_available():
-            self.hag_chk.setEnabled(False)
-            self.hag_chk.setText("Compute Height-Above-Ground (HAG) - PDAL not installed")
+            # grid still works without PDAL; convert_dataset falls back to grid
+            # if a PDAL filter is picked anyway.
+            self.hag_chk.setText("Compute Height-Above-Ground (HAG) - grid only, "
+                                 "PDAL not installed")
         # TODO(not ready): parallel-worker UI hidden until reviewed; conversion runs
         # single-process (max_workers=1 forced in _conversion_plan).
         # Scenes to convert concurrently. 0 = Auto (clamp to cores + free RAM); a
@@ -519,9 +519,9 @@ class DatasetsPage(QWidget):
             "val_inputs": val_inputs, "test_inputs": test_inputs,
             "classes": classes, "ignored": ignored, "spec": self._spec(),
             "out_root": self._output_root(),
-            "compute_hag": pretrain.pdal_available() and self.hag_chk.isChecked(),
+            "compute_hag": self.hag_chk.isChecked(),
             "ground_value": gv,
-            "use_smrf": (gv is None) or self.hag_fill_smrf.isChecked(),
+            "use_smrf": gv is None,     # labels win; SMRF only ever detects
             "hag_filter": self.hag_filter.currentText(),
             "max_workers": 1,   # TODO(not ready): parallel UI hidden; force single-process
         }
@@ -560,7 +560,7 @@ class DatasetsPage(QWidget):
             "uploaded": False,
         })
         self._reload_known()
-        hag = " (with HAG)" if self.hag_chk.isChecked() and pretrain.pdal_available() else ""
+        hag = " (with HAG)" if self.hag_chk.isChecked() else ""
         if appstate.get_exec_mode() == "local":
             self._append(f"✓ Built{hag} -> {staged}. Pick '{staged.name}' on the Train "
                          f"page (bind-mounted at /datasets/{staged.name}).")

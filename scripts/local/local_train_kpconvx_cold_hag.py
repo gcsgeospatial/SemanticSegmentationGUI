@@ -35,7 +35,7 @@ Usage:
     python local_train_kpconvx_cold_hag.py --dataset <name> --mode eval \
         --weights runs/<id>/final_model.pth   # re-score with the voted eval
     python local_train_kpconvx_cold_hag.py --mode infer --infer-input <job> \
-        --weights runs/<id>/final_model.pth   # label uploaded scenes
+        --weights runs/<id>/final_model.pth   # label staged scenes
 """
 
 import os
@@ -63,7 +63,7 @@ VAL_EVERY     = 10           # held-out val pass every N epochs (no weight updat
 TIMEOUT_HOURS = 24
 
 # Resume: when True, continue the most recent AdamW-recipe run in the outputs
-# volume (same run dir, appended metrics) instead of starting fresh. On, to
+# dir (same run dir, appended metrics) instead of starting fresh. On, to
 # extend the 150-epoch run to 200. Set back to False for a fresh run.
 RESUME = False
 
@@ -143,22 +143,6 @@ LABEL_SMOOTH  = 0.2          # KPConvX smooth_labels
 GRAD_CLIP     = 100.0
 BN_MOMENTUM   = 0.02
 
-# ============================================================================
-# Modal image
-# ============================================================================
-
-
-# Local stand-ins for the modal Volumes the body commits to: the data is
-# already on the bind-mounted /outputs /datasets, so there is nothing to
-# upload. (The modal shell does the real commits when it runs this.)
-class _NoVol:
-    def commit(self, *a, **k): pass
-    def reload(self, *a, **k): pass
-
-
-outputs_volume, datasets_volume = _NoVol(), _NoVol()
-
-
 def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
                   weights: Optional[str] = None,
                   infer_input: Optional[str] = None, grid: Optional[float] = None,
@@ -172,6 +156,7 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
 
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "helper"))
     import density as dg
+    import train_common as tc
     # DG flags: env-overridable (GUI "Density generalization" panel / DG_*=1 in the shell).
     # globals()[...] reads the module default; the local shadow is what the nested closures use.
     DG_DENSITY_AUG = dg.env_bool("DG_DENSITY_AUG", globals()["DG_DENSITY_AUG"])
@@ -197,7 +182,7 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
 
     # --dataset (a canonical 3-folder trainer_gui dataset) is required for
     # training and eval. Folder inference (--mode infer) is the only dataset-free
-    # path: it labels uploaded scenes from trained weights.
+    # path: it labels staged scenes from trained weights.
     if dataset is None and not INFER:
         raise ValueError("--dataset is required: pass a canonical trainer_gui "
                          "dataset name (train/val/test folders). The only "
@@ -215,8 +200,8 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
     EPOCH_STEPS = steps_per_epoch if steps_per_epoch is not None else globals()["EPOCH_STEPS"]
     PACK_N      = batch if batch is not None else globals()["PACK_N"]
 
-    # --dataset NAME selects a canonical trainer_gui dataset on the terminal-
-    # datasets volume. Scenes carry a per-point `hag` when the Datasets page
+    # --dataset NAME selects a canonical trainer_gui dataset under /datasets
+    # (bind-mounted). Scenes carry a per-point `hag` when the Datasets page
     # computed it; otherwise the HAG channel falls back to the z-tile-min proxy.
     # NUM_CLASSES / CLASS_NAMES / PREP_DIR are locals so the whole function tracks
     # the dataset's class layout.
@@ -225,13 +210,14 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
     if ds_root:
         meta_path = f"{ds_root}/dataset_meta.json"
         if not os.path.exists(meta_path):
-            raise FileNotFoundError(f"{meta_path} not found — upload the dataset "
+            raise FileNotFoundError(f"{meta_path} not found — build the dataset "
                                     f"with the trainer_gui app first.")
         with open(meta_path) as f:
             ds_meta = json.load(f)
         NUM_CLASSES = int(ds_meta["num_classes"])
         CLASS_NAMES = list(ds_meta["class_names"])
-        HAG_SOURCE = "pdal_hag_nn" if ds_meta.get("has_hag") else "z_minus_scene_min_proxy"
+        HAG_SOURCE = (((ds_meta.get("source") or {}).get("hag_source") or "pdal_hag_nn")
+                      if ds_meta.get("has_hag") else "z_minus_scene_min_proxy")
         PREP_DIR = f"{ds_root}/prep/kpconvx_cold_hag_grid{GRID:g}_c{int(CHUNK_XY)}"
     else:
         # Folder inference (--mode infer): no --dataset. Reproduce the TRAINED
@@ -267,7 +253,7 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
         majority labels. Mirrors KPConv-PyTorch's grid_subsampling (the C++ op
         that produces the first_subsampling_dl=2.0 layer-0 cloud)."""
         keys = np.floor(xyz / voxel).astype(np.int64)
-        _, inv = np.unique(keys, axis=0, return_inverse=True)
+        inv = tc.voxel_unique(keys, return_inverse=True)[1]
         nv = int(inv.max()) + 1
         cnt = np.bincount(inv, minlength=nv).astype(np.float64)
         sx = np.zeros((nv, 3)); np.add.at(sx, inv, xyz); sx /= cnt[:, None]
@@ -407,7 +393,7 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
         split seed, label map, feature recipe, HAG source …) instead of silently
         mixing incompatible data. Migrate a pre-validation cache by stamping
         .done markers for already-tiled scenes. Returns True if the signature
-        file was newly written (so the caller commits the volume)."""
+        file was newly written (so the caller can report fresh work)."""
         meta_path = f"{PREP_DIR}/cache_meta.json"
         cur = _cache_signature()
         if os.path.exists(meta_path):
@@ -465,8 +451,7 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
         print(f"  [test] {len(test_list)} scenes", flush=True)
         tile_remaining(test_list, f"{PREP_DIR}/test", CHUNK_XY, STRIDE)
         if any_new[0]:
-            datasets_volume.commit()
-            print("  preprocessing committed.", flush=True)
+            print("  preprocessing cache updated.", flush=True)
         else:
             print("  all scenes already cached.", flush=True)
         return train_list, val_list, test_list
@@ -480,7 +465,7 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
     def find_latest_checkpoint():
         """Most recent run (run-ids are timestamps, so they sort) that has
         checkpoints AND was trained with this script's recipe — old SGD-recipe
-        runs in the volume are not valid warm starts. Returns
+        runs in the outputs dir are not valid warm starts. Returns
         (run_dir, ckpt_path, epoch) or None."""
         def _ep(p):
             return int(os.path.basename(p)[2:5])   # ep149.pth -> 149
@@ -488,11 +473,14 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
             ckpts = glob.glob(f"{rd}/checkpoints/ep*.pth")
             if not ckpts:
                 continue
-            try:
-                with open(f"{rd}/run_config.json") as f:
-                    opt_type = json.load(f).get("optimizer", {}).get("type")
-            except Exception:
-                opt_type = None
+            opt_type = None
+            for _cfg in (f"{rd}/run.json", f"{rd}/run_config.json"):   # legacy fallback
+                try:
+                    with open(_cfg) as f:
+                        opt_type = json.load(f).get("optimizer", {}).get("type")
+                    break
+                except Exception:
+                    continue
             if opt_type != "AdamW":
                 print(f"  resume: skipping {os.path.basename(rd)} "
                       f"(recipe mismatch: optimizer={opt_type})", flush=True)
@@ -515,8 +503,8 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
     if INFER:
         # Inference-only: fresh *_infer run dir, weights loaded after net build.
         run_id = datetime.utcnow().strftime("%Y%m%d_%H%M%S_infer")
-        # Predictions live next to the input scenes on terminal-datasets (not the
-        # per-backbone outputs volume), so inference output is in one consistent place.
+        # Predictions live next to the input scenes under /datasets/_infer (not the
+        # per-model runs dir), so inference output is in one consistent place.
         run_dir = f"/datasets/_infer/{infer_input}"
         os.makedirs(f"{run_dir}/predictions", exist_ok=True)
         resume_ckpt, start_epoch = None, 0
@@ -532,11 +520,11 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
     else:
         if EVAL_ONLY:
             raise RuntimeError("eval mode: no AdamW-recipe run with checkpoints "
-                               "found on the outputs volume")
+                               "found under /outputs")
         run_id, run_dir = make_run_dir()
         resume_ckpt, start_epoch = None, 0
     if resume_ckpt is None and not INFER:
-        with open(f"{run_dir}/run_config.json", "w") as f:
+        with open(f"{run_dir}/run.json", "w") as f:
             json.dump({
             "backbone": "KPConvX-L",
             "warm_start": False,
@@ -653,7 +641,7 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
         # the training loop, so the script falls straight to the final eval.
         fm = f"/outputs/{weights}" if weights else f"{run_dir}/final_model.pth"
         if weights and not os.path.exists(fm):
-            raise FileNotFoundError(f"--weights not found on outputs volume: {fm}")
+            raise FileNotFoundError(f"--weights not found under /outputs: {fm}")
         if os.path.exists(fm):
             net.load_state_dict(torch.load(fm, map_location="cuda", weights_only=True)["model"])
             print(f"  EVAL-ONLY: loaded {fm}", flush=True)
@@ -868,41 +856,35 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
         per-raw-point real HeightAboveGround when the scene carries it; None ->
         the z-tile-min proxy."""
         pred = np.full(len(xyz), -1, np.int64)
-        mins, maxs = xyz[:, :2].min(0), xyz[:, :2].max(0)
         with torch.no_grad():
-            for x0 in np.arange(mins[0], maxs[0] + CHUNK_XY, CHUNK_XY):
-                for y0 in np.arange(mins[1], maxs[1] + CHUNK_XY, CHUNK_XY):
-                    m = ((xyz[:, 0] >= x0) & (xyz[:, 0] < x0 + CHUNK_XY) &
-                         (xyz[:, 1] >= y0) & (xyz[:, 1] < y0 + CHUNK_XY))
-                    if m.sum() < 64:
-                        continue
-                    idx = np.where(m)[0]
-                    cols = [intensity_n[idx], ret_num[idx]]
-                    if hag is not None:
-                        cols.append(hag[idx])          # carry real HAG through the voxel mean
-                    attrs = np.stack(cols, axis=1).astype(np.float32)
-                    sx, sa, _ = grid_subsample(xyz[idx], attrs, None, GRID)
-                    if len(sx) < 32:
-                        continue
-                    sub_hag = (sa[:, 2] if hag is not None
-                               else (sx[:, 2] - sx[:, 2].min()).astype(np.float32))
-                    feat = build_feat(sx, sa[:, 0], sa[:, 1], sub_hag)
-                    base = (sx - sx.mean(0)).astype(np.float32)
-                    # D5 density-TTA: scale s is a density change (o->o/s^2); average
-                    # softmax over views. views=[1.0] when off -> old single-view argmax.
-                    views = [1.0] + (list(np.linspace(0.85, 1.2, DG_INFER_TTA))
-                                     if DG_INFER_TTA else [])
-                    try:
-                        prob = None
-                        for s in views:
-                            batch, _ = make_kp_pack([((base * s).astype(np.float32), feat, None)])
-                            p = torch.softmax(net(batch).float(), -1).cpu().numpy()
-                            prob = p if prob is None else prob + p
-                        sub_pred = prob.argmax(-1)
-                    except Exception:
-                        continue
-                    _, nn = cKDTree(sx).query(xyz[idx])
-                    pred[idx] = sub_pred[nn]
+            # windows via one packed-code sort, not a full-cloud mask per window
+            for idx in tc.xy_chunk_groups(xyz, CHUNK_XY, min_pts=64):
+                cols = [intensity_n[idx], ret_num[idx]]
+                if hag is not None:
+                    cols.append(hag[idx])          # carry real HAG through the voxel mean
+                attrs = np.stack(cols, axis=1).astype(np.float32)
+                sx, sa, _ = grid_subsample(xyz[idx], attrs, None, GRID)
+                if len(sx) < 32:
+                    continue
+                sub_hag = (sa[:, 2] if hag is not None
+                           else (sx[:, 2] - sx[:, 2].min()).astype(np.float32))
+                feat = build_feat(sx, sa[:, 0], sa[:, 1], sub_hag)
+                base = (sx - sx.mean(0)).astype(np.float32)
+                # D5 density-TTA: scale s is a density change (o->o/s^2); average
+                # softmax over views. views=[1.0] when off -> old single-view argmax.
+                views = [1.0] + (list(np.linspace(0.85, 1.2, DG_INFER_TTA))
+                                 if DG_INFER_TTA else [])
+                try:
+                    prob = None
+                    for s in views:
+                        batch, _ = make_kp_pack([((base * s).astype(np.float32), feat, None)])
+                        p = torch.softmax(net(batch).float(), -1).cpu().numpy()
+                        prob = p if prob is None else prob + p
+                    sub_pred = prob.argmax(-1)
+                except Exception:
+                    continue
+                _, nn = cKDTree(sx).query(xyz[idx])
+                pred[idx] = sub_pred[nn]
         miss = pred < 0
         if miss.any() and (~miss).any():
             _, nn = cKDTree(xyz[~miss]).query(xyz[miss])
@@ -910,7 +892,7 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
         return np.clip(pred, 0, NUM_CLASSES - 1)
 
     # ------------------------------------------------------------------------
-    # Arbitrary-folder inference (trainer_gui): label the npz scenes uploaded to
+    # Arbitrary-folder inference (trainer_gui): label the npz scenes staged to
     # terminal-datasets:/_infer/<job>/scenes/ and write predictions, then stop.
     # Scenes carry real HAG when present; otherwise the 4th channel falls back to
     # the z-tile-min proxy. KPConvX geometry is fixed to the trained values; any
@@ -948,12 +930,11 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
         if not scenes:
             raise FileNotFoundError(f"No scenes under /datasets/_infer/{infer_input}/scenes")
         pred_dir = f"{run_dir}/predictions"
-        with open(f"{run_dir}/run_config.json", "w") as f:
-            json.dump({"backbone": "KPConvX-L-HAG", "mode": "infer", "weights": weights,
-                       "infer_input": infer_input, "num_classes": NUM_CLASSES,
-                       "class_names": CLASS_NAMES, "grid": GRID, "chunk_xy": CHUNK_XY,
-                       "hag": "proxy_z_tile_min", "gpu": gpu_name(),
-                       "scenes": [os.path.basename(s) for s in scenes]}, f, indent=2)
+        infer_cfg = {"backbone": "KPConvX-L-HAG", "mode": "infer", "weights": weights,
+                     "infer_input": infer_input, "num_classes": NUM_CLASSES,
+                     "class_names": CLASS_NAMES, "grid": GRID, "chunk_xy": CHUNK_XY,
+                     "hag": "proxy_z_tile_min", "gpu": gpu_name(),
+                     "started_utc": datetime.utcnow().isoformat() + "Z"}
         print(f"  [infer] labeling {len(scenes)} scene(s) -> {run_dir}/predictions", flush=True)
         if DG_INFER_ADABN:
             # D2b: re-estimate BN running stats on the target tiles (label-free). The hag
@@ -972,31 +953,26 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
                     trn = (z["return_number"].astype(np.float32) if "return_number" in z
                            else (z["ret_num"].astype(np.float32) if "ret_num" in z
                                  else np.zeros(len(txyz), np.float32)))
-                    mins, maxs = txyz[:, :2].min(0), txyz[:, :2].max(0)
-                    for x0 in np.arange(mins[0], maxs[0] + CHUNK_XY, CHUNK_XY):
-                        for y0 in np.arange(mins[1], maxs[1] + CHUNK_XY, CHUNK_XY):
-                            if seen >= cap:
-                                return
-                            m = ((txyz[:, 0] >= x0) & (txyz[:, 0] < x0 + CHUNK_XY) &
-                                 (txyz[:, 1] >= y0) & (txyz[:, 1] < y0 + CHUNK_XY))
-                            if m.sum() < 64:
-                                continue
-                            idx = np.where(m)[0]
-                            attrs = np.stack([tin[idx], trn[idx]], 1).astype(np.float32)
-                            sx, sa, _ = grid_subsample(txyz[idx], attrs, None, GRID)
-                            if len(sx) < 32:
-                                continue
-                            sub_hag = (sx[:, 2] - sx[:, 2].min()).astype(np.float32)
-                            feat = build_feat(sx, sa[:, 0], sa[:, 1], sub_hag)
-                            cxyz = (sx - sx.mean(0)).astype(np.float32)
-                            try:
-                                b, _ = make_kp_pack([(cxyz, feat, None)])
-                            except Exception:
-                                continue
-                            seen += 1
-                            yield b
+                    # windows via one packed-code sort, not a full-cloud mask per window
+                    for idx in tc.xy_chunk_groups(txyz, CHUNK_XY, min_pts=64):
+                        if seen >= cap:
+                            return
+                        attrs = np.stack([tin[idx], trn[idx]], 1).astype(np.float32)
+                        sx, sa, _ = grid_subsample(txyz[idx], attrs, None, GRID)
+                        if len(sx) < 32:
+                            continue
+                        sub_hag = (sx[:, 2] - sx[:, 2].min()).astype(np.float32)
+                        feat = build_feat(sx, sa[:, 0], sa[:, 1], sub_hag)
+                        cxyz = (sx - sx.mean(0)).astype(np.float32)
+                        try:
+                            b, _ = make_kp_pack([(cxyz, feat, None)])
+                        except Exception:
+                            continue
+                        seen += 1
+                        yield b
             dg.adabn_recalibrate(net, _target_batches(), forward=lambda m, b: m(b))
             net.eval()
+        scene_stats = []
         for pc_path in scenes:
             name = os.path.splitext(os.path.basename(pc_path))[0]
             t0 = time.time()
@@ -1014,8 +990,11 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
             pred = _predict_points(xyz, intensity_n, ret_num, hag=hag)
             _write_ply(f"{pred_dir}/{name}_pred.ply", xyz, pred, intensity_n)
             np.savetxt(f"{pred_dir}/{name}_pred_CLS.txt", pred, fmt="%d")
+            scene_stats.append({"scene": os.path.basename(pc_path),
+                                "points": int(len(xyz)),
+                                "seconds": round(time.time() - t0, 3)})
+            tc.write_infer_run(run_dir, infer_cfg, scene_stats)   # crash-safe: per scene
             print(f"  [infer] {name}: {len(xyz):,} pts in {time.time()-t0:.1f}s", flush=True)
-        datasets_volume.commit()
         print(f"  [infer] done — predictions in _infer/{infer_input}/predictions", flush=True)
         return
 
@@ -1029,8 +1008,8 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
 
     # ------------------------------------------------------------------------
     # Periodic held-out validation (eval mode, no_grad — weights untouched).
-    # Appends to val_metrics.csv and commits the volume, so progress can be
-    # watched mid-run with:  modal volume get <app>-outputs runs/<id>/val_metrics.csv
+    # Appends to val_metrics.csv, so progress can be
+    # watched mid-run by tailing runs/<id>/val_metrics.csv under the outputs dir.
     # ------------------------------------------------------------------------
     val_csv = f"{run_dir}/val_metrics.csv"
     if not os.path.exists(val_csv):
@@ -1092,8 +1071,8 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
                     n_skipped_scenes += 1; continue
                 K = np.concatenate(keys_l); L = np.concatenate(log_l)
                 P = np.concatenate(xyz_l)
-                uniq, first, inv = np.unique(K, axis=0, return_index=True, return_inverse=True)
-                votes = np.zeros((len(uniq), NUM_CLASSES), np.float64)
+                first, inv = tc.voxel_unique(K, return_inverse=True)
+                votes = np.zeros((len(first), NUM_CLASSES), np.float64)
                 np.add.at(votes, inv, L)
                 pred_u  = votes.argmax(1)
                 rep_xyz = P[first]                      # one representative coord per voxel
@@ -1143,7 +1122,7 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
               f"skipped(tiles={n_skipped_tiles},scenes={n_skipped_scenes})", flush=True)
         return m
 
-    import os as _os, sys as _sys   # scripts/helper is a sibling dir (flat /root in Modal)
+    import os as _os, sys as _sys   # scripts/helper is a sibling dir (flat /root in the container image)
     _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "helper"))
     from train_common import BestCheckpoint, write_run_manifest
     best = BestCheckpoint(run_dir)
@@ -1167,7 +1146,6 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
                 json.dump({"val": m, "test": mt,
                            "val_scenes": [n for n, _, _ in val_list],
                            "test_scenes": [n for n, _, _ in test_list]}, fj, indent=2)
-        outputs_volume.commit()
         net.train()
         return m
 
@@ -1252,7 +1230,6 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
             torch.save({"model": net.state_dict(), "optim": optim.state_dict(),
                         "epoch": ep},
                        f"{run_dir}/checkpoints/ep{ep:03d}.pth")
-            outputs_volume.commit()
         if (ep + 1) % VAL_EVERY == 0 and ep != N_EPOCHS - 1:
             run_eval(ep)               # last epoch handled by the final eval below
 
@@ -1262,12 +1239,11 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
         best.finalize(lambda p: torch.save(
             {"model": net.state_dict(), "epoch": N_EPOCHS - 1}, p))
     print(f"  total wall-clock: {(time.time() - t_run)/3600:.2f} h")
-    outputs_volume.commit()
 
 
 def main():
     import argparse
-    ap = argparse.ArgumentParser(description='Local kpconvx_cold_hag trainer/inferencer (no modal).')
+    ap = argparse.ArgumentParser(description='Local kpconvx_cold_hag trainer/inferencer.')
     ap.add_argument('--dataset', default=None)
     ap.add_argument('--mode', default='train')
     ap.add_argument('--weights', default=None)

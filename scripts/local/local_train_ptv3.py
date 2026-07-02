@@ -2,7 +2,7 @@
 Local training script for PointTransformerV3 on a canonical trainer_gui dataset.
 
 Trains on the 3-folder --dataset path: a dataset materialized by the trainer_gui
-app onto the terminal-datasets volume as train/val/test scene folders (.npz) plus
+app under /datasets as train/val/test scene folders (.npz) plus
 a dataset_meta.json (num_classes / class_names). NUM_CLASSES / CLASS_NAMES come
 from that metadata; val = in-distribution selection holdout, test = final report.
 
@@ -90,7 +90,7 @@ DG_P_NATIVE    = 0.5     # P(tile kept at native GRID_SIZE)
 DG_INFER_TTA   = 0       # D5: # extra density(scale) views to average at inference (0=off)
 
 # Loss = weighted CE (+ optional focal / label smoothing) + Lovász-Softmax,
-# mirroring modal_train_kpconvx_cold.py. PTv3's own outdoor loss is CE + Lovász.
+# mirroring the kpconvx_cold trainer. PTv3's own outdoor loss is CE + Lovász.
 CLASS_WEIGHTING  = True
 WEIGHT_BETA      = 0.5     # 0.5 = inverse-SQRT-frequency (sub-linear, stable)
 WEIGHT_CAP       = 5.0     # clamp each weight to [1/CAP, CAP] after mean-norm
@@ -111,7 +111,7 @@ VAL_EVERY        = 10      # held-out val pass every N epochs (no weight updates
 CHECKPOINT_GAP   = 3       # checkpoint (model + optimizer) frequency, epochs
 RESUME           = True   # force-resume the latest matching run (see AUTO_RESUME)
 AUTO_RESUME      = False    # auto-continue an unfinished run (no DONE marker) on
-                          # relaunch / Modal auto-retry, so an intermittent crash
+                          # relaunch / auto-retry, so an intermittent crash
                           # never loses the run — only epochs since last checkpoint
 DEBUG_CUDA       = False   # ONE-OFF diagnostic: CUDA_LAUNCH_BLOCKING + dump the
                           # offending batch's stats + no retries (set True to debug).
@@ -121,23 +121,7 @@ STEM_KERNEL      = 5       # PTv3's faithful 5x5x5 stem. (Shrinking it to 3 was 
                           # the spconv-cu118 build, so the original stem is restored.
                           # Set 3 only if a large-kernel spconv issue ever recurs.)
 
-DATASETS_ROOT = "/datasets"   # terminal-datasets volume (trainer_gui canonical datasets)
-
-# ============================================================================
-# Image
-# ============================================================================
-
-
-# Local stand-ins for the modal Volumes the body commits to: the data is
-# already on the bind-mounted /outputs /datasets, so there is nothing to
-# upload. (The modal shell does the real commits when it runs this.)
-class _NoVol:
-    def commit(self, *a, **k): pass
-    def reload(self, *a, **k): pass
-
-
-outputs_volume, datasets_volume = _NoVol(), _NoVol()
-
+DATASETS_ROOT = "/datasets"   # bind-mounted datasets root (trainer_gui canonical datasets)
 
 def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                epochs: Optional[int] = None, batch: Optional[int] = None,
@@ -146,7 +130,7 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                infer_input: Optional[str] = None):
     if dataset is None and mode != "infer":
         raise ValueError("--dataset is required: pass a canonical trainer_gui dataset "
-                         "name materialized on the terminal-datasets volume. The only "
+                         "name materialized under /datasets. The only "
                          "dataset-free path is --mode infer.")
     import os, sys, time, json, csv, glob, traceback
     from datetime import datetime
@@ -154,6 +138,7 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
     import torch
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "helper"))
     import density as dg
+    import train_common as tc
     # DG flags: env-overridable (GUI "Density generalization" panel / DG_*=1 in the shell).
     DG_DENSITY_AUG = dg.env_bool("DG_DENSITY_AUG", globals()["DG_DENSITY_AUG"])
     DG_COARSEN_MAX = dg.env_float("DG_COARSEN_MAX", globals()["DG_COARSEN_MAX"])
@@ -195,7 +180,7 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
         ds_root = f"{DATASETS_ROOT}/{dataset}"
         meta_path = f"{ds_root}/dataset_meta.json"
         if not os.path.exists(meta_path):
-            raise FileNotFoundError(f"{meta_path} not found — upload the dataset "
+            raise FileNotFoundError(f"{meta_path} not found — build the dataset "
                                     f"with the trainer_gui app first.")
         with open(meta_path) as f:
             ds_meta = json.load(f)
@@ -298,8 +283,7 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
         print(f"  [test] {len(test_paths)} canonical scenes", flush=True)
         tile_remaining(test_paths, f"{PREP_DIR}/test", CHUNK_XY, STRIDE)
         if any_new[0]:
-            datasets_volume.commit()
-            print("  preprocessing committed.", flush=True)
+            print("  preprocessing cache updated.", flush=True)
         else:
             print("  all scenes already cached.", flush=True)
 
@@ -388,44 +372,37 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
             # map, scatter per-voxel predictions back, NN-fill stragglers.
             xyz, rgb, _ = load_scene(scene_path)
             pred = np.full(len(xyz), -1, np.int64)
-            mins, maxs = xyz[:, :2].min(0), xyz[:, :2].max(0)
             with torch.no_grad():
-                for x0 in np.arange(mins[0], maxs[0] + CHUNK_XY, CHUNK_XY):
-                    for y0 in np.arange(mins[1], maxs[1] + CHUNK_XY, CHUNK_XY):
-                        m = ((xyz[:, 0] >= x0) & (xyz[:, 0] < x0 + CHUNK_XY) &
-                             (xyz[:, 1] >= y0) & (xyz[:, 1] < y0 + CHUNK_XY))
-                        if m.sum() < 64:
-                            continue
-                        idx = np.where(m)[0]
-                        w0 = (xyz[idx] - xyz[idx].mean(0)).astype(np.float32)
-                        rgbf = rgb[idx].astype(np.float32) / 255.0
-                        # D5 density-TTA: isotropic scale s is a density change (o->o/s^2);
-                        # re-voxelize per view, average per-point softmax. views=[1.0] when
-                        # off -> identical to the old single-view argmax.
-                        views = [1.0] + (list(np.linspace(0.85, 1.2, DG_INFER_TTA))
-                                         if DG_INFER_TTA else [])
-                        pprob = None
-                        for s in views:
-                            w = (w0 * s).astype(np.float32)
-                            keys = np.floor(w / GRID_SIZE).astype(np.int64)
-                            _, first, inverse = np.unique(keys, axis=0, return_index=True,
-                                                          return_inverse=True)
-                            vx = w[first]
-                            feat = np.concatenate(
-                                [vx, rgbf[first]]
-                                + ([dg.local_density_logdk(vx, DG_LOGDK_K)[:, None]] if DG_LOGDK_FEAT else []),
-                                axis=1).astype(np.float32)
-                            coord = torch.from_numpy(vx).cuda()
-                            featt = torch.from_numpy(feat).cuda()
-                            offset = torch.tensor([len(vx)], dtype=torch.long).cuda()
-                            gc = keys[first] - keys[first].min(0)   # unique, dedup-consistent
-                            grid_coord = torch.from_numpy(np.ascontiguousarray(gc)).long().cuda()
-                            point = backbone({"coord": coord, "grid_coord": grid_coord,
-                                              "feat": featt, "offset": offset})
-                            fe = point["feat"] if isinstance(point, dict) else point.feat
-                            vp = torch.softmax(head(fe).float(), -1).cpu().numpy()[inverse]
-                            pprob = vp if pprob is None else pprob + vp
-                        pred[idx] = pprob.argmax(-1)
+                # windows via one packed-code sort, not a full-cloud mask per window
+                for idx in tc.xy_chunk_groups(xyz, CHUNK_XY, min_pts=64):
+                    w0 = (xyz[idx] - xyz[idx].mean(0)).astype(np.float32)
+                    rgbf = rgb[idx].astype(np.float32) / 255.0
+                    # D5 density-TTA: isotropic scale s is a density change (o->o/s^2);
+                    # re-voxelize per view, average per-point softmax. views=[1.0] when
+                    # off -> identical to the old single-view argmax.
+                    views = [1.0] + (list(np.linspace(0.85, 1.2, DG_INFER_TTA))
+                                     if DG_INFER_TTA else [])
+                    pprob = None
+                    for s in views:
+                        w = (w0 * s).astype(np.float32)
+                        keys = np.floor(w / GRID_SIZE).astype(np.int64)
+                        first, inverse = tc.voxel_unique(keys, return_inverse=True)
+                        vx = w[first]
+                        feat = np.concatenate(
+                            [vx, rgbf[first]]
+                            + ([dg.local_density_logdk(vx, DG_LOGDK_K)[:, None]] if DG_LOGDK_FEAT else []),
+                            axis=1).astype(np.float32)
+                        coord = torch.from_numpy(vx).cuda()
+                        featt = torch.from_numpy(feat).cuda()
+                        offset = torch.tensor([len(vx)], dtype=torch.long).cuda()
+                        gc = keys[first] - keys[first].min(0)   # unique, dedup-consistent
+                        grid_coord = torch.from_numpy(np.ascontiguousarray(gc)).long().cuda()
+                        point = backbone({"coord": coord, "grid_coord": grid_coord,
+                                          "feat": featt, "offset": offset})
+                        fe = point["feat"] if isinstance(point, dict) else point.feat
+                        vp = torch.softmax(head(fe).float(), -1).cpu().numpy()[inverse]
+                        pprob = vp if pprob is None else pprob + vp
+                    pred[idx] = pprob.argmax(-1)
             miss = pred < 0
             if miss.any() and (~miss).any():
                 _, nn = cKDTree(xyz[~miss]).query(xyz[miss])
@@ -442,7 +419,7 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
             raise ValueError("--mode infer requires --weights and --infer-input")
         wpath = f"/outputs/{weights}"
         if not os.path.exists(wpath):
-            raise FileNotFoundError(f"weights not found on outputs volume: {wpath}")
+            raise FileNotFoundError(f"weights not found under /outputs: {wpath}")
         try:   # weights_only=True: a hand-picked .pth can't run code on load
             ckpt = torch.load(wpath, map_location="cpu", weights_only=True)
         except Exception as e:
@@ -475,29 +452,32 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
             raise FileNotFoundError(f"No scenes under {DATASETS_ROOT}/_infer/{infer_input}/scenes")
 
         run_id = datetime.utcnow().strftime("%Y%m%d_%H%M%S_infer")
-        # Predictions live next to the input scenes on the shared terminal-datasets
-        # volume (not the per-backbone outputs volume), so inference output lands in
+        # Predictions live next to the input scenes under the shared /datasets tree
+        # (not the per-model runs dir), so inference output lands in
         # one consistent place no matter which model produced it.
         run_dir = f"{DATASETS_ROOT}/_infer/{infer_input}"
         pred_dir = f"{run_dir}/predictions"
         os.makedirs(pred_dir, exist_ok=True)
-        with open(f"{run_dir}/run_config.json", "w") as f:
-            json.dump({"backbone": "PTv3", "mode": "infer", "weights": weights,
-                       "infer_input": infer_input, "num_classes": num_classes,
-                       "class_names": class_names, "grid_size": GRID_SIZE,
-                       "chunk_xy": CHUNK_XY, "gpu": gpu_name(),
-                       "scenes": [os.path.basename(s) for s in scenes]}, f, indent=2)
+        infer_cfg = {"backbone": "PTv3", "mode": "infer", "weights": weights,
+                     "infer_input": infer_input, "num_classes": num_classes,
+                     "class_names": class_names, "grid_size": GRID_SIZE,
+                     "chunk_xy": CHUNK_XY, "gpu": gpu_name(),
+                     "started_utc": datetime.utcnow().isoformat() + "Z"}
 
         predict_scene = make_predict_scene(backbone, head, num_classes)
         palette = _palette(num_classes)
         print(f"  [infer] labeling {len(scenes)} scene(s) -> {pred_dir}", flush=True)
+        scene_stats = []
         for pc_path in scenes:
             name = os.path.splitext(os.path.basename(pc_path))[0]
             t0 = time.time()
             xyz, pred, inten = predict_scene(pc_path)
             _write_ply(f"{pred_dir}/{name}_pred.ply", xyz, pred, palette, inten)
+            scene_stats.append({"scene": os.path.basename(pc_path),
+                                "points": int(len(xyz)),
+                                "seconds": round(time.time() - t0, 3)})
+            tc.write_infer_run(run_dir, infer_cfg, scene_stats)   # crash-safe: per scene
             print(f"  [infer] {name}: {len(xyz):,} pts in {time.time()-t0:.1f}s", flush=True)
-        datasets_volume.commit()
         print(f"  [infer] done — predictions in _infer/{infer_input}/predictions", flush=True)
         return
 
@@ -558,7 +538,7 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
         run_dir = f"/outputs/runs/{run_id}"
         os.makedirs(f"{run_dir}/checkpoints", exist_ok=True)
         resume_ckpt, start_epoch = None, 0
-        with open(f"{run_dir}/run_config.json", "w") as f:
+        with open(f"{run_dir}/run.json", "w") as f:
             cfg = {
                 "backbone": "PTv3", "n_epochs": N_EPOCHS, "batch_size": BATCH_SIZE,
                 "dataset": dataset,
@@ -623,7 +603,7 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
           f"{len(synth_test_tiles)}   test: {len(real_test_tiles)}", flush=True)
 
     # --- class balance: scan training tiles for inverse-frequency weights +
-    # rare-class tile flags. The per-tile np.load over the Modal volume is the
+    # rare-class tile flags. The per-tile np.load over the dataset dir is the
     # bottleneck (~45k tiles -> minutes), so read in parallel AND cache the raw
     # scan to PREP_DIR (keyed on the tile set) — instant on every later launch. -
     train_pool = synth_train_tiles + real_train_tiles
@@ -662,7 +642,6 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
         try:
             np.savez(cache_path, tile_names=pool_names, class_counts=class_counts,
                      present_mask=present_mask, num_classes=np.int64(NUM_CLASSES))
-            datasets_volume.commit()
             print(f"  class balance: cached scan -> {cache_path}", flush=True)
         except Exception as e:
             print(f"  class balance: could not write cache ({e})", flush=True)
@@ -826,7 +805,7 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
             g_eff = (dg.effective_grid(GRID_SIZE, DG_COARSEN_MAX, DG_P_NATIVE)
                      if (training and DG_DENSITY_AUG) else GRID_SIZE)
             keys = np.floor(xyz / g_eff).astype(np.int64)
-            _, uniq = np.unique(keys, axis=0, return_index=True)
+            uniq = tc.voxel_unique(keys)
             xyz = xyz[uniq]; rgb = rgb[uniq]; lab = lab[uniq]
             # feat = augmented/centered coords + color/intensity (intensity is
             # carried in the rgb channels for LiDAR canonical datasets).
@@ -908,8 +887,7 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                         continue
                     xyz, rgb, cxyz = xyz[ok], rgb[ok], cxyz[ok]
                     vk = np.floor(cxyz / GRID_SIZE).astype(np.int64)
-                    _, first, inverse = np.unique(vk, axis=0, return_index=True,
-                                                  return_inverse=True)
+                    first, inverse = tc.voxel_unique(vk, return_inverse=True)
                     vx = cxyz[first].astype(np.float32)
                     feat = np.concatenate(
                         [vx, rgb[first].astype(np.float32) / 255.0]
@@ -940,8 +918,8 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                 if not keys_l:
                     n_skipped_scenes += 1; continue
                 K = np.concatenate(keys_l); V = np.concatenate(vote_l); P = np.concatenate(xyz_l)
-                uniq, ufirst, uinv = np.unique(K, axis=0, return_index=True, return_inverse=True)
-                votes = np.zeros((len(uniq), NUM_CLASSES), np.float64)
+                ufirst, uinv = tc.voxel_unique(K, return_inverse=True)
+                votes = np.zeros((len(ufirst), NUM_CLASSES), np.float64)
                 np.add.at(votes, uinv, V)
                 pred_u  = votes.argmax(1)
                 rep_xyz = P[ufirst]                      # one raw coord per voxel
@@ -1000,7 +978,7 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                 ["epoch", "val_acc", "val_miou"] +
                 [f"iou_{_name(c)}" for c in range(NUM_CLASSES)])
 
-    import os as _os, sys as _sys   # scripts/helper is a sibling dir (flat /root in Modal)
+    import os as _os, sys as _sys   # scripts/helper is a sibling dir (flat /root in the container image)
     _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "helper"))
     from train_common import BestCheckpoint, write_run_manifest
     best = BestCheckpoint(run_dir)
@@ -1025,7 +1003,6 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                 json.dump({"val": m, "test": mt,
                            "val_scenes": [n for n, _, _ in val_items],
                            "test_scenes": [n for n, _, _ in test_items]}, fj, indent=2)
-        outputs_volume.commit()
         backbone.train(); head.train()
         return m
 
@@ -1115,7 +1092,6 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                     os.remove(old)
                 except OSError:
                     pass
-            outputs_volume.commit()
         if (ep + 1) % VAL_EVERY == 0 and ep != N_EPOCHS - 1:
             run_eval(ep)               # last epoch handled by the final eval below
 
@@ -1127,18 +1103,16 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
         {"backbone": backbone.state_dict(), "head": head.state_dict(),
          "epoch": N_EPOCHS - 1}, p))
     print(f"  total wall-clock {(time.time() - t_run)/3600:.2f} h")
-    outputs_volume.commit()
 
     # Mark the run complete so AUTO_RESUME won't re-resume it on the next launch
     # (a crashed/retried run has no DONE and is picked back up automatically).
     open(f"{run_dir}/DONE", "w").close()
-    outputs_volume.commit()
     print(f"  run complete -> {run_id}", flush=True)
 
 
 def main():
     import argparse
-    ap = argparse.ArgumentParser(description='Local ptv3 trainer/inferencer (no modal).')
+    ap = argparse.ArgumentParser(description='Local ptv3 trainer/inferencer.')
     ap.add_argument('--dataset', default=None)   # required to train; omitted for --mode infer
     ap.add_argument('--grid', type=float, default=None)
     ap.add_argument('--epochs', type=int, default=None)

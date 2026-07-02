@@ -10,8 +10,7 @@ Run it head-to-head against local_train_randlanet.py to measure HAG's
 contribution.
 
 Trains on a canonical trainer_gui dataset (--dataset NAME) whose three
-materialized train/val/test scene folders live on the terminal-datasets
-volume. Random initialization (no pretrained weights); the warm sibling
+materialized train/val/test scene folders live under /datasets. Random initialization (no pretrained weights); the warm sibling
 shares the architecture and feature recipe for a clean init comparison.
 
 Per-scene p95-clipped intensity normalization, vertical-rotation / x-flip /
@@ -21,7 +20,7 @@ VAL_EVERY epochs (-> val_metrics.csv), and a final full-coverage eval that
 scores every val/test scene on its raw points.
 
 Flags:
-  --dataset NAME    (required) canonical dataset on the terminal-datasets volume
+  --dataset NAME    (required) canonical dataset under /datasets
   --sub-grid / --num-points / --epochs / --batch / --steps-per-epoch
   --mode infer --weights runs/<id>/final_model.pth --infer-input <job_id>
 
@@ -91,23 +90,7 @@ RARE_FREQ_THRESH = 0.02          # classes under 2% of train points count as rar
 RARE_CENTER_PROB = 0.25          # P(center the next train sphere on a rare-class point)
 VAL_EVERY        = 10            # held-out val pass every N epochs (no weight updates)
 
-DATASETS_ROOT = "/datasets"   # terminal-datasets volume (trainer_gui canonical datasets)
-
-# ============================================================================
-# Image
-# ============================================================================
-
-
-# Local stand-ins for the modal Volumes the body commits to: the data is
-# already on the bind-mounted /data /outputs /datasets, so there is nothing
-# to upload. (The modal shell does the real commits when it runs this.)
-class _NoVol:
-    def commit(self, *a, **k): pass
-    def reload(self, *a, **k): pass
-
-
-data_volume, outputs_volume, datasets_volume = _NoVol(), _NoVol(), _NoVol()
-
+DATASETS_ROOT = "/datasets"   # bind-mounted datasets root (trainer_gui canonical datasets)
 
 def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = None,
                     num_points: Optional[int] = None, epochs: Optional[int] = None,
@@ -116,7 +99,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                     infer_input: Optional[str] = None):
     if dataset is None and mode != "infer":
         raise ValueError("--dataset is required: pass a canonical trainer_gui "
-                         "dataset name on the terminal-datasets volume. The only "
+                         "dataset name under /datasets. The only "
                          "dataset-free path is --mode infer.")
     import os, sys, time, json, csv, glob
     from datetime import datetime
@@ -128,6 +111,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     from torch.utils.data import DataLoader, Dataset
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "helper"))
     import density as dg
+    import train_common as tc
     # DG flags: env-overridable (GUI "Density generalization" panel / DG_*=1 in the shell).
     DG_DENSITY_AUG = dg.env_bool("DG_DENSITY_AUG", globals()["DG_DENSITY_AUG"])
     DG_COARSEN_MAX = dg.env_float("DG_COARSEN_MAX", globals()["DG_COARSEN_MAX"])
@@ -158,14 +142,15 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         ds_root = f"{DATASETS_ROOT}/{dataset}"
         meta_path = f"{ds_root}/dataset_meta.json"
         if not os.path.exists(meta_path):
-            raise FileNotFoundError(f"{meta_path} not found — upload the dataset "
+            raise FileNotFoundError(f"{meta_path} not found — build the dataset "
                                     f"with the trainer_gui app first.")
         with open(meta_path) as f:
             ds_meta = json.load(f)
         NUM_CLASSES = int(ds_meta["num_classes"])
         CLASS_NAMES = list(ds_meta["class_names"])
         # Real PDAL HAG when the dataset carries it, else a z-scene-min proxy.
-        HAG_SOURCE = "pdal_hag_nn" if ds_meta.get("has_hag") else "z_minus_scene_min_proxy"
+        HAG_SOURCE = (((ds_meta.get("source") or {}).get("hag_source") or "pdal_hag_nn")
+                      if ds_meta.get("has_hag") else "z_minus_scene_min_proxy")
         # No "warm" in the name: the cold sibling shares this cache (identical prep).
         PREP_DIR = f"{ds_root}/prep/randlanet_hag_grid{int(round(SUB_GRID_SIZE * 100))}_p95"
     else:
@@ -218,7 +203,8 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         # probas: (N, C) softmax probabilities; labels: (N,) in [0, C). Averages
         # the per-class loss over classes actually present in the batch.
         if probas.numel() == 0:
-            return probas * 0.0
+            return probas.sum() * 0.0   # scalar 0 (not (0,C)): an all-ignored batch must
+            #                             not make `loss` empty -> `not isfinite(loss)` crash
         C = probas.size(1)
         losses = []
         for c in torch.unique(labels):
@@ -319,7 +305,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
 
     def grid_subsample(xyz, intensity, ret_num, hag, lab, grid):
         keys = np.floor(xyz / grid).astype(np.int64)
-        _, uniq = np.unique(keys, axis=0, return_index=True)
+        uniq = tc.voxel_unique(keys)
         return xyz[uniq], intensity[uniq], ret_num[uniq], hag[uniq], lab[uniq]
 
     def _split_scenes():
@@ -361,7 +347,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         dataset, feature recipe, HAG source …) instead of silently mixing
         incompatible data. Migrate a pre-validation cache by stamping .done
         markers for already-saved scenes. Returns True if the signature file
-        was newly written (so the caller commits the volume)."""
+        was newly written (so the caller can report fresh work)."""
         meta_path = f"{PREP_DIR}/cache_meta.json"
         cur = _cache_signature()
         if os.path.exists(meta_path):
@@ -428,8 +414,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                 print(f"    [{i+1}/{len(items)}] {name}: {n_in:,} -> "
                       f"{len(xyz):,} pts in {time.time()-t0:.1f}s", flush=True)
         if any_new:
-            datasets_volume.commit()
-            print("  preprocessing committed.", flush=True)
+            print("  preprocessing cache updated.", flush=True)
         else:
             print("  all scenes already cached.", flush=True)
         return train_list, val_list, test_list
@@ -595,7 +580,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
             hag0 = (z["hag"].astype(np.float32) if "hag" in z.files
                     else (xyz0[:, 2] - xyz0[:, 2].min()).astype(np.float32))
             keys = np.floor(xyz0 / SUB_GRID_SIZE).astype(np.int64)
-            _, uniq = np.unique(keys, axis=0, return_index=True)
+            uniq = tc.voxel_unique(keys)
             sub_xyz = xyz0[uniq]
             order = np.lexsort((sub_xyz[:, 1], sub_xyz[:, 0]))   # rough spatial locality
             sub_sorted = sub_xyz[order]
@@ -660,7 +645,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
             raise ValueError("--mode infer requires --weights and --infer-input")
         wpath = f"/outputs/{weights}"
         if not os.path.exists(wpath):
-            raise FileNotFoundError(f"weights not found on outputs volume: {wpath}")
+            raise FileNotFoundError(f"weights not found under /outputs: {wpath}")
         try:   # weights_only=True: a hand-picked .pth can't run code on load
             ckpt = torch.load(wpath, map_location=device, weights_only=True)
         except Exception as e:
@@ -700,18 +685,17 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
             raise FileNotFoundError(f"No scenes under {DATASETS_ROOT}/_infer/{infer_input}/scenes")
 
         run_id = datetime.utcnow().strftime("%Y%m%d_%H%M%S_infer")
-        # Predictions live next to the input scenes on the shared terminal-datasets
-        # volume (not the per-backbone outputs volume), so inference output lands in
+        # Predictions live next to the input scenes under the shared /datasets tree
+        # (not the per-model runs dir), so inference output lands in
         # one consistent place no matter which model produced it.
         run_dir = f"{DATASETS_ROOT}/_infer/{infer_input}"
         pred_dir = f"{run_dir}/predictions"
         os.makedirs(pred_dir, exist_ok=True)
-        with open(f"{run_dir}/run_config.json", "w") as f:
-            json.dump({"backbone": "RandLA-Net", "mode": "infer", "weights": weights,
-                       "infer_input": infer_input, "num_classes": num_classes,
-                       "class_names": class_names, "sub_grid_size": SUB_GRID_SIZE,
-                       "gpu": gpu_name(),
-                       "scenes": [os.path.basename(s) for s in scenes]}, f, indent=2)
+        infer_cfg = {"backbone": "RandLA-Net", "mode": "infer", "weights": weights,
+                     "infer_input": infer_input, "num_classes": num_classes,
+                     "class_names": class_names, "sub_grid_size": SUB_GRID_SIZE,
+                     "gpu": gpu_name(),
+                     "started_utc": datetime.utcnow().isoformat() + "Z"}
 
         predict_scene = make_predict_scene(net, num_classes)
         palette = _palette(num_classes)
@@ -735,7 +719,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                             else (z["ret_num"].astype(np.float32) if "ret_num" in z
                                   else np.zeros(len(xyz0), np.float32)))
                     keys = np.floor(xyz0 / SUB_GRID_SIZE).astype(np.int64)
-                    _, uniq = np.unique(keys, axis=0, return_index=True)
+                    uniq = tc.voxel_unique(keys)
                     sx, si, sr = xyz0[uniq], itn0[uniq], ret0[uniq]
                     shag = (sx[:, 2] - sx[:, 2].min()).astype(np.float32)
                     for s0 in range(0, len(sx), N):
@@ -766,13 +750,17 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                         yield batch
             dg.adabn_recalibrate(net, _target_batches(), forward=lambda m, b: m(b))
             net.eval()
+        scene_stats = []
         for pc_path in scenes:
             name = os.path.splitext(os.path.basename(pc_path))[0]
             t0 = time.time()
             xyz, pred, inten = predict_scene(pc_path)
             _write_ply(f"{pred_dir}/{name}_pred.ply", xyz, pred, palette, inten)
+            scene_stats.append({"scene": os.path.basename(pc_path),
+                                "points": int(len(xyz)),
+                                "seconds": round(time.time() - t0, 3)})
+            tc.write_infer_run(run_dir, infer_cfg, scene_stats)   # crash-safe: per scene
             print(f"  [infer] {name}: {len(xyz):,} pts in {time.time()-t0:.1f}s", flush=True)
-        datasets_volume.commit()
         print(f"  [infer] done — predictions in _infer/{infer_input}/predictions", flush=True)
         return
 
@@ -788,7 +776,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     run_id = datetime.utcnow().strftime(f"%Y%m%d_%H%M%S_{tag}_randlanet_cold_hag")
     run_dir = f"/outputs/runs/{run_id}"
     os.makedirs(f"{run_dir}/checkpoints", exist_ok=True)
-    with open(f"{run_dir}/run_config.json", "w") as f:
+    with open(f"{run_dir}/run.json", "w") as f:
         json.dump({
             "backbone": "RandLA-Net", "warm_start": False,
             "dataset": dataset,
@@ -1003,7 +991,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         csv.writer(f).writerow(["epoch", "val_acc", "val_miou"] +
                                [f"iou_{n}" for n in CLASS_NAMES])
 
-    import os as _os, sys as _sys   # scripts/helper is a sibling dir (flat /root in Modal)
+    import os as _os, sys as _sys   # scripts/helper is a sibling dir (flat /root in the container image)
     _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "helper"))
     from train_common import BestCheckpoint, write_run_manifest
     best = BestCheckpoint(run_dir)
@@ -1024,7 +1012,6 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                 json.dump({"val": m, "test": m_test,
                            "val_scenes": [n for n, _, _ in val_list],
                            "test_scenes": [n for n, _, _ in test_list]}, fj, indent=2)
-        outputs_volume.commit()
         net.train()
         return m
 
@@ -1088,7 +1075,6 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
             torch.save({"model": net.state_dict(), "optim": opt.state_dict(),
                         "epoch": ep},
                        f"{run_dir}/checkpoints/ep{ep:03d}.pth")
-            outputs_volume.commit()
         if (ep + 1) % VAL_EVERY == 0 and ep != N_EPOCHS - 1:
             run_eval(ep)               # last epoch handled by the final eval below
 
@@ -1097,12 +1083,11 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     best.finalize(lambda p: torch.save(
         {"model": net.state_dict(), "epoch": N_EPOCHS - 1}, p))
     print(f"  total wall-clock {(time.time() - t_run)/3600:.2f} h")
-    outputs_volume.commit()
 
 
 def main():
     import argparse
-    ap = argparse.ArgumentParser(description='Local randlanet_hag trainer/inferencer (no modal).')
+    ap = argparse.ArgumentParser(description='Local randlanet_hag trainer/inferencer.')
     ap.add_argument('--dataset', default=None)
     ap.add_argument('--sub-grid', type=float, default=None)
     ap.add_argument('--num-points', type=int, default=None)

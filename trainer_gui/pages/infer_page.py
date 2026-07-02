@@ -37,6 +37,7 @@ class InferPage(QWidget):
         self.repo_root = repo_root
         self.converter = FuncWorker(self)
         self.preflight = FuncWorker(self)
+        self.exporter = FuncWorker(self)   # PLY -> chosen prediction format (host-side)
         self.runner = JobRunner(self)
         self.parser = LogParser(self)
         self._stage = ""
@@ -174,6 +175,18 @@ class InferPage(QWidget):
         out_row.addWidget(out_btn)
         self.out_row_w = _wrap(out_row)
         iform.addRow("Output folder (predictions)", self.out_row_w)
+        # Prediction file format — every option is xyz + classification only
+        # (no RGB: colour/palette is a viewer concern, not the deliverable's).
+        self.fmt_combo = QComboBox()
+        for label, key in (("LAS (.las)", "las"), ("LAZ (.laz)", "laz"),
+                           ("PLY (.ply)", "ply"), ("Text (.txt)", "txt"),
+                           ("CSV (.csv)", "csv")):
+            self.fmt_combo.addItem(label, key)
+        i = self.fmt_combo.findData(appstate.get("infer_format", "las"))
+        self.fmt_combo.setCurrentIndex(i if i >= 0 else 0)
+        self.fmt_combo.setToolTip("Predictions are written as xyz + classification "
+                                  "(no colour columns).")
+        iform.addRow("Prediction format", self.fmt_combo)
 
         run_row = QHBoxLayout()
         self.run_btn = QPushButton("Run inference")
@@ -227,6 +240,9 @@ class InferPage(QWidget):
         self.preflight.output.connect(self._append)
         self.preflight.done.connect(self._on_preflight)
         self.preflight.error.connect(self._on_preflight_error)
+        self.exporter.output.connect(self._append)
+        self.exporter.done.connect(self._on_exported)
+        self.exporter.error.connect(self._on_export_error)
         self.runner.output.connect(self._on_output)
         self.runner.finished.connect(self._on_stage_done)
         self.runner.failed.connect(self._on_runner_failed)
@@ -391,7 +407,8 @@ class InferPage(QWidget):
         for bdir in appstate.runs_dir().iterdir() if appstate.runs_dir().exists() else []:
             if bdir.is_dir():
                 for rdir in bdir.iterdir():
-                    if rdir.name not in seen and (rdir / "run_config.json").exists():
+                    if rdir.name not in seen and any(
+                            (rdir / fn).exists() for fn in ("run.json", "run_config.json")):
                         seen.add(rdir.name)
                         self.run_combo.addItem(f"{rdir.name}  ({bdir.name})",
                                                {"run_id": rdir.name, "backbone": bdir.name})
@@ -647,26 +664,32 @@ class InferPage(QWidget):
         # p95 end-to-end; honor a legacy norm recorded in run.json.
         norm = (self._manifest or {}).get("intensity_norm", "p95") \
             if (self.from_run_radio.isChecked() and self._manifest) else "p95"
-        want_hag = self._run_wants_real_hag()
-        if want_hag:
-            from .. import pretrain
-            if pretrain.pdal_available():
-                self._append("[1/4] Run used PDAL HAG - computing it for the input scenes.")
-            else:
-                self._append("Run used PDAL HAG, but PDAL isn't installed here; "
-                             "using a z-min proxy (degraded results).")
+        hag_filter = self._run_hag_filter()
+        if hag_filter:
+            self._append(f"[1/4] Run trained on real HAG ({hag_filter}) - reproducing "
+                         "it for the input scenes.")
         self._append(f"[1/4] Converting {input_dir} to scenes (job {self._job_id}; "
                      f"intensity={norm})…")
         self.converter.start(dataset.convert_infer_job, self._job_id, input_dir,
-                             appstate.staging_dir(), intensity_norm=norm, hag=want_hag)
+                             appstate.staging_dir(), intensity_norm=norm,
+                             hag=bool(hag_filter), hag_filter=hag_filter or "grid")
 
-    def _run_wants_real_hag(self) -> bool:
-        """True if the run trained on real PDAL HAG (else z-min proxy)."""
+    def _run_hag_filter(self) -> str | None:
+        """The HAG method the run trained with (to reproduce at inference), or
+        None when it trained on the z-min proxy / no HAG. Legacy hag_source
+        strings (pdal_hag_nn, smrf, labeled+smrf, per_tile_smrf, ...) were all
+        PDAL-based -> hag_nn."""
         m = self._manifest if (self.from_run_radio.isChecked() and self._manifest) else None
         if not m:
-            return False
+            return None
         s = str(m.get("hag_source", "")).lower()
-        return ("pdal" in s or "hag_nn" in s) and "proxy" not in s and "z_minus" not in s
+        if not s or "proxy" in s or "z_minus" in s:
+            return None
+        if "grid" in s:
+            return "grid"
+        if "delaunay" in s:
+            return "hag_delaunay"
+        return "hag_nn"
 
     def _on_preflight(self, present):
         """Weights check: True=found, False=missing (block), None=couldn't list (proceed)."""
@@ -733,22 +756,40 @@ class InferPage(QWidget):
             self._report_predictions(self._dl_dest / "predictions")
 
     def _report_predictions(self, pred_dir):
-        """Final report — green only when predictions actually landed (a stage can
-        exit 0 yet write nothing)."""
-        self.run_btn.setEnabled(True)
+        """Predictions landed (a stage can exit 0 yet write nothing) -> convert the
+        scripts' coloured PLYs to the chosen format (xyz + classification, no RGB)
+        on a worker thread; _on_exported prints the final green report."""
         pred_dir = Path(pred_dir) if pred_dir else None
         if not (pred_dir and pred_dir.is_dir()):
+            self.run_btn.setEnabled(True)
             self._append(f"\n✗ No predictions folder at {pred_dir}.")
             return
         preds = [p for p in sorted(pred_dir.iterdir())
                  if p.suffix.lower() in (".ply", ".npz")]
         if not preds:
+            self.run_btn.setEnabled(True)
             self._append(f"\n✗ No prediction files in {pred_dir}. Check the log above.")
             return
         appstate.put("last_view_dir", str(pred_dir))
-        self._append(f"\n✓ Done - {len(preds)} prediction file(s) in {pred_dir}.\n"
+        fmt = self.fmt_combo.currentData()
+        appstate.put("infer_format", fmt)
+        self._append(f"\n[export] writing predictions as {fmt} (xyz + classification)…")
+        self.exporter.start(dataset.export_predictions, pred_dir, fmt)
+
+    def _on_exported(self, written):
+        self.run_btn.setEnabled(True)
+        if not written:
+            self._append("✗ Nothing exported (no *_pred.ply in the predictions folder).")
+            return
+        self._append(f"\n✓ Done - {len(written)} prediction file(s) in {written[0].parent}.\n"
                      f"  'View a point cloud…' to open one, or 'Compare to ground "
                      f"truth…' for accuracy + mIoU.")
+
+    def _on_export_error(self, tb: str):
+        # Predictions exist as the scripts' coloured PLYs; only the rewrite failed.
+        self.run_btn.setEnabled(True)
+        self._append(f"\n✗ Format conversion failed — predictions remain as coloured "
+                     f".ply files.\n{tb}")
 
     def _start_modal_run(self):
         b = self._backbone()
@@ -820,9 +861,13 @@ class InferPage(QWidget):
         self.runner.start(prog, args, cwd=self.repo_root)
 
     def _on_output(self, text: str):
-        self._append(text, newline=False)
+        # Local Docker logs print container bind-mount paths (/datasets/_infer/<job>/…)
+        # that mean nothing on the host; show the real output folder the files land in.
+        disp = (_localize_paths(text, self._job_id, self._pred_dir, self._staged)
+                if self._stage == "run_local" else text)
+        self._append(disp, newline=False)
         if self._stage in ("run", "run_local"):
-            self.parser.feed(text)
+            self.parser.feed(text)   # parser sees the raw text
 
     def _on_run_id(self, run_id: str):
         self._run_id = run_id
@@ -899,6 +944,15 @@ class InferPage(QWidget):
                  f"  labeled  : {m['labeled']:,} pts",
                  "  per-class IoU:"]
         lines += [f"    {nm(c)}: {iou:.4f}" for c, iou in sorted(m["per_class_iou"].items())]
+        # Persist beside the prediction so the numbers aren't lost with the log.
+        mpath = Path(pred).with_suffix(".metrics.json")
+        try:
+            with open(mpath, "w", encoding="utf-8") as f:
+                json.dump({"prediction": str(pred), "ground_truth": str(gt),
+                           "class_names": names, **m}, f, indent=2)
+            lines.append(f"  saved -> {mpath}")
+        except OSError as e:
+            lines.append(f"  (couldn't save metrics json: {e})")
         self._append("\n".join(lines))
 
     def _export_gt(self):
@@ -1010,6 +1064,19 @@ class ClassPaletteDialog(QDialog):
 
     def colors(self) -> list:
         return [list(c) for c in self._colors]
+
+
+def _localize_paths(text: str, job_id: str, pred_dir, staged) -> str:
+    """Rewrite container bind-mount paths to the host folders they map to (see the
+    mounts in _start_local_infer), so a local run's log shows where files really go.
+    Predictions first (the more specific mount), then the staging root."""
+    if pred_dir:
+        for p in (f"/datasets/_infer/{job_id}/predictions", f"_infer/{job_id}/predictions"):
+            text = text.replace(p, str(pred_dir))
+    if staged:
+        for p in (f"/datasets/_infer/{job_id}", f"_infer/{job_id}"):
+            text = text.replace(p, str(staged))
+    return text
 
 
 def _entry_name(entry: dict) -> str:

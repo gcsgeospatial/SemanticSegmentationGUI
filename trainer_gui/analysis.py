@@ -171,7 +171,7 @@ LOSS_DEFAULTS = {"focal": False, "focal_gamma": 2.0, "class_weighting": True,
 def loss_config_to_env(cfg: dict) -> dict:
     """Per-run loss / class-balance config -> LOSS_*/RARE_* env vars the training
     scripts read (mirrors the DG env pattern). Emits only values that differ from
-    the script defaults; the run's choices are recorded in run_config.json's loss
+    the script defaults; the run's choices are recorded in run.json's loss
     block. focal_gamma is emitted only when focal is on (otherwise it's a no-op)."""
     env: dict[str, str] = {}
     if not cfg:

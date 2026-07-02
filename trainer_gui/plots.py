@@ -10,7 +10,7 @@ Data sources written by the training scripts:
   val_metrics.csv   epoch, val_acc, val_miou, iou_<Class>...  (periodic val pass)
   metrics.csv       epoch, train_loss/acc/iou, ...            (per-epoch training)
   test_metrics.json final val + test overall/per-class metrics
-  run_config.json   backbone, dataset, class names
+  run.json          backbone, dataset, class names (run_config.json on legacy runs)
 """
 
 from __future__ import annotations
@@ -61,12 +61,14 @@ def read_csv_columns(path: Path) -> dict[str, list]:
 
 
 def read_config(run_dir: Path) -> dict:
-    p = Path(run_dir) / "run_config.json"
-    if p.exists():
-        try:
-            return json.loads(p.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return {}
+    # run.json is the single run record; run_config.json = legacy runs.
+    for fn in ("run.json", "run_config.json"):
+        p = Path(run_dir) / fn
+        if p.exists():
+            try:
+                return json.loads(p.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                return {}
     return {}
 
 
@@ -118,7 +120,8 @@ def available_metrics(run_dir: Path) -> list[str]:
 
 def is_run_dir(d: Path) -> bool:
     d = Path(d)
-    return d.is_dir() and ((d / "val_metrics.csv").exists() or (d / "run_config.json").exists())
+    return d.is_dir() and any((d / fn).exists()
+                              for fn in ("val_metrics.csv", "run.json", "run_config.json"))
 
 
 def discover_runs(root: Path) -> list[Path]:

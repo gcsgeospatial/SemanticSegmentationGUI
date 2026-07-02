@@ -331,12 +331,57 @@ def main():
 
         # Train page's Modal-presence check parses `modal volume ls --json` entries
         # whose basename key varies by CLI version — lock the parser.
-        from trainer_gui.pages.infer_page import _entry_name
+        from trainer_gui.pages.infer_page import _entry_name, _localize_paths
         check("infer: _entry_name reads path/Filename/name across CLI shapes",
               _entry_name({"path": "/ds/dataset_meta.json"}) == "dataset_meta.json"
               and _entry_name({"Filename": "train/"}) == "train"
               and _entry_name({"name": "a.npz"}) == "a.npz"
               and _entry_name({}) == "")
+        # Local runs must show the host output folder, not the container's /datasets
+        # bind-mount path — both the leading-slash and bare forms the scripts print.
+        check("infer: _localize_paths maps container paths to the host output folder",
+              _localize_paths("labeling -> /datasets/_infer/J/predictions/s_pred.ply",
+                              "J", r"C:\out", r"C:\stage") == r"labeling -> C:\out/s_pred.ply"
+              and _localize_paths("done — predictions in _infer/J/predictions",
+                                  "J", r"C:\out", r"C:\stage") == r"done — predictions in C:\out")
+
+        # ---------------- prediction export (Inference page format picker)
+        # The scripts' coloured *_pred.ply -> chosen format carrying xyz +
+        # classification ONLY (no RGB); class indices invert losslessly from the
+        # palette colours; the coloured source ply is consumed.
+        from trainer_gui.palette import palette_for
+        exd = tmp / "pred_export"
+        exd.mkdir()
+        ex_cls = np.array([0, 1, 2, 3, 4, 2, 0], np.int64)
+        hdr7 = ("ply\nformat ascii 1.0\nelement vertex 7\nproperty float x\n"
+                "property float y\nproperty float z\nproperty uchar red\n"
+                "property uchar green\nproperty uchar blue\nend_header")
+
+        def _mk_pred():
+            np.savetxt(exd / "sceneX_pred.ply",
+                       np.column_stack([make_xyz(7), palette_for(5)[ex_cls]]),
+                       fmt=["%.3f"] * 3 + ["%d"] * 3, header=hdr7, comments="")
+
+        import laspy
+        _mk_pred()
+        las_out = dataset.export_predictions(exd, "las")[0]
+        check("export: las carries the palette-inverted classes, source ply consumed",
+              las_out.suffix == ".las"
+              and list(laspy.read(str(las_out)).classification) == list(ex_cls)
+              and not (exd / "sceneX_pred.ply").exists())
+        _mk_pred()
+        csv_out = dataset.export_predictions(exd, "csv")[0]
+        rows = np.genfromtxt(csv_out, delimiter=",", names=True)
+        check("export: csv has an x,y,z,classification header + the classes",
+              set(rows.dtype.names) == {"x", "y", "z", "classification"}
+              and list(rows["classification"].astype(int)) == list(ex_cls))
+        _mk_pred()
+        from plyfile import PlyData
+        ply_out = dataset.export_predictions(exd, "ply")[0]
+        pv = PlyData.read(str(ply_out))["vertex"]
+        check("export: ply rewrite drops RGB, keeps only a classification column",
+              {p.name for p in pv.properties} == {"x", "y", "z", "classification"}
+              and list(np.asarray(pv["classification"]).astype(int)) == list(ex_cls))
 
         # ---------------- plots: read val curves, build figures, average runs
         from trainer_gui import plots
@@ -466,37 +511,39 @@ def main():
             check("pretrain hag: txt sidecar HAG spans ground..elevated",
                   zt_hag["hag_max"] > 2.0)
 
-            # per-tile HAG over a converted dataset -> sibling <name>_hag with a hag key
-            hag_ds = dataset.add_hag_to_dataset(staged, tmp / "staging" / "laz_demo_hag",
-                                                progress=print)
-            zhd = np.load(hag_ds / "train" / "scene0.npz")
-            check("dataset: add_hag_to_dataset adds a per-tile hag channel",
-                  "hag" in zhd.files and zhd["hag"].shape[0] == zhd["xyz"].shape[0])
-            check("dataset: add_hag covers the test split too",
-                  "hag" in np.load(hag_ds / "test" / "scene0.npz").files)
-            mhd = json.loads((hag_ds / "dataset_meta.json").read_text())
-            check("dataset: hag dataset meta tags per_tile source + keeps classes",
-                  mhd["source"]["hag_source"] == "per_tile_smrf"
-                  and mhd["num_classes"] == 3 and isinstance(mhd["has_hag"], bool))
-
-            # inline HAG: bake it during tiling in one pass (no separate reload).
-            # ground_value=2 (the "Ground" source value) + use_smrf -> labeled
-            # ground UNIONed with SMRF, so SMRF fills holes the labels miss.
-            staged_ih = dataset.convert_dataset(
-                "laz_hag_inline", str(laz_root / "train"), spec, classes, [0], tmp / "staging",
-                val_inputs=[str(laz_root / "val")], test_inputs=[str(laz_root / "test")],
-                compute_hag=True, ground_value=2, use_smrf=True, progress=print)
-            zih = np.load(staged_ih / "train" / "scene0.npz")
-            check("convert_dataset(compute_hag): tiles carry a hag channel inline",
-                  "hag" in zih.files and zih["hag"].shape[0] == zih["xyz"].shape[0])
-            mih = json.loads((staged_ih / "dataset_meta.json").read_text())
-            check("convert_dataset(compute_hag): meta records labeled+smrf ground + has_hag",
-                  mih["has_hag"] is True
-                  and mih["source"]["hag_source"] == "labeled+smrf"
-                  and mih["source"]["hag_ground_value"] == 2
-                  and mih["source"]["hag_use_smrf"] is True)
         else:
             print("  - pretrain hag: skipped (pdal not installed)")
+
+        # per-tile HAG over a converted dataset -> sibling <name>_hag with a hag
+        # key. Default method is now "grid" (raster approximation) — no PDAL.
+        hag_ds = dataset.add_hag_to_dataset(staged, tmp / "staging" / "laz_demo_hag",
+                                            progress=print)
+        zhd = np.load(hag_ds / "train" / "scene0.npz")
+        check("dataset: add_hag_to_dataset adds a per-tile hag channel",
+              "hag" in zhd.files and zhd["hag"].shape[0] == zhd["xyz"].shape[0])
+        check("dataset: add_hag covers the test split too",
+              "hag" in np.load(hag_ds / "test" / "scene0.npz").files)
+        mhd = json.loads((hag_ds / "dataset_meta.json").read_text())
+        check("dataset: hag dataset meta tags per_tile source + keeps classes",
+              mhd["source"]["hag_source"] == "per_tile_grid"
+              and mhd["num_classes"] == 3 and isinstance(mhd["has_hag"], bool))
+
+        # inline HAG: bake it during tiling in one pass (no separate reload).
+        # ground_value=2 (the "Ground" source value) -> the labels are the ONLY
+        # ground source (SMRF never runs); grid nearest-fills label gaps.
+        staged_ih = dataset.convert_dataset(
+            "laz_hag_inline", str(laz_root / "train"), spec, classes, [0], tmp / "staging",
+            val_inputs=[str(laz_root / "val")], test_inputs=[str(laz_root / "test")],
+            compute_hag=True, ground_value=2, use_smrf=True, progress=print)
+        zih = np.load(staged_ih / "train" / "scene0.npz")
+        check("convert_dataset(compute_hag): tiles carry a hag channel inline",
+              "hag" in zih.files and zih["hag"].shape[0] == zih["xyz"].shape[0])
+        mih = json.loads((staged_ih / "dataset_meta.json").read_text())
+        check("convert_dataset(compute_hag): meta records grid+labels ground + has_hag",
+              mih["has_hag"] is True
+              and mih["source"]["hag_source"] == "grid+labels"
+              and mih["source"]["hag_ground_value"] == 2
+              and mih["source"]["hag_use_smrf"] is False)
 
         # ---------------- analysis.scan_folder on raw files
         stats = analysis.scan_folder(dataset.discover_scenes(laz_root / "train"))
@@ -660,9 +707,10 @@ def main():
                 local_ok = False
                 continue
             fn = next((getattr(lm, n) for n in dir(lm) if n.startswith("train_")), None)
-            if fn is None or type(lm.outputs_volume).__name__ != "_NoVol":
+            # Volumes are a Modal concept; the local scripts must carry NO stand-ins.
+            if fn is None or hasattr(lm, "outputs_volume") or hasattr(lm, "datasets_volume"):
                 local_ok = False
-        check("local: all 6 local_train_*.py import + expose train fn + no-op volumes", local_ok)
+        check("local: all 6 local_train_*.py import + expose train fn + no volume stubs", local_ok)
         # --mode infer labels arbitrary clouds from weights, so it must NOT demand a
         # --dataset (the class count/names come from the checkpoint + its run.json).
         # Calling with dataset=None must fault PAST the dataset gate (missing weights /
@@ -681,7 +729,8 @@ def main():
         with open(importlib.import_module("local_train_ptv3").__file__, encoding="utf-8") as f:
             _lt_src = f.read()
         check("local: local_train_ptv3.py has no 'import modal' (source is decoupled)",
-              "import modal" not in _lt_src and "_NoVol" in _lt_src)
+              "import modal" not in _lt_src and "_NoVol" not in _lt_src
+              and "modal" not in _lt_src.lower())
         # inversion: the modal wrapper bakes its local script in + shells out to it.
         _modal_shim.install()
         for m in list(sys.modules):

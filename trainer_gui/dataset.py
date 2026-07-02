@@ -173,15 +173,20 @@ def _subset(cloud: Cloud, raw: np.ndarray | None, mask: np.ndarray):
     return sub, (raw[mask] if raw is not None else None)
 
 
-def _hist_of(raw, value_to_index: dict, num_classes: int) -> np.ndarray:
-    """Per-class point counts for one atom's RAW labels (ignored points dropped)."""
-    h = np.zeros(num_classes, dtype=np.int64)
+def _tile_hists(inv: np.ndarray, n_tiles: int, raw, value_to_index: dict,
+                num_classes: int) -> np.ndarray:
+    """(n_tiles, C) per-class point counts, one vectorized pass: map raw->index
+    once for the whole cloud, then bincount the (tile, class) pairs."""
+    hist = np.zeros((n_tiles, max(num_classes, 1)), dtype=np.int64)
     if raw is None or num_classes == 0:
-        return h
-    for src_val, idx in value_to_index.items():
-        if 0 <= int(idx) < num_classes:
-            h[int(idx)] += int(np.count_nonzero(raw == src_val))
-    return h
+        return hist[:, :num_classes] if num_classes else np.zeros((n_tiles, 0), np.int64)
+    idx = np.full(len(raw), -1, dtype=np.int64)
+    for src_val, i in value_to_index.items():
+        if 0 <= int(i) < num_classes:
+            idx[raw == src_val] = int(i)
+    v = idx >= 0
+    return np.bincount(inv[v] * num_classes + idx[v],
+                       minlength=n_tiles * num_classes).reshape(n_tiles, num_classes)
 
 
 def _hist_from_counts(class_counts: dict, num_classes: int) -> np.ndarray:
@@ -290,31 +295,51 @@ def allocate_splits(pts, hist, val_frac: float, test_frac: float,
 
 
 def _atomize(cloud: Cloud, tile_m: float):
-    """Group a single cloud's points into XY grid tiles -> list of index arrays."""
+    """XY grid tiles for a single cloud -> (keys, uniq, inv): per-point integer
+    cell coords, the unique cells, and each point's tile id (row into uniq)."""
     xy = cloud.xyz[:, :2]
     keys = np.floor((xy - xy.min(0)) / max(float(tile_m), 1e-6)).astype(np.int64)
-    _, inv = np.unique(keys, axis=0, return_inverse=True)
-    return [np.where(inv == t)[0] for t in range(int(inv.max()) + 1)]
+    # 1-D packed code instead of unique(axis=0): ~10x faster on multi-M clouds
+    # (axis=0 sorts rows as structured voids).
+    span = int(keys[:, 1].max()) + 1
+    code, inv = np.unique(keys[:, 0] * span + keys[:, 1], return_inverse=True)
+    uniq = np.column_stack([code // span, code % span])
+    return keys, uniq, inv
 
 
-def _seam_drop(xyz, split_of_point, seam_buffer_m: float) -> np.ndarray:
-    """Keep-mask: drop points within seam_buffer_m (2-D) of a point that belongs to
-    a DIFFERENT split, so the reassembled per-split clouds don't touch."""
-    keep = np.ones(len(xyz), dtype=bool)
+def _seam_drop(xy, keys, uniq, split_of_point, tile_m: float,
+               seam_buffer_m: float) -> np.ndarray:
+    """Keep-mask: drop points within seam_buffer_m of a NEIGHBOURING tile that
+    belongs to a different split, so the reassembled per-split clouds don't touch.
+
+    ponytail: tile-edge approximation — pure arithmetic on each point's offset
+    inside its tile plus a dense neighbour-split lookup, O(n), no KD-tree. It's a
+    superset of the exact within-buffer-of-a-foreign-POINT set (a foreign point's
+    tile region is never farther than the point), so it can only over-drop a
+    little, never leak. Ceiling: only the 8 adjacent tiles are checked, so the
+    effective buffer caps at tile_m."""
+    n = len(xy)
+    keep = np.ones(n, dtype=bool)
     if seam_buffer_m <= 0:
         return keep
-    try:
-        from scipy.spatial import cKDTree
-    except Exception:
-        return keep
-    for s in range(3):
-        mine = np.where(split_of_point == s)[0]
-        others = np.where((split_of_point != s) & (split_of_point >= 0))[0]
-        if len(mine) == 0 or len(others) == 0:
-            continue
-        d, _ = cKDTree(xyz[others, :2]).query(xyz[mine, :2])
-        keep[mine[d < seam_buffer_m]] = False
-    return keep
+    tile = max(float(tile_m), 1e-6)
+    b = min(float(seam_buffer_m), tile)
+    k0 = uniq.min(0)
+    grid = np.full(uniq.max(0) - k0 + 3, -1, dtype=np.int64)   # +1 pad each side; -1 = empty
+    kx = keys[:, 0] - k0[0] + 1
+    ky = keys[:, 1] - k0[1] + 1
+    grid[kx, ky] = split_of_point
+    u = xy - xy.min(0) - keys * tile                           # offset in [0, tile)
+    near = {-1: (u < b), 1: (u > tile - b), 0: np.ones((n, 2), dtype=bool)}
+    drop = np.zeros(n, dtype=bool)
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            if dx == 0 and dy == 0:
+                continue
+            nb = grid[kx + dx, ky + dy]
+            drop |= (near[dx][:, 0] & near[dy][:, 1]
+                     & (nb >= 0) & (nb != split_of_point))
+    return ~drop
 
 
 # --------------------------------------------------------------------- conversion
@@ -338,7 +363,7 @@ def _hag_from_cloud(cloud: Cloud) -> np.ndarray | None:
 def _convert_one(cloud: Cloud, raw: np.ndarray | None, value_to_index: dict[int, int],
                  out_path: Path, intensity_norm: str = "max",
                  compute_hag: bool = False, ground_value: int | None = None,
-                 use_smrf: bool = True, hag_filter: str = "hag_nn") -> dict:
+                 use_smrf: bool = True, hag_filter: str = "grid") -> dict:
     """Write one (already-read, already-cropped) cloud to a canonical npz.
 
     compute_hag: also store a per-point real HeightAboveGround ("hag", SMRF->hag)
@@ -402,7 +427,7 @@ def _convert_one(cloud: Cloud, raw: np.ndarray | None, value_to_index: dict[int,
 def convert_scene(path: Path, spec: LabelSpec | None, value_to_index: dict[int, int],
                   out_path: Path, intensity_norm: str = "max",
                   compute_hag: bool = False, ground_value: int | None = None,
-                  use_smrf: bool = True, hag_filter: str = "hag_nn") -> dict:
+                  use_smrf: bool = True, hag_filter: str = "grid") -> dict:
     """Read one source file and convert the whole cloud (no cropping)."""
     cloud = read_points(path)
     raw = read_labels(path, cloud, spec) if spec is not None else None
@@ -511,7 +536,7 @@ def _plan_and_convert(input_files: list[Path], val_files: list[Path] | None,
                       spec: LabelSpec | None, value_to_index: dict[int, int],
                       num_classes: int, out_root: Path, intensity_norm: str, say, *,
                       compute_hag: bool = False, ground_value: int | None = None,
-                      use_smrf: bool = True, hag_filter: str = "hag_nn",
+                      use_smrf: bool = True, hag_filter: str = "grid",
                       max_workers: int | None = None) -> dict:
     """Convert sources into out_root/{train,val,test}/*.npz; returns
     {"train": [stats], "val": [stats], "test": [stats]}.
@@ -562,15 +587,13 @@ def _plan_and_convert(input_files: list[Path], val_files: list[Path] | None,
                                        hag_filter=hag_filter)
             if h is not None and len(h) == cloud.n:
                 cloud.fields["HeightAboveGround"] = h.astype(np.float32)
-        groups = _atomize(cloud, split.tile_m)
-        pts = [len(g) for g in groups]
-        hist = [_hist_of(raw[g] if raw is not None else None, value_to_index, num_classes)
-                for g in groups]
+        keys, uniq, inv = _atomize(cloud, split.tile_m)
+        pts = np.bincount(inv, minlength=len(uniq))
+        hist = _tile_hists(inv, len(uniq), raw, value_to_index, num_classes)
         assign = allocate_splits(pts, hist, vfrac, tfrac, split.mode, split.seed)
-        sop = np.full(cloud.n, -1, dtype=np.int64)
-        for g, a in zip(groups, assign):
-            sop[g] = a
-        keep = _seam_drop(cloud.xyz, sop, split.seam_buffer_m)
+        sop = assign[inv]
+        keep = _seam_drop(cloud.xyz[:, :2], keys, uniq, sop,
+                          split.tile_m, split.seam_buffer_m)
         for s, split_name in enumerate(_SPLITS):
             mask = (sop == s) & keep
             if not mask.any():
@@ -612,7 +635,7 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
                     split: SplitConfig | None = None,
                     intensity_norm: str = "max", compute_hag: bool = False,
                     ground_value: int | None = None, use_smrf: bool = True,
-                    hag_filter: str = "hag_nn", max_workers: int | None = None,
+                    hag_filter: str = "grid", max_workers: int | None = None,
                     progress=None) -> Path:
     """Convert `inputs` (files and/or folders) into a staged canonical dataset with
     materialized train/val/test folders.
@@ -624,11 +647,13 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
         isn't provided explicitly (default: SplitConfig()).
     classes: [{"index", "source_value", "name"}] — built by the Datasets page.
     compute_hag: bake a per-scene HeightAboveGround channel into every scene in
-        the SAME pass as conversion. ground_value names the source label value
-        that means GROUND (None = none); use_smrf runs PDAL SMRF and unions it
-        with that labeled ground so SMRF fills holes the labels miss (e.g. under
-        buildings). With no ground_value, use_smrf is the sole ground source;
-        hag_filter picks nn/delaunay.
+        the SAME pass as conversion. hag_filter picks the method: "grid" (fast
+        raster approximation, no PDAL, default) or "hag_nn"/"hag_delaunay"
+        (accurate PDAL path). ground_value names the source label value that
+        means GROUND — when set, those labels are the ONLY ground source (SMRF
+        never runs; holes are nearest-filled/interpolated). With no ground_value
+        the method detects ground itself: the grid's opening heuristic, or SMRF
+        for the PDAL filters (use_smrf).
     """
     from . import analysis
 
@@ -655,13 +680,14 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
 
     if compute_hag:
         from . import pretrain
-        if pretrain.pdal_available():
-            src = (f"ground=class {ground_value}" + (" + SMRF fill" if use_smrf else "")
-                   if ground_value is not None else "SMRF")
-            say(f"computing HeightAboveGround inline (PDAL {src} -> {hag_filter}) …")
-        else:
-            say("⚠ HAG requested but PDAL isn't installed - written without it.")
-            compute_hag = False
+        if hag_filter != "grid" and not pretrain.pdal_available():
+            say(f"⚠ {hag_filter} needs PDAL (not installed) - using the grid method instead.")
+            hag_filter = "grid"
+        # Trusted ground labels win outright; the grid method detects for itself.
+        use_smrf = use_smrf and ground_value is None and hag_filter != "grid"
+        src = (f"ground=class {ground_value}" if ground_value is not None
+               else ("SMRF" if use_smrf else "grid detection"))
+        say(f"computing HeightAboveGround inline ({src} -> {hag_filter}) …")
     scene_stats = _plan_and_convert(input_files, val_files, test_files, split, spec,
                                     value_to_index, num_classes, out_root,
                                     intensity_norm, say, compute_hag=compute_hag,
@@ -722,15 +748,16 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
         "intensity_raw_max": {s["scene"]: s["intensity_raw_max"] for s in all_stats
                               if s["intensity_raw_max"] is not None},
     }
-    # How every scene's HAG was produced (recorded for the GUI + reproducibility).
+    # How every scene's HAG was produced (recorded for the GUI + reproducibility;
+    # inference reads it back through the run manifest to reproduce the METHOD).
     if not all(s["has_hag"] for s in all_stats):
         hag_src = ""
     elif not compute_hag:
         hag_src = "source_dimension"          # HAG came from a dim already in the cloud
-    elif ground_value is None:
-        hag_src = "smrf"
+    elif ground_value is not None:
+        hag_src = f"{hag_filter}+labels"
     else:
-        hag_src = "labeled+smrf" if use_smrf else "labeled"
+        hag_src = "grid" if hag_filter == "grid" else f"{hag_filter}+smrf"
     meta = {
         "schema_version": 2,
         "name": name,
@@ -778,26 +805,29 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
 
 
 def convert_infer_job(job_id: str, input_dir: str, staging_root: Path, progress=None,
-                      intensity_norm: str = "p95", hag: bool = False) -> Path:
+                      intensity_norm: str = "p95", hag: bool = False,
+                      hag_filter: str = "grid") -> Path:
     """Label-less conversion for inference-only jobs -> <staging>/_infer/<job_id>/.
 
     intensity_norm MUST match what the weights were trained with (max -> [0,1], or
     p95 -> [0,2] for weights trained that way) — a mismatch feeds the net
     out-of-distribution intensity and tanks accuracy for every checkpoint.
-    `hag=True` (for *_hag weights trained on real PDAL HeightAboveGround) computes a
-    per-point "hag" channel via SMRF->hag_nn when PDAL is available, so inference
-    reproduces the trained feature instead of a z-min proxy; falls back to the proxy
-    (with a warning) when PDAL is missing.
+    `hag=True` (for *_hag weights trained on a real HAG channel) computes a
+    per-point "hag" channel with `hag_filter` — pass the METHOD the run trained
+    with (the caller maps the manifest's hag_source) so inference reproduces the
+    trained feature. There are no labels here, so ground is always detected:
+    grid's opening heuristic or PDAL SMRF. A PDAL filter without PDAL installed
+    falls back to grid (still far closer to real HAG than the z-min proxy).
     """
     say = progress or (lambda s: None)
     if hag:
         from . import pretrain
-        if pretrain.pdal_available():
-            say("  computing real PDAL HeightAboveGround (SMRF -> hag_nn) per scene …")
-        else:
-            say("  ⚠ HAG requested but PDAL isn't installed here - using a z-min proxy "
-                "(degraded for a model trained on real HAG).")
-            hag = False
+        if hag_filter != "grid" and not pretrain.pdal_available():
+            say(f"  ⚠ run trained with {hag_filter} but PDAL isn't installed here - "
+                "using the grid method (approximate HAG).")
+            hag_filter = "grid"
+        src = "grid detection" if hag_filter == "grid" else "SMRF"
+        say(f"  computing HeightAboveGround per scene ({src} -> {hag_filter}) …")
     out_root = staging_root / "_infer" / job_id
     files = discover_scenes(input_dir)
     if not files:
@@ -807,7 +837,7 @@ def convert_infer_job(job_id: str, input_dir: str, staging_root: Path, progress=
         out_path = out_root / "scenes" / (path.stem + ".npz")
         say(f"  converting {path.name} ...")
         st = convert_scene(path, None, {}, out_path, intensity_norm=intensity_norm,
-                           compute_hag=hag)
+                           compute_hag=hag, hag_filter=hag_filter)
         st["scene"] = out_path.name
         st["source_file"] = str(path)
         scenes.append(out_path.name)
@@ -826,20 +856,87 @@ def convert_infer_job(job_id: str, input_dir: str, staging_root: Path, progress=
     return out_root
 
 
+# Prediction export formats the Inference page offers. All carry xyz +
+# classification only (no colour — the palette is the viewer's concern, not the
+# deliverable's). e57 is deliberately absent: ASTM E2807 defines no
+# classification attribute, so the format can't hold the one column we export.
+PRED_EXPORT_FORMATS = ("las", "laz", "ply", "txt", "csv")
+
+
+def export_predictions(pred_dir, fmt: str, progress=None) -> list[Path]:
+    """Rewrite a run's *_pred.ply files (palette-coloured, from the training
+    scripts) as <name>_pred.<fmt> carrying xyz + classification only. The class
+    index is recovered losslessly from the palette colours (the scripts paint
+    exact palette_for() values). The coloured source .ply is removed on success;
+    fmt='ply' rewrites in place. Returns the written paths."""
+    from plyfile import PlyData
+
+    from .palette import class_from_rgb
+    fmt = fmt.lower().lstrip(".")
+    if fmt not in PRED_EXPORT_FORMATS:
+        raise ValueError(f"unsupported prediction format '{fmt}' "
+                         f"(one of {', '.join(PRED_EXPORT_FORMATS)})")
+    say = progress or (lambda s: None)
+    written: list[Path] = []
+    for src in sorted(Path(pred_dir).glob("*_pred.ply")):
+        v = PlyData.read(str(src))["vertex"]
+        xyz = np.stack([v["x"], v["y"], v["z"]], -1).astype(np.float64)
+        names = {p.name for p in v.properties}
+        if "classification" in names:      # already class-carrying (future scripts)
+            cls = np.asarray(v["classification"], np.int64)
+        else:
+            cls = class_from_rgb(np.stack([v["red"], v["green"], v["blue"]], -1))
+        # ponytail: uint8 classification (LAS pf6 / uchar); >255 classes would clip.
+        cls = np.clip(cls, 0, 255).astype(np.uint8)
+        dst = src.with_suffix(f".{fmt}")
+        _write_pred(dst, xyz, cls, fmt)
+        if dst != src:
+            src.unlink()
+        written.append(dst)
+        say(f"  {src.name} -> {dst.name} ({len(xyz):,} pts)")
+    return written
+
+
+def _write_pred(dst: Path, xyz: np.ndarray, cls: np.ndarray, fmt: str):
+    """One classified cloud -> dst. xyz float, cls uint8; nothing else."""
+    if fmt in ("las", "laz"):
+        import laspy
+        h = laspy.LasHeader(point_format=6, version="1.4")   # 8-bit classification
+        h.offsets = xyz.min(0)
+        h.scales = [0.001] * 3
+        las = laspy.LasData(h)
+        las.x, las.y, las.z = xyz[:, 0], xyz[:, 1], xyz[:, 2]
+        las.classification = cls
+        las.write(str(dst))
+    elif fmt == "ply":
+        header = ("ply\nformat ascii 1.0\n" + f"element vertex {len(xyz)}\n"
+                  "property float x\nproperty float y\nproperty float z\n"
+                  "property uchar classification\nend_header")
+        np.savetxt(dst, np.column_stack([xyz, cls]),
+                   fmt=["%.3f"] * 3 + ["%d"], header=header, comments="")
+    elif fmt == "txt":                                       # x y z class
+        np.savetxt(dst, np.column_stack([xyz, cls]), fmt="%.3f %.3f %.3f %d")
+    elif fmt == "csv":
+        np.savetxt(dst, np.column_stack([xyz, cls]), delimiter=",",
+                   fmt=["%.3f"] * 3 + ["%d"], header="x,y,z,classification",
+                   comments="")
+
+
 def add_hag_to_dataset(src_dir, out_dir, *, use_smrf: bool = True,
-                       hag_filter: str = "hag_nn", progress=None) -> Path:
+                       hag_filter: str = "grid", progress=None) -> Path:
     """Add a per-tile HeightAboveGround channel to an already-converted dataset.
 
-    Reads each train|val|test/*.npz, recomputes HAG with PDAL (SMRF -> hag) on the
-    tile's OWN points (the inference twin pretrain.hag_for_cloud, kept in RAM),
-    and writes a sibling dataset with a `hag` key added to every tile. Returns
-    out_dir. Ground here is SMRF only — the converted tiles carry remapped label
-    indices, not the source ground value; use the inline HAG in convert_dataset
-    (ground_value=…) when you want labeled ground unioned with SMRF.
+    Reads each train|val|test/*.npz, recomputes HAG with `hag_filter` (grid
+    detection by default; SMRF -> hag for the PDAL filters) on the tile's OWN
+    points (the inference twin pretrain.hag_for_cloud, kept in RAM), and writes
+    a sibling dataset with a `hag` key added to every tile. Returns out_dir.
+    Ground is detected — the converted tiles carry remapped label indices, not
+    the source ground value; use the inline HAG in convert_dataset
+    (ground_value=…) when you want labeled ground.
 
-    Per-tile ground is weaker than whole-cloud SMRF on tiles with little bare
-    earth; tiles where PDAL can't return an aligned result keep no `hag` key and
-    the *_hag trainer falls back to its z-min proxy for them, so `has_hag` records
+    Per-tile detection is weaker than whole-cloud on tiles with little bare
+    earth; tiles where no aligned result comes back keep no `hag` key and the
+    *_hag trainer falls back to its z-min proxy for them, so `has_hag` records
     whether ALL tiles got real HAG.
     """
     from . import pretrain
@@ -849,8 +946,8 @@ def add_hag_to_dataset(src_dir, out_dir, *, use_smrf: bool = True,
     meta_path = src_dir / "dataset_meta.json"
     if not meta_path.exists():
         raise FileNotFoundError(f"{src_dir} is not a converted dataset (no dataset_meta.json)")
-    if not pretrain.pdal_available():
-        raise RuntimeError("PDAL is not installed - cannot compute HeightAboveGround.")
+    if hag_filter != "grid" and not pretrain.pdal_available():
+        raise RuntimeError(f"{hag_filter} needs PDAL (not installed) - use the grid method.")
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
 
     n_tiles = n_hag = 0
@@ -884,7 +981,7 @@ def add_hag_to_dataset(src_dir, out_dir, *, use_smrf: bool = True,
 
     meta["name"] = sanitize_name(out_dir.name)
     meta["has_hag"] = (n_hag == n_tiles)
-    meta.setdefault("source", {})["hag_source"] = "per_tile_smrf"
+    meta.setdefault("source", {})["hag_source"] = f"per_tile_{hag_filter}"
     meta["created_utc"] = datetime.now(timezone.utc).isoformat()
     out_dir.mkdir(parents=True, exist_ok=True)
     with open(out_dir / "dataset_meta.json", "w", encoding="utf-8") as f:
