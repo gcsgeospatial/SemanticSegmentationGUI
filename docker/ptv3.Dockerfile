@@ -13,6 +13,6 @@ RUN python -m pip install --no-cache-dir --upgrade pip
 RUN python -m pip install --no-cache-dir torch==2.1.0 torchvision==0.16.0 'numpy<2.0' scipy scikit-learn plyfile tqdm tensorboard addict einops timm 'pandas<3' --index-url https://download.pytorch.org/whl/cu118 --extra-index-url https://pypi.org/simple
 RUN python -m pip install --no-cache-dir spconv-cu118 torch-scatter torch-cluster --find-links https://data.pyg.org/whl/torch-2.1.0+cu118.html
 ENV PYTHONUNBUFFERED=1
-COPY --from=ptv3src . /opt/ptv3
+RUN git clone https://github.com/Pointcept/PointTransformerV3.git /opt/ptv3 && git -C /opt/ptv3 checkout --detach 3229e9b7de1770c8ad17c316f8e349982de509f8 && rm -rf /opt/ptv3/.git
 RUN touch /opt/ptv3/__init__.py
 WORKDIR /workspace

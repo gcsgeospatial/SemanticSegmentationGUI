@@ -12,7 +12,7 @@ RUN ln -sf /usr/bin/python3 /usr/bin/python
 RUN python -m pip install --no-cache-dir --upgrade pip
 RUN python -m pip install --no-cache-dir torch==2.2.2 torchvision==0.17.2 'numpy<2.0' scipy scikit-learn tqdm tensorboard pyyaml matplotlib Cython 'pandas<3' laspy lazrs --index-url https://download.pytorch.org/whl/cu121 --extra-index-url https://pypi.org/simple
 ENV PYTHONUNBUFFERED=1
-COPY --from=randlanetsrc . /opt/randlanet
+RUN git clone https://github.com/tsunghan-wu/RandLA-Net-pytorch.git /opt/randlanet && git -C /opt/randlanet checkout --detach 75adeacdb796db07e69ba990c36409c5d3ee886b && rm -rf /opt/randlanet/.git
 RUN <<'TT_EOT'
 cat > /opt/randlanet/utils/nearest_neighbors/setup.py <<'PY'
 

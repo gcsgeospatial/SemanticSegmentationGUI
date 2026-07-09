@@ -14,6 +14,6 @@ RUN python -m pip install --no-cache-dir torch==2.5.0 torchvision==0.20.0 'numpy
 RUN python -m pip install --no-cache-dir spconv-cu124 torch-scatter torch-cluster --find-links https://data.pyg.org/whl/torch-2.5.0+cu124.html
 RUN pip install --no-deps https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.5cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
 ENV PYTHONUNBUFFERED=1
-COPY --from=ptv3src . /opt/ptv3
+RUN git clone https://github.com/Pointcept/PointTransformerV3.git /opt/ptv3 && git -C /opt/ptv3 checkout --detach 3229e9b7de1770c8ad17c316f8e349982de509f8 && rm -rf /opt/ptv3/.git
 RUN touch /opt/ptv3/__init__.py
 WORKDIR /workspace

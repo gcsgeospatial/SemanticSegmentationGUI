@@ -58,10 +58,14 @@ image = (
 
 # Mount the KPConvX standalone repo into the image at /opt/kpconvx.
 # (Path corrected from the warm script — the repo now lives under Modal_H3D.)
-image = image.add_local_dir(
-    "C:/Users/OrionHoch/Desktop/Modal_H3D/ml-kpconvx/Standalone/KPConvX",
-    "/opt/kpconvx",
-    copy=True,
+# Model source: pinned upstream clone (the standalone KPConvX subtree) —
+# portable (no local checkout needed to build). Bump the SHA deliberately:
+# it IS the architecture version.
+image = image.run_commands(
+    "git clone https://github.com/apple/ml-kpconvx.git /tmp/ml-kpconvx"
+    " && git -C /tmp/ml-kpconvx checkout --detach 54e644a9f3bddd4c344a58193897a44582b0fea4"
+    " && mv /tmp/ml-kpconvx/Standalone/KPConvX /opt/kpconvx"
+    " && rm -rf /tmp/ml-kpconvx",
 )
 image = image.run_commands(
     "cd /opt/kpconvx/cpp_wrappers/cpp_subsampling && python setup.py build_ext --inplace",
@@ -73,6 +77,9 @@ image = image.run_commands(
 
 image = image.add_local_file("scripts/local/local_train_kpconvx_cold.py", "/root/local_train_kpconvx_cold.py")
 image = image.add_local_file("scripts/helper/train_common.py", "/root/train_common.py")
+# density.py: the DG/env-knob helper every local trainer imports (`import density
+# as dg`) — without it cloud runs die on ModuleNotFoundError at startup.
+image = image.add_local_file("scripts/helper/density.py", "/root/density.py")
 
 outputs_volume  = modal.Volume.from_name(f"{APP_NAME}-outputs",  create_if_missing=True)
 datasets_volume = modal.Volume.from_name(
@@ -93,7 +100,8 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
                   weights: Optional[str] = None,
                   infer_input: Optional[str] = None, grid: Optional[float] = None,
                   chunk_xy: Optional[float] = None, epochs: Optional[int] = None,
-                  batch: Optional[int] = None, steps_per_epoch: Optional[int] = None):
+                  batch: Optional[int] = None, steps_per_epoch: Optional[int] = None,
+                  env_json: Optional[str] = None):
     """Modal shell: provision the GPU container + volumes, then run the LOCAL
     trainer. All training/inference logic lives in local_train_kpconvx_cold.py — this only
     shells out to it, so local and cloud run byte-identical code."""
@@ -115,6 +123,12 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
     ):
         if _val is not None:
             cmd += [_flag, str(_val)]
+    env = dict(os.environ)
+    if env_json:
+        import json
+        _ov = {str(k): str(v) for k, v in json.loads(env_json).items()}
+        env.update(_ov)
+        print("[modal-shell] env overrides: " + " ".join(sorted(_ov)), flush=True)
     print("[modal-shell] " + " ".join(cmd), flush=True)
 
     # Persist checkpoints + prep cache mid-run so an uncatchable spconv CUDA
@@ -132,7 +146,7 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
     _t = threading.Thread(target=_commit_loop, daemon=True)
     _t.start()
     try:
-        subprocess.run(cmd, check=True)
+        subprocess.run(cmd, check=True, env=env)
     finally:
         _stop.set()
         outputs_volume.commit()
@@ -143,10 +157,11 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
 def main(dataset: Optional[str] = None, mode: str = "train", weights: Optional[str] = None,
          infer_input: Optional[str] = None, grid: Optional[float] = None,
          chunk_xy: Optional[float] = None, epochs: Optional[int] = None,
-         batch: Optional[int] = None, steps_per_epoch: Optional[int] = None):
+         batch: Optional[int] = None, steps_per_epoch: Optional[int] = None,
+                  env_json: Optional[str] = None):
     what = {"eval": "eval-only re-score", "infer": f"infer({weights})"}.get(
         mode, f"train({dataset})")
     print(f"Launching {APP_NAME} [{what}] on {GPU_TYPE} for up to {TIMEOUT_HOURS}h.")
     train_kpconvx.remote(dataset=dataset, mode=mode, weights=weights, infer_input=infer_input,
                          grid=grid, chunk_xy=chunk_xy, epochs=epochs, batch=batch,
-                         steps_per_epoch=steps_per_epoch)
+                         steps_per_epoch=steps_per_epoch, env_json=env_json)

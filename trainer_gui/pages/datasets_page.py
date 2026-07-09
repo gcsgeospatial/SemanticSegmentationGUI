@@ -653,15 +653,17 @@ class DatasetsPage(QWidget):
                          f"runs/ + infer/ under {staged or 'nothing on disk'} for records.")
 
     def _start_upload(self, staged: Path):
-        # Each dataset gets its own Modal volume named after it; mounted at
-        # /datasets, so the remote path stays /<name>.
+        # All datasets live on the ONE datasets volume the modal shells mount at
+        # /datasets (TT_DATASET_VOLUME, default 'terminal-datasets'), each under
+        # /<name> — the same layout the local path bind-mounts. (Was: one volume
+        # per dataset, which the trainers never mounted — invisible in the cloud.)
         self._uploading = staged
         name = staged.name
         self.upload_saved_btn.setEnabled(False)
-        self._append(f"\nCreating + uploading volume '{name}' (-> /{name}) …")
-        prog, args = modal_cli.volume_put(name, str(staged), f"/{name}")
+        self._append(f"\nUploading -> {modal_cli.DATASETS_VOLUME}:/{name} …")
+        prog, args = modal_cli.volume_put(modal_cli.DATASETS_VOLUME, str(staged), f"/{name}")
         self.uploader.start(prog, args, cwd=self.repo_root,
-                            pre=modal_cli.volume_create(name))
+                            pre=modal_cli.volume_create(modal_cli.DATASETS_VOLUME))
 
     def _on_upload_failed(self, err: str):
         self.upload_saved_btn.setEnabled(True)
@@ -680,10 +682,11 @@ class DatasetsPage(QWidget):
             "staged_dir": str(staged),
             "meta_path": str(staged / "dataset_meta.json"),
             "uploaded": True,
-            "volume": name,
+            "volume": modal_cli.DATASETS_VOLUME,
         })
         self._reload_known()
-        self._append(f"\n✓ Uploaded '{name}' to volume '{name}'. Go to the Train page.")
+        self._append(f"\n✓ Uploaded '{name}' -> {modal_cli.DATASETS_VOLUME}:/{name}. "
+                     "Go to the Train page.")
 
     def _on_worker_error(self, tb: str):
         self._done_cb = None

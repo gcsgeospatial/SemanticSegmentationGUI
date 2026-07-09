@@ -78,10 +78,12 @@ image = (
     .env({"PYTHONUNBUFFERED": "1"})
 )
 
-image = image.add_local_dir(
-    "C:/Users/OrionHoch/Desktop/testSem/PointTransformerV3",
-    "/opt/ptv3",
-    copy=True,
+# Model source: pinned upstream clone — portable (no local checkout needed to
+# build). Bump the SHA deliberately: it IS the architecture version.
+image = image.run_commands(
+    "git clone https://github.com/Pointcept/PointTransformerV3.git /opt/ptv3"
+    " && git -C /opt/ptv3 checkout --detach 3229e9b7de1770c8ad17c316f8e349982de509f8"
+    " && rm -rf /opt/ptv3/.git",
 )
 # model.py uses a package-relative import (`from .serialization import encode`),
 # so it must be imported as `ptv3.model`, not top-level `model`. Make /opt/ptv3
@@ -92,6 +94,9 @@ image = image.add_local_file("scripts/local/local_train_ptv3_hag.py", "/root/loc
 # the hag entry point is a thin wrapper since the merge — ship the real trainer too
 image = image.add_local_file("scripts/local/local_train_ptv3.py", "/root/local_train_ptv3.py")
 image = image.add_local_file("scripts/helper/train_common.py", "/root/train_common.py")
+# density.py: the DG/env-knob helper every local trainer imports (`import density
+# as dg`) — without it cloud runs die on ModuleNotFoundError at startup.
+image = image.add_local_file("scripts/helper/density.py", "/root/density.py")
 
 outputs_volume  = modal.Volume.from_name(f"{APP_NAME}-outputs", create_if_missing=True)
 datasets_volume = modal.Volume.from_name(
@@ -118,7 +123,8 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                epochs: Optional[int] = None, batch: Optional[int] = None,
                steps_per_epoch: Optional[int] = None, chunk_xy: Optional[float] = None,
                mode: str = "train", weights: Optional[str] = None,
-               infer_input: Optional[str] = None):
+               infer_input: Optional[str] = None,
+               env_json: Optional[str] = None):
     """Modal shell: provision the GPU container + volumes, then run the LOCAL
     trainer. All training/inference logic lives in local_train_ptv3_hag.py — this only
     shells out to it, so local and cloud run byte-identical code."""
@@ -140,6 +146,12 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
     ):
         if _val is not None:
             cmd += [_flag, str(_val)]
+    env = dict(os.environ)
+    if env_json:
+        import json
+        _ov = {str(k): str(v) for k, v in json.loads(env_json).items()}
+        env.update(_ov)
+        print("[modal-shell] env overrides: " + " ".join(sorted(_ov)), flush=True)
     print("[modal-shell] " + " ".join(cmd), flush=True)
 
     # Persist checkpoints + prep cache mid-run so an uncatchable spconv CUDA
@@ -157,7 +169,7 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
     _t = threading.Thread(target=_commit_loop, daemon=True)
     _t.start()
     try:
-        subprocess.run(cmd, check=True)
+        subprocess.run(cmd, check=True, env=env)
     finally:
         _stop.set()
         outputs_volume.commit()
@@ -169,9 +181,10 @@ def main(dataset: Optional[str] = None, grid: Optional[float] = None,
          epochs: Optional[int] = None, batch: Optional[int] = None,
          steps_per_epoch: Optional[int] = None, chunk_xy: Optional[float] = None,
          mode: str = "train", weights: Optional[str] = None,
-         infer_input: Optional[str] = None):
+         infer_input: Optional[str] = None,
+               env_json: Optional[str] = None):
     what = f"infer({weights})" if mode == "infer" else f"train({dataset})"
     print(f"Launching {APP_NAME} [{what}] on {GPU_TYPE} for up to {TIMEOUT_HOURS}h.")
     train_ptv3.remote(dataset=dataset, grid=grid, epochs=epochs, batch=batch,
                       steps_per_epoch=steps_per_epoch, chunk_xy=chunk_xy, mode=mode,
-                      weights=weights, infer_input=infer_input)
+                      weights=weights, infer_input=infer_input, env_json=env_json)

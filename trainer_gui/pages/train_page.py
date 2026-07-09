@@ -1,7 +1,11 @@
-"""Train page (local Docker): dataset + model + params -> a local docker run,
-with live logs and epoch metrics. Dataset check verifies the train/val/test
-standard; per-model image status/pull live in a popup; DG training knobs are
-per run (inference-time DG is on the Infer page).
+"""Train page: dataset + model + params -> a training run, with live logs and
+epoch metrics. Two backends, chosen by the sidebar's Execution backend switch:
+local (docker run on your GPU; output folder on the host) and Modal (modal run
+on a cloud GPU; dataset read from / run written to Modal volumes). Dataset
+check verifies the train/val/test standard; per-model image status/pull live
+in a popup; DG training knobs are per run (inference-time DG is on the Infer
+page). Loss / class-balance / DG knobs reach the trainer as env either way
+(docker -e locally, --env-json through the modal shell in the cloud).
 """
 
 from __future__ import annotations
@@ -17,8 +21,8 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog,
                                QPlainTextEdit, QPushButton, QTableWidget, QTableWidgetItem,
                                QVBoxLayout, QWidget)
 
-from .. import analysis, appstate, local_cli, theme, ui
-from ..backbones import BACKBONES
+from .. import analysis, appstate, local_cli, modal_cli, theme, ui
+from ..backbones import BACKBONES, GPU_CHOICES
 from ..jobs import FuncWorker, JobRunner, LogParser
 
 
@@ -28,9 +32,10 @@ class TrainPage(QWidget):
     def __init__(self, repo_root: str):
         super().__init__()
         self.repo_root = repo_root
-        self.runner = JobRunner(self)          # training docker process
+        self.runner = JobRunner(self)          # training process (docker or modal run)
         self.pull_runner = JobRunner(self)     # docker pull, streamed to log
         self.status_worker = FuncWorker(self)  # off-thread image-presence check
+        self.modal_worker = FuncWorker(self)   # off-thread modal volume preflight
         self.parser = LogParser(self)
         self._param_widgets: dict[str, QWidget] = {}
         self._meta: dict | None = None
@@ -70,6 +75,22 @@ class TrainPage(QWidget):
         self.smoke_chk = QCheckBox("Smoke run (2 epochs × 50 steps)")
         self.smoke_chk.toggled.connect(self._apply_smoke)
         form.addRow("Options", self.smoke_chk)
+        # Modal-only: detach = `modal run --detach`, returns as soon as the cloud
+        # app starts, freeing this page to launch the next model — the way to
+        # train several models on one dataset in parallel.
+        self.detach_chk = QCheckBox("Detach (return immediately — launch several models in parallel)")
+        self.detach_chk.setToolTip("Runs in the cloud without streaming logs here. Reattach with "
+                                   "`modal app logs <app>`; the run id appears under runs/ on the "
+                                   "model's outputs volume (the Inference page Run field is editable).")
+        form.addRow("", self.detach_chk)
+        # Modal-only: cloud GPU type (TT_GPU env, read by the modal shell at launch).
+        self.gpu_combo = QComboBox()
+        for g in GPU_CHOICES:
+            self.gpu_combo.addItem(g)
+        self.gpu_combo.setToolTip("Cloud GPU for this run (Modal only). Defaults to the "
+                                  "model's recommendation when you switch models.")
+        form.addRow("GPU (Modal)", self.gpu_combo)
+        self.backbone_combo.currentIndexChanged.connect(self._sync_gpu_default)
         # Base folder for output; a run lands at <base>/<dataset>/runs/<id> on the host.
         self.out_edit = QLineEdit()
         self.out_edit.setText(appstate.get("local_train_out") or str(appstate.workspace_dir()))
@@ -81,7 +102,8 @@ class TrainPage(QWidget):
         out_btn = QPushButton("Browse…")
         out_btn.clicked.connect(self._pick_out)
         out_row.addWidget(out_btn)
-        form.addRow("Output folder", _wrap(out_row))
+        self.out_row_w = _wrap(out_row)
+        form.addRow("Output folder", self.out_row_w)
 
         self.params_box = QGroupBox("Parameters (pre-filled)")
         self.params_form = QFormLayout(self.params_box)
@@ -137,17 +159,34 @@ class TrainPage(QWidget):
         self.status_worker.done.connect(self._apply_statuses)
         self.parser.epoch.connect(self._on_epoch)
         self.parser.run_id.connect(self._on_run_id)
+        self.modal_worker.done.connect(self._on_modal_preflight)
+        self.modal_worker.error.connect(self._on_modal_preflight_error)
 
-        self.apply_exec_mode(True)   # local-only page
+        self.apply_exec_mode(appstate.get_exec_mode() == "local")
         self._rebuild_params()
         self.refresh_images()
 
     def apply_exec_mode(self, local: bool):
-        """Local-only page, kept for main.py's call. Refresh copy and lists."""
+        """Re-scheme for the chosen backend: hide Docker-only / Modal-only rows."""
         self.sub.setText(
             "Pick a dataset and model. Parameters are pre-filled from density analysis; "
-            "edit before launching. Runs locally in Docker on your GPU.")
+            "edit before launching. "
+            + ("Runs locally in Docker on your GPU."
+               if local else
+               "Runs on a Modal cloud GPU — upload the dataset from the Datasets page "
+               "first; the finished run lands on the model's outputs volume."))
+        self.cfg_btn.setVisible(local)                      # docker image mgmt
+        self.form.setRowVisible(self.out_row_w, local)      # host output folder
+        self.form.setRowVisible(self.gpu_combo, not local)  # cloud GPU pick
+        self.form.setRowVisible(self.detach_chk, not local) # parallel cloud launches
         self.reload_datasets()
+
+    def _sync_gpu_default(self):
+        b = self._backbone()
+        if b is not None:
+            i = self.gpu_combo.findText(b.rec_gpu)
+            if i >= 0:
+                self.gpu_combo.setCurrentIndex(i)
 
     # ------------------------------------------------- per-model Docker popup
     def _open_model_config(self):
@@ -586,8 +625,12 @@ class TrainPage(QWidget):
         if loss_env:
             self._append("[loss] overrides: "
                          + " ".join(f"{k}={v}" for k, v in sorted(loss_env.items())))
-        self._start_local_run({"backbone": b, "flags": flags, "dataset": name,
-                               "env": env, "info": info})
+        payload = {"backbone": b, "flags": flags, "dataset": name,
+                   "env": env, "info": info}
+        if appstate.get_exec_mode() == "local":
+            self._start_local_run(payload)
+        else:
+            self._preflight_modal_run(payload)
 
     def _start_local_run(self, p):
         b, flags, name, info = p["backbone"], p["flags"], p["dataset"], p["info"]
@@ -634,6 +677,63 @@ class TrainPage(QWidget):
             return
         self.runner.start(prog, args, cwd=self.repo_root)
 
+    # ------------------------------------------------------------- modal path
+    def _preflight_modal_run(self, p):
+        """Check the dataset is on the datasets volume before paying for a GPU
+        container that would just print 'No training tiles'. Off-thread — the
+        `modal volume ls` call can take seconds."""
+        import shutil as _sh
+        if _sh.which("modal") is None:
+            self._append("[modal] 'modal' CLI not found on PATH — `pip install modal`, "
+                         "then `modal setup` to authenticate, and launch again.")
+            self.launch_btn.setEnabled(True)
+            return
+        self._pending = p
+        name = p["dataset"]
+        self._append(f"[modal] checking '{name}' on the "
+                     f"'{modal_cli.DATASETS_VOLUME}' volume…")
+        self.modal_worker.start(
+            lambda progress=None: modal_cli.list_volume_entries(
+                modal_cli.DATASETS_VOLUME, f"/{name}"))
+
+    def _on_modal_preflight(self, entries):
+        p, self._pending = self._pending, None
+        if p is None:
+            return
+        if not entries:
+            self._append(f"✗ Dataset '{p['dataset']}' isn't on the "
+                         f"'{modal_cli.DATASETS_VOLUME}' volume. Upload it from the "
+                         "Datasets page (Upload to Modal) and launch again.")
+            self.launch_btn.setEnabled(True)
+            return
+        self._start_modal_run(p)
+
+    def _on_modal_preflight_error(self, tb: str):
+        # Can't list (auth hiccup, flaky network) — warn but let the run proceed;
+        # the trainer itself fails fast and clearly if the dataset is missing.
+        p, self._pending = self._pending, None
+        if p is None:
+            return
+        self._append("[modal] (couldn't verify the dataset on the volume — "
+                     "proceeding anyway.)")
+        self._start_modal_run(p)
+
+    def _start_modal_run(self, p):
+        b, flags = p["backbone"], p["flags"]
+        gpu = self.gpu_combo.currentText()
+        detach = self.detach_chk.isChecked()
+        prog, args = modal_cli.run_script(b.script, flags, detach=detach,
+                                          env=p.get("env") or None)
+        self._append(f"\n[modal] $ TT_GPU={gpu} modal {' '.join(args)}\n")
+        self._append(f"[modal] Training on {gpu}; the run is written to the "
+                     f"'{b.outputs_volume}' volume as runs/<id> — pick it on the "
+                     "Inference page (Training run) when it finishes.")
+        if detach:
+            self._append("[modal] Detached: this returns once the cloud app starts — "
+                         "no logs/metrics stream here. Reattach with "
+                         f"`modal app logs {b.app_name}`; then launch the next model.")
+        self.runner.start(prog, args, cwd=self.repo_root, extra_env={"TT_GPU": gpu})
+
     def _on_runner_failed(self, err: str):
         # FailedToStart fires failed not finished; re-enable here.
         self.launch_btn.setEnabled(True)
@@ -643,6 +743,10 @@ class TrainPage(QWidget):
         if self.runner.running:
             self.runner.terminate()
             self._append("\n[stopped]")
+            if appstate.get_exec_mode() != "local":
+                self._append("[modal] note: killing the local client can leave the "
+                             "cloud app running — `modal app list` to check, "
+                             "`modal app stop <app>` to stop it.")
         else:
             self._append("\n[no process running]")
 

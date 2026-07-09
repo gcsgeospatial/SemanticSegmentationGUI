@@ -103,7 +103,16 @@ class InferPage(QWidget):
         self.run_combo = QComboBox()
         self.run_combo.setEditable(True)   # run ids can also be typed/pasted
         self.run_combo.currentIndexChanged.connect(self._on_run_pick)
-        wf.addRow("Run", self.run_combo)
+        run_row = QHBoxLayout()
+        run_row.addWidget(self.run_combo, 1)
+        self.dl_run_btn = QPushButton("Download run…")
+        self.dl_run_btn.setToolTip("Fetch runs/<id> (weights + run.json + metrics) from the "
+                                   "model's outputs volume to this machine — for backup, local "
+                                   "inference later, or the class legend.")
+        self.dl_run_btn.clicked.connect(self._download_run)
+        run_row.addWidget(self.dl_run_btn)
+        self.run_row_w = _wrap(run_row)
+        wf.addRow("Run", self.run_row_w)
         self.pth_edit = QLineEdit()
         pth_row = QHBoxLayout()
         pth_row.addWidget(self.pth_edit, 1)
@@ -281,6 +290,11 @@ class InferPage(QWidget):
         self.runner.finished.connect(self._on_stage_done)
         self.runner.failed.connect(self._on_runner_failed)
         self.parser.run_id.connect(self._on_run_id)
+        self.dl_runner = JobRunner(self)   # run download, independent of the infer stages
+        self.dl_runner.output.connect(lambda s: self._append(s, newline=False))
+        self.dl_runner.finished.connect(self._on_run_downloaded)
+        self.dl_runner.failed.connect(
+            lambda e: self._append(f"✗ Run download failed to start: {e}"))
 
         self.reload_backbones()
         self.reload_runs()
@@ -298,7 +312,7 @@ class InferPage(QWidget):
         self.iform.setRowVisible(self.out_row_w, True)
         self.wf.setRowVisible(self.runjson_row_w, local)  # run.json picker = local only
         self.wf.setRowVisible(self.weights_row_w, local)  # weights override = local only
-        self.wf.setRowVisible(self.run_combo, not local)  # run-id combo = modal only
+        self.wf.setRowVisible(self.run_row_w, not local)  # run-id combo = modal only
         self.reload_backbones()
 
     def reload_backbones(self):
@@ -473,6 +487,39 @@ class InferPage(QWidget):
                 except (OSError, json.JSONDecodeError):
                     pass
         return None
+
+    def _download_run(self):
+        """Modal: fetch runs/<id> (weights + run.json + metrics) from the model's
+        outputs volume to runs_dir()/<backbone>/<id> — the folder reload_runs and
+        the class-legend lookup already read."""
+        b = self._backbone()
+        h = self.run_combo.currentData()
+        run_id = ((h.get("run_id") if isinstance(h, dict) else None)
+                  or self.run_combo.currentText().strip())
+        if not (b and run_id):
+            self._append("Pick (or type) a run id to download.")
+            return
+        if self.dl_runner.running:
+            self._append("A run download is already in progress.")
+            return
+        dest_base = appstate.runs_dir() / b.key
+        dest_base.mkdir(parents=True, exist_ok=True)
+        self._dl_run_dest = dest_base / run_id
+        self._append(f"\nDownloading {b.outputs_volume}:/runs/{run_id} -> {self._dl_run_dest} …")
+        prog, args = modal_cli.volume_get(b.outputs_volume, f"runs/{run_id}", str(dest_base))
+        self.dl_run_btn.setEnabled(False)
+        self.dl_runner.start(prog, args, cwd=self.repo_root)
+
+    def _on_run_downloaded(self, code: int):
+        self.dl_run_btn.setEnabled(True)
+        dest = getattr(self, "_dl_run_dest", None)
+        if code != 0:
+            self._append(f"\n✗ Run download failed (exit {code}).")
+            return
+        self._append(f"\n✓ Run downloaded -> {dest} (weights: final_model.pth). "
+                     "It now also appears under locally-known runs.")
+        self.reload_runs()          # adopt run.json classes + list the local copy
+        self._on_run_pick()
 
     def _pick_runjson(self):
         start = self.runjson_edit.text().strip() or str(appstate.workspace_dir())
@@ -896,7 +943,10 @@ class InferPage(QWidget):
             flags["chunk-xy"] = self.chunk_spin.value()
         self._append(f"[3/4] Running inference on Modal ({b.label})…")
         self._stage = "run"
-        prog, args = modal_cli.run_script(b.script, flags, detach=False)
+        # Same DG_INFER_* knobs the local branch passes — the shell forwards
+        # them to the trainer subprocess via --env-json.
+        prog, args = modal_cli.run_script(b.script, flags, detach=False,
+                                          env=self._infer_dg_env())
         self._append(f"$ modal {' '.join(args)}\n")
         self.runner.start(prog, args, cwd=self.repo_root)
 

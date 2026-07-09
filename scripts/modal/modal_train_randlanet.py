@@ -55,10 +55,12 @@ image = (
     .env({"PYTHONUNBUFFERED": "1"})
 )
 
-image = image.add_local_dir(
-    "C:/Users/OrionHoch/Desktop/testSem/RandLA-Net-pytorch",
-    "/opt/randlanet",
-    copy=True,
+# Model source: pinned upstream clone — portable (no local checkout needed to
+# build). Bump the SHA deliberately: it IS the architecture version.
+image = image.run_commands(
+    "git clone https://github.com/tsunghan-wu/RandLA-Net-pytorch.git /opt/randlanet"
+    " && git -C /opt/randlanet checkout --detach 75adeacdb796db07e69ba990c36409c5d3ee886b"
+    " && rm -rf /opt/randlanet/.git",
 )
 
 # Compile cpp wrappers and nearest_neighbors at image-build time. The upstream
@@ -96,6 +98,9 @@ image = image.run_commands(
 
 image = image.add_local_file("scripts/local/local_train_randlanet.py", "/root/local_train_randlanet.py")
 image = image.add_local_file("scripts/helper/train_common.py", "/root/train_common.py")
+# density.py: the DG/env-knob helper every local trainer imports (`import density
+# as dg`) — without it cloud runs die on ModuleNotFoundError at startup.
+image = image.add_local_file("scripts/helper/density.py", "/root/density.py")
 
 outputs_volume  = modal.Volume.from_name(f"{APP_NAME}-outputs",  create_if_missing=True)
 datasets_volume = modal.Volume.from_name(
@@ -117,7 +122,8 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                     num_points: Optional[int] = None, epochs: Optional[int] = None,
                     batch: Optional[int] = None, steps_per_epoch: Optional[int] = None,
                     mode: str = "train", weights: Optional[str] = None,
-                    infer_input: Optional[str] = None):
+                    infer_input: Optional[str] = None,
+               env_json: Optional[str] = None):
     """Modal shell: provision the GPU container + volumes, then run the LOCAL
     trainer. All training/inference logic lives in local_train_randlanet.py — this only
     shells out to it, so local and cloud run byte-identical code."""
@@ -139,6 +145,12 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     ):
         if _val is not None:
             cmd += [_flag, str(_val)]
+    env = dict(os.environ)
+    if env_json:
+        import json
+        _ov = {str(k): str(v) for k, v in json.loads(env_json).items()}
+        env.update(_ov)
+        print("[modal-shell] env overrides: " + " ".join(sorted(_ov)), flush=True)
     print("[modal-shell] " + " ".join(cmd), flush=True)
 
     # Persist checkpoints + prep cache mid-run so an uncatchable spconv CUDA
@@ -156,7 +168,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     _t = threading.Thread(target=_commit_loop, daemon=True)
     _t.start()
     try:
-        subprocess.run(cmd, check=True)
+        subprocess.run(cmd, check=True, env=env)
     finally:
         _stop.set()
         outputs_volume.commit()
@@ -168,7 +180,8 @@ def main(dataset: Optional[str] = None, sub_grid: Optional[float] = None,
          num_points: Optional[int] = None, epochs: Optional[int] = None,
          batch: Optional[int] = None, steps_per_epoch: Optional[int] = None,
          mode: str = "train", weights: Optional[str] = None,
-         infer_input: Optional[str] = None):
+         infer_input: Optional[str] = None,
+               env_json: Optional[str] = None):
     # .remote() keeps the local CLI attached so logs stream in real time.
     # Pair with `modal run --detach ...` if you want to close the terminal
     # mid-run; you can then reattach with `modal app logs {APP_NAME} -f`
@@ -177,4 +190,4 @@ def main(dataset: Optional[str] = None, sub_grid: Optional[float] = None,
     print(f"Launching {APP_NAME} [{what}] on {GPU_TYPE} for up to {TIMEOUT_HOURS}h.")
     train_randlanet.remote(dataset=dataset, sub_grid=sub_grid, num_points=num_points,
                            epochs=epochs, batch=batch, steps_per_epoch=steps_per_epoch,
-                           mode=mode, weights=weights, infer_input=infer_input)
+                           mode=mode, weights=weights, infer_input=infer_input, env_json=env_json)

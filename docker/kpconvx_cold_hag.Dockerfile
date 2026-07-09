@@ -12,7 +12,7 @@ RUN ln -sf /usr/bin/python3 /usr/bin/python
 RUN python -m pip install --no-cache-dir --upgrade pip
 RUN python -m pip install --no-cache-dir torch==2.3.0 torchvision==0.18.0 'numpy<2.0' scipy scikit-learn easydict h5py matplotlib timm pykeops tqdm tensorboard 'pandas<3' laspy lazrs --index-url https://download.pytorch.org/whl/cu121 --extra-index-url https://pypi.org/simple
 ENV PYTHONUNBUFFERED=1
-COPY --from=kpconvxsrc . /opt/kpconvx
+RUN git clone https://github.com/apple/ml-kpconvx.git /tmp/ml-kpconvx && git -C /tmp/ml-kpconvx checkout --detach 54e644a9f3bddd4c344a58193897a44582b0fea4 && mv /tmp/ml-kpconvx/Standalone/KPConvX /opt/kpconvx && rm -rf /tmp/ml-kpconvx
 RUN cd /opt/kpconvx/cpp_wrappers/cpp_subsampling && python setup.py build_ext --inplace
 RUN cd /opt/kpconvx/cpp_wrappers/cpp_neighbors && python setup.py build_ext --inplace
 RUN touch /opt/kpconvx/cpp_wrappers/__init__.py       /opt/kpconvx/cpp_wrappers/cpp_subsampling/__init__.py       /opt/kpconvx/cpp_wrappers/cpp_neighbors/__init__.py

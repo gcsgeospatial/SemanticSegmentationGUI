@@ -4,8 +4,9 @@ Desktop GUI (PySide6) for training and running point-cloud semantic-segmentation
 models. Bring a folder of point clouds, pick a model, train it, run inference,
 view the predicted cloud — all in one window.
 
-Two execution backends: **Local (Docker)** — the live path — and **Modal
-(cloud)**, which is **paused** (see `scripts/modal/DEPRECATED.md`). Everything
+Two execution backends: **Local (Docker)** and **Modal (cloud)** — switched in
+the sidebar. Both run the same `scripts/local/` trainers (the Modal shells
+subprocess them on a cloud GPU; see `scripts/modal/README.md`). Everything
 below is the local path.
 
 ## Run it
@@ -60,7 +61,7 @@ no CUDA).
 ```
 scripts/local/    the real trainers/inferencers — plain argparse, no modal.
                   Edit these. Run standalone: python scripts/local/local_train_ptv3.py --dataset X
-scripts/modal/    PAUSED thin shells that bake the local twin into a modal.Image
+scripts/modal/    thin shells that bake the local twin into a modal.Image
                   and subprocess it in the cloud. Frozen — don't touch.
 scripts/helper/   train_common.py (shared training/manifest logic),
                   density.py, _modal_shim.py (used only by gen_dockerfiles.py)
@@ -217,7 +218,7 @@ and never re-split.
 ```
 trainer_gui/     the PySide6 app (pip/pixi package) — pages/, local_cli.py, ...
 scripts/local/   the real trainers/inferencers (run in Docker)
-scripts/modal/   paused thin shells + DEPRECATED.md
+scripts/modal/   thin shells (see its README.md)
 scripts/helper/  train_common.py, density.py, _modal_shim.py
 docker/          generated Dockerfiles + build/pull/push scripts
 tools/           gen_dockerfiles.py

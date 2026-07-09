@@ -721,8 +721,9 @@ def main():
               df.splitlines()[0] == "# syntax=docker/dockerfile:1")
         check("gen: shell-unsafe pip version specs are quoted",
               "'numpy<2.0'" in df and "'pandas<3'" in df)
-        check("gen: model repo COPY uses a build-context matching build_all",
-              "COPY --from=ptv3src . /opt/ptv3" in df and "ptv3src" in contexts)
+        check("gen: model repo is a pinned upstream clone (no build-contexts)",
+              "git clone https://github.com/Pointcept/PointTransformerV3.git /opt/ptv3" in df
+              and "checkout --detach" in df and not contexts)
         check("gen: local_train script is NOT baked (bind-mounted at /workspace locally)",
               "local_train" not in df)
         dfr, _ = gen.build_dockerfile("randlanet", "modal_train_randlanet.py")
