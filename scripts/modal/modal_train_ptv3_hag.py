@@ -89,6 +89,8 @@ image = image.add_local_dir(
 image = image.run_commands("touch /opt/ptv3/__init__.py")
 
 image = image.add_local_file("scripts/local/local_train_ptv3_hag.py", "/root/local_train_ptv3_hag.py")
+# the hag entry point is a thin wrapper since the merge — ship the real trainer too
+image = image.add_local_file("scripts/local/local_train_ptv3.py", "/root/local_train_ptv3.py")
 image = image.add_local_file("scripts/helper/train_common.py", "/root/train_common.py")
 
 outputs_volume  = modal.Volume.from_name(f"{APP_NAME}-outputs", create_if_missing=True)

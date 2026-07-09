@@ -3,9 +3,12 @@
 Run:  python tests/smoke_test.py   (from the trainer_gui/ project dir)
 
 Covers: synthetic LAZ/PLY/ASCII scenes -> canonical conversion (field + companion
-label specs), npz contract, meta + recommendations, inference-job conversion,
-local prep caches (the live ptv3/randlanet cold paths), density-generalization
-manifest round-trip, training-log parsing, viewer loading, local Docker backend.
+label specs), npz contract, meta + recommendations, inference-job conversion
+(incl. opt-in HAG), density-generalization manifest round-trip, training-log
+parsing, viewer loading, Dockerfile generation, local Docker backend.
+
+Every check here guards code the shipped app reaches. If a function's only caller
+is this file, delete the function — don't add a check for it.
 """
 
 from __future__ import annotations
@@ -144,21 +147,25 @@ def main():
         # Occupancy o = rho*g^2 must stay >= 1 (the density-invariant band, see
         # scripts/DENSITY_DG.md), grids shrink monotonically as density grows, and
         # every value stays inside its UI band so the Train page never clamps.
-        prev = None
-        for rho in (0.5, 2.0, 10.0, 50.0, 100.0, 250.0, 1000.0):
-            r = analysis.recommend({"stats": {"mean_pts_per_m2": rho,
-                                              "mean_spacing_m": rho ** -0.5}})
-            for k, rec in r.items():
-                g = rec["grid"]
-                dflt = next(int(p.default) for p in analysis.BACKBONES[k].params
-                            if p.flag == "batch")
-                ok = (rho * g * g >= 0.99 and 1 <= rec["batch"] <= dflt
-                      and (10 <= rec["chunk_xy"] <= 200 if "chunk_xy" in rec else True))
-                check(f"recommend rho={rho} {k}: o>=1, batch<=default, chunk in band", ok)
-            if prev is not None:
-                check(f"recommend rho={rho}: grids shrink with density",
-                      all(r[k]["grid"] <= prev[k]["grid"] + 1e-9 for k in r))
-            prev = r
+        # The whole sweep is folded into two checks — one failing (rho, backbone)
+        # is named in the message, so per-cell checks bought nothing but noise.
+        DENSITIES = (0.5, 2.0, 10.0, 50.0, 100.0, 250.0, 1000.0)
+        recs = {rho: analysis.recommend({"stats": {"mean_pts_per_m2": rho,
+                                                   "mean_spacing_m": rho ** -0.5}})
+                for rho in DENSITIES}
+        def _in_band(rho, k, rec):
+            dflt = next(int(p.default) for p in analysis.BACKBONES[k].params
+                        if p.flag == "batch")
+            return (rho * rec["grid"] ** 2 >= 0.99 and 1 <= rec["batch"] <= dflt
+                    and (10 <= rec["chunk_xy"] <= 200 if "chunk_xy" in rec else True))
+
+        bad = [f"rho={rho} {k}" for rho, r in recs.items() for k, rec in r.items()
+               if not _in_band(rho, k, rec)]
+        check("recommend: o>=1, batch<=default, chunk in band across the sweep"
+              + (" - bad: " + ", ".join(bad) if bad else ""), not bad)
+        check("recommend: grids shrink monotonically with density",
+              all(recs[hi][k]["grid"] <= recs[lo][k]["grid"] + 1e-9
+                  for lo, hi in zip(DENSITIES, DENSITIES[1:]) for k in recs[hi]))
         r05 = analysis.recommend({"stats": {"mean_pts_per_m2": 0.5,
                                             "mean_spacing_m": 0.5 ** -0.5}})
         check("recommend: kpconvx reproduces the proven sparse recipe (g=2.0, chunk=100)",
@@ -466,118 +473,6 @@ def main():
         check("plots: multi_run_figure overlays runs + an average line",
               len(line_labels) == 3 and any("average" in s for s in line_labels))
 
-        # ---------------- local prep caches (live cold backbones: ptv3, randlanet)
-        from trainer_gui import prep
-
-        # ptv3 (cold): rgb tiles. prep mirrors the dataset's three materialized
-        # splits verbatim (val = selection holdout, test = final report) — it does
-        # NOT re-derive its own val.
-        pd = prep.prep_dataset("ptv3", staged, {"chunk-xy": 50.0}, progress=print)
-        check("prep ptv3: dir name", pd.name == "ptv3_cold_chunk50")
-        train_tiles = sorted((pd / "train").glob("*.npz"))
-        val_tiles = sorted((pd / "val").glob("*.npz"))
-        test_tiles = sorted((pd / "test").glob("*.npz"))
-        check("prep ptv3: tiles in train + val + test",
-              bool(train_tiles) and bool(val_tiles) and bool(test_tiles))
-        check("prep ptv3: cold tile keys (rgb layout)",
-              set(np.load(train_tiles[0]).files) == {"xyz", "rgb", "lab"})
-
-        # randlanet (cold): whole-scene grid subsample, fewer points than input
-        pr = prep.prep_dataset("randlanet", staged, {"sub-grid": 0.3})
-        check("prep randlanet: dir name", pr.name == "randlanet_cold_grid30")
-        zr = np.load(next((pr / "train").glob("*.npz")))
-        zin = np.load(next((staged / "train").glob("*.npz")))
-        check("prep randlanet: keys + subsampled",
-              set(zr.files) == {"xyz", "rgb", "lab"} and len(zr["xyz"]) < len(zin["xyz"]))
-
-        # idempotency: a second run does no extra work and keeps tile counts
-        n_before = len(list((pd / "train").glob("*.npz")))
-        prep.prep_dataset("ptv3", staged, {"chunk-xy": 50.0})
-        check("prep: idempotent re-run",
-              len(list((pd / "train").glob("*.npz"))) == n_before)
-
-        # the live backbones without a local prep path are correctly unsupported
-        check("prep: kpconvx_cold + hag variants have no local prep",
-              not prep.supports_local_prep("kpconvx_cold")
-              and not prep.supports_local_prep("ptv3_hag")
-              and not prep.supports_local_prep("randlanet_hag"))
-
-        # ---------------- Pretraining: tile_for_model (no PDAL needed)
-        from trainer_gui import pretrain
-
-        pt_out = tmp / "pretrain_tile"
-        prep_dir = pretrain.tile_for_model(str(laz_root / "train"), pt_out,
-                                           "ptv3", {"chunk-xy": 50.0}, progress=print)
-        check("pretrain tile: prep dir tag", prep_dir.name == "ptv3_cold_chunk50")
-        check("pretrain tile: staged under out/_staged",
-              (pt_out / "_staged" / "train").exists())
-        pt_tiles = sorted((prep_dir / "train").glob("*.npz"))
-        check("pretrain tile: train tiles produced", len(pt_tiles) > 0)
-        zpt = np.load(pt_tiles[0])
-        check("pretrain tile: tile keys match prep contract",
-              set(zpt.files) == {"xyz", "rgb", "lab"})
-
-        # ---------------- Pretraining: add_hag (skipped if PDAL absent)
-        try:
-            import pdal  # noqa: F401
-            have_pdal = True
-        except Exception:  # noqa: BLE001
-            have_pdal = False
-        if have_pdal:
-            hag_src = tmp / "hag_src"
-            hag_src.mkdir()
-            xyz = make_xyz(20_000)
-            # Low points are ground (class 2) so hag_nn has a surface to measure.
-            labels = np.where(xyz[:, 2] < 0.5, 2, 6).astype(np.uint8)
-            write_laz(hag_src / "scene_h.las", xyz, labels, RNG.uniform(0, 4000, len(xyz)))
-            hag_out = tmp / "hag_out"
-            summary = pretrain.add_hag(str(hag_src), hag_out, ground_class=2,
-                                       use_smrf=False, hag_filter="hag_nn", progress=print)
-            check("pretrain hag: output laz written", (hag_out / "scene_h.laz").exists())
-            sidecar = hag_out / "scene_h.json"
-            check("pretrain hag: json sidecar written", sidecar.exists())
-            sj = json.loads(sidecar.read_text())
-            check("pretrain hag: sidecar has hag stats",
-                  {"hag_min", "hag_mean", "hag_max"}.issubset(sj))
-            check("pretrain hag: summary json written",
-                  (hag_out / "pretrain_summary.json").exists() and summary["n_files"] == 1)
-
-            # txt input: a clear ground plane + elevated points so SMRF finds ground
-            txt_hag = tmp / "hag_txt_src"
-            txt_hag.mkdir()
-            ground = make_xyz(10_000)
-            ground[:, 2] = RNG.uniform(0, 0.05, len(ground))      # flat ground ~0 m
-            above = make_xyz(10_000)
-            above[:, 2] = RNG.uniform(3, 8, len(above))           # elevated points
-            gxyz = np.vstack([ground, above])
-            pc = np.column_stack([gxyz, RNG.uniform(0, 100, len(gxyz)),
-                                  np.ones(len(gxyz))])             # x,y,z,intensity,ret
-            np.savetxt(txt_hag / "scene_t_PC3.txt", pc, delimiter=",", fmt="%.3f")
-            txt_out = tmp / "hag_txt_out"
-            pretrain.add_hag(str(txt_hag), txt_out, use_smrf=True,
-                             hag_filter="hag_nn", progress=print)
-            check("pretrain hag: txt input -> laz", (txt_out / "scene_t_PC3.laz").exists())
-            zt_hag = json.loads((txt_out / "scene_t_PC3.json").read_text())
-            check("pretrain hag: txt sidecar HAG spans ground..elevated",
-                  zt_hag["hag_max"] > 2.0)
-
-        else:
-            print("  - pretrain hag: skipped (pdal not installed)")
-
-        # per-tile HAG over a converted dataset -> sibling <name>_hag with a hag
-        # key. Default method is now "grid" (raster approximation) — no PDAL.
-        hag_ds = dataset.add_hag_to_dataset(staged, tmp / "staging" / "laz_demo_hag",
-                                            progress=print)
-        zhd = np.load(hag_ds / "train" / "scene0.npz")
-        check("dataset: add_hag_to_dataset adds a per-tile hag channel",
-              "hag" in zhd.files and zhd["hag"].shape[0] == zhd["xyz"].shape[0])
-        check("dataset: add_hag covers the test split too",
-              "hag" in np.load(hag_ds / "test" / "scene0.npz").files)
-        mhd = json.loads((hag_ds / "dataset_meta.json").read_text())
-        check("dataset: hag dataset meta tags per_tile source + keeps classes",
-              mhd["source"]["hag_source"] == "per_tile_grid"
-              and mhd["num_classes"] == 3 and isinstance(mhd["has_hag"], bool))
-
         # inline HAG: bake it during tiling in one pass (no separate reload).
         # ground_value=2 (the "Ground" source value) -> the labels are the ONLY
         # ground source (SMRF never runs); grid nearest-fills label gaps.
@@ -594,6 +489,31 @@ def main():
               and mih["source"]["hag_source"] == "grid+labels"
               and mih["source"]["hag_ground_value"] == 2
               and mih["source"]["hag_use_smrf"] is False)
+
+        # convert_infer_job with the HAG box ticked + a ground class: resolves the
+        # 'classification' field off files[0], masks ground by value, bakes a hag
+        # channel — and STILL writes no label key (empty value_to_index). Guards the
+        # whole opt-in HAG path; grid needs no PDAL.
+        job_h = dataset.convert_infer_job("hag_job", str(laz_root / "val"),
+                                          tmp / "staging", hag=True, hag_filter="grid",
+                                          ground_value=2, progress=print)
+        zjh = np.load(next((job_h / "scenes").glob("*.npz")))
+        check("convert_infer_job(hag, ground_value): hag baked, no label key",
+              "hag" in zjh.files and "label" not in zjh.files
+              and zjh["hag"].shape[0] == zjh["xyz"].shape[0])
+        # Ground from the labels must NOT equal ground from detection — otherwise
+        # ground_value silently isn't reaching hag_for_cloud's ground_mask.
+        job_d = dataset.convert_infer_job("hag_detect_job", str(laz_root / "val"),
+                                          tmp / "staging", hag=True, hag_filter="grid")
+        zjd = np.load(next((job_d / "scenes").glob("*.npz")))
+        check("convert_infer_job(ground_value): labeled ground != detected ground",
+              "hag" in zjd.files and not np.allclose(zjh["hag"], zjd["hag"]))
+        # HAG off = the default: not one wasted ground pass, no hag channel.
+        job_n = dataset.convert_infer_job("nohag_job", str(laz_root / "val"),
+                                          tmp / "staging")
+        zjn = np.load(next((job_n / "scenes").glob("*.npz")))
+        check("convert_infer_job(): HAG is opt-in — no hag channel by default",
+              "hag" not in zjn.files)
 
         # ---------------- analysis.scan_folder on raw files
         stats = analysis.scan_folder(dataset.discover_scenes(laz_root / "train"))

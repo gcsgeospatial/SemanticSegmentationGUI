@@ -6,6 +6,10 @@ materialized train/val/test scene folders live under /datasets. Random initializ
 shares the architecture and feature recipe for a clean init comparison.
 
 Features are [xyz, intensity, return_number] (5 ch); fc0 is rebuilt 5->8.
+--hag appends a HeightAboveGround channel (IN_DIM 5 -> 6), read per point from
+the scene npz "hag" array, which the dataset (or the Inference page's HAG box)
+must provide — this replaces the old copy-paste local_train_randlanet_hag.py
+twin (that file is now a thin wrapper forcing --hag).
 Per-scene p95-clipped intensity normalization, vertical-rotation / x-flip /
 isotropic-scale train augmentation, class-weighted CE (+ optional focal /
 Lovász) with rare-class-centered sphere sampling, a held-out val pass every
@@ -14,7 +18,7 @@ scores every val/test scene on its raw points.
 
 Flags:
   --dataset NAME    (required) canonical dataset under /datasets
-  --sub-grid / --num-points / --epochs / --batch / --steps-per-epoch
+  --sub-grid / --num-points / --epochs / --batch / --steps-per-epoch / --hag
   --mode infer --weights runs/<id>/final_model.pth --infer-input <job_id>
 
 Timeout comes from the TT_TIMEOUT_HOURS env var.
@@ -52,6 +56,13 @@ DG_COARSEN_MAX = 2.0     # = 1/(SUB_GRID_SIZE*sqrt(rho_min)); density sweep-down
 DG_P_NATIVE    = 0.5     # P(sphere kept at native SUB_GRID_SIZE)
 DG_INFER_ADABN = False   # D2b: recompute BN stats on target tiles before predicting (RandLA is pure-BN)
 DG_INFER_TTA   = 0       # D5: # extra density(scale) views to average at inference (0=off)
+EVAL_VOTES     = 2       # overlap-vote passes at eval/inference: pass v shifts the
+                         # block grid by v/EVAL_VOTES of a block and softmax probs
+                         # accumulate per point, so block-border points get a vote
+                         # from a block that centers them (the same overlap voting
+                         # the PTv3/KPConvX evals already do). 1 = old single-pass
+                         # argmax at the old cost; each extra pass costs one more
+                         # full forward over the scene.
 # D3b: explicit local-density input channel (log k-th-NN distance) -> bumps IN_DIM 5->6
 # (retrain; old fc0 weights won't load). Pair with DG_DENSITY_AUG so rho varies.
 DG_LOGDK_FEAT  = False
@@ -89,7 +100,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                     num_points: Optional[int] = None, epochs: Optional[int] = None,
                     batch: Optional[int] = None, steps_per_epoch: Optional[int] = None,
                     mode: str = "train", weights: Optional[str] = None,
-                    infer_input: Optional[str] = None):
+                    infer_input: Optional[str] = None, hag: bool = False):
     if dataset is None and mode != "infer":
         raise ValueError("--dataset is required: pass a canonical trainer_gui "
                          "dataset name under /datasets. The only "
@@ -109,6 +120,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     DG_LOGDK_K     = dg.env_int("DG_LOGDK_K", globals()["DG_LOGDK_K"])
     DG_INFER_ADABN = dg.env_bool("DG_INFER_ADABN", globals()["DG_INFER_ADABN"])
     DG_INFER_TTA   = dg.env_int("DG_INFER_TTA", globals()["DG_INFER_TTA"])
+    EVAL_VOTES     = dg.env_int("EVAL_VOTES", globals()["EVAL_VOTES"])
     # Loss / class-balance overrides (GUI "Loss & class balance" panel -> LOSS_*/
     # RARE_* env; mirrors the DG env pattern). Unset env -> the script constants.
     USE_FOCAL       = dg.env_bool("LOSS_FOCAL", globals()["USE_FOCAL"])
@@ -116,16 +128,18 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     CLASS_WEIGHTING = dg.env_bool("LOSS_CLASS_WEIGHTING", globals()["CLASS_WEIGHTING"])
     WEIGHT_BETA     = dg.env_float("LOSS_WEIGHT_BETA", globals()["WEIGHT_BETA"])
     RARE_OVERSAMPLE = dg.env_bool("RARE_OVERSAMPLE", globals()["RARE_OVERSAMPLE"])
+    RARE_CENTER_PROB = dg.env_float("RARE_CENTER_PROB", globals()["RARE_CENTER_PROB"])
     import torch.nn as nn
     import torch.optim as optim
     from torch.utils.data import DataLoader, Dataset
 
     # --- resolve config: CLI args override the module defaults ---------------
     SUB_GRID_SIZE = sub_grid if sub_grid is not None else globals()["SUB_GRID_SIZE"]
-    # D3b: effective input dim grows by 1 when the log-d_k channel is on. Shadow IN_DIM
-    # here (before build_net is defined) so build_net's default, the checkpoint in-dim
-    # check, and the run-config all track it.
-    IN_DIM = globals()["IN_DIM"] + (1 if DG_LOGDK_FEAT else 0)
+    HAG = bool(hag)   # --hag: local vars named `hag` below are per-point ARRAYS
+    # Effective input dim: +1 HAG channel (--hag), +1 log-d_k channel (D3b). Shadow
+    # IN_DIM here (before build_net is defined) so build_net's default, the checkpoint
+    # in-dim check, and the run-config all track it.
+    IN_DIM = globals()["IN_DIM"] + (1 if HAG else 0) + (1 if DG_LOGDK_FEAT else 0)
     NUM_POINTS    = num_points if num_points is not None else globals()["NUM_POINTS"]
     N_EPOCHS      = epochs if epochs is not None else globals()["N_EPOCHS"]
     BATCH_SIZE    = batch if batch is not None else globals()["BATCH_SIZE"]
@@ -140,13 +154,24 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
             ds_meta = json.load(f)
         NUM_CLASSES = int(ds_meta["num_classes"])
         CLASS_NAMES = list(ds_meta["class_names"])
+        if HAG and not ds_meta.get("has_hag"):
+            raise ValueError(
+                f"--hag needs a dataset with a real HeightAboveGround channel, but "
+                f"'{dataset}' has none (has_hag=false). Rebuild it with the Datasets "
+                f"page 'Compute Height-Above-Ground' box, or train the plain RandLA-Net.")
+        # --hag: the dataset's real HAG. (Legacy datasets recorded no method; the
+        # PDAL nearest-neighbour filter was the only one back then.)
+        HAG_SOURCE = (((ds_meta.get("source") or {}).get("hag_source") or "pdal_hag_nn")
+                      if HAG else None)
         # No "warm" in the name: the cold sibling shares this cache (identical prep).
-        PREP_DIR = f"{ds_root}/prep/randlanet_grid{int(round(SUB_GRID_SIZE * 100))}_p95"
+        # --hag gets its own cache family (tiles carry a "hag" array).
+        PREP_DIR = (f"{ds_root}/prep/randlanet{'_hag' if HAG else ''}"
+                    f"_grid{int(round(SUB_GRID_SIZE * 100))}_p95")
     else:
         # --mode infer: dataset-free. The real class count/names come from the
         # checkpoint (+ its run.json) in the inference branch; these are placeholders
         # so the inline `class Cfg` (num_classes = NUM_CLASSES) below has a value.
-        ds_meta, NUM_CLASSES, CLASS_NAMES, PREP_DIR = {}, 0, [], None
+        ds_meta, NUM_CLASSES, CLASS_NAMES, HAG_SOURCE, PREP_DIR = {}, 0, [], None, None
 
     # utils/metric.py calls sklearn.metrics.confusion_matrix(y_true, y_pred,
     # np.arange(...)) — the third positional was the `labels` argument in old
@@ -284,10 +309,19 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     def load_scene(pc_path, cls_path=None):
         return load_canonical(pc_path)
 
-    def grid_subsample(xyz, intensity, ret_num, lab, grid):
+    def load_canonical_hag(npz_path, xyz):
+        # --hag: real per-point HAG from the dataset's npz. The startup guard already
+        # rejected a dataset without one, so a miss here means a corrupt scene.
+        z = np.load(npz_path)
+        if "hag" in z.files and len(z["hag"]) == len(xyz):
+            return z["hag"].astype(np.float32)
+        raise ValueError(f"{os.path.basename(npz_path)} is missing its 'hag' channel, "
+                         f"which --hag requires. Rebuild the dataset with HAG enabled.")
+
+    def grid_subsample(xyz, intensity, ret_num, hag, lab, grid):
         keys = np.floor(xyz / grid).astype(np.int64)
         uniq = tc.voxel_unique(keys)
-        return xyz[uniq], intensity[uniq], ret_num[uniq], lab[uniq]
+        return xyz[uniq], intensity[uniq], ret_num[uniq], hag[uniq], lab[uniq]
 
     def _split_scenes():
         """Read the dataset's three materialized whole-scene folders verbatim
@@ -307,14 +341,18 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     def _cache_signature():
         # Everything that changes what a cached scene .npz contains. A mismatch
         # means the cache is stale/leaky and must not be silently reused.
+        # Both dicts reproduce the pre-merge signatures byte-for-byte (base and
+        # _hag script), so every existing cache stays valid.
         sig = {
             "format_version": 1,
-            "pipeline": "randlanet",
+            "pipeline": "randlanet_hag" if HAG else "randlanet",
             "dataset": dataset,
             "sub_grid_size": SUB_GRID_SIZE,
             "num_classes": NUM_CLASSES,
-            "feature_recipe": "xyz,intensity,return_number",
+            "feature_recipe": "xyz,intensity,return_number" + (",hag" if HAG else ""),
         }
+        if HAG:
+            sig["hag_source"] = HAG_SOURCE
         # The dataset carries the split decision in dataset_meta.json; fold its
         # seed/mode in so a re-split of the dataset invalidates the cache.
         sp = ds_meta.get("split", {}) if isinstance(ds_meta, dict) else {}
@@ -375,16 +413,22 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                 try:
                     xyz, intensity, ret_num, lab = load_scene(pc_path, cls_path)
                     n_in = len(xyz)
-                    xyz, intensity, ret_num, lab = grid_subsample(
-                        xyz, intensity, ret_num, lab, SUB_GRID_SIZE)
+                    # --hag: the scene's real per-point HAG rides through the
+                    # subsample and is saved into the cache tiles; without --hag
+                    # the tile layout is exactly the pre-merge one (no hag key).
+                    hag = (load_canonical_hag(pc_path, xyz) if HAG
+                           else np.zeros(len(xyz), np.float32))
+                    xyz, intensity, ret_num, hag, lab = grid_subsample(
+                        xyz, intensity, ret_num, hag, lab, SUB_GRID_SIZE)
                 except Exception as e:
                     print(f"  skip {pc_path}: {e}", flush=True); continue
-                np.savez_compressed(
-                    out,
-                    xyz=xyz.astype(np.float32),
-                    intensity=intensity.astype(np.float32),
-                    ret_num=ret_num.astype(np.float32),
-                    lab=lab.astype(np.int32))
+                tile = dict(xyz=xyz.astype(np.float32),
+                            intensity=intensity.astype(np.float32),
+                            ret_num=ret_num.astype(np.float32),
+                            lab=lab.astype(np.int32))
+                if HAG:
+                    tile["hag"] = hag.astype(np.float32)
+                np.savez_compressed(out, **tile)
                 open(out + ".done", "w").close()      # mark complete after a clean write
                 any_new = True
                 print(f"    [{i+1}/{len(items)}] {name}: {n_in:,} -> "
@@ -414,8 +458,8 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         return flat
 
     def collate_fn(batch):
-        # Items are (pc, extra_feats(2ch), label, point_idx, cloud_idx); the
-        # network input is [xyz, intensity, return_number] = IN_DIM channels.
+        # Items are (pc, extra_feats, label, point_idx, cloud_idx); the network
+        # input is [xyz, intensity, return_number(, hag)] = IN_DIM channels.
         pcs, feats, lbs, idxs, cinds = zip(*batch)
         pcs  = np.stack(pcs);  feats = np.stack(feats); lbs = np.stack(lbs)
         idxs = np.stack(idxs); cinds = np.stack(cinds)
@@ -450,15 +494,17 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         @staticmethod
         def _load(f):
             z = np.load(f)
-            return (z["xyz"], z["intensity"], z["ret_num"], z["lab"])
+            # --hag caches carry "hag"; base caches don't and never read the slot.
+            hag = z["hag"] if "hag" in z.files else None
+            return (z["xyz"], z["intensity"], z["ret_num"], hag, z["lab"])
 
         def set_rare_classes(self, rare_classes):
             self.rare_idx = [np.where(np.isin(lab, rare_classes))[0]
-                             for _, _, _, lab in self.scenes]
+                             for _, _, _, _, lab in self.scenes]
             self.rare_scenes = [i for i, r in enumerate(self.rare_idx) if len(r)]
 
         def sample_sphere(self, cloud_idx, center_idx, augment=False, rng=np.random):
-            xyz, intensity, ret_num, lab = self.scenes[cloud_idx]
+            xyz, intensity, ret_num, hag, lab = self.scenes[cloud_idx]
             center = xyz[center_idx:center_idx + 1]
             d2 = np.sum((xyz - center) ** 2, axis=1)
             sel = np.argpartition(d2, min(cfg.num_points, len(xyz) - 1))[:cfg.num_points]
@@ -486,6 +532,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                     pc[:, 0] *= -1.0
                 pc = pc * np.float32(rng.uniform(0.9, 1.1))
             feat2 = np.stack([intensity[sel], ret_num[sel]]
+                             + ([hag[sel]] if HAG else [])
                              + ([dg.local_density_logdk(pc, DG_LOGDK_K)] if DG_LOGDK_FEAT else []),
                              axis=1).astype(np.float32)   # D3b: + log d_k on the (augmented) coords
             lb = lab[sel].astype(np.int64)
@@ -513,28 +560,18 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     # --- Prediction helpers (shared by post-training demo + infer mode) ------
     import traceback
     from scipy.spatial import cKDTree
-    BASE_PALETTE = np.array([
-        [139, 90, 43], [34, 160, 34], [200, 60, 60], [40, 110, 220], [235, 225, 60],
-        [150, 80, 200], [240, 140, 40], [70, 200, 200], [220, 100, 170], [120, 120, 120],
-        [90, 140, 60], [180, 180, 90], [60, 60, 160], [200, 170, 130], [100, 220, 120],
-        [230, 70, 110], [50, 160, 110], [170, 110, 60], [110, 170, 230], [240, 200, 160],
-    ], dtype=np.int32)
 
-    def _palette(num_classes):
-        reps = -(-num_classes // len(BASE_PALETTE))
-        return np.tile(BASE_PALETTE, (reps, 1))[:num_classes]
-
-    def _write_ply(path, xyz, pred_idx, palette, intensity=None):
-        cols = [xyz.astype(np.float32), palette[pred_idx]]
-        props = ("property float x\nproperty float y\nproperty float z\n"
-                 "property uchar red\nproperty uchar green\nproperty uchar blue\n")
-        fmt = ["%.3f", "%.3f", "%.3f", "%d", "%d", "%d"]
-        if intensity is not None:            # carry per-point intensity for the viewer
-            cols.append(np.asarray(intensity, np.float32).reshape(-1, 1))
-            props += "property float intensity\n"
-            fmt.append("%.5f")
-        header = "ply\nformat ascii 1.0\n" + f"element vertex {len(xyz)}\n" + props + "end_header"
-        np.savetxt(path, np.column_stack(cols), fmt=fmt, header=header, comments="")
+    def scene_hag(z, pc_path, n):
+        """Real per-point HAG from an inference scene npz (--hag); None when plain.
+        convert_infer_job writes it when the HAG box is ticked."""
+        if not HAG:
+            return None
+        if "hag" not in z.files or len(z["hag"]) != n:
+            raise ValueError(
+                f"{os.path.basename(pc_path)} has no per-point 'hag' channel, which this "
+                f"HAG model requires. Tick 'Compute Height-Above-Ground' on the Inference "
+                f"page and run again.")
+        return z["hag"].astype(np.float32)
 
     def make_predict_scene(net, num_classes):
         def _predict_scene(pc_path):
@@ -548,25 +585,36 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
             ret0 = z["return_number"].astype(np.float32) if "return_number" in z \
                 else (z["ret_num"].astype(np.float32) if "ret_num" in z
                       else np.zeros(len(xyz0), np.float32))
+            hag0 = scene_hag(z, pc_path, len(xyz0))
             keys = np.floor(xyz0 / SUB_GRID_SIZE).astype(np.int64)
             uniq = tc.voxel_unique(keys)
             sub_xyz = xyz0[uniq]
             order = np.lexsort((sub_xyz[:, 1], sub_xyz[:, 0]))   # rough spatial locality
-            sub_sorted = sub_xyz[order]
-            sub_itn = itn0[uniq][order]
-            sub_ret = ret0[uniq][order]
-            sub_pred = np.full(len(sub_xyz), -1, np.int64)
+            sub_itn0 = itn0[uniq]
+            sub_ret0 = ret0[uniq]
+            sub_hag0 = hag0[uniq] if HAG else None
+            # EVAL_VOTES soft-vote passes over offset block grids (same overlap
+            # voting as the eval protocol; votes is n_sub x C float32).
+            sub_votes = np.zeros((len(sub_xyz), num_classes), np.float32)
             N = cfg.num_points
+            n_passes = max(int(EVAL_VOTES), 1)
             with torch.no_grad():
+              for vp in range(n_passes):
+                ov = np.roll(order, -(N * vp) // n_passes) if vp else order
+                sub_sorted = sub_xyz[ov]
+                sub_itn = sub_itn0[ov]
+                sub_ret = sub_ret0[ov]
+                sub_hag = sub_hag0[ov] if HAG else None
                 for s in range(0, len(sub_sorted), N):
                     real = min(N, len(sub_sorted) - s)
                     if real < 64:
                         continue
                     block = sub_sorted[s:s + N]
                     f2 = np.stack([sub_itn[s:s + N], sub_ret[s:s + N]]
+                                  + ([sub_hag[s:s + N]] if HAG else [])
                                   + ([dg.local_density_logdk(block, DG_LOGDK_K)] if DG_LOGDK_FEAT else []),
                                   axis=1)   # D3b
-                    orig = order[s:s + real].astype(np.int64)   # indices into sub_xyz
+                    orig = ov[s:s + real].astype(np.int64)      # indices into sub_xyz
                     if real < N:                         # pad the final short block
                         pad = np.random.choice(real, N - real)
                         block = np.concatenate([block, block[pad]], axis=0)
@@ -579,7 +627,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                     pc0 = (block - block.mean(0, keepdims=True)).astype(np.float32)
                     # D5 density-TTA: isotropic scale s rescales the LocSE relative-coord
                     # magnitudes (a density view); average softmax over views. views=[1.0]
-                    # when off -> identical to the old single-view argmax.
+                    # when off -> identical to the old single-view behavior.
                     views = [1.0] + (list(np.linspace(0.85, 1.2, DG_INFER_TTA))
                                      if DG_INFER_TTA else [])
                     prob = None
@@ -595,12 +643,11 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                         lg = net(batch)["logits"].transpose(1, 2).reshape(-1, num_classes)
                         pp = torch.softmax(lg.float(), -1).cpu().numpy()
                         prob = pp if prob is None else prob + pp
-                    p = prob.argmax(-1)
                     valid = orig >= 0
-                    sub_pred[orig[valid]] = p[valid]
-            valid = sub_pred >= 0
+                    sub_votes[orig[valid]] += prob[valid]
+            valid = sub_votes.sum(1) > 0
             nn = cKDTree(sub_xyz[valid]).query(xyz0)[1]
-            pred = sub_pred[valid][nn]
+            pred = sub_votes[valid].argmax(1)[nn]
             # itn0 is the p95-normalized intensity (the feature the net saw).
             return xyz0, np.clip(pred, 0, num_classes - 1), itn0
         return _predict_scene
@@ -641,8 +688,9 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         if ckpt_in_dim != IN_DIM:
             raise ValueError(
                 f"checkpoint fc0 expects {ckpt_in_dim} input channels but this "
-                f"script feeds {IN_DIM} ([xyz, intensity, return_number]) — "
-                f"use weights trained by this script version")
+                f"script feeds {IN_DIM} ([xyz, intensity, return_number"
+                f"{', hag' if HAG else ''}]) — use weights trained with the same "
+                f"feature recipe (HAG runs need --hag and vice versa)")
         net.load_state_dict(sd)
         net.eval()
         print(f"  [infer] loaded {weights} ({num_classes} classes: {class_names}; "
@@ -662,11 +710,10 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         infer_cfg = {"backbone": "RandLA-Net", "mode": "infer", "weights": weights,
                      "infer_input": infer_input, "num_classes": num_classes,
                      "class_names": class_names, "sub_grid_size": SUB_GRID_SIZE,
-                     "gpu": gpu_name(),
+                     "hag": HAG, "gpu": gpu_name(),
                      "started_utc": datetime.utcnow().isoformat() + "Z"}
 
         predict_scene = make_predict_scene(net, num_classes)
-        palette = _palette(num_classes)
         print(f"  [infer] labeling {len(scenes)} scene(s) -> {pred_dir}", flush=True)
         if DG_INFER_ADABN:
             # D2b: re-estimate BN running stats on the target tiles (label-free) so the
@@ -686,9 +733,12 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                     ret0 = (z["return_number"].astype(np.float32) if "return_number" in z
                             else (z["ret_num"].astype(np.float32) if "ret_num" in z
                                   else np.zeros(len(xyz0), np.float32)))
+                    hag0 = scene_hag(z, pc_path, len(xyz0))
                     keys = np.floor(xyz0 / SUB_GRID_SIZE).astype(np.int64)
                     uniq = tc.voxel_unique(keys)
                     sx, si, sr = xyz0[uniq], itn0[uniq], ret0[uniq]
+                    # BN stats must see the same feature the net will be fed at predict.
+                    shag = hag0[uniq] if HAG else None
                     for s0 in range(0, len(sx), N):
                         if seen >= cap:
                             return
@@ -697,6 +747,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                             continue
                         block = sx[s0:s0 + N]
                         f2 = np.stack([si[s0:s0 + N], sr[s0:s0 + N]]
+                                      + ([shag[s0:s0 + N]] if HAG else [])
                                       + ([dg.local_density_logdk(block, DG_LOGDK_K)] if DG_LOGDK_FEAT else []),
                                       axis=1)   # D3b
                         if real < N:
@@ -735,12 +786,14 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     # TRAINING MODE
     # ==========================================================================
     print("=" * 70)
-    print(f"  RandLA-Net  {dataset}  "
+    print(f"  RandLA-Net{' +HAG' if HAG else ''}  {dataset}  "
           f"({gpu_name()}, {N_EPOCHS} ep, batch {BATCH_SIZE})")
     print("=" * 70)
     train_list, val_list, test_list = ensure_prep()
     tag = dataset
-    run_id = datetime.utcnow().strftime(f"%Y%m%d_%H%M%S_{tag}_randlanet_cold")
+    # keep the exact pre-merge run-id suffixes so run lineage stays continuous
+    run_id = datetime.utcnow().strftime(
+        f"%Y%m%d_%H%M%S_{tag}_randlanet_cold" + ("_hag" if HAG else ""))
     run_dir = f"/outputs/runs/{run_id}"
     os.makedirs(f"{run_dir}/checkpoints", exist_ok=True)
     with open(f"{run_dir}/run.json", "w") as f:
@@ -751,8 +804,11 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
             "n_epochs": N_EPOCHS,
             "batch_size": BATCH_SIZE, "num_points": NUM_POINTS,
             "sub_grid_size": SUB_GRID_SIZE, "in_dim": IN_DIM,
-            "features": ["x", "y", "z", "intensity", "return_number"],
+            "features": ["x", "y", "z", "intensity", "return_number"]
+                        + (["HAG"] if HAG else []),
+            "hag_source": HAG_SOURCE,
             "steps_per_epoch": STEPS,
+            "eval_votes": EVAL_VOTES,
             "class_balance": {"weighting": CLASS_WEIGHTING, "beta": WEIGHT_BETA,
                               "weight_scheme": "inv_sqrt_freq" if WEIGHT_BETA == 0.5
                               else f"inv_freq^{WEIGHT_BETA}",
@@ -783,7 +839,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     # rare classes. Rare = train frequency < RARE_FREQ_THRESH.
     print("  scanning train scenes for class balance…", flush=True)
     class_counts = np.zeros(NUM_CLASSES, dtype=np.int64)
-    for _, _, _, lab in train_ds.scenes:
+    for _, _, _, _, lab in train_ds.scenes:
         v = lab[lab >= 0]
         if v.size:
             class_counts += np.bincount(v, minlength=NUM_CLASSES)
@@ -851,10 +907,12 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
 
     def evaluate(ds, name2src, label):
         """Full-coverage eval scored on the ORIGINAL raw points (official
-        protocol). Each scene's 0.30 m subsampled points are predicted once via
-        spatially-sorted NUM_POINTS blocks; those predictions are then
-        propagated to the raw cloud by nearest neighbour and scored against the
-        raw GT, instead of scoring the subsampled points (which is neither the
+        protocol). Each scene's 0.30 m subsampled points are predicted via
+        spatially-sorted NUM_POINTS blocks, over EVAL_VOTES offset passes whose
+        per-point softmax probs are summed (overlap voting — the protocol the
+        PTv3/KPConvX evals use); the voted predictions are then propagated to
+        the raw cloud by nearest neighbour and scored against the raw GT,
+        instead of scoring the subsampled points (which is neither the
         benchmark protocol nor comparable across backbones)."""
         t_inter = np.zeros(NUM_CLASSES, dtype=np.int64)
         t_union = np.zeros(NUM_CLASSES, dtype=np.int64)
@@ -863,9 +921,11 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         n_scenes = n_skipped = 0
         N = cfg.num_points
         with torch.no_grad():
-            for i, (xyz, intensity, ret_num, lab) in enumerate(ds.scenes):
+            for i, (xyz, intensity, ret_num, hag, lab) in enumerate(ds.scenes):
                 order = np.lexsort((xyz[:, 1], xyz[:, 0]))   # rough spatial locality
-                pred = np.full(len(xyz), -1, np.int64)
+                # EVAL_VOTES soft-vote passes over offset block grids (votes is
+                # n_sub x C float32 — a few MB per class per million points).
+                votes = np.zeros((len(xyz), NUM_CLASSES), np.float32)
                 pend_items, pend_blocks = [], []
 
                 def flush():
@@ -874,46 +934,52 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                         return
                     batch = _to_device(collate_fn(pend_items))
                     end_points = net(batch)
-                    p = end_points["logits"].transpose(1, 2).argmax(-1).cpu().numpy()
+                    p = torch.softmax(end_points["logits"].transpose(1, 2).float(),
+                                      -1).cpu().numpy()
                     for bi, orig in enumerate(pend_blocks):
                         valid = orig >= 0           # drop padded positions
-                        pred[orig[valid]] = p[bi, valid]
+                        votes[orig[valid]] += p[bi, valid]
                     pend_items, pend_blocks = [], []
 
-                for s in range(0, len(order), N):
-                    blk = order[s:s + N]
-                    real = len(blk)
-                    if real < 64:
-                        continue
-                    pts_blk = xyz[blk]
-                    f2 = np.stack([intensity[blk], ret_num[blk]]
-                                  + ([dg.local_density_logdk(pts_blk, DG_LOGDK_K)] if DG_LOGDK_FEAT else []),
-                                  axis=1).astype(np.float32)   # D3b
-                    orig = blk.astype(np.int64)
-                    if real < N:                         # pad the final short block
-                        pad = np.random.choice(real, N - real)
-                        pts_blk = np.concatenate([pts_blk, pts_blk[pad]], axis=0)
-                        f2 = np.concatenate([f2, f2[pad]], axis=0)
-                        orig = np.concatenate([orig, np.full(N - real, -1, np.int64)])
-                    # RandLA-Net subsamples by taking the FIRST points at each
-                    # layer (tf_map), so the input MUST be shuffled — training
-                    # spheres are (sample_sphere). The lexsort-ordered block
-                    # collapses the multi-scale subsampling onto one corner and
-                    # wrecks predictions. Shuffle, then track originals.
-                    perm = np.random.permutation(N)
-                    pts_blk, f2, orig = pts_blk[perm], f2[perm], orig[perm]
-                    pc_c = (pts_blk - pts_blk.mean(0, keepdims=True)).astype(np.float32)
-                    pend_items.append((pc_c, f2, np.zeros(N, np.int64),
-                                       np.arange(N, dtype=np.int32),
-                                       np.array([0], np.int32)))
-                    pend_blocks.append(orig)
-                    if len(pend_items) == VAL_BATCH:
-                        flush()
-                flush()
+                n_passes = max(int(EVAL_VOTES), 1)
+                for vp in range(n_passes):
+                    ov = np.roll(order, -(N * vp) // n_passes) if vp else order
+                    for s in range(0, len(ov), N):
+                        blk = ov[s:s + N]
+                        real = len(blk)
+                        if real < 64:
+                            continue
+                        pts_blk = xyz[blk]
+                        f2 = np.stack([intensity[blk], ret_num[blk]]
+                                      + ([hag[blk]] if HAG else [])
+                                      + ([dg.local_density_logdk(pts_blk, DG_LOGDK_K)] if DG_LOGDK_FEAT else []),
+                                      axis=1).astype(np.float32)   # D3b
+                        orig = blk.astype(np.int64)
+                        if real < N:                         # pad the final short block
+                            pad = np.random.choice(real, N - real)
+                            pts_blk = np.concatenate([pts_blk, pts_blk[pad]], axis=0)
+                            f2 = np.concatenate([f2, f2[pad]], axis=0)
+                            orig = np.concatenate([orig, np.full(N - real, -1, np.int64)])
+                        # RandLA-Net subsamples by taking the FIRST points at each
+                        # layer (tf_map), so the input MUST be shuffled — training
+                        # spheres are (sample_sphere). The lexsort-ordered block
+                        # collapses the multi-scale subsampling onto one corner and
+                        # wrecks predictions. Shuffle, then track originals.
+                        perm = np.random.permutation(N)
+                        pts_blk, f2, orig = pts_blk[perm], f2[perm], orig[perm]
+                        pc_c = (pts_blk - pts_blk.mean(0, keepdims=True)).astype(np.float32)
+                        pend_items.append((pc_c, f2, np.zeros(N, np.int64),
+                                           np.arange(N, dtype=np.int32),
+                                           np.array([0], np.int32)))
+                        pend_blocks.append(orig)
+                        if len(pend_items) == VAL_BATCH:
+                            flush()
+                    flush()
+                pred = votes.argmax(1)
                 # Reproject the subsampled-point predictions onto the raw cloud.
                 name = os.path.splitext(os.path.basename(ds.files[i]))[0]
                 src = name2src.get(name)
-                got = pred >= 0
+                got = votes.sum(1) > 0
                 if src is None or not got.any():
                     n_skipped += 1; continue
                 try:
@@ -966,7 +1032,9 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "helper"))
     from train_common import BestCheckpoint, write_run_manifest
     best = BestCheckpoint(run_dir)
-    write_run_manifest(run_dir, "randlanet", dataset)   # the single inference manifest (run.json)
+    # the single inference manifest (run.json); the _hag key keeps the Infer
+    # page mapping HAG runs back to the HAG entry point exactly as before.
+    write_run_manifest(run_dir, "randlanet_hag" if HAG else "randlanet", dataset)
 
     def run_eval(ep, write_json=False):
         net.eval()
@@ -1070,6 +1138,9 @@ def main():
     ap.add_argument('--mode', default='train')
     ap.add_argument('--weights', default=None)
     ap.add_argument('--infer-input', default=None)
+    ap.add_argument('--hag', action='store_true',
+                    help='append the HeightAboveGround input channel '
+                         '(replaces the old local_train_randlanet_hag.py)')
     args = ap.parse_args()
     train_randlanet(**vars(args))
 

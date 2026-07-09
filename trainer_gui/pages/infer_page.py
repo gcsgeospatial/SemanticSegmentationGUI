@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (QCheckBox, QColorDialog, QComboBox, QDialog, QDia
                                QRadioButton, QSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout,
                                QWidget)
 
-from .. import appstate, dataset, local_cli, modal_cli, ui
+from .. import appstate, dataset, local_cli, modal_cli, pretrain, ui
 from ..backbones import BACKBONES, infer_backbones
 from ..jobs import FuncWorker, JobRunner, LogParser
 
@@ -52,6 +52,7 @@ class InferPage(QWidget):
         self._local_weights: Path | None = None    # weights = the run.json's sibling
         self._dg: dict = {}                         # DG settings baked into the weights (run.json["dg"])
         self._run_class_names: list | None = None   # the loaded run's own classes (run.json)
+        self._hag_ground_value: int | None = None   # parsed in _check_hag, used by the converter
 
         root = QVBoxLayout(self)
         title = QLabel("Inference")
@@ -142,6 +143,39 @@ class InferPage(QWidget):
         self.chunk_spin.setDecimals(0)
         self.chunk_spin.setValue(50.0)
         iform.addRow("Tile size (m)", self.chunk_spin)
+        # HAG is opt-in: only the *_hag models read it, and computing it costs a full
+        # ground-detection pass. Loading a HAG run's run.json ticks this for you.
+        self.hag_chk = QCheckBox("Compute Height-Above-Ground (HAG)")
+        self.hag_chk.setToolTip("Bakes a per-point HAG channel into each converted scene. "
+                                "Only the *_hag models use it. Ground comes from the class "
+                                "named below when you set one, else it's detected.")
+        self.hag_chk.toggled.connect(lambda on: self.hag_opts_w.setVisible(on))
+        iform.addRow("Height-Above-Ground", self.hag_chk)
+        self.hag_filter = QComboBox()
+        self.hag_filter.addItems(list(pretrain.HAG_METHODS))
+        self.hag_filter.setToolTip("grid: fast raster approximation, no PDAL needed. "
+                                   "hag_nn / hag_delaunay: accurate PDAL filters (SMRF "
+                                   "detects ground when no ground class is set).")
+        self.hag_ground = QLineEdit()
+        self.hag_ground.setPlaceholderText("blank = detect")
+        self.hag_ground.setMaximumWidth(90)
+        self.hag_ground.setToolTip("Classification value in the input clouds that means "
+                                   "ground (e.g. 2). When set, those points are the only "
+                                   "ground source. Blank = detect ground instead.")
+        hag_row = QHBoxLayout()
+        hag_row.addWidget(QLabel("method"))
+        hag_row.addWidget(self.hag_filter)
+        hag_row.addWidget(QLabel("ground class"))
+        hag_row.addWidget(self.hag_ground)
+        hag_row.addStretch()
+        self.hag_opts_w = _wrap(hag_row)
+        self.hag_opts_w.setVisible(False)
+        iform.addRow("", self.hag_opts_w)
+        if not pretrain.pdal_available():
+            # grid still works without PDAL; convert_infer_job falls back to grid
+            # if a PDAL filter is picked anyway.
+            self.hag_chk.setText("Compute Height-Above-Ground (HAG) - grid only, "
+                                 "PDAL not installed")
         # TODO(not ready): inference-time density-adapt UI (AdaBN / density TTA)
         # hidden until reviewed; _infer_dg_env sends no AdaBN/TTA env for now.
         # Density generalization: inference-time, label-free, no retrain. Any model.
@@ -494,6 +528,16 @@ class InferPage(QWidget):
             self._append(f"✗ Model '{bkey}' isn't available here. Enable it on the "
                          f"Train page, then reload this run.json.")
             return
+        # hag_source is a truthy string iff the run trained with --hag. The old z-min
+        # height proxy is gone, so weights that learned it can never be fed their
+        # training feature again — refuse rather than silently hand them real HAG.
+        hs = str(m.get("hag_source") or "").lower()
+        if "proxy" in hs or "z_minus" in hs:
+            self._append(f"✗ This {bkey} run was trained on the z-min height proxy "
+                         f"(hag_source={m.get('hag_source')}). That feature no longer "
+                         f"exists. Rebuild the dataset with Height-Above-Ground enabled "
+                         f"and retrain.")
+            return
         self._manifest, self._manifest_path = m, p
         self.backbone_combo.setCurrentIndex(i)       # fires _sync_controls (sets defaults)
         if m.get("grid") is not None:                # then the manifest overrides them
@@ -504,6 +548,16 @@ class InferPage(QWidget):
         self.weights_edit.setText(str(self._local_weights))   # default
         # logdk changes input width, so it MUST be re-fed at inference (DG_* env below).
         self._dg = m.get("dg") or {}
+        # Prefill HAG from the run: tick + preselect the method it trained with. The
+        # user can still untick. Ground class isn't prefilled — run.json doesn't carry
+        # one, and it describes the inference input, not the training set.
+        self.hag_chk.setChecked(bool(hs))
+        if hs:
+            method = ("grid" if "grid" in hs
+                      else "hag_delaunay" if "delaunay" in hs else "hag_nn")
+            j = self.hag_filter.findText(method)
+            if j >= 0:
+                self.hag_filter.setCurrentIndex(j)
         # Label legend + viewer with the model's own classes.
         self._set_run_classes(self._names_from_manifest(m))
         self._apply_manifest_lock(True)   # arch/grid/tile come from the run — grey them out
@@ -511,6 +565,9 @@ class InferPage(QWidget):
         self._append(f"Loaded {p.name}: {bkey}, grid={m.get('grid')}, "
                      f"chunk={m.get('chunk_xy')}, intensity={m.get('intensity_norm')}. "
                      f"{ok} {self._local_weights}")
+        if hs:
+            self._append(f"[hag] run trained on real HAG ({m.get('hag_source')}); "
+                         f"HAG enabled, method={self.hag_filter.currentText()}.")
         if self._dg.get("logdk"):
             self._append(f"[dg] trained with the log-d_k density channel "
                          f"(k={self._dg.get('logdk_k', 8)}); recomputed at inference.")
@@ -600,6 +657,35 @@ class InferPage(QWidget):
             return BACKBONES[self._manifest["backbone"]]
         return BACKBONES[self.backbone_combo.currentData()]
 
+    def _check_hag(self, bkey) -> bool:
+        """Parse the ground class and refuse a HAG/model mismatch before we convert.
+
+        The *_hag scripts now hard-error on a scene with no 'hag' channel, and the
+        plain ones ignore one — so either mismatch is a mistake worth catching here
+        rather than in a Docker traceback. Sets self._hag_ground_value."""
+        self._hag_ground_value = None
+        on = self.hag_chk.isChecked()
+        gtxt = self.hag_ground.text().strip()
+        if on and gtxt:
+            try:
+                self._hag_ground_value = int(gtxt)
+            except ValueError:
+                self._append(f"Ground class '{gtxt}' isn't an integer - clear it to "
+                             f"detect ground, or enter a classification value.")
+                return False
+        is_hag_model = bool(bkey) and str(bkey).endswith("_hag")
+        if is_hag_model and not on:
+            self._append("✗ This is a HAG model - it needs a HeightAboveGround channel. "
+                         "Tick 'Compute Height-Above-Ground' in the Input box, or pick "
+                         "the non-HAG model.")
+            return False
+        if on and not is_hag_model:
+            self._append("✗ 'Compute Height-Above-Ground' is on, but this model ignores "
+                         "HAG - computing it would only cost time. Untick it, or pick "
+                         "the *_hag model.")
+            return False
+        return True
+
     # ------------------------------------------------------------- run chain
     def _run(self):
         input_dir = self.input_edit.text().strip()
@@ -613,6 +699,7 @@ class InferPage(QWidget):
                 self._append("Choose a .pth file.")
                 return
             self._weights_remote = f"uploads/{Path(self.pth_edit.text()).name}"
+            bkey = self.backbone_combo.currentData()   # a loose .pth has no manifest
         elif not modal:
             # LOCAL: run.json is the explicit input; weights = its sibling.
             if not (self._manifest and self._manifest_path):
@@ -637,12 +724,16 @@ class InferPage(QWidget):
             if not run_id:
                 self._append("Pick or type a run id.")
                 return
-            bkey = h.get("backbone") if isinstance(h, dict) else None
+            bkey = (h.get("backbone") if isinstance(h, dict) else None) \
+                or self.backbone_combo.currentData()
             if bkey in BACKBONES and not BACKBONES[bkey].folder_infer:
                 self._append(f"✗ {BACKBONES[bkey].label} doesn't support folder inference.")
                 return
             self._weights_remote = f"runs/{run_id}/final_model.pth"
             weights_run_id = run_id
+
+        if not self._check_hag(bkey):
+            return
 
         self._job_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         self._run_id = ""
@@ -664,17 +755,22 @@ class InferPage(QWidget):
         # p95 end-to-end; honor a legacy norm recorded in run.json.
         norm = (self._manifest or {}).get("intensity_norm", "p95") \
             if (self.from_run_radio.isChecked() and self._manifest) else "p95"
-        hag_filter = self._run_hag_filter()
-        if hag_filter:
-            self._append(f"[1/4] Run trained on real HAG ({hag_filter}) - reproducing "
-                         "it for the input scenes.")
+        # HAG comes from the checkbox, never from the run — _run() already refused a
+        # HAG/model mismatch, and the ground value parsed there.
+        hag_on = self.hag_chk.isChecked()
+        hag_filter = self.hag_filter.currentText() if hag_on else "grid"
+        if hag_on:
+            src = (f"ground = class {self._hag_ground_value}"
+                   if self._hag_ground_value is not None else "ground detected")
+            self._append(f"[1/4] Computing HeightAboveGround ({hag_filter}, {src}) "
+                         "for the input scenes.")
         job_root = self._infer_out_dir()
         self._append(f"[1/4] Converting {input_dir} to scenes (job {self._job_id}; "
                      f"intensity={norm}) -> {job_root}…")
         self.converter.start(dataset.convert_infer_job, self._job_id, input_dir,
                              appstate.workspace_dir(), intensity_norm=norm,
-                             hag=bool(hag_filter), hag_filter=hag_filter or "grid",
-                             out_dir=job_root)
+                             hag=hag_on, hag_filter=hag_filter,
+                             ground_value=self._hag_ground_value, out_dir=job_root)
 
     def _infer_out_dir(self) -> Path:
         """Nest this infer job under its owning dataset (<dataset>/infer/<job>) when
@@ -687,23 +783,6 @@ class InferPage(QWidget):
         if staged and os.path.isdir(staged):
             return appstate.dataset_root(name) / "infer" / self._job_id
         return appstate.scratch_infer_dir() / self._job_id
-
-    def _run_hag_filter(self) -> str | None:
-        """The HAG method the run trained with (to reproduce at inference), or
-        None when it trained on the z-min proxy / no HAG. Legacy hag_source
-        strings (pdal_hag_nn, smrf, labeled+smrf, per_tile_smrf, ...) were all
-        PDAL-based -> hag_nn."""
-        m = self._manifest if (self.from_run_radio.isChecked() and self._manifest) else None
-        if not m:
-            return None
-        s = str(m.get("hag_source", "")).lower()
-        if not s or "proxy" in s or "z_minus" in s:
-            return None
-        if "grid" in s:
-            return "grid"
-        if "delaunay" in s:
-            return "hag_delaunay"
-        return "hag_nn"
 
     def _on_preflight(self, present):
         """Weights check: True=found, False=missing (block), None=couldn't list (proceed)."""

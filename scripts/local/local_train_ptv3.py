@@ -16,9 +16,14 @@ Softmax, inverse-sqrt-frequency class weights + rare-class tile oversampling,
 AdamW (lr 2e-3, wd 5e-3) + warmup/cosine, overlap-voting eval scored on raw
 points, periodic held-out validation + resumable checkpoints.
 
+--hag appends a HeightAboveGround input channel (in_channels 6 -> 7;
+[xyz, rgb, HAG]), read per point from the tile/scene "hag" array, which the
+dataset (or the Inference page's HAG box) must supply — this replaces the old
+copy-paste local_train_ptv3_hag.py twin (now a thin wrapper forcing --hag).
+
 Usage:
     python local_train_ptv3.py --dataset NAME [--grid G] [--chunk-xy C]
-        [--epochs N] [--batch B] [--steps-per-epoch S]
+        [--epochs N] [--batch B] [--steps-per-epoch S] [--hag]
     python local_train_ptv3.py --dataset NAME --mode infer
         --weights runs/<id>/final_model.pth --infer-input <job_id>
 
@@ -105,11 +110,16 @@ RARE_OVERSAMPLE  = True
 RARE_CLASSES     = None
 RARE_FREQ_FRAC   = 0.5
 RARE_TILE_PROB   = 0.25    # P(draw the next train tile from a rare-class tile)
+RARE_CENTER_PROB = 0.25    # P(center the train crop on a rare-class point): the
+                           # sample-level half of oversampling — a rare TILE is
+                           # still mostly ground, so a uniform crop center would
+                           # usually miss the rare points the tile was picked for
+                           # (same idea as RandLA's rare-centered spheres)
 
 # Periodic held-out validation + checkpoint/resume cadence.
 VAL_EVERY        = 10      # held-out val pass every N epochs (no weight updates)
 CHECKPOINT_GAP   = 3       # checkpoint (model + optimizer) frequency, epochs
-RESUME           = True   # force-resume the latest matching run (see AUTO_RESUME)
+RESUME           = False   # force-resume the latest matching run (see AUTO_RESUME)
 AUTO_RESUME      = False    # auto-continue an unfinished run (no DONE marker) on
                           # relaunch / auto-retry, so an intermittent crash
                           # never loses the run — only epochs since last checkpoint
@@ -127,7 +137,7 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                epochs: Optional[int] = None, batch: Optional[int] = None,
                steps_per_epoch: Optional[int] = None, chunk_xy: Optional[float] = None,
                mode: str = "train", weights: Optional[str] = None,
-               infer_input: Optional[str] = None):
+               infer_input: Optional[str] = None, hag: bool = False):
     if dataset is None and mode != "infer":
         raise ValueError("--dataset is required: pass a canonical trainer_gui dataset "
                          "name materialized under /datasets. The only "
@@ -153,6 +163,7 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
     CLASS_WEIGHTING = dg.env_bool("LOSS_CLASS_WEIGHTING", globals()["CLASS_WEIGHTING"])
     WEIGHT_BETA     = dg.env_float("LOSS_WEIGHT_BETA", globals()["WEIGHT_BETA"])
     RARE_OVERSAMPLE = dg.env_bool("RARE_OVERSAMPLE", globals()["RARE_OVERSAMPLE"])
+    RARE_CENTER_PROB = dg.env_float("RARE_CENTER_PROB", globals()["RARE_CENTER_PROB"])
     from plyfile import PlyData
 
     sys.path.insert(0, "/opt")          # so `import ptv3.model` resolves
@@ -172,6 +183,7 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
     STEPS       = steps_per_epoch if steps_per_epoch is not None else 500
     CHUNK_XY    = chunk_xy if chunk_xy is not None else 50.0
     STRIDE      = CHUNK_XY / 2.0
+    HAG = bool(hag)   # --hag: local vars named `hag` below are per-point ARRAYS
 
     # NUM_CLASSES / CLASS_NAMES come ONLY from the dataset's dataset_meta.json.
     # --mode infer is dataset-free: the inference branch below reads the class
@@ -186,7 +198,19 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
             ds_meta = json.load(f)
         NUM_CLASSES = int(ds_meta["num_classes"])
         CLASS_NAMES = list(ds_meta["class_names"])
-        PREP_DIR = f"{ds_root}/prep/ptv3_cold_chunk{int(CHUNK_XY)}"
+        if HAG and not ds_meta.get("has_hag"):
+            raise ValueError(
+                f"--hag needs a dataset with a real HeightAboveGround channel, but "
+                f"'{dataset}' has none (has_hag=false). Rebuild it with the Datasets "
+                f"page 'Compute Height-Above-Ground' box, or train the plain PTv3.")
+        # --hag: the dataset's real HAG. (Legacy datasets recorded no method; the
+        # PDAL nearest-neighbour filter was the only one back then.)
+        HAG_SOURCE = (((ds_meta.get("source") or {}).get("hag_source") or "pdal_hag_nn")
+                      if HAG else None)
+        # --hag gets its own cache family (tiles carry a "hag" array), keyed by the
+        # HAG method too — tiles built one way must never be reused by another.
+        _hag_tag = f"_hag_{HAG_SOURCE.replace('+', '_')}" if HAG else ""
+        PREP_DIR = f"{ds_root}/prep/ptv3_cold{_hag_tag}_chunk{int(CHUNK_XY)}"
 
     # --- Preprocessing ------------------------------------------------------
     def load_ply(path):
@@ -235,6 +259,13 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                 xyz, rgb, lab = load_scene(src)
             except Exception as e:
                 print(f"  skip {src}: {e}", flush=True); continue
+            # --hag: per-point HAG from the source scene npz rides into the cache
+            # tiles; without --hag the tile layout is exactly the pre-merge one.
+            hag = None
+            if HAG and src.endswith(".npz"):
+                z = np.load(src)
+                if "hag" in z.files and len(z["hag"]) == len(xyz):
+                    hag = z["hag"].astype(np.float32)
             print(f"    [{fi+1}/{len(src_paths)}] {scene}: {len(xyz):,} pts "
                   f"loaded in {time.time()-t0:.1f}s, tiling…", flush=True)
             mins, maxs = xyz[:, :2].min(0), xyz[:, :2].max(0)
@@ -245,10 +276,12 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                          (xyz[:, 1] >= y0) & (xyz[:, 1] < y0 + chunk_xy))
                     if m.sum() < 2048: continue
                     out_path = f"{out_dir}/{scene}_x{int(x0)}_y{int(y0)}.npz"
-                    np.savez_compressed(out_path,
-                        xyz=xyz[m].astype(np.float32),
-                        rgb=rgb[m].astype(np.uint8),
-                        lab=lab[m].astype(np.int32))
+                    tile = {"xyz": xyz[m].astype(np.float32),
+                            "rgb": rgb[m].astype(np.uint8),
+                            "lab": lab[m].astype(np.int32)}
+                    if hag is not None:
+                        tile["hag"] = hag[m].astype(np.float32)
+                    np.savez_compressed(out_path, **tile)
                     n_tiles += 1
             print(f"      -> {n_tiles} tiles", flush=True)
 
@@ -308,6 +341,19 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
             _spc.SubMConv3d._stem_patched = True
             print(f"  [spconv] PTv3 stem SubMConv3d kernel 5 -> {STEM_KERNEL}", flush=True)
 
+    def _hag_of(z_or_files, xyz):
+        """Per-point real HeightAboveGround for a cached tile (--hag).
+
+        Callers invoke this unconditionally; plain PTv3 is 6-channel and throws the
+        column away, so it gets zeros rather than a fabricated height."""
+        files = z_or_files.files if hasattr(z_or_files, "files") else z_or_files
+        if files is not None and "hag" in files:
+            return z_or_files["hag"].astype(np.float32)
+        if HAG:
+            raise ValueError("A --hag tile is missing its 'hag' channel. Rebuild the "
+                             "dataset with Height-Above-Ground enabled.")
+        return np.zeros(len(xyz), np.float32)   # plain PTv3: never reaches the net
+
     def build_model(num_classes):
         # FlashAttention is optional — the image installs it best-effort
         # (`pip install flash-attn || echo ...`), so it may be absent. PTv3's
@@ -324,7 +370,7 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                 print("  flash_attn unavailable — falling back to "
                       "enable_flash=False (slower attention).", flush=True)
         backbone = PointTransformerV3(
-            in_channels=6 + (1 if DG_LOGDK_FEAT else 0),   # xyz + rgb (+ log d_k, D3b)
+            in_channels=6 + (1 if HAG else 0) + (1 if DG_LOGDK_FEAT else 0),   # xyz + rgb (+ HAG, --hag) (+ log d_k, D3b)
             order=("z", "z-trans", "hilbert", "hilbert-trans"),
             stride=(2, 2, 2, 2),
             enc_depths=(2, 2, 2, 6, 2),
@@ -343,40 +389,30 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
         return backbone, head
 
     from scipy.spatial import cKDTree
-    BASE_PALETTE = np.array([
-        [139, 90, 43], [34, 160, 34], [200, 60, 60], [40, 110, 220], [235, 225, 60],
-        [150, 80, 200], [240, 140, 40], [70, 200, 200], [220, 100, 170], [120, 120, 120],
-        [90, 140, 60], [180, 180, 90], [60, 60, 160], [200, 170, 130], [100, 220, 120],
-        [230, 70, 110], [50, 160, 110], [170, 110, 60], [110, 170, 230], [240, 200, 160],
-    ], dtype=np.int32)
-
-    def _palette(num_classes):
-        reps = -(-num_classes // len(BASE_PALETTE))
-        return np.tile(BASE_PALETTE, (reps, 1))[:num_classes]
-
-    def _write_ply(path, xyz, pred_idx, palette, intensity=None):
-        cols = [xyz.astype(np.float32), palette[pred_idx]]
-        props = ("property float x\nproperty float y\nproperty float z\n"
-                 "property uchar red\nproperty uchar green\nproperty uchar blue\n")
-        fmt = ["%.3f", "%.3f", "%.3f", "%d", "%d", "%d"]
-        if intensity is not None:            # carry per-point intensity for the viewer
-            cols.append(np.asarray(intensity, np.float32).reshape(-1, 1))
-            props += "property float intensity\n"
-            fmt.append("%.5f")
-        header = "ply\nformat ascii 1.0\n" + f"element vertex {len(xyz)}\n" + props + "end_header"
-        np.savetxt(path, np.column_stack(cols), fmt=fmt, header=header, comments="")
 
     def make_predict_scene(backbone, head, num_classes):
         def _predict_scene(scene_path):
             # Tile into CHUNK_XY windows, voxel-downsample tracking the inverse
             # map, scatter per-voxel predictions back, NN-fill stragglers.
             xyz, rgb, _ = load_scene(scene_path)
+            # --hag: real per-point HAG, written by convert_infer_job. The scene npz
+            # stores xyz unreordered, so z["hag"] aligns 1:1 with load_scene's xyz.
+            hag = None
+            if HAG:
+                _z = np.load(scene_path) if scene_path.endswith(".npz") else None
+                if _z is None or "hag" not in _z.files or len(_z["hag"]) != len(xyz):
+                    raise ValueError(
+                        f"{os.path.basename(scene_path)} has no per-point 'hag' channel, "
+                        f"which this HAG model requires. Tick 'Compute Height-Above-Ground' "
+                        f"on the Inference page and run again.")
+                hag = _z["hag"].astype(np.float32)
             pred = np.full(len(xyz), -1, np.int64)
             with torch.no_grad():
                 # windows via one packed-code sort, not a full-cloud mask per window
                 for idx in tc.xy_chunk_groups(xyz, CHUNK_XY, min_pts=64):
                     w0 = (xyz[idx] - xyz[idx].mean(0)).astype(np.float32)
                     rgbf = rgb[idx].astype(np.float32) / 255.0
+                    hagf = hag[idx].astype(np.float32) if HAG else None
                     # D5 density-TTA: isotropic scale s is a density change (o->o/s^2);
                     # re-voxelize per view, average per-point softmax. views=[1.0] when
                     # off -> identical to the old single-view argmax.
@@ -390,6 +426,7 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                         vx = w[first]
                         feat = np.concatenate(
                             [vx, rgbf[first]]
+                            + ([hagf[first, None]] if HAG else [])
                             + ([dg.local_density_logdk(vx, DG_LOGDK_K)[:, None]] if DG_LOGDK_FEAT else []),
                             axis=1).astype(np.float32)
                         coord = torch.from_numpy(vx).cuda()
@@ -461,11 +498,10 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
         infer_cfg = {"backbone": "PTv3", "mode": "infer", "weights": weights,
                      "infer_input": infer_input, "num_classes": num_classes,
                      "class_names": class_names, "grid_size": GRID_SIZE,
-                     "chunk_xy": CHUNK_XY, "gpu": gpu_name(),
+                     "chunk_xy": CHUNK_XY, "hag": HAG, "gpu": gpu_name(),
                      "started_utc": datetime.utcnow().isoformat() + "Z"}
 
         predict_scene = make_predict_scene(backbone, head, num_classes)
-        palette = _palette(num_classes)
         print(f"  [infer] labeling {len(scenes)} scene(s) -> {pred_dir}", flush=True)
         scene_stats = []
         for pc_path in scenes:
@@ -497,6 +533,8 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
     # a distinct tag so AUTO_RESUME starts a fresh lineage instead of trying (and
     # failing) to load mismatched weights.
     _pt = "ptv3" if STEM_KERNEL == 5 else f"ptv3k{STEM_KERNEL}"
+    if HAG:
+        _pt += "_hag"   # exact pre-merge twin suffix at the default 5x5x5 stem
 
     def lr_at(ep):
         """PTv3 outdoor schedule: short linear warmup to BASE_LR, then cosine
@@ -545,6 +583,10 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                 "mode": mode, "gpu": gpu_name(),
                 "num_classes": NUM_CLASSES, "grid_size": GRID_SIZE,
                 "class_names": CLASS_NAMES,
+                # --hag adds exactly the twin's extra keys; base mode writes none.
+                **({"in_channels": 7,
+                    "features": ["x", "y", "z", "rgb_r", "rgb_g", "rgb_b", "HAG"],
+                    "hag_source": HAG_SOURCE} if HAG else {}),
                 "chunk_xy": CHUNK_XY, "stride": STRIDE,
                 "steps_per_epoch": STEPS,
                 "flash_attn": USE_FLASH_ATTN,
@@ -565,7 +607,8 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                 "class_balance": {"rare_oversample": RARE_OVERSAMPLE,
                                   "rare_classes": RARE_CLASSES,
                                   "rare_freq_frac": RARE_FREQ_FRAC,
-                                  "rare_tile_prob": RARE_TILE_PROB},
+                                  "rare_tile_prob": RARE_TILE_PROB,
+                                  "rare_center_prob": RARE_CENTER_PROB},
             }
             json.dump(cfg, f, indent=2)
 
@@ -772,14 +815,24 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
         for tile in tiles_for_batch:
             z = np.load(tile)
             xyz, rgb, lab = z["xyz"], z["rgb"], z["lab"]
-            # random crop ~30m for memory (train only — eval keeps full tiles)
+            hag = _hag_of(z, xyz)                      # real HAG (zeros when plain)
+            # random crop ~30m for memory (train only — eval keeps full tiles).
+            # With prob RARE_CENTER_PROB the crop centers on a rare-class point,
+            # so the rare points a rare tile was drawn for actually land in-crop.
             if training and len(xyz) > 80000:
-                c = xyz[np.random.randint(len(xyz))]
+                c = None
+                if (RARE_OVERSAMPLE and rare_cols
+                        and np.random.rand() < RARE_CENTER_PROB):
+                    ridx = np.where(np.isin(lab, rare_cols))[0]
+                    if len(ridx):
+                        c = xyz[ridx[np.random.randint(len(ridx))]]
+                if c is None:
+                    c = xyz[np.random.randint(len(xyz))]
                 d2 = np.sum((xyz[:, :2] - c[:2]) ** 2, axis=1)
                 idx = np.where(d2 < 15.0 ** 2)[0]
                 if len(idx) > 80000:
                     idx = np.random.choice(idx, 80000, replace=False)
-                xyz, rgb, lab = xyz[idx], rgb[idx], lab[idx]
+                xyz, rgb, lab, hag = xyz[idx], rgb[idx], lab[idx], hag[idx]
             xyz = xyz.astype(np.float32)
             if training and AUG_ENABLE:
                 xyz = augment_xyz(xyz)
@@ -792,7 +845,7 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                   & (np.abs(xyz[:, 2]) <= 200.0))
             if int(ok.sum()) < 64:
                 continue
-            xyz = xyz[ok]; rgb = rgb[ok]; lab = lab[ok]
+            xyz = xyz[ok]; rgb = rgb[ok]; lab = lab[ok]; hag = hag[ok]
             # voxel-grid downsample to GRID_SIZE. Take grid_coord from the SAME
             # integer keys used to dedup, so it is unique per cloud and phase-
             # consistent with the kept points. Recomputing it as
@@ -806,11 +859,12 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                      if (training and DG_DENSITY_AUG) else GRID_SIZE)
             keys = np.floor(xyz / g_eff).astype(np.int64)
             uniq = tc.voxel_unique(keys)
-            xyz = xyz[uniq]; rgb = rgb[uniq]; lab = lab[uniq]
+            xyz = xyz[uniq]; rgb = rgb[uniq]; lab = lab[uniq]; hag = hag[uniq]
             # feat = augmented/centered coords + color/intensity (intensity is
             # carried in the rgb channels for LiDAR canonical datasets).
             feat = np.concatenate(
                 [xyz.astype(np.float32), rgb.astype(np.float32) / 255.0]
+                + ([hag[:, None].astype(np.float32)] if HAG else [])
                 + ([dg.local_density_logdk(xyz, DG_LOGDK_K)[:, None]] if DG_LOGDK_FEAT else []),
                 axis=1)
             coords.append(xyz); feats.append(feat); labels.append(lab)
@@ -847,7 +901,8 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
         """Closure -> (xyz, rgb, lab) for the ORIGINAL raw scene, so the voted
         voxel predictions can be reprojected onto raw points + raw GT. `name` is a
         parameter, so each closure binds its own scene (no loop late-binding bug).
-        split is 'val'|'test' -> the matching materialized dataset folder."""
+        split is 'val'|'test' -> the matching materialized dataset folder.
+        HAG isn't needed here — raw scoring only uses raw xyz + raw GT."""
         return lambda: load_canonical(f"{ds_root}/{split}/{name}.npz")
 
     val_items = [(n, _raw_loader("val", n), val_tile_dir) for n in sorted(hold)]
@@ -879,18 +934,20 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                     xyz, rgb = z["xyz"].astype(np.float32), z["rgb"]
                     if len(xyz) < 64:
                         continue
+                    hag = _hag_of(z, xyz)
                     cxyz = xyz - xyz.mean(0, keepdims=True)
                     ok = (np.isfinite(cxyz).all(1)
                           & (np.abs(cxyz[:, :2]).max(1) <= CHUNK_XY)
                           & (np.abs(cxyz[:, 2]) <= 200.0))
                     if int(ok.sum()) < 64:
                         continue
-                    xyz, rgb, cxyz = xyz[ok], rgb[ok], cxyz[ok]
+                    xyz, rgb, cxyz, hag = xyz[ok], rgb[ok], cxyz[ok], hag[ok]
                     vk = np.floor(cxyz / GRID_SIZE).astype(np.int64)
                     first, inverse = tc.voxel_unique(vk, return_inverse=True)
                     vx = cxyz[first].astype(np.float32)
                     feat = np.concatenate(
                         [vx, rgb[first].astype(np.float32) / 255.0]
+                        + ([hag[first, None].astype(np.float32)] if HAG else [])
                         + ([dg.local_density_logdk(vx, DG_LOGDK_K)[:, None]] if DG_LOGDK_FEAT else []),
                         axis=1).astype(np.float32)
                     coord = torch.from_numpy(vx).cuda()
@@ -982,7 +1039,9 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
     _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "helper"))
     from train_common import BestCheckpoint, write_run_manifest
     best = BestCheckpoint(run_dir)
-    write_run_manifest(run_dir, "ptv3", dataset)   # the single inference manifest (run.json)
+    # the single inference manifest (run.json); the _hag key keeps the Infer
+    # page mapping HAG runs back to the HAG entry point exactly as before.
+    write_run_manifest(run_dir, "ptv3_hag" if HAG else "ptv3", dataset)
 
     def run_eval(ep, write_json=False):
         # Periodic pass scores the held-out VAL scenes only (no test peeking) and
@@ -1122,6 +1181,9 @@ def main():
     ap.add_argument('--mode', default='train')
     ap.add_argument('--weights', default=None)
     ap.add_argument('--infer-input', default=None)
+    ap.add_argument('--hag', action='store_true',
+                    help='append the HeightAboveGround input channel '
+                         '(replaces the old local_train_ptv3_hag.py)')
     args = ap.parse_args()
     train_ptv3(**vars(args))
 

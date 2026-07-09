@@ -106,6 +106,15 @@ use Hugging Face / S3 for the `.pth` weights. Full details: `docker/README.md`.
 | KPConvX-L + HAG | `kpconvx_cold_hag` | `scripts/local/local_train_kpconvx_cold_hag.py` |
 
 `_hag` = an extra **HeightAboveGround** input channel (PDAL SMRF ground → `hag_nn`).
+The `_hag` scripts are thin wrappers that run the base script with `--hag` — one
+trainer per backbone, so recipe changes land in one file.
+
+A `_hag` model **requires a real HAG channel**: train it on a dataset built with
+**Compute Height-Above-Ground**, and tick the same box on the Inference page. There
+is no substitute height — a missing `hag` channel is a hard error, not a silent
+fallback. Checkpoints from before this rule (their `run.json` records
+`hag_source: z_minus_scene_min_proxy`) learned a stand-in height and must be
+retrained; the Inference page refuses them.
 
 ## The normal path: Datasets → Train → Inference
 
@@ -162,18 +171,29 @@ Inference needs.
 Reads a run's `run.json` + weights, writes predictions to a host folder.
 
 - **Weights → From a training run**: **Browse** to the run's **`run.json`**. It
-  auto-fills the backbone, grid, tile size, intensity norm and HAG settings, and
-  points **Weights file** at the sibling `.pth` (override if you want). (Or pick
-  **Local .pth file** and choose the architecture yourself.)
+  auto-fills the backbone, grid, tile size and intensity norm, ticks
+  **Compute Height-Above-Ground** when the run trained with it (you can untick),
+  and points **Weights file** at the sibling `.pth` (override if you want). (Or
+  pick **Local .pth file** and choose the architecture yourself.)
 - **Input**: a folder or single cloud to label. Grid/tile come from the run.
-  Optional label-free **density adapt (AdaBN)** / **density TTA** for inference at
-  a different density than training. Set the **Output folder** for predictions.
+  **Compute Height-Above-Ground** is off by default and only the `_hag` models use
+  it; when on, name the **ground class** (e.g. `2`) if your clouds already carry a
+  ground classification, else ground is detected. Optional label-free
+  **density adapt (AdaBN)** / **density TTA** for inference at a different density
+  than training. Set the **Output folder** for predictions.
 - **Run inference** converts the input to canonical scenes, then `docker run
   --mode infer` with the scenes bind-mounted and predictions written straight to
   your output folder (no upload/download).
 - View results in place: **View a point cloud…**, **Compare to ground truth…**
   (prints accuracy + per-class mIoU, paints mismatches), **Export comparison
   PLY…**, and **Class colours & names…** to set the legend.
+- **Ensemble 2-3 models** (typically ~+2 mIoU): run inference on the same input
+  with each trained model (a separate output folder per model), then
+  majority-vote the folders —
+  `python scripts/local/ensemble_vote.py --inputs predsA predsB [predsC] --out voted`
+  (strongest model first; it wins vote ties). Works across backbones and
+  formats: all three models predict the same raw points, and the voter reads
+  the exported `*_pred.las/laz/ply/txt/csv` (or raw `.npz`) directly.
 
 ## Canonical dataset format
 

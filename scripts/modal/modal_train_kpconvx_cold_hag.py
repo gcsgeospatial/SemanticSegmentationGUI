@@ -78,6 +78,8 @@ image = image.run_commands(
 )
 
 image = image.add_local_file("scripts/local/local_train_kpconvx_cold_hag.py", "/root/local_train_kpconvx_cold_hag.py")
+# the hag entry point is a thin wrapper since the merge — ship the real trainer too
+image = image.add_local_file("scripts/local/local_train_kpconvx_cold.py", "/root/local_train_kpconvx_cold.py")
 image = image.add_local_file("scripts/helper/train_common.py", "/root/train_common.py")
 
 outputs_volume  = modal.Volume.from_name(f"{APP_NAME}-outputs",  create_if_missing=True)

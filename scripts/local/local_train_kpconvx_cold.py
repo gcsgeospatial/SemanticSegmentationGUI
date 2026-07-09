@@ -2,11 +2,15 @@
 Local training script for KPConvX-L on a canonical trainer_gui --dataset
 (3-folder train/val/test), COLD-START, native-features variant.
 
-  Features  : 4 = [1, intensity, return_number, height], where height is a
-              tile-relative proxy (z - tile_min_z). No geometric-feature
+  Features  : 4 = [1, intensity, return_number, height], where height is
+              tile-relative (z - tile_min_z). No geometric-feature
               computation — uses the attributes the cloud carries.
-  HAG twin  : local_train_kpconvx_cold_hag.py — same run, 4th channel = real
-              PDAL HeightAboveGround when the dataset carries it.
+  --hag     : swaps the 4th channel to real PDAL HeightAboveGround, which the
+              dataset (or the Inference page's HAG box) must supply.
+              Same 4 channels / param count -> a clean A/B of tile-relative
+              height vs true height above ground. Replaces the old copy-paste
+              local_train_kpconvx_cold_hag.py twin (now a thin wrapper
+              forcing --hag).
 
 Random init (no warm-start). Geometry: 2.0 m grid, conv radius 2.5 cells, BN
 momentum 0.02, with KPConvX's own training recipe (experiments/S3DIS):
@@ -27,6 +31,7 @@ continue the most recent run.
 
 Usage:
     python local_train_kpconvx_cold.py --dataset <name>
+    python local_train_kpconvx_cold.py --dataset <name> --hag   # real-HAG 4th channel
     python local_train_kpconvx_cold.py --dataset <name> --mode eval \
         --weights runs/<id>/final_model.pth   # re-score with the voted eval
     python local_train_kpconvx_cold.py --mode infer --infer-input <job> \
@@ -85,7 +90,10 @@ LOVASZ_WEIGHT   = 1.0
 USE_FOCAL       = False
 FOCAL_GAMMA     = 2.0
 RARE_OVERSAMPLE = True
-RARE_CLASSES    = [3, 4]     # Water, Bridge (contiguous class indices)
+RARE_CLASSES    = None       # explicit class indices, or None -> auto from train
+                             # frequency (same rule as the PTv3 script), so any
+                             # dataset's minority classes are picked up unchanged
+RARE_FREQ_FRAC  = 0.5        # auto-rare threshold: freq < frac x median present freq
 # 0.5 + cap 10 overcooked (Building 0.74->0.61, rare tiles memorised): dialed back.
 RARE_TILE_PROB  = 0.25       # P(draw the next train tile from a rare-class tile)
 
@@ -144,7 +152,8 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
                   weights: Optional[str] = None,
                   infer_input: Optional[str] = None, grid: Optional[float] = None,
                   chunk_xy: Optional[float] = None, epochs: Optional[int] = None,
-                  batch: Optional[int] = None, steps_per_epoch: Optional[int] = None):
+                  batch: Optional[int] = None, steps_per_epoch: Optional[int] = None,
+                  hag: bool = False):
     import os, sys, time, json, csv, glob, traceback
     from datetime import datetime
     import numpy as np
@@ -196,10 +205,15 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
     N_EPOCHS    = epochs if epochs is not None else globals()["N_EPOCHS"]
     EPOCH_STEPS = steps_per_epoch if steps_per_epoch is not None else globals()["EPOCH_STEPS"]
     PACK_N      = batch if batch is not None else globals()["PACK_N"]
+    HAG = bool(hag)   # --hag: local vars named `hag` below are per-point ARRAYS
+    # --hag swaps the 4th feature channel (still 4 ch): shadow FEATURE_MODE so the
+    # banner / run.json / resume filter all track the variant.
+    FEATURE_MODE = "native_hag" if HAG else globals()["FEATURE_MODE"]
 
     # --dataset NAME selects a canonical trainer_gui dataset under /datasets
     # (bind-mounted); NUM_CLASSES / CLASS_NAMES / PREP_DIR are locals so the
     # whole function tracks the dataset's class layout.
+    HAG_SOURCE = None
     ds_root = f"/datasets/{dataset}" if dataset else None
     if ds_root:
         meta_path = f"{ds_root}/dataset_meta.json"
@@ -210,7 +224,18 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
             ds_meta = json.load(f)
         NUM_CLASSES = int(ds_meta["num_classes"])
         CLASS_NAMES = list(ds_meta["class_names"])
-        PREP_DIR = f"{ds_root}/prep/kpconvx_cold_grid{GRID:g}_c{int(CHUNK_XY)}"
+        if HAG and not ds_meta.get("has_hag"):
+            raise ValueError(
+                f"--hag needs a dataset with a real HeightAboveGround channel, but "
+                f"'{dataset}' has none (has_hag=false). Rebuild it with the Datasets "
+                f"page 'Compute Height-Above-Ground' box, or train the plain KPConvX-L "
+                f"(its 4th channel is the tile-relative height, which needs no HAG).")
+        # --hag: the dataset's real HAG. (Legacy datasets recorded no method; the
+        # PDAL nearest-neighbour filter was the only one back then.)
+        HAG_SOURCE = (((ds_meta.get("source") or {}).get("hag_source") or "pdal_hag_nn")
+                      if HAG else None)
+        # --hag gets its own cache family (tiles carry a "hag" array).
+        PREP_DIR = f"{ds_root}/prep/kpconvx_cold{'_hag' if HAG else ''}_grid{GRID:g}_c{int(CHUNK_XY)}"
     else:
         # Folder inference (--mode infer): no --dataset. Reproduce the TRAINED
         # geometry + class layout from the run's run.json (the self-contained
@@ -225,12 +250,21 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
             from train_common import infer_meta
             meta = infer_meta(f"/outputs/{weights}")
             if meta:
-                if meta.get("hag_source"):   # M5: a HAG run in the plain script (both 4-ch)
+                # M5: never load cross-variant weights — both variants are 4-ch, so
+                # no shape check can catch it (run.json's hag_source tags them).
+                if HAG and not meta.get("hag_source"):
+                    raise ValueError(
+                        "These weights are from a plain KPConvX-L run (no 'hag_source' in "
+                        "run.json): its 4th input channel is the native tile-relative "
+                        "height, not real HAG. Re-run inference with the plain "
+                        "'KPConvX-L' backbone.")
+                if not HAG and meta.get("hag_source"):
                     raise ValueError(
                         "These weights are from a KPConvX-L + HAG run (run.json has "
                         "'hag_source'): its 4th input channel is HeightAboveGround, not the "
-                        "height proxy this script feeds. Re-run inference with the "
+                        "native height this script feeds. Re-run inference with the "
                         "'KPConvX-L + HAG' backbone.")
+                HAG_SOURCE = meta.get("hag_source")   # record what the weights were trained on
                 NUM_CLASSES = int(meta.get("num_classes") or NUM_CLASSES)
                 CLASS_NAMES = list(meta.get("class_names") or
                                    [f"class {i}" for i in range(NUM_CLASSES)])
@@ -301,13 +335,21 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
     def tile_and_save(name, pc_path, cls_path, out_dir, chunk_xy, stride):
         os.makedirs(out_dir, exist_ok=True)
         t0 = time.time()
-        try:                              # canonical .npz (label embedded)
+        try:                              # canonical .npz (label + optional hag embedded)
             xyz, intensity, ret_num, lab = load_canonical(pc_path)
+            hag = None
+            if HAG:   # --hag: the scene's real per-point HAG (startup guard vouches for it)
+                z = np.load(pc_path)
+                if "hag" not in z.files or len(z["hag"]) != len(xyz):
+                    raise ValueError("missing its 'hag' channel, which --hag requires; "
+                                     "rebuild the dataset with HAG enabled")
+                hag = z["hag"].astype(np.float32)
         except Exception as e:
             print(f"  skip {pc_path}: {e}", flush=True); return None
         # Canonical intensity is already GUI-normalized, so pass it through (just clip).
         intensity_n = np.clip(intensity, 0.0, 2.0).astype(np.float32)
-        print(f"    {name}: {len(xyz):,} pts loaded in {time.time()-t0:.1f}s, tiling…",
+        print(f"    {name}: {len(xyz):,} pts loaded in {time.time()-t0:.1f}s, "
+              + (f"HAG {hag.min():.1f}..{hag.max():.1f}m, " if HAG else "") + "tiling…",
               flush=True)
         mins = xyz[:, :2].min(0); maxs = xyz[:, :2].max(0)
         x0s = np.arange(mins[0], maxs[0], stride)
@@ -323,17 +365,21 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
                 # tiles are sparse — the old 256-pt cut deleted them from training.
                 if mask.sum() < 64:
                     continue
-                attrs = np.stack([intensity_n[mask], ret_num[mask]], axis=1).astype(np.float32)
+                attrs = np.stack([intensity_n[mask], ret_num[mask]]
+                                 + ([hag[mask]] if HAG else []), axis=1).astype(np.float32)
                 sx, sa, sl = grid_subsample(xyz[mask], attrs, lab[mask], GRID)
                 if len(sx) < 32:
                     continue
-                np.savez_compressed(
-                    os.path.join(out_dir, f"{name}_x{int(x0)}_y{int(y0)}.npz"),
+                tile = dict(
                     xyz=sx.astype(np.float32),
                     intensity=sa[:, 0].astype(np.float32),
                     ret_num=sa[:, 1].astype(np.float32),
-                    lab=sl.astype(np.int32),
                 )
+                if HAG:   # --hag caches carry the subsampled hag column; without
+                    tile["hag"] = sa[:, 2].astype(np.float32)   # --hag the tile layout is exactly pre-merge
+                tile["lab"] = sl.astype(np.int32)
+                np.savez_compressed(
+                    os.path.join(out_dir, f"{name}_x{int(x0)}_y{int(y0)}.npz"), **tile)
                 n_tiles += 1
         print(f"      -> {n_tiles} tiles", flush=True)
         return n_tiles
@@ -359,9 +405,11 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
         # property of the DATASET (3 materialized folders), so the signature
         # records the dataset's split identity.
         sp = ds_meta.get("split", {})
-        return {
+        # --hag is a separate cache family (pipeline / recipe / hag_source below
+        # match the old _hag script), so every existing cache stays valid.
+        sig = {
             "format_version": 1,
-            "pipeline": "kpconvx_cold",
+            "pipeline": "kpconvx_cold_hag" if HAG else "kpconvx_cold",
             "grid": GRID,
             "chunk_xy": CHUNK_XY,
             "stride": STRIDE,
@@ -370,8 +418,12 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
             "min_pts_mask": 64,
             "min_pts_sub": 32,
             "intensity_norm": "p95_clip2",
-            "feature_recipe": "bias,intensity,ret_num,height",
+            "feature_recipe": ("bias,intensity,ret_num,hag" if HAG
+                               else "bias,intensity,ret_num,height"),
         }
+        if HAG:
+            sig["hag_source"] = HAG_SOURCE
+        return sig
 
     def _validate_cache(lists):
         """Refuse to reuse a cache built with different settings (grid, stride,
@@ -442,7 +494,9 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
         return train_list, val_list, test_list
 
     def make_run_dir():
-        run_id = datetime.utcnow().strftime("%Y%m%d_%H%M%S_kpconvx_cold_native")
+        run_id = datetime.utcnow().strftime(
+            "%Y%m%d_%H%M%S_kpconvx_cold_hag" if HAG
+            else "%Y%m%d_%H%M%S_kpconvx_cold_native")
         run_dir = f"/outputs/runs/{run_id}"
         os.makedirs(f"{run_dir}/checkpoints", exist_ok=True)
         return run_id, run_dir
@@ -458,17 +512,25 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
             ckpts = glob.glob(f"{rd}/checkpoints/ep*.pth")
             if not ckpts:
                 continue
-            opt_type = None
+            opt_type = fmode = None
             for _cfg in (f"{rd}/run.json", f"{rd}/run_config.json"):   # legacy fallback
                 try:
                     with open(_cfg) as f:
-                        opt_type = json.load(f).get("optimizer", {}).get("type")
+                        _rc = json.load(f)
+                    opt_type = _rc.get("optimizer", {}).get("type")
+                    fmode = _rc.get("feature_mode")
                     break
                 except Exception:
                     continue
             if opt_type != "AdamW":
                 print(f"  resume: skipping {os.path.basename(rd)} "
                       f"(recipe mismatch: optimizer={opt_type})", flush=True)
+                continue
+            # Both variants live in this script since the --hag merge: never resume
+            # across them (run.json feature_mode: "native" vs "native_hag").
+            if fmode != FEATURE_MODE:
+                print(f"  resume: skipping {os.path.basename(rd)} "
+                      f"(variant mismatch: feature_mode={fmode})", flush=True)
                 continue
             latest = max(ckpts, key=_ep)
             return rd, latest, _ep(latest)
@@ -516,6 +578,7 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
             "feature_mode": FEATURE_MODE,
             "input_channels": INPUT_CHANNELS,
             "dataset": dataset,
+            **({"hag_source": HAG_SOURCE} if HAG else {}),   # --hag: tags the variant
             "n_epochs": N_EPOCHS, "epoch_steps": EPOCH_STEPS,
             "pack_n": PACK_N, "accum": ACCUM,
             "grid_m": GRID, "kp_radius": KP_RADIUS, "radius_scaling": RADIUS_SCALING,
@@ -530,7 +593,9 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
             "class_balance": {"weighting": CLASS_WEIGHTING, "beta": WEIGHT_BETA,
                               "weight_scheme": "inv_sqrt_freq" if WEIGHT_BETA == 0.5
                               else f"inv_freq^{WEIGHT_BETA}",
-                              "cap": WEIGHT_CAP, "rare_tile_prob": RARE_TILE_PROB},
+                              "cap": WEIGHT_CAP, "rare_tile_prob": RARE_TILE_PROB,
+                              "rare_classes": RARE_CLASSES if RARE_CLASSES is not None
+                              else "auto", "rare_freq_frac": RARE_FREQ_FRAC},
             "loss": {"pointwise": "focal" if USE_FOCAL else "weighted_ce",
                      "focal_gamma": FOCAL_GAMMA if USE_FOCAL else None,
                      "ce_weighted": CLASS_WEIGHTING,
@@ -658,18 +723,30 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
 
     # --- class-balanced loss + rare-class oversampling ----------------------
     # One pass over the training tiles: count labels for inverse-frequency class
-    # weights, and flag tiles containing Water/Bridge so we can oversample them.
+    # weights, then flag tiles containing any rare class so we can oversample
+    # them. Rare = explicit RARE_CLASSES, else auto — present classes whose
+    # count is below RARE_FREQ_FRAC x the median present-class count (data-
+    # driven, so this works for any dataset's class set; was hardcoded [3, 4]).
     print("  scanning train tiles for class balance…", flush=True)
     class_counts = np.zeros(NUM_CLASSES, dtype=np.int64)
-    rare_tiles = []
+    tile_counts = []                       # (path, per-class bincount) per tile
     for tp in train_tiles:
         lab = np.load(tp)["lab"]
         v = lab[lab >= 0]
-        if v.size:
-            class_counts += np.bincount(v, minlength=NUM_CLASSES)
-            if RARE_OVERSAMPLE and np.isin(v, RARE_CLASSES).any():
-                rare_tiles.append(tp)
+        cnt = (np.bincount(v, minlength=NUM_CLASSES) if v.size
+               else np.zeros(NUM_CLASSES, np.int64))
+        class_counts += cnt
+        tile_counts.append((tp, cnt))
     print(f"  class counts: {dict(zip(CLASS_NAMES, class_counts.tolist()))}", flush=True)
+    if RARE_CLASSES is not None:
+        rare_classes = list(RARE_CLASSES)
+    else:
+        present = class_counts[class_counts > 0]
+        thresh = RARE_FREQ_FRAC * float(np.median(present)) if present.size else 0.0
+        rare_classes = [c for c in range(NUM_CLASSES) if 0 < class_counts[c] < thresh]
+    rare_tiles = ([tp for tp, cnt in tile_counts if cnt[rare_classes].any()]
+                  if (RARE_OVERSAMPLE and rare_classes) else [])
+    print(f"  rare classes: {[CLASS_NAMES[c] for c in rare_classes]}", flush=True)
     print(f"  rare-class tiles: {len(rare_tiles)} / {len(train_tiles)}", flush=True)
 
     if CLASS_WEIGHTING:
@@ -752,13 +829,27 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
             return rare_tiles[np.random.randint(len(rare_tiles))]
         return train_tiles[np.random.randint(len(train_tiles))]
 
-    def build_feat(xyz, intensity, ret_num, drop=False):
-        """[1, intensity, return_number, height]. height = z - min(z) over the
-        tile. With `drop`, zero the non-bias channels (train_LAS feature-drop,
+    def _hag_of(z, xyz):
+        """Real per-point HeightAboveGround for a cached --hag tile. Call only when
+        HAG; the plain recipe wants build_feat's native height instead."""
+        if "hag" not in z.files:
+            raise ValueError("A --hag tile is missing its 'hag' channel. Rebuild the "
+                             "dataset with Height-Above-Ground enabled.")
+        return z["hag"].astype(np.float32)
+
+    def build_feat(xyz, intensity, ret_num, hag=None, drop=False):
+        """[1, intensity, return_number, height].
+
+        height is the passed per-point `hag` array (--hag: real HeightAboveGround).
+        When hag is None this is the PLAIN recipe, whose 4th channel is genuinely
+        z - min(z) over the tile — a trained-on native feature, not a HAG stand-in.
+        With `drop`, zero the non-bias channels (train_LAS feature-drop,
         P=1-augment_color=0.2)."""
         bias = np.ones((len(xyz), 1), np.float32)
-        height = (xyz[:, 2:3] - xyz[:, 2].min()).astype(np.float32)
-        attrs = np.concatenate([intensity[:, None], ret_num[:, None], height], axis=1).astype(np.float32)
+        if hag is None:
+            hag = (xyz[:, 2] - xyz[:, 2].min()).astype(np.float32)   # native height
+        attrs = np.concatenate([intensity[:, None], ret_num[:, None],
+                                hag[:, None]], axis=1).astype(np.float32)
         if drop:
             attrs[:, 1:] = 0.0   # keep intensity (water's main cue); drop ret_num/height
         cols = [bias, attrs]
@@ -769,12 +860,15 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
     def sample_tile(tile_path, max_pts=60000, min_pts=32, training=True):
         z = np.load(tile_path)
         xyz, intensity, ret_num, lab = z["xyz"], z["intensity"], z["ret_num"], z["lab"]
+        hag = _hag_of(z, xyz) if HAG else None   # --hag: cached per-point array
         if len(xyz) < min_pts:
             return None
         idx = np.arange(len(xyz))
         if len(idx) > max_pts:
             idx = np.random.choice(idx, max_pts, replace=False)
         xyz, intensity, ret_num, lab = xyz[idx], intensity[idx], ret_num[idx], lab[idx]
+        if HAG:
+            hag = hag[idx]
         # D1 density jitter: re-subsample the (already GRID-tiled) cloud to a coarser
         # effective grid so the model trains across the density range it will infer on.
         # Coarsen-only (one-way valve); index-consistent across all per-point arrays.
@@ -783,10 +877,12 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
             if g_eff > GRID:
                 keep = dg.voxel_first_idx(xyz, g_eff)
                 xyz, intensity, ret_num, lab = xyz[keep], intensity[keep], ret_num[keep], lab[keep]
+                if HAG:
+                    hag = hag[keep]   # SAME index as xyz, so the feature never desyncs
         # height comes from the original (pre-augmentation) z so it stays a
-        # meaningful height-above-tile-min feature.
+        # meaningful height-above-tile-min feature; --hag feeds the cached HAG instead.
         drop = (training and np.random.rand() > AUG_COLOR)
-        feat = build_feat(xyz, intensity, ret_num, drop=drop)
+        feat = build_feat(xyz, intensity, ret_num, hag, drop=drop)
         geo_xyz = augment(xyz) if training else xyz
         geo_xyz = (geo_xyz - geo_xyz.mean(0)).astype(np.float32)
         return geo_xyz, feat, lab.astype(np.int64)
@@ -825,18 +921,37 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
                         np.concatenate([s[2] for s in samples]))).long().cuda()
         return _KPBatch(pyr), lab_t
 
-    def _predict_points(xyz, intensity_n, ret_num):
+    def scene_hag(z, pc_path, n):
+        """Real per-point HAG from an inference scene npz (--hag); None when plain.
+        convert_infer_job writes it when the HAG box is ticked."""
+        if not HAG:
+            return None
+        if "hag" not in z.files or len(z["hag"]) != n:
+            raise ValueError(
+                f"{os.path.basename(pc_path)} has no per-point 'hag' channel, which this "
+                f"HAG model requires. Tick 'Compute Height-Above-Ground' on the Inference "
+                f"page and run again.")
+        return z["hag"].astype(np.float32)
+
+    def _predict_points(xyz, intensity_n, ret_num, hag=None):
         """Sliding-window KPConvX inference over already-normalized features;
-        returns per-raw-point class indices (used by --mode infer)."""
+        returns per-raw-point class indices (used by --mode infer). `hag` is
+        per-raw-point real HeightAboveGround (--hag); None -> the plain recipe's
+        native tile-relative height."""
         pred = np.full(len(xyz), -1, np.int64)
         with torch.no_grad():
             # windows via one packed-code sort, not a full-cloud mask per window
             for idx in tc.xy_chunk_groups(xyz, CHUNK_XY, min_pts=64):
-                attrs = np.stack([intensity_n[idx], ret_num[idx]], axis=1).astype(np.float32)
+                cols = [intensity_n[idx], ret_num[idx]]
+                if hag is not None:
+                    cols.append(hag[idx])          # carry real HAG through the voxel mean
+                attrs = np.stack(cols, axis=1).astype(np.float32)
                 sx, sa, _ = grid_subsample(xyz[idx], attrs, None, GRID)
                 if len(sx) < 32:
                     continue
-                feat = build_feat(sx, sa[:, 0], sa[:, 1])
+                # None -> build_feat derives the plain recipe's native height from sx.
+                sub_hag = sa[:, 2] if hag is not None else None
+                feat = build_feat(sx, sa[:, 0], sa[:, 1], sub_hag)
                 base = (sx - sx.mean(0)).astype(np.float32)
                 # D5 density-TTA: isotropic coord scale s IS a density change
                 # (o -> o/s^2). Average softmax over decorrelated density views;
@@ -872,34 +987,19 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
         if (grid is not None and grid != GRID) or (chunk_xy is not None and chunk_xy != CHUNK_XY):
             print(f"  [infer] note: KPConvX uses its trained geometry "
                   f"(grid={GRID}, chunk={CHUNK_XY}); --grid/--chunk-xy ignored.", flush=True)
+        if HAG:
+            print("  [infer] 4th channel = real HeightAboveGround; every scene must "
+                  "carry a per-point 'hag' array.", flush=True)
         net.eval()
-        # Palette tiled to NUM_CLASSES so models with any class count don't
-        # index past a fixed colour table.
-        _BASE_PAL = np.array([[139, 90, 43], [34, 160, 34], [200, 60, 60], [40, 110, 220],
-                              [235, 225, 60], [150, 80, 200], [240, 140, 40], [70, 200, 200],
-                              [220, 100, 170], [120, 120, 120]], dtype=np.int32)
-        PALETTE = np.tile(_BASE_PAL, (-(-NUM_CLASSES // len(_BASE_PAL)), 1))[:NUM_CLASSES]
-
-        def _write_ply(path, pxyz, pred_idx, intensity=None):
-            cols = [pxyz.astype(np.float32), PALETTE[pred_idx]]
-            props = ("property float x\nproperty float y\nproperty float z\n"
-                     "property uchar red\nproperty uchar green\nproperty uchar blue\n")
-            fmt = ["%.3f", "%.3f", "%.3f", "%d", "%d", "%d"]
-            if intensity is not None:        # carry per-point intensity for the viewer
-                cols.append(np.asarray(intensity, np.float32).reshape(-1, 1))
-                props += "property float intensity\n"
-                fmt.append("%.5f")
-            header = "ply\nformat ascii 1.0\n" + f"element vertex {len(pxyz)}\n" + props + "end_header"
-            np.savetxt(path, np.column_stack(cols), fmt=fmt, header=header, comments="")
-
         scenes = sorted(glob.glob(f"/datasets/_infer/{infer_input}/scenes/*.npz"))
         if not scenes:
             raise FileNotFoundError(f"No scenes under /datasets/_infer/{infer_input}/scenes")
         pred_dir = f"{run_dir}/predictions"
-        infer_cfg = {"backbone": "KPConvX-L", "mode": "infer", "weights": weights,
+        infer_cfg = {"backbone": "KPConvX-L-HAG" if HAG else "KPConvX-L", "mode": "infer",
+                     "weights": weights,
                      "infer_input": infer_input, "num_classes": NUM_CLASSES,
                      "class_names": CLASS_NAMES, "grid": GRID, "chunk_xy": CHUNK_XY,
-                     "gpu": gpu_name(),
+                     "hag": (HAG_SOURCE if HAG else False), "gpu": gpu_name(),
                      "started_utc": datetime.utcnow().isoformat() + "Z"}
         print(f"  [infer] labeling {len(scenes)} scene(s) -> {run_dir}/predictions", flush=True)
         if DG_INFER_ADABN:
@@ -919,15 +1019,19 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
                     trn = (z["return_number"].astype(np.float32) if "return_number" in z
                            else (z["ret_num"].astype(np.float32) if "ret_num" in z
                                  else np.zeros(len(txyz), np.float32)))
+                    thag = scene_hag(z, pc_path, len(txyz))
                     # windows via one packed-code sort, not a full-cloud mask per window
                     for idx in tc.xy_chunk_groups(txyz, CHUNK_XY, min_pts=64):
                         if seen >= cap:
                             return
-                        attrs = np.stack([tin[idx], trn[idx]], 1).astype(np.float32)
+                        cols = [tin[idx], trn[idx]] + ([thag[idx]] if HAG else [])
+                        attrs = np.stack(cols, 1).astype(np.float32)
                         sx, sa, _ = grid_subsample(txyz[idx], attrs, None, GRID)
                         if len(sx) < 32:
                             continue
-                        feat = build_feat(sx, sa[:, 0], sa[:, 1])
+                        # BN stats must see the same feature predict will be fed.
+                        feat = build_feat(sx, sa[:, 0], sa[:, 1],
+                                          sa[:, 2] if HAG else None)
                         cxyz = (sx - sx.mean(0)).astype(np.float32)
                         try:
                             b, _ = make_kp_pack([(cxyz, feat, None)])
@@ -949,7 +1053,8 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
             ret_num = (z["return_number"].astype(np.float32) if "return_number" in z
                        else (z["ret_num"].astype(np.float32) if "ret_num" in z
                              else np.zeros(len(xyz), np.float32)))
-            pred = _predict_points(xyz, intensity_n, ret_num)
+            hag = scene_hag(z, pc_path, len(xyz))   # --hag: real HAG; plain: None
+            pred = _predict_points(xyz, intensity_n, ret_num, hag=hag)
             tc.write_pred(f"{pred_dir}/{name}_pred.npz", xyz, pred, intensity_n)
             np.savetxt(f"{pred_dir}/{name}_pred_CLS.txt", pred, fmt="%d")
             scene_stats.append({"scene": os.path.basename(pc_path),
@@ -1012,7 +1117,8 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
                     xyz = z["xyz"]
                     if len(xyz) < 32:
                         continue
-                    feat = build_feat(xyz, z["intensity"], z["ret_num"])
+                    feat = build_feat(xyz, z["intensity"], z["ret_num"],
+                                      _hag_of(z, xyz) if HAG else None)
                     cxyz = (xyz - xyz.mean(0)).astype(np.float32)
                     try:
                         batch, _ = make_kp_pack([(cxyz, feat, None)])
@@ -1087,7 +1193,9 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
     _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "helper"))
     from train_common import BestCheckpoint, write_run_manifest
     best = BestCheckpoint(run_dir)
-    write_run_manifest(run_dir, "kpconvx_cold", dataset)   # the single inference manifest (run.json)
+    # the single inference manifest (run.json); the _hag key keeps the Infer
+    # page mapping HAG runs back to the HAG entry point exactly as before.
+    write_run_manifest(run_dir, "kpconvx_cold_hag" if HAG else "kpconvx_cold", dataset)
 
     def run_eval(ep, write_json=False):
         # Periodic pass scores the held-out VAL scenes only (no test peeking) and
@@ -1216,6 +1324,9 @@ def main():
     ap.add_argument('--epochs', type=int, default=None)
     ap.add_argument('--batch', type=int, default=None)
     ap.add_argument('--steps-per-epoch', type=int, default=None)
+    ap.add_argument('--hag', action='store_true',
+                    help='swap the 4th input channel to real HeightAboveGround '
+                         '(replaces the old local_train_kpconvx_cold_hag.py)')
     args = ap.parse_args()
     # --dataset is required for training/eval; only --mode infer may omit it.
     if args.dataset is None and args.mode != 'infer':

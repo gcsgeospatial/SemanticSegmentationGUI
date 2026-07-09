@@ -1,45 +1,30 @@
-"""Pretraining preprocessing — PDAL HAG augmentation + model-ready tiling.
+"""HeightAboveGround for one cloud, by two interchangeable methods.
 
-Two standalone functions backing the Pretraining tab:
+`hag_for_cloud` is the single engine behind every HAG channel in the app: the
+Datasets page bakes it into a dataset during conversion, and the Inference page
+bakes it into the scenes a *_hag model is about to label.
 
-- `add_hag`: run PDAL on each LAS/LAZ cloud to compute HeightAboveGround and
-  write it back out as a new dimension (georeferencing preserved). Ground can
-  come from SMRF (use_smrf), from a labeled ground class (ground_class), or both
-  unioned so SMRF fills the holes the labels miss (e.g. under buildings). Each
-  cloud gets a `.json` sidecar with the executed pipeline + HAG stats; the folder
-  gets a `pretrain_summary.json`.
+  - "grid"  : pure numpy/scipy raster (ground = per-cell low-percentile Z, roofs
+              rejected by a grey opening). Fast, no PDAL.
+  - hag_nn / hag_delaunay : PDAL filters, with SMRF detecting ground when no
+              ground mask is supplied. Accurate, needs python-pdal.
 
-- `tile_for_model`: produce train-ready tiles for a chosen backbone by staging
-  the folder to the canonical npz layout (`dataset.convert_scene`) and running
-  the existing, tested tilers (`prep.prep_dataset`). HAG stays in the LAZ from
-  `add_hag`; the npz tiles keep the scripts' byte-layout contract unchanged.
+Ground comes from ONE source, never a union: a caller-supplied ground_mask
+(trusted labels) wins outright and disables SMRF. Returns None on any failure —
+callers then write no "hag" key, and the *_hag models refuse to run.
 
-`pdal` is imported lazily so this module (and the GUI) load fine without it —
-only `add_hag` needs it. `tile_for_model` is pure numpy/laspy.
+`pdal` is imported lazily, so this module (and the GUI) load fine without it.
 """
 
 from __future__ import annotations
 
 import json
 import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
-from pathlib import Path
 
 import numpy as np
 
-from . import dataset, prep
-from .dataset import LabelSpec
-from .readers import SUPPORTED_EXTS, read_points
-
-LAS_EXTS = {".las", ".laz"}
-HAG_FILTERS = ("hag_nn", "hag_delaunay")     # PDAL filters (add_hag + the accurate path)
+HAG_FILTERS = ("hag_nn", "hag_delaunay")     # PDAL filters (the accurate path)
 HAG_METHODS = ("grid",) + HAG_FILTERS        # hag_for_cloud methods; "grid" = fast default
-
-# SMRF overwrites Classification (ground->2). When the label lives in that dim,
-# add_hag(preserve_class_as=...) ferries it here BEFORE SMRF so a downstream
-# converter can read the real labels back after HAG.
-HAG_PRESERVED_CLASS_DIM = "label_src"
 
 
 def pdal_available() -> bool:
@@ -107,146 +92,6 @@ def _structured_from_cloud(cloud) -> np.ndarray:
     return arr
 
 
-def _hag_pipeline(reader_stage, out_path: str, *, ground_class: int | None = None,
-                  use_smrf: bool = True, hag_filter: str = "hag_nn",
-                  has_header: bool = True, preserve_class_as: str | None = None,
-                  smrf_cell: float = 2.0) -> list:
-    """[reader] -> [ferry] -> [smrf] -> [assign ground] -> filters.<hag> -> writers.las.
-
-    Ground for the HAG filter is built from, in combination:
-      - use_smrf: PDAL SMRF detects ground (sets Classification=2).
-      - ground_class: the cloud's OWN label value for ground is re-asserted as
-        Classification=2 AFTER SMRF — so labeled ground is UNIONed with SMRF's,
-        and SMRF fills the holes the labels miss (missing ground returns, e.g.
-        under buildings) without discarding the trusted labels.
-    SMRF overwrites Classification, so when a ground_class is trusted its original
-    values are stashed first (preserve_class_as, else HAG_PRESERVED_CLASS_DIM) and
-    the assign reads ground back from that stash.
-
-    `reader_stage` is the readers.las dict for LAS/LAZ inputs, or None when the
-    points are injected as a numpy array. writers.las writes every extra dim
-    (incl. HeightAboveGround), LAS 1.4; the header is forwarded only when there is
-    a LAS reader to forward it from.
-    """
-    # Stash original Classification when we need to read a labeled ground back
-    # after SMRF clobbers it (and/or when the caller wants labels preserved).
-    stash = preserve_class_as or (HAG_PRESERVED_CLASS_DIM if ground_class is not None else None)
-    stages: list = [reader_stage] if reader_stage else []
-    if stash:
-        stages.append({"type": "filters.ferry",
-                       "dimensions": f"Classification=>{stash}"})
-    if use_smrf:
-        # cell = ground-raster resolution; coarser than PDAL's 1.0 m default is
-        # ~(1.0/cell)^2 cheaper in SMRF and fine for a HAG reference surface.
-        stages.append({"type": "filters.smrf", "cell": smrf_cell})
-    if ground_class is not None:
-        # Re-assert the labeled ground as class 2 (union with SMRF when it ran).
-        stages.append({"type": "filters.assign",
-                       "value": f"Classification = 2 WHERE {stash} == {int(ground_class)}"})
-    stages.append({"type": f"filters.{hag_filter}"})
-    writer = {"type": "writers.las", "filename": out_path,
-              "minor_version": 4, "extra_dims": "all"}
-    if has_header:
-        writer["forward"] = "all"
-    stages.append(writer)
-    return stages
-
-
-def add_hag(in_dir: str | Path, out_dir: str | Path, *, ground_class: int | None = None,
-            use_smrf: bool = True, hag_filter: str = "hag_nn", smrf_cell: float = 2.0,
-            preserve_class_as: str | None = None, max_workers: int | None = None,
-            progress=None) -> dict:
-    """Add a HeightAboveGround dim to every cloud in `in_dir` -> `out_dir`.
-
-    LAS/LAZ are read by PDAL directly (CRS + dims preserved). Other supported
-    formats (txt/csv/xyz/pts/ply/pcd/npy/npz) are read via readers.py and
-    transformed to LAS/LAZ on the way through the HAG pipeline. Outputs are
-    `.laz` with a HeightAboveGround dim + a per-file `.json` sidecar.
-
-    Files are processed concurrently (PDAL drops the GIL in execute), so this
-    scales with cores when there's more than one scene; smrf_cell trades ground
-    resolution for SMRF speed. Returns a summary dict (also written to
-    out_dir/pretrain_summary.json).
-    """
-    import pdal
-
-    if hag_filter not in HAG_FILTERS:
-        raise ValueError(f"hag_filter must be one of {HAG_FILTERS}, got {hag_filter!r}")
-    if ground_class is not None:
-        use_smrf = False              # trusted labels -> SMRF never runs
-    say = progress or (lambda s: None)
-    in_dir, out_dir = Path(in_dir), Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    files = dataset.discover_scenes(in_dir)   # accepts a folder OR a single file
-    if not files:
-        raise FileNotFoundError(f"No supported point-cloud files in {in_dir}")
-
-    say(f"{len(files)} cloud(s) -> {out_dir}"
-        + ("   (SMRF ground-classify)" if use_smrf else "")
-        + (f"   (+ labeled ground = class {ground_class})" if ground_class is not None else ""))
-
-    def _process_one(path: Path) -> dict:
-        out_path = out_dir / (path.stem + ".laz")
-        is_las = path.suffix.lower() in LAS_EXTS
-        if is_las:
-            reader = {"type": "readers.las", "filename": str(path)}
-            arrays = None
-        else:
-            reader = None
-            arrays = [_structured_from_cloud(read_points(path))]
-        stages = _hag_pipeline(reader, str(out_path), ground_class=ground_class,
-                               use_smrf=use_smrf, hag_filter=hag_filter, smrf_cell=smrf_cell,
-                               has_header=is_las, preserve_class_as=preserve_class_as)
-        pipe = (pdal.Pipeline(json.dumps(stages), arrays=arrays) if arrays
-                else pdal.Pipeline(json.dumps(stages)))
-        n = pipe.execute()
-        arr = pipe.arrays[0]
-        hag = np.asarray(arr["HeightAboveGround"], np.float64)
-        n_ground = int((np.asarray(arr["Classification"]) == 2).sum())
-        st = {
-            "scene": path.name,
-            "output": out_path.name,
-            "n_points": int(n),
-            "n_ground": n_ground,
-            "hag_min": float(hag.min()),
-            "hag_mean": float(hag.mean()),
-            "hag_max": float(hag.max()),
-        }
-        with open(out_dir / (path.stem + ".json"), "w", encoding="utf-8") as f:
-            json.dump({"pipeline": stages, **st}, f, indent=2)
-        return st
-
-    # Each SMRF holds its whole cloud in RAM — clamp by RAM + cores so a big
-    # multi-file run can't OOM (one policy, shared with the converter).
-    workers = max_workers or dataset._worker_cap(files)
-    per_file = []
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = {ex.submit(_process_one, p): p for p in files}
-        for fut in as_completed(futs):
-            st = fut.result()
-            per_file.append(st)
-            say(f"  ✓ {st['scene']} -> {st['output']}: {st['n_points']:,} pts, "
-                f"{st['n_ground']:,} ground, HAG {st['hag_min']:.2f}..{st['hag_max']:.2f} m")
-    per_file.sort(key=lambda s: s["scene"])   # completion order -> stable report
-
-    summary = {
-        "created_utc": datetime.now(timezone.utc).isoformat(),
-        "input_dir": str(in_dir),
-        "output_dir": str(out_dir),
-        "ground_class": ground_class,
-        "use_smrf": use_smrf,
-        "hag_filter": hag_filter,
-        "n_files": len(per_file),
-        "total_points": sum(s["n_points"] for s in per_file),
-        "files": per_file,
-    }
-    with open(out_dir / "pretrain_summary.json", "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2)
-    say(f"✓ HAG added for {len(per_file)} cloud(s) -> {out_dir}")
-    return summary
-
-
 # Grid-HAG knobs. cell = ground-raster resolution (error ~ cell x slope);
 # open window = largest structure whose roof-only cells get rejected; relief =
 # terrain rise the opening may flatten before a cell counts as non-ground.
@@ -272,9 +117,9 @@ def hag_grid_for_cloud(cloud, *, ground_mask=None,
     cells are nearest-filled the same way.
 
     HAG = z - bilinear(raster). Error is ~cell x slope: a feature channel, not
-    survey ground — the trainers' accepted fallback is z-scene-min, far cruder.
-    Returns float32 aligned 1:1 to cloud.xyz, or None when it can't produce one
-    (caller falls back to that proxy)."""
+    survey ground. Returns float32 aligned 1:1 to cloud.xyz, or None when it
+    can't produce one — the scene then carries no "hag" key and the *_hag models
+    refuse it (there is no fallback height)."""
     try:
         from scipy import ndimage
     except Exception:  # noqa: BLE001
@@ -355,9 +200,10 @@ def hag_for_cloud(cloud, *, ground_mask=None, use_smrf: bool = True,
         method does its own detection and ignores use_smrf.
 
     Returns float32 length cloud.n, or None when no method can produce an
-    aligned result (caller falls back to a z-min proxy — never worse than
-    before). smrf+hag preserve input order; the length + first/last-X guard
-    rejects the pathological case where they don't."""
+    aligned result — callers then write no "hag" key, and the *_hag models fail
+    loudly rather than train or predict on a fabricated height. smrf+hag preserve
+    input order; the length + first/last-X guard rejects the pathological case
+    where they don't."""
     if hag_filter not in HAG_METHODS:
         raise ValueError(f"hag_filter must be one of {HAG_METHODS}, got {hag_filter!r}")
     if ground_mask is not None:
@@ -396,87 +242,19 @@ def hag_for_cloud(cloud, *, ground_mask=None, use_smrf: bool = True,
             return None
         ax = np.asarray(out["X"], np.float64)
         if not (np.isclose(ax[0], cloud.xyz[0, 0]) and np.isclose(ax[-1], cloud.xyz[-1, 0])):
-            return None   # PDAL reordered the points -> can't pair, fall back to proxy
+            return None   # PDAL reordered the points -> can't pair them back up
         return np.asarray(out["HeightAboveGround"], np.float32)
     except Exception:  # noqa: BLE001
         return None
 
 
-# ---------------------------------------------------------------- Stage B: tile
-
-def tile_for_model(in_dir: str | Path, out_dir: str | Path, backbone_key: str,
-                   params: dict, progress=None) -> Path:
-    """Tile a folder of clouds into train-ready npz tiles for `backbone_key`.
-
-    Stages the folder to the canonical npz layout under <out_dir>/_staged/train,
-    reading per-point labels from the LAS `classification` dim (value 0 /
-    unclassified -> ignore, the same default as the Datasets page), then runs
-    the existing per-backbone tiler. Returns the prep dir (<...>/prep/<tag>).
-    """
-    say = progress or (lambda s: None)
-    in_dir, out_dir = Path(in_dir), Path(out_dir)
-    if not prep.supports_local_prep(backbone_key):
-        raise ValueError(f"Tiling not supported for backbone '{backbone_key}'")
-
-    files = dataset.discover_scenes(in_dir)
-    if not files:
-        raise FileNotFoundError(f"No supported point-cloud files in {in_dir}")
-
-    spec = LabelSpec(kind="field", field="classification")
-    say(f"scanning labels across {min(len(files), 8)} of {len(files)} scene(s) …")
-    counts = dataset.scan_label_values(files, spec)
-    # Identity map over observed classes; 0/unclassified is ignored (-1).
-    value_to_index = {v: i for i, v in enumerate(sorted(c for c in counts if c != 0))}
-    if not value_to_index:
-        raise ValueError("No trainable classes found in the `classification` dim "
-                         "(only value 0 / unclassified present).")
-    say(f"classes (source->index): {value_to_index}   ·   ignored: [0]")
-
-    staged = out_dir / "_staged"
-    say(f"staging {len(files)} scene(s) -> {staged / 'train'} …")
-    for path in files:
-        out_path = staged / "train" / (path.stem + ".npz")
-        say(f"  {path.name} …")
-        dataset.convert_scene(path, spec, value_to_index, out_path)
-
-    tag = prep.prep_tag(backbone_key, params)
-    say(f"tiling -> prep/{tag} …")
-    prep_dir = prep.prep_dataset(backbone_key, staged, params, progress=say)
-    say(f"✓ tiles ready -> {prep_dir}")
-    return prep_dir
-
-
 # --------------------------------------------------------------------- self-check
 
 def _selfcheck():
-    """_hag_pipeline stage ordering (no PDAL needed): ferry-before-smrf when
-    preserving labels, ground re-asserted AFTER smrf (union), writer always last."""
-    s = _hag_pipeline({"type": "readers.las"}, "/x.laz", use_smrf=True,
-                      hag_filter="hag_nn", has_header=True,
-                      preserve_class_as=HAG_PRESERVED_CLASS_DIM)
-    assert [st["type"] for st in s] == [
-        "readers.las", "filters.ferry", "filters.smrf",
-        "filters.hag_nn", "writers.las"], s
-    assert s[1]["dimensions"] == f"Classification=>{HAG_PRESERVED_CLASS_DIM}"
-    assert s[-1]["forward"] == "all"          # LAS reader -> forward the header
-    # labeled ground + SMRF fill: stash labels, smrf, re-assert ground=class, hag
-    u = _hag_pipeline(None, "/x.laz", ground_class=6, use_smrf=True,
-                      hag_filter="hag_nn", has_header=False)
-    assert [st["type"] for st in u] == [
-        "filters.ferry", "filters.smrf", "filters.assign",
-        "filters.hag_nn", "writers.las"], u
-    assert u[2]["value"] == f"Classification = 2 WHERE {HAG_PRESERVED_CLASS_DIM} == 6"
-    # labeled ground only (no smrf), array input -> no header to forward
-    only = _hag_pipeline(None, "/x.laz", ground_class=2, use_smrf=False,
-                         hag_filter="hag_nn", has_header=False)
-    assert [st["type"] for st in only] == [
-        "filters.ferry", "filters.assign", "filters.hag_nn", "writers.las"], only
-    assert "forward" not in only[-1]          # array input -> no header to forward
-
-    # grid HAG numerics (no PDAL needed): flat ground at z=0 with a 10x10 m
-    # "roof" at z=10 and no ground returns beneath it. Detection must reject the
-    # roof cells (opening) and nearest-fill them; the labeled path must get the
-    # same answer from the mask alone.
+    """Grid HAG numerics (no PDAL needed): flat ground at z=0 with a 10x10 m
+    "roof" at z=10 and no ground returns beneath it. Detection must reject the
+    roof cells (opening) and nearest-fill them; the labeled path must get the
+    same answer from the mask alone."""
     from .readers import Cloud
     g = np.mgrid[0:60, 0:60].reshape(2, -1).T.astype(np.float64)
     on_roof = (g[:, 0] >= 25) & (g[:, 0] < 35) & (g[:, 1] >= 25) & (g[:, 1] < 35)

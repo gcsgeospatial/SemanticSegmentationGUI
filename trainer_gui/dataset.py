@@ -36,7 +36,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .readers import SUPPORTED_EXTS, Cloud, read_points
+from .readers import SUPPORTED_EXTS, Cloud, list_label_fields, read_points
 
 
 @dataclass
@@ -347,9 +347,10 @@ def _seam_drop(xy, keys, uniq, split_of_point, tile_m: float,
 def _hag_from_cloud(cloud: Cloud) -> np.ndarray | None:
     """Return a source HeightAboveGround/HAG field when one exists and aligns 1:1.
 
-    `pretrain.add_hag()` writes LAS/LAZ with a `HeightAboveGround` extra dim;
-    readers.py exposes that as a numeric field. Preserve it into the canonical
-    npz so *_hag trainers get the real HAG feature instead of their z-min proxy.
+    A cloud that already carries HAG (e.g. LAS/LAZ with a `HeightAboveGround`
+    extra dim, which readers.py exposes as a numeric field) keeps it verbatim —
+    it wins over recomputation. *_hag models require a real HAG feature and
+    refuse to run without one.
     """
     for name, arr in cloud.fields.items():
         key = name.lower().replace("_", "")
@@ -369,12 +370,14 @@ def _convert_one(cloud: Cloud, raw: np.ndarray | None, value_to_index: dict[int,
     compute_hag: also store a per-point real HeightAboveGround ("hag", SMRF->hag)
     aligned to xyz — for *_hag weights trained on real HAG, or to bake HAG into a
     dataset during tiling. Computing it here (points already in RAM) is a single
-    pass — no reload/re-write round trip. Silently skipped (the loaders fall back
-    to a z-min proxy) when PDAL can't produce an aligned result."""
+    pass — no reload/re-write round trip. Skipped when PDAL can't produce an
+    aligned result; the scene then has no "hag" key and *_hag models refuse it."""
     out: dict[str, np.ndarray] = {"xyz": cloud.xyz.astype(np.float32)}
 
     class_counts: dict[int, int] = {}
-    if raw is not None:
+    # No class mapping = inference: `raw` was read only to locate ground (see
+    # ground_value below), so writing an all-(-1) label array would be a lie.
+    if raw is not None and value_to_index:
         label = np.full(cloud.n, -1, dtype=np.int32)
         for src_val, idx in value_to_index.items():
             label[raw == src_val] = idx
@@ -804,9 +807,16 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
     return out_root
 
 
+# Field names that plausibly carry a classification, best first. Same order the
+# Datasets page offers when it picks a label field (see datasets_page._scan_labels).
+_GROUND_FIELD_CANDIDATES = ("classification", "Classification", "scalar_label",
+                            "label", "class")
+
+
 def convert_infer_job(job_id: str, input_dir: str, staging_root: Path, progress=None,
                       intensity_norm: str = "p95", hag: bool = False,
-                      hag_filter: str = "grid", out_dir: Path | None = None) -> Path:
+                      hag_filter: str = "grid", ground_value: int | None = None,
+                      out_dir: Path | None = None) -> Path:
     """Label-less conversion for inference-only jobs -> <staging>/_infer/<job_id>/,
     or to `out_dir` when given (the caller nests it under the owning dataset, e.g.
     <dataset>/infer/<job_id>). The container mount name stays /datasets/_infer/<job>
@@ -815,32 +825,52 @@ def convert_infer_job(job_id: str, input_dir: str, staging_root: Path, progress=
     intensity_norm MUST match what the weights were trained with (max -> [0,1], or
     p95 -> [0,2] for weights trained that way) — a mismatch feeds the net
     out-of-distribution intensity and tanks accuracy for every checkpoint.
-    `hag=True` (for *_hag weights trained on a real HAG channel) computes a
-    per-point "hag" channel with `hag_filter` — pass the METHOD the run trained
-    with (the caller maps the manifest's hag_source) so inference reproduces the
-    trained feature. There are no labels here, so ground is always detected:
-    grid's opening heuristic or PDAL SMRF. A PDAL filter without PDAL installed
-    falls back to grid (still far closer to real HAG than the z-min proxy).
+
+    `hag=True` (required by *_hag weights) computes a per-point "hag" channel with
+    `hag_filter`. `ground_value` names the classification value that means ground —
+    those points become the ONLY ground source, exactly as on the Datasets page.
+    Left None, ground is detected instead (grid's opening heuristic, or PDAL SMRF).
+    A PDAL filter without PDAL installed falls back to grid.
+
+    use_smrf is deliberately not a parameter: hag_for_cloud already forces it off
+    once a usable ground mask arrives, and a scene that happens to contain none of
+    `ground_value` degrades to detection rather than producing no HAG at all.
     """
     say = progress or (lambda s: None)
     if hag:
         from . import pretrain
         if hag_filter != "grid" and not pretrain.pdal_available():
-            say(f"  ⚠ run trained with {hag_filter} but PDAL isn't installed here - "
-                "using the grid method (approximate HAG).")
+            say(f"  ⚠ {hag_filter} needs PDAL (not installed) - using the grid method "
+                "instead (approximate HAG).")
             hag_filter = "grid"
-        src = "grid detection" if hag_filter == "grid" else "SMRF"
+        src = (f"ground=class {ground_value}" if ground_value is not None
+               else ("grid detection" if hag_filter == "grid" else "SMRF"))
         say(f"  computing HeightAboveGround per scene ({src} -> {hag_filter}) …")
     out_root = Path(out_dir) if out_dir else (staging_root / "_infer" / job_id)
     files = discover_scenes(input_dir)
     if not files:
         raise FileNotFoundError(f"No supported point-cloud files in {input_dir}")
+    # One spec for the whole job: per-file resolution would let scenes key off
+    # different fields and silently change what "ground" means mid-job. A file that
+    # lacks the chosen field fails loud in read_labels.
+    spec = None
+    if hag and ground_value is not None:
+        fields = list_label_fields(files[0])
+        field = next((f for f in _GROUND_FIELD_CANDIDATES if f in fields), None)
+        if field is None:
+            raise ValueError(
+                f"Ground class {ground_value} was set, but {files[0].name} carries no "
+                f"classification field (has: {sorted(fields)}). Clear the ground class "
+                f"to detect ground instead.")
+        spec = LabelSpec(kind="field", field=field)
+        say(f"  ground from the '{field}' field, value {ground_value}")
     scenes, stats = [], []
     for path in files:
         out_path = out_root / "scenes" / (path.stem + ".npz")
         say(f"  converting {path.name} ...")
-        st = convert_scene(path, None, {}, out_path, intensity_norm=intensity_norm,
-                           compute_hag=hag, hag_filter=hag_filter)
+        st = convert_scene(path, spec, {}, out_path, intensity_norm=intensity_norm,
+                           compute_hag=hag, ground_value=ground_value,
+                           hag_filter=hag_filter)
         st["scene"] = out_path.name
         st["source_file"] = str(path)
         scenes.append(out_path.name)
@@ -915,74 +945,6 @@ def _write_pred(dst: Path, xyz: np.ndarray, cls: np.ndarray, fmt: str):
         np.savetxt(dst, np.column_stack([xyz, cls]), delimiter=",",
                    fmt=["%.3f"] * 3 + ["%d"], header="x,y,z,classification",
                    comments="")
-
-
-def add_hag_to_dataset(src_dir, out_dir, *, use_smrf: bool = True,
-                       hag_filter: str = "grid", progress=None) -> Path:
-    """Add a per-tile HeightAboveGround channel to an already-converted dataset.
-
-    Reads each train|val|test/*.npz, recomputes HAG with `hag_filter` (grid
-    detection by default; SMRF -> hag for the PDAL filters) on the tile's OWN
-    points (the inference twin pretrain.hag_for_cloud, kept in RAM), and writes
-    a sibling dataset with a `hag` key added to every tile. Returns out_dir.
-    Ground is detected — the converted tiles carry remapped label indices, not
-    the source ground value; use the inline HAG in convert_dataset
-    (ground_value=…) when you want labeled ground.
-
-    Per-tile detection is weaker than whole-cloud on tiles with little bare
-    earth; tiles where no aligned result comes back keep no `hag` key and the
-    *_hag trainer falls back to its z-min proxy for them, so `has_hag` records
-    whether ALL tiles got real HAG.
-    """
-    from . import pretrain
-
-    say = progress or (lambda s: None)
-    src_dir, out_dir = Path(src_dir), Path(out_dir)
-    meta_path = src_dir / "dataset_meta.json"
-    if not meta_path.exists():
-        raise FileNotFoundError(f"{src_dir} is not a converted dataset (no dataset_meta.json)")
-    if hag_filter != "grid" and not pretrain.pdal_available():
-        raise RuntimeError(f"{hag_filter} needs PDAL (not installed) - use the grid method.")
-    meta = json.loads(meta_path.read_text(encoding="utf-8"))
-
-    n_tiles = n_hag = 0
-    for split in ("train", "val", "test"):
-        sdir = src_dir / split
-        if not sdir.is_dir():
-            continue
-        tiles = sorted(sdir.glob("*.npz"))
-        say(f"[{split}] {len(tiles)} tile(s)")
-        for npz_path in tiles:
-            with np.load(npz_path) as z:
-                data = {k: z[k] for k in z.files}
-            cloud = Cloud(
-                xyz=data["xyz"].astype(np.float64),
-                rgb=data.get("rgb"),
-                intensity=data.get("intensity"),
-                return_number=data.get("return_number"),
-            )
-            h = pretrain.hag_for_cloud(cloud, use_smrf=use_smrf, hag_filter=hag_filter)
-            if h is not None and len(h) == cloud.n:
-                data["hag"] = h.astype(np.float32)
-                n_hag += 1
-            out_path = out_dir / split / npz_path.name
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            np.savez_compressed(out_path, **data)
-            n_tiles += 1
-            say(f"  {split}/{npz_path.name}: "
-                f"{'HAG' if 'hag' in data else 'proxy'} ({cloud.n:,} pts)")
-    if n_tiles == 0:
-        raise ValueError(f"No npz tiles under {src_dir}/train|val|test - convert the dataset first.")
-
-    meta["name"] = sanitize_name(out_dir.name)
-    meta["has_hag"] = (n_hag == n_tiles)
-    meta.setdefault("source", {})["hag_source"] = f"per_tile_{hag_filter}"
-    meta["created_utc"] = datetime.now(timezone.utc).isoformat()
-    out_dir.mkdir(parents=True, exist_ok=True)
-    with open(out_dir / "dataset_meta.json", "w", encoding="utf-8") as f:
-        json.dump(meta, f, indent=2)
-    say(f"✓ HAG dataset -> {out_dir}  ({n_hag}/{n_tiles} tiles with real HAG)")
-    return out_dir
 
 
 # --------------------------------------------------------------------- self-check

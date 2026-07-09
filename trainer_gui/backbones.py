@@ -133,8 +133,9 @@ BACKBONES: dict[str, Backbone] = {b.key: b for b in [
                + _common(250, 6, chunk=False),
     ),
     # Both KPConvX scripts now have a --dataset training path (canonical scenes;
-    # the HAG variant uses the z-scene-min HAG proxy since canonical data has no
-    # HAG laz) plus --mode infer --infer-input for folder inference.
+    # the HAG variant requires a real per-point HAG channel, from a dataset built
+    # with HAG or the Inference page's HAG box) plus --mode infer --infer-input
+    # for folder inference.
     Backbone(
         key="kpconvx_cold_hag", label="KPConvX-L_hag",
         script="scripts/modal/modal_train_kpconvx_cold_hag.py",
