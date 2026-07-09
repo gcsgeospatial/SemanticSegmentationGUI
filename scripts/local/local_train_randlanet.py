@@ -722,7 +722,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
             name = os.path.splitext(os.path.basename(pc_path))[0]
             t0 = time.time()
             xyz, pred, inten = predict_scene(pc_path)
-            _write_ply(f"{pred_dir}/{name}_pred.ply", xyz, pred, palette, inten)
+            tc.write_pred(f"{pred_dir}/{name}_pred.npz", xyz, pred, inten)
             scene_stats.append({"scene": os.path.basename(pc_path),
                                 "points": int(len(xyz)),
                                 "seconds": round(time.time() - t0, 3)})

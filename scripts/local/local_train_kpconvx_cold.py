@@ -950,7 +950,7 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
                        else (z["ret_num"].astype(np.float32) if "ret_num" in z
                              else np.zeros(len(xyz), np.float32)))
             pred = _predict_points(xyz, intensity_n, ret_num)
-            _write_ply(f"{pred_dir}/{name}_pred.ply", xyz, pred, intensity_n)
+            tc.write_pred(f"{pred_dir}/{name}_pred.npz", xyz, pred, intensity_n)
             np.savetxt(f"{pred_dir}/{name}_pred_CLS.txt", pred, fmt="%d")
             scene_stats.append({"scene": os.path.basename(pc_path),
                                 "points": int(len(xyz)),

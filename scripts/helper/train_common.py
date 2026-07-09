@@ -11,6 +11,20 @@ import json
 import os
 
 
+def write_pred(path, xyz, pred, intensity=None):
+    """Write one inferred scene as a compact npz — xyz + per-point class index
+    (+ optional intensity). The host exporter (dataset.export_predictions) writes
+    the user's chosen file type straight from this, so there's no intermediate
+    coloured PLY to render and then reparse. Class is stored losslessly (the raw
+    prediction), not encoded as palette colour."""
+    import numpy as np
+    d = {"xyz": np.asarray(xyz, np.float32),
+         "classification": np.asarray(pred, np.int32)}
+    if intensity is not None:
+        d["intensity"] = np.asarray(intensity, np.float32)
+    np.savez(path, **d)
+
+
 def best_val_miou(val_csv):
     """Max val_miou already recorded (resume-safe seed). -1.0 if none."""
     if not os.path.exists(val_csv):

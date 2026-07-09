@@ -32,8 +32,9 @@ class Backbone:
     ready: bool = False                # can train via --dataset + param flags
     folder_infer: bool = False         # supports `--mode infer --infer-input <job>`
     grid_kind: str = "grid"            # "grid" | "octree_depth" — drives recommendation math
-    grid_clamp: tuple = (0.05, 1.0)    # clamp band for the recommended grid (m)
-    grid_mult: float = 3.0             # recommended grid = grid_mult x mean point spacing
+    grid_clamp: tuple = (0.05, 2.0)    # clamp band for the recommended grid (m)
+    grid_mult: float = 1.25            # recommended grid = grid_mult x mean point
+                                       # spacing -> occupancy o ~ grid_mult^2 (>1)
     rec_gpu: str = "A100"              # rough recommended GPU for training (tune to your data)
     min_vram_gb: int = 16             # rough min VRAM (GB) for local training (tune)
     params: list = field(default_factory=list)
@@ -74,8 +75,15 @@ BACKBONES: dict[str, Backbone] = {b.key: b for b in [
     Backbone(
         key="ptv3", label="PTv3", script="scripts/modal/modal_train_ptv3.py",
         app_name="ptv3", ready=True, folder_infer=True,
-        rec_gpu="A100", min_vram_gb=16,
-        grid_clamp=(0.05, 0.6),
+        # 24 GB floor: the script trains fp32 with standard (non-flash) attention
+        # (~0.2 MB/voxel retained -> ~15 GB peak at the recommended ~52-58k voxels
+        # per forward), and vertical-heavy (forest) tiles collapse less under the
+        # 3D voxel dedup than the mean-scene estimate assumes - 16 GB has no margin.
+        rec_gpu="A100", min_vram_gb=24,
+        # lo 0.15: the script's fixed 80k/15m train crop caps TRAIN density at
+        # ~113 pts/m2, so finer grids train on mostly-empty cells while eval runs
+        # full (the DG mismatch); at 0.15 train fill is ~92% vs eval ~100%
+        grid_clamp=(0.15, 2.0), grid_mult=1.25,
         params=[ParamSpec("grid", "Grid size (m)", "float", 0.05, 0.02, 3.0,
                           step=0.05, decimals=2, recommend_key="grid")]
                + _common(250, 4),
@@ -84,17 +92,20 @@ BACKBONES: dict[str, Backbone] = {b.key: b for b in [
         key="randlanet", label="RandLA-Net", script="scripts/modal/modal_train_randlanet.py",
         app_name="randlanet-cold", ready=True, folder_infer=True,
         rec_gpu="A10G", min_vram_gb=8,
-        grid_clamp=(0.06, 0.5),
+        grid_clamp=(0.06, 2.0), grid_mult=1.2,
         params=[ParamSpec("sub-grid", "Sub-grid size (m)", "float", 0.12, 0.02, 2.0,
                           step=0.05, decimals=2, recommend_key="grid"),
-                ParamSpec("num-points", "Points / sample", "int", 45056, 4096, 131072)]
+                ParamSpec("num-points", "Points / sample", "int", 45056, 4096, 131072,
+                          recommend_key="num_points")]
                + _common(250, 6, chunk=False),
     ),
     Backbone(
         key="kpconvx_cold", label="KPConvX-L", script="scripts/modal/modal_train_kpconvx_cold.py",
         app_name="kpconvx-cold", ready=True, folder_infer=True,
         rec_gpu="A100-80GB", min_vram_gb=24,
-        grid_clamp=(0.5, 3.0),
+        # hi 2.0 reproduces the proven g=2.0/chunk=100 recipe at 0.5 pts/m2;
+        # lo 0.4 keeps the 2.5g..40g conv-radius ladder spanning real structures
+        grid_clamp=(0.4, 2.0), grid_mult=1.5,
         params=[ParamSpec("grid", "Grid size (m)", "float", 2.0, 0.1, 5.0,
                           step=0.1, decimals=2, recommend_key="grid")]
                + _common(150, 4, steps_default=300, chunk_default=100.0),
@@ -103,8 +114,8 @@ BACKBONES: dict[str, Backbone] = {b.key: b for b in [
     Backbone(
         key="ptv3_hag", label="PTv3_hag", script="scripts/modal/modal_train_ptv3_hag.py",
         app_name="ptv3-hag", ready=True, folder_infer=True,
-        rec_gpu="A100", min_vram_gb=16,
-        grid_clamp=(0.05, 0.6),
+        rec_gpu="A100", min_vram_gb=24,   # same fp32 non-flash budget as ptv3
+        grid_clamp=(0.15, 2.0), grid_mult=1.25,
         params=[ParamSpec("grid", "Grid size (m)", "float", 0.05, 0.02, 3.0,
                           step=0.05, decimals=2, recommend_key="grid")]
                + _common(250, 4),
@@ -114,10 +125,11 @@ BACKBONES: dict[str, Backbone] = {b.key: b for b in [
         script="scripts/modal/modal_train_randlanet_hag.py",
         app_name="randlanet-cold-hag", ready=True, folder_infer=True,
         rec_gpu="A10G", min_vram_gb=8,
-        grid_clamp=(0.06, 0.5),
+        grid_clamp=(0.06, 2.0), grid_mult=1.2,
         params=[ParamSpec("sub-grid", "Sub-grid size (m)", "float", 0.12, 0.02, 2.0,
                           step=0.05, decimals=2, recommend_key="grid"),
-                ParamSpec("num-points", "Points / sample", "int", 45056, 4096, 131072)]
+                ParamSpec("num-points", "Points / sample", "int", 45056, 4096, 131072,
+                          recommend_key="num_points")]
                + _common(250, 6, chunk=False),
     ),
     # Both KPConvX scripts now have a --dataset training path (canonical scenes;
@@ -128,7 +140,7 @@ BACKBONES: dict[str, Backbone] = {b.key: b for b in [
         script="scripts/modal/modal_train_kpconvx_cold_hag.py",
         app_name="kpconvx-cold-hag", ready=True, folder_infer=True,
         rec_gpu="A100-80GB", min_vram_gb=24,
-        grid_clamp=(0.5, 3.0),
+        grid_clamp=(0.4, 2.0), grid_mult=1.5,
         params=[ParamSpec("grid", "Grid size (m)", "float", 2.0, 0.1, 5.0,
                           step=0.1, decimals=2, recommend_key="grid")]
                + _common(150, 4, steps_default=300, chunk_default=100.0),

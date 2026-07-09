@@ -135,10 +135,62 @@ def main():
         check("meta: recommendations for all backbones",
               "ptv3" in meta["recommendations"] and "kpconvx_cold" in meta["recommendations"])
         grid = meta["recommendations"]["ptv3"]["grid"]
-        # 20k pts over ~100x100m -> 2 pts/m² -> spacing .7m -> 3x = 2.1 clamped to 0.6
-        check(f"meta: ptv3 grid clamped to band (got {grid})", 0.05 <= grid <= 0.6)
+        # 20k pts over ~100x100m -> 2 pts/m² -> spacing .71m -> 1.25x = 0.88 (in band)
+        check(f"meta: ptv3 grid clamped to band (got {grid})", 0.10 <= grid <= 2.0)
         check("meta: kpconvx grid clamped to its band",
-              0.5 <= meta["recommendations"]["kpconvx_cold"]["grid"] <= 3.0)
+              0.4 <= meta["recommendations"]["kpconvx_cold"]["grid"] <= 2.0)
+
+        # ---------------- analysis.recommend: aerial density sweep 0.5 -> 1000 pts/m2.
+        # Occupancy o = rho*g^2 must stay >= 1 (the density-invariant band, see
+        # scripts/DENSITY_DG.md), grids shrink monotonically as density grows, and
+        # every value stays inside its UI band so the Train page never clamps.
+        prev = None
+        for rho in (0.5, 2.0, 10.0, 50.0, 100.0, 250.0, 1000.0):
+            r = analysis.recommend({"stats": {"mean_pts_per_m2": rho,
+                                              "mean_spacing_m": rho ** -0.5}})
+            for k, rec in r.items():
+                g = rec["grid"]
+                dflt = next(int(p.default) for p in analysis.BACKBONES[k].params
+                            if p.flag == "batch")
+                ok = (rho * g * g >= 0.99 and 1 <= rec["batch"] <= dflt
+                      and (10 <= rec["chunk_xy"] <= 200 if "chunk_xy" in rec else True))
+                check(f"recommend rho={rho} {k}: o>=1, batch<=default, chunk in band", ok)
+            if prev is not None:
+                check(f"recommend rho={rho}: grids shrink with density",
+                      all(r[k]["grid"] <= prev[k]["grid"] + 1e-9 for k in r))
+            prev = r
+        r05 = analysis.recommend({"stats": {"mean_pts_per_m2": 0.5,
+                                            "mean_spacing_m": 0.5 ** -0.5}})
+        check("recommend: kpconvx reproduces the proven sparse recipe (g=2.0, chunk=100)",
+              r05["kpconvx_cold"]["grid"] == 2.0 and r05["kpconvx_cold"]["chunk_xy"] == 100)
+        r100 = analysis.recommend({"stats": {"mean_pts_per_m2": 100.0,
+                                             "mean_spacing_m": 0.1}})
+        check("recommend: randlanet num_points adapts with density (pyramid-friendly)",
+              r05["randlanet"]["num_points"] == 8192
+              and r100["randlanet"]["num_points"] == 45056
+              and r05["randlanet"]["num_points"] % 4096 == 0)
+        check("recommend: ptv3 tiles stay clear of the script's 80k train crop",
+              all(analysis.recommend({"stats": {"mean_pts_per_m2": d,
+                                                "mean_spacing_m": d ** -0.5}}
+                                     )["ptv3"]["chunk_xy"] ** 2 * d <= 80_000
+                  for d in (2.0, 10.0, 50.0)))
+        dg_wide = analysis.dg_recommend(1000.0, 2.0)   # UAV-trained, QL2 inference
+        # need comes from the grid the model ACTUALLY trains at (ptv3 pinned at
+        # 0.15 by the crop), not the raw density ratio: 1/(0.15*sqrt(2)) ~ 4.7
+        check("dg: dense-trained gap sized to the real (pinned) grid, not the ratio",
+              4.5 <= dg_wide["coarsen_max"] <= 5.0 and dg_wide["p_native"] == 0.35
+              and dg_wide["tta"] == 4 and dg_wide["logdk"]
+              and "exceeds the aug range" not in dg_wide["rationale"])
+        dg_over = analysis.dg_recommend(50.0, 0.5)     # beyond the aug range
+        check("dg: gap beyond the aug range caps at 6 + retrain advice",
+              dg_over["coarsen_max"] == 6.0
+              and "exceeds the aug range" in dg_over["rationale"])
+        dg_mid = analysis.dg_recommend(8.0, 2.0)       # QL1 -> QL2: modest 4x
+        check("dg: modest gap stays in the aug range",
+              1.5 <= dg_mid["coarsen_max"] <= 2.0
+              and "exceeds the aug range" not in dg_mid["rationale"])
+        check("dg: no aug when the pinned training grid already covers the target",
+              analysis.dg_recommend(100.0, 50.0)["density_aug"] is False)
 
         # ---------------- scene split: a folder of clouds is split by WHOLE scenes
         # (no tiling) into three disjoint train/val/test folders.
@@ -346,29 +398,27 @@ def main():
                                   "J", r"C:\out", r"C:\stage") == r"done — predictions in C:\out")
 
         # ---------------- prediction export (Inference page format picker)
-        # The scripts' coloured *_pred.ply -> chosen format carrying xyz +
-        # classification ONLY (no RGB); class indices invert losslessly from the
-        # palette colours; the coloured source ply is consumed.
-        from trainer_gui.palette import palette_for
+        # The scripts' *_pred.npz (xyz + class, straight from inference) -> chosen
+        # format carrying xyz + classification; the inferred data is transformed
+        # directly into the target type (no coloured PLY); the source npz is consumed.
         exd = tmp / "pred_export"
         exd.mkdir()
         ex_cls = np.array([0, 1, 2, 3, 4, 2, 0], np.int64)
-        hdr7 = ("ply\nformat ascii 1.0\nelement vertex 7\nproperty float x\n"
-                "property float y\nproperty float z\nproperty uchar red\n"
-                "property uchar green\nproperty uchar blue\nend_header")
+        ex_xyz = make_xyz(7)
 
         def _mk_pred():
-            np.savetxt(exd / "sceneX_pred.ply",
-                       np.column_stack([make_xyz(7), palette_for(5)[ex_cls]]),
-                       fmt=["%.3f"] * 3 + ["%d"] * 3, header=hdr7, comments="")
+            # scripts now write inferred data as a compact npz (xyz + class); export
+            # writes the chosen type straight from it — no intermediate coloured PLY.
+            np.savez(exd / "sceneX_pred.npz", xyz=ex_xyz.astype(np.float32),
+                     classification=ex_cls.astype(np.int32))
 
         import laspy
         _mk_pred()
         las_out = dataset.export_predictions(exd, "las")[0]
-        check("export: las carries the palette-inverted classes, source ply consumed",
+        check("export: las carries the inferred classes, source npz consumed",
               las_out.suffix == ".las"
               and list(laspy.read(str(las_out)).classification) == list(ex_cls)
-              and not (exd / "sceneX_pred.ply").exists())
+              and not (exd / "sceneX_pred.npz").exists())
         _mk_pred()
         csv_out = dataset.export_predictions(exd, "csv")[0]
         rows = np.genfromtxt(csv_out, delimiter=",", names=True)
@@ -379,7 +429,7 @@ def main():
         from plyfile import PlyData
         ply_out = dataset.export_predictions(exd, "ply")[0]
         pv = PlyData.read(str(ply_out))["vertex"]
-        check("export: ply rewrite drops RGB, keeps only a classification column",
+        check("export: ply carries only xyz + a classification column",
               {p.name for p in pv.properties} == {"x", "y", "z", "classification"}
               and list(np.asarray(pv["classification"]).astype(int)) == list(ex_cls))
 
@@ -806,6 +856,21 @@ def main():
             check("appstate: delete_dataset forgets the entry even when rmtree fails",
                   "stuck" not in appstate.known_datasets() and err)
 
+            # delete removes only the data; runs/ + infer/ are kept for record keeping
+            keep_ds = tmp / "keep_ds"
+            (keep_ds / "train").mkdir(parents=True)
+            (keep_ds / "dataset_meta.json").write_text("{}", encoding="utf-8")
+            (keep_ds / "runs" / "r1").mkdir(parents=True)
+            (keep_ds / "infer" / "j1").mkdir(parents=True)
+            appstate.remember_dataset("keep_ds", {"staged_dir": str(keep_ds), "uploaded": False})
+            _, kerr = appstate.delete_dataset("keep_ds")
+            check("appstate: delete_dataset keeps runs/ + infer/, removes only data",
+                  not kerr and not (keep_ds / "train").exists()
+                  and not (keep_ds / "dataset_meta.json").exists()
+                  and (keep_ds / "runs" / "r1").is_dir() and (keep_ds / "infer" / "j1").is_dir())
+            check("appstate: kept runs re-registered on the Plotting page",
+                  str(keep_ds / "runs") in appstate.get("plot_extra_roots", []))
+
             # Registry defaults to our GHCR org when never set (pulling works out
             # of the box); TT_REGISTRY/env or an explicit value override it.
             _saved_reg = os.environ.pop("TT_REGISTRY", None)
@@ -843,6 +908,42 @@ def main():
             check("local_cli: image tag override respected (else trainer-local-<key>)",
                   local_cli.image_for(BB["ptv3"]) == "myimg:1"
                   and local_cli.image_for(BB["randlanet"]) == "trainer-local-randlanet")
+
+            # ---- workspace re-root: one root owns every dataset; runs + infer nest
+            # under it, host-side only (container paths /datasets, /outputs unchanged).
+            ws = tmp / "ws"
+            appstate.set_workspace(str(ws))
+            # A prior check pinned datasets_root to a resolved path; clear it so we
+            # exercise the real default (blank -> derives from the workspace).
+            appstate.set_local_config({**appstate.local_config(), "datasets_root": ""})
+            check("appstate: workspace_dir + datasets_root default to the set workspace",
+                  appstate.workspace_dir() == ws
+                  and appstate.local_config()["datasets_root"] == str(ws))
+            # base /datasets = workspace (so /datasets/<name> resolves with no extra
+            # mount); the dataset's own folder bound to /outputs => runs at <ds>/runs/<id>.
+            ds_root = ws / "myds"
+            _, wargs = local_cli.run_script(
+                "modal_train_ptv3.py", {"dataset": "myds"}, BB["ptv3"],
+                repo_root="/repo", outputs_root=str(ds_root))
+            wj = " ".join(wargs)
+            check("local_cli: workspace -> /datasets and the dataset folder -> /outputs",
+                  f"{ws.as_posix()}:/datasets" in wj and f"{ds_root.as_posix()}:/outputs" in wj)
+            check("appstate: scratch_infer_dir sits under the workspace",
+                  appstate.scratch_infer_dir() == ws / "_scratch" / "infer")
+            # infer job nested under its owning dataset via out_dir (container path fixed)
+            job2 = dataset.convert_infer_job("ijob", str(txt_root / "val"),
+                                             ws, out_dir=ds_root / "infer" / "ijob")
+            check("dataset: convert_infer_job(out_dir=) nests scenes under <ds>/infer/<job>",
+                  job2 == ds_root / "infer" / "ijob"
+                  and (job2 / "scenes").is_dir() and (job2 / "job_meta.json").exists())
+            appstate.remember_dataset("myds", {"staged_dir": str(ds_root),
+                                               "meta_path": str(ds_root / "dataset_meta.json"),
+                                               "uploaded": False})
+            (ds_root / "runs").mkdir(parents=True, exist_ok=True)
+            check("appstate: dataset_root + dataset_run_roots resolve inside the workspace",
+                  appstate.dataset_root("myds") == ds_root
+                  and (ds_root / "runs") in appstate.dataset_run_roots())
+            appstate.forget_dataset("myds")
 
             # registry distribution: a configured registry makes the default tag
             # pullable (build once, pull anywhere); local-only tags must be built.

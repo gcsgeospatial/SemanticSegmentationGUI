@@ -82,10 +82,14 @@ class PlottingPage(QWidget):
 
     # ------------------------------------------------------------- run discovery
     def _default_roots(self) -> list[Path]:
-        """Run output roots: the Train page's output folder (default Downloads) plus
-        the repo's runs/ folder."""
-        out = appstate.get("local_train_out", "") or str(appstate.default_download_dir())
-        return [Path(out) / "runs", Path(self.repo_root) / "runs"]
+        """Run roots: each dataset's own runs/ folder (runs now nest under their
+        dataset), the repo's runs/, and — for runs made before the workspace layout —
+        the Train page's last output folder if one was recorded."""
+        roots = [*appstate.dataset_run_roots(), Path(self.repo_root) / "runs"]
+        out = appstate.get("local_train_out", "")
+        if out:
+            roots.append(Path(out) / "runs")
+        return roots
 
     def _rescan(self):
         """Reload the list from the default roots, keeping any user-added folders."""

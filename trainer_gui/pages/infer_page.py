@@ -37,7 +37,7 @@ class InferPage(QWidget):
         self.repo_root = repo_root
         self.converter = FuncWorker(self)
         self.preflight = FuncWorker(self)
-        self.exporter = FuncWorker(self)   # PLY -> chosen prediction format (host-side)
+        self.exporter = FuncWorker(self)   # npz -> chosen prediction format (host-side)
         self.runner = JobRunner(self)
         self.parser = LogParser(self)
         self._stage = ""
@@ -441,7 +441,7 @@ class InferPage(QWidget):
         return None
 
     def _pick_runjson(self):
-        start = self.runjson_edit.text().strip() or str(appstate.local_runs_dir())
+        start = self.runjson_edit.text().strip() or str(appstate.workspace_dir())
         path, _ = QFileDialog.getOpenFileName(
             self, "Choose run.json", start, "Run manifest (run.json *.json)")
         if path:
@@ -540,7 +540,7 @@ class InferPage(QWidget):
     def _pick_weights(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Choose weights (.pth)",
-            self.weights_edit.text().strip() or str(appstate.local_runs_dir()),
+            self.weights_edit.text().strip() or str(appstate.workspace_dir()),
             "PyTorch checkpoints (*.pth *.pt)")
         if path:
             self.weights_edit.setText(path)
@@ -668,11 +668,25 @@ class InferPage(QWidget):
         if hag_filter:
             self._append(f"[1/4] Run trained on real HAG ({hag_filter}) - reproducing "
                          "it for the input scenes.")
+        job_root = self._infer_out_dir()
         self._append(f"[1/4] Converting {input_dir} to scenes (job {self._job_id}; "
-                     f"intensity={norm})…")
+                     f"intensity={norm}) -> {job_root}…")
         self.converter.start(dataset.convert_infer_job, self._job_id, input_dir,
-                             appstate.staging_dir(), intensity_norm=norm,
-                             hag=bool(hag_filter), hag_filter=hag_filter or "grid")
+                             appstate.workspace_dir(), intensity_norm=norm,
+                             hag=bool(hag_filter), hag_filter=hag_filter or "grid",
+                             out_dir=job_root)
+
+    def _infer_out_dir(self) -> Path:
+        """Nest this infer job under its owning dataset (<dataset>/infer/<job>) when
+        the run names a known, on-disk dataset; else a findable workspace scratch
+        spot (loose .pth has no linked dataset). The container still mounts it at
+        /datasets/_infer/<job> regardless."""
+        name = (self._manifest or {}).get("dataset") \
+            if (self.from_run_radio.isChecked() and self._manifest) else None
+        staged = appstate.known_datasets().get(name or "", {}).get("staged_dir", "")
+        if staged and os.path.isdir(staged):
+            return appstate.dataset_root(name) / "infer" / self._job_id
+        return appstate.scratch_infer_dir() / self._job_id
 
     def _run_hag_filter(self) -> str | None:
         """The HAG method the run trained with (to reproduce at inference), or
@@ -756,9 +770,9 @@ class InferPage(QWidget):
             self._report_predictions(self._dl_dest / "predictions")
 
     def _report_predictions(self, pred_dir):
-        """Predictions landed (a stage can exit 0 yet write nothing) -> convert the
-        scripts' coloured PLYs to the chosen format (xyz + classification, no RGB)
-        on a worker thread; _on_exported prints the final green report."""
+        """Predictions landed (a stage can exit 0 yet write nothing) -> write the
+        scripts' npz predictions as the chosen format (xyz + classification) on a
+        worker thread; _on_exported prints the final green report."""
         pred_dir = Path(pred_dir) if pred_dir else None
         if not (pred_dir and pred_dir.is_dir()):
             self.run_btn.setEnabled(True)
@@ -779,17 +793,17 @@ class InferPage(QWidget):
     def _on_exported(self, written):
         self.run_btn.setEnabled(True)
         if not written:
-            self._append("✗ Nothing exported (no *_pred.ply in the predictions folder).")
+            self._append("✗ Nothing exported (no *_pred.npz in the predictions folder).")
             return
         self._append(f"\n✓ Done - {len(written)} prediction file(s) in {written[0].parent}.\n"
                      f"  'View a point cloud…' to open one, or 'Compare to ground "
                      f"truth…' for accuracy + mIoU.")
 
     def _on_export_error(self, tb: str):
-        # Predictions exist as the scripts' coloured PLYs; only the rewrite failed.
+        # Predictions still exist as the scripts' raw .npz; only the rewrite failed.
         self.run_btn.setEnabled(True)
-        self._append(f"\n✗ Format conversion failed — predictions remain as coloured "
-                     f".ply files.\n{tb}")
+        self._append(f"\n✗ Format conversion failed — predictions remain as raw "
+                     f".npz files.\n{tb}")
 
     def _start_modal_run(self):
         b = self._backbone()

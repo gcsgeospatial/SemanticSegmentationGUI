@@ -122,17 +122,27 @@ class JobRunner(QObject):
         self.proc = None
 
 
+class Stopped(Exception):
+    """Raised inside a job's progress() callback when the user hits Stop."""
+
+
 class FuncWorker(QObject):
     """Run a Python callable on a background thread; signals are queued to the
-    GUI thread. The callable receives a `progress(str)` callback."""
+    GUI thread. The callable receives a `progress(str)` callback.
+
+    Cancellation is cooperative: cancel() sets a flag and the next progress()
+    call raises Stopped, so a job only stops at its own checkpoints (scenes call
+    progress() one-per-scene, so a build stops between scenes)."""
 
     output = Signal(str)
     done = Signal(object)    # return value
     error = Signal(str)
+    stopped = Signal()       # user cancelled; job unwound cleanly
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._thread: threading.Thread | None = None
+        self._cancel = threading.Event()
 
     @property
     def running(self) -> bool:
@@ -141,10 +151,18 @@ class FuncWorker(QObject):
     def start(self, fn, *args, **kwargs):
         if self.running:
             raise RuntimeError("FuncWorker already running")
+        self._cancel.clear()
+
+        def progress(s):
+            if self._cancel.is_set():
+                raise Stopped()
+            self.output.emit(s)
 
         def _run():
             try:
-                result = fn(*args, progress=self.output.emit, **kwargs)
+                result = fn(*args, progress=progress, **kwargs)
+            except Stopped:
+                self.stopped.emit()
             except Exception:
                 self.error.emit(traceback.format_exc())
             else:
@@ -152,3 +170,7 @@ class FuncWorker(QObject):
 
         self._thread = threading.Thread(target=_run, daemon=True)
         self._thread.start()
+
+    def cancel(self):
+        """Cooperative stop: the running job bails at its next progress() call."""
+        self._cancel.set()

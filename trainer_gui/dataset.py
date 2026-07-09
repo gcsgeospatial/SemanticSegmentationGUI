@@ -806,8 +806,11 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
 
 def convert_infer_job(job_id: str, input_dir: str, staging_root: Path, progress=None,
                       intensity_norm: str = "p95", hag: bool = False,
-                      hag_filter: str = "grid") -> Path:
-    """Label-less conversion for inference-only jobs -> <staging>/_infer/<job_id>/.
+                      hag_filter: str = "grid", out_dir: Path | None = None) -> Path:
+    """Label-less conversion for inference-only jobs -> <staging>/_infer/<job_id>/,
+    or to `out_dir` when given (the caller nests it under the owning dataset, e.g.
+    <dataset>/infer/<job_id>). The container mount name stays /datasets/_infer/<job>
+    regardless — only the host folder changes.
 
     intensity_norm MUST match what the weights were trained with (max -> [0,1], or
     p95 -> [0,2] for weights trained that way) — a mismatch feeds the net
@@ -828,7 +831,7 @@ def convert_infer_job(job_id: str, input_dir: str, staging_root: Path, progress=
             hag_filter = "grid"
         src = "grid detection" if hag_filter == "grid" else "SMRF"
         say(f"  computing HeightAboveGround per scene ({src} -> {hag_filter}) …")
-    out_root = staging_root / "_infer" / job_id
+    out_root = Path(out_dir) if out_dir else (staging_root / "_infer" / job_id)
     files = discover_scenes(input_dir)
     if not files:
         raise FileNotFoundError(f"No supported point-cloud files in {input_dir}")
@@ -864,34 +867,26 @@ PRED_EXPORT_FORMATS = ("las", "laz", "ply", "txt", "csv")
 
 
 def export_predictions(pred_dir, fmt: str, progress=None) -> list[Path]:
-    """Rewrite a run's *_pred.ply files (palette-coloured, from the training
-    scripts) as <name>_pred.<fmt> carrying xyz + classification only. The class
-    index is recovered losslessly from the palette colours (the scripts paint
-    exact palette_for() values). The coloured source .ply is removed on success;
-    fmt='ply' rewrites in place. Returns the written paths."""
-    from plyfile import PlyData
-
-    from .palette import class_from_rgb
+    """Write each inferred scene (<name>_pred.npz — xyz + classification, straight
+    from the training scripts) as <name>_pred.<fmt> carrying xyz + classification.
+    The inferred data is transformed directly into the chosen type — there is no
+    intermediate coloured PLY to render and reparse. The source .npz is removed on
+    success. Returns the written paths."""
     fmt = fmt.lower().lstrip(".")
     if fmt not in PRED_EXPORT_FORMATS:
         raise ValueError(f"unsupported prediction format '{fmt}' "
                          f"(one of {', '.join(PRED_EXPORT_FORMATS)})")
     say = progress or (lambda s: None)
     written: list[Path] = []
-    for src in sorted(Path(pred_dir).glob("*_pred.ply")):
-        v = PlyData.read(str(src))["vertex"]
-        xyz = np.stack([v["x"], v["y"], v["z"]], -1).astype(np.float64)
-        names = {p.name for p in v.properties}
-        if "classification" in names:      # already class-carrying (future scripts)
-            cls = np.asarray(v["classification"], np.int64)
-        else:
-            cls = class_from_rgb(np.stack([v["red"], v["green"], v["blue"]], -1))
+    for src in sorted(Path(pred_dir).glob("*_pred.npz")):
+        with np.load(src) as d:
+            xyz = np.asarray(d["xyz"], np.float64)
+            cls = np.asarray(d["classification"], np.int64)
         # ponytail: uint8 classification (LAS pf6 / uchar); >255 classes would clip.
         cls = np.clip(cls, 0, 255).astype(np.uint8)
         dst = src.with_suffix(f".{fmt}")
         _write_pred(dst, xyz, cls, fmt)
-        if dst != src:
-            src.unlink()
+        src.unlink()                        # npz is never a target format
         written.append(dst)
         say(f"  {src.name} -> {dst.name} ({len(xyz):,} pts)")
     return written

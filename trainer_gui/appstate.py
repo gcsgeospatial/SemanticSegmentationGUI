@@ -40,6 +40,44 @@ def staging_dir() -> Path:
     return d
 
 
+def workspace_dir() -> Path:
+    """The single root that owns every dataset and, nested inside each, its runs/
+    and infer/ output. Set once via the first-launch prompt (set_workspace);
+    until then it falls back to staging_dir() so nothing breaks. This is the host
+    dir bound to /datasets, so /datasets/<name> resolves for every dataset."""
+    w = get("workspace")
+    d = Path(w) if w else staging_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def set_workspace(path: str) -> None:
+    put("workspace", str(path))
+
+
+def dataset_root(name: str) -> Path:
+    """A dataset's on-disk root = its registered staged_dir (may live outside the
+    workspace for pre-existing datasets — zero-move keeps them where they are)."""
+    return Path(known_datasets()[name]["staged_dir"])
+
+
+def dataset_run_roots() -> list[Path]:
+    """`<dataset>/runs` for every registered dataset still on disk — the roots the
+    Plotting page scans for local training runs."""
+    roots = []
+    for name, info in known_datasets().items():
+        staged = info.get("staged_dir", "")
+        if staged and os.path.isdir(staged):
+            roots.append(Path(staged) / "runs")
+    return roots
+
+
+def scratch_infer_dir() -> Path:
+    """Where inference from a loose .pth (no linked dataset) lands — a findable
+    spot in the workspace instead of forcing a dataset pick."""
+    return workspace_dir() / "_scratch" / "infer"
+
+
 def runs_dir() -> Path:
     d = app_dir() / "runs"
     d.mkdir(parents=True, exist_ok=True)
@@ -85,7 +123,7 @@ DEFAULT_REGISTRY = "ghcr.io/gcsgeospatial"
 _DEFAULT_LOCAL_CONFIG = {
     "images": {},          # backbone.key -> docker image tag (default trainer-local-<key>)
     "registry": "",        # registry prefix, e.g. "ghcr.io/you" -> pull instead of build
-    "datasets_root": "",   # host -> /datasets (default: staging_dir())
+    "datasets_root": "",   # host -> /datasets (default: workspace_dir())
     "outputs_root": "",    # host -> /outputs  (default: local_runs_dir())
     "gpus": "all",         # docker --gpus value ("all" | "0" | "" to disable)
     "extra_args": [],      # extra `docker run` args
@@ -95,7 +133,7 @@ _DEFAULT_LOCAL_CONFIG = {
 def local_config() -> dict:
     saved = get("local_config", {})
     cfg = {**_DEFAULT_LOCAL_CONFIG, **saved}
-    cfg["datasets_root"] = cfg["datasets_root"] or str(staging_dir())
+    cfg["datasets_root"] = cfg["datasets_root"] or str(workspace_dir())
     cfg["outputs_root"] = cfg["outputs_root"] or str(local_runs_dir())
     # Registry precedence: a saved value (even "") wins; else TT_REGISTRY (set it
     # once in the env, no JSON edit); else our DEFAULT_REGISTRY so pulling works
@@ -190,16 +228,44 @@ def forget_dataset(name: str) -> None:
     put("datasets", ds)
 
 
-def delete_dataset(name: str) -> tuple[str, str]:
-    """Forget a saved dataset AND delete its staged copy on disk, plus any per-
-    dataset overrides keyed by name. Returns (staged_dir, error): error is ""
-    when the on-disk folder is gone (or there was none), else the reason it
-    couldn't be removed (locked/in-use file — common on Windows). The registry
-    entry + overrides are dropped regardless, so the list stays consistent even
-    if files linger. Every dataset is deletable — there is no protected kind."""
+# A dataset folder's record-keeping subdirs: kept when the dataset is deleted so
+# past training runs + inference outputs survive. Everything else is "data".
+_KEEP_ON_DELETE = ("runs", "infer")
+
+
+def _rmtree_force(path: Path) -> str:
+    """Remove a file or a whole dir tree, best-effort. On Windows retry once after
+    clearing the read-only bit that blocks rmtree. Returns "" on success, else the
+    error string — NEVER raises (a throw would skip the caller's list refresh)."""
     import shutil
     import stat
 
+    def _rm():
+        shutil.rmtree(path) if path.is_dir() else path.unlink()
+
+    try:
+        _rm()
+    except OSError:
+        try:
+            for p in ([path, *path.rglob("*")] if path.is_dir() else [path]):
+                try:
+                    os.chmod(p, stat.S_IWRITE)
+                except OSError:
+                    pass
+            _rm()
+        except OSError as e:
+            return str(e)
+    return ""
+
+
+def delete_dataset(name: str) -> tuple[str, str]:
+    """Forget a saved dataset AND delete its DATA on disk (train/val/test, meta,
+    prep cache), plus any per-dataset overrides keyed by name. Its runs/ and infer/
+    subdirs are KEPT for record keeping (and re-registered on the Plotting page).
+    Returns (staged_dir, error): error is "" when the data is gone (or there was
+    none), else the reason it couldn't be removed (locked/in-use file — common on
+    Windows). The registry entry + overrides are dropped regardless, so the list
+    stays consistent even if files linger. Every dataset is deletable."""
     info = known_datasets().get(name, {})
     staged = info.get("staged_dir", "")
 
@@ -212,21 +278,33 @@ def delete_dataset(name: str) -> tuple[str, str]:
             allc.pop(name, None)
             put(key, allc)
 
-    # Best-effort disk removal — must NEVER raise (any throw here would skip the
-    # caller's list refresh). rglob/rmtree can both throw if a handle is open.
+    # Best-effort disk removal — must NEVER raise. Delete only the data; if runs/
+    # or infer/ are present, keep them (and the folder) and remove data per-child;
+    # otherwise there's nothing to preserve, so drop the whole folder.
     err = ""
     if staged and os.path.isdir(staged):
-        try:
-            shutil.rmtree(staged)
-        except OSError:
-            # Windows: read-only files block rmtree. Clear the flag and retry once.
-            try:
-                for p in Path(staged).rglob("*"):
-                    try:
-                        os.chmod(p, stat.S_IWRITE)
-                    except OSError:
-                        pass
-                shutil.rmtree(staged)
-            except OSError as e:
-                err = str(e)
+        root = Path(staged)
+        if any(c.name in _KEEP_ON_DELETE for c in root.iterdir()):
+            for child in root.iterdir():
+                if child.name not in _KEEP_ON_DELETE:
+                    err = _rmtree_force(child) or err
+            _register_kept_runs(root)
+        else:
+            err = _rmtree_force(root)
     return (staged, err)
+
+
+def _register_kept_runs(root: Path) -> None:
+    """A deleted dataset's registry entry is gone, so dataset_run_roots() no longer
+    covers its kept runs/. Add it to the Plotting page's extra roots so those runs
+    stay visible for record keeping."""
+    runs = root / "runs"
+    try:
+        has_runs = runs.is_dir() and any(runs.iterdir())
+    except OSError:
+        return
+    if has_runs:
+        extra = get("plot_extra_roots", [])
+        if str(runs) not in extra:
+            extra.append(str(runs))
+            put("plot_extra_roots", extra)

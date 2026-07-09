@@ -8,9 +8,9 @@ from pathlib import Path
 
 from PySide6.QtCore import QByteArray, QEvent, QObject, Qt
 from PySide6.QtGui import QIcon
-from PySide6.QtWidgets import (QAbstractSpinBox, QApplication, QComboBox, QHBoxLayout, QLabel,
-                               QListWidget, QListWidgetItem, QMessageBox, QStackedWidget, QVBoxLayout,
-                               QWidget)
+from PySide6.QtWidgets import (QAbstractSpinBox, QApplication, QComboBox, QFileDialog, QHBoxLayout,
+                               QLabel, QListWidget, QListWidgetItem, QMessageBox, QStackedWidget,
+                               QVBoxLayout, QWidget)
 
 # Repo root = the project dir holding scripts/ (one level up from this trainer_gui/
 # package). modal runs are launched with cwd=REPO_ROOT, so this must be where
@@ -183,6 +183,20 @@ def _app_icon() -> QIcon:
     return QIcon()
 
 
+def _ensure_workspace(parent=None) -> None:
+    """First launch only: ask where the workspace root should live — datasets and,
+    nested inside each, their runs/ and infer/ output. Seeded with the current
+    staging dir so accepting it moves nothing; cancel falls back to staging too.
+    Once stored, never prompts again."""
+    from . import appstate
+    if appstate.get("workspace"):
+        return
+    d = QFileDialog.getExistingDirectory(
+        parent, "Choose a workspace folder (datasets, training runs, and inference live here)",
+        str(appstate.staging_dir()))
+    appstate.set_workspace(d or str(appstate.staging_dir()))
+
+
 def _check_modal_cli(parent=None) -> bool:
     if shutil.which("modal"):
         return True
@@ -216,6 +230,7 @@ def main() -> int:
             and theme.apply(app, appstate.get("ui_theme", "system")))
     except (AttributeError, TypeError):
         pass
+    _ensure_workspace()   # set the workspace BEFORE pages read it for their defaults
     win = MainWindow()
     win.show()
     _check_modal_cli(win)

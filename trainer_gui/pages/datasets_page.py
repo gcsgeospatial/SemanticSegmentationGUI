@@ -86,6 +86,7 @@ class DatasetsPage(QWidget):
         self.worker.output.connect(self._append)
         self.worker.done.connect(self._dispatch_done)
         self.worker.error.connect(self._on_worker_error)
+        self.worker.stopped.connect(self._on_stopped)
         self.uploader.output.connect(lambda s: self._append(s, newline=False))
         self.uploader.finished.connect(self._on_upload_done)
         self.uploader.failed.connect(self._on_upload_failed)
@@ -122,7 +123,8 @@ class DatasetsPage(QWidget):
         self.field_combo.setEditable(True)
         form.addRow("Label field", self.field_combo)
         self.out_edit, out_row = self._dir_row(self._pick_out)
-        self.out_edit.setPlaceholderText("default: app staging folder")
+        self.out_edit.setText(str(appstate.workspace_dir()))   # show the default
+        self.out_edit.setToolTip("Base folder. A dataset builds into <this>/<name>.")
         form.addRow("Output folder", out_row)
         return box
 
@@ -135,12 +137,12 @@ class DatasetsPage(QWidget):
         self.scan_btn = QPushButton("Scan label values")
         self.scan_btn.clicked.connect(self._scan_labels)
         btn_row.addWidget(self.scan_btn)
-        self.combine_btn = QPushButton("Combine selected")
-        self.combine_btn.clicked.connect(self._combine_selected)
-        btn_row.addWidget(self.combine_btn)
         self.analyze_btn = QPushButton("Analyze density")
         self.analyze_btn.clicked.connect(self._analyze)
         btn_row.addWidget(self.analyze_btn)
+        self.combine_btn = QPushButton("Combine selected")
+        self.combine_btn.clicked.connect(self._combine_selected)
+        btn_row.addWidget(self.combine_btn)
         btn_row.addStretch()
         cl.addLayout(btn_row)
         self.class_table = QTableWidget(0, 4)
@@ -251,8 +253,14 @@ class DatasetsPage(QWidget):
         self.tile_btn = QPushButton("Build dataset")
         self.tile_btn.setObjectName("primary")
         self.tile_btn.clicked.connect(self._start_tiling)
+        # One Stop for the shared worker: cancels whichever of scan/analyze/build
+        # is running (a build stops between scenes).
+        self.stop_btn = QPushButton("Stop")
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.clicked.connect(self._stop)
         row = QHBoxLayout()
         row.addWidget(self.tile_btn)
+        row.addWidget(self.stop_btn)
         row.addStretch()
         form.addRow("", _wrap(row))
         return box
@@ -270,6 +278,25 @@ class DatasetsPage(QWidget):
         return lay
 
     # ------------------------------------------------------------- widgets
+    def _set_busy(self, on: bool):
+        """One worker at a time: disable every action that would start a second
+        job while one runs (this is the guard that stops scan+analyze colliding),
+        and light up Stop only while there's something to stop."""
+        for b in (self.scan_btn, self.analyze_btn, self.tile_btn):
+            b.setEnabled(not on)
+        self.stop_btn.setEnabled(on)
+
+    def _stop(self):
+        if self.worker.running:
+            self._append("Stopping after the current step…")
+            self.worker.cancel()
+            self.stop_btn.setEnabled(False)   # buttons reset when the job unwinds
+
+    def _on_stopped(self):
+        self._done_cb = None
+        self._set_busy(False)
+        self._append("⏹ Stopped.")
+
     def _dispatch_done(self, result):
         cb, self._done_cb = self._done_cb, None
         if cb:
@@ -335,7 +362,7 @@ class DatasetsPage(QWidget):
 
     def _output_root(self) -> Path:
         txt = self.out_edit.text().strip()
-        return Path(txt) if txt else appstate.staging_dir()
+        return Path(txt) if txt else appstate.workspace_dir()
 
     def _populate_fields(self, path: str):
         self.field_combo.clear()
@@ -375,7 +402,7 @@ class DatasetsPage(QWidget):
             return
         spec = self._spec()
         self._append("Scanning label values…")
-        self.scan_btn.setEnabled(False)
+        self._set_busy(True)
         def job(progress):
             files = dataset.expand_inputs(in_path)
             progress(f"  sampling {min(len(files), 8)} of {len(files)} file(s)")
@@ -385,7 +412,7 @@ class DatasetsPage(QWidget):
         self.worker.start(job)
 
     def _on_scanned(self, counts):
-        self.scan_btn.setEnabled(True)
+        self._set_busy(False)
         self._label_values = counts
         # Default-ignore value 0 only for ASPRS-style classification fields; else
         # class 0 may be real.
@@ -413,7 +440,10 @@ class DatasetsPage(QWidget):
         if not os.path.exists(in_path):
             self._append("Pick an input file or folder first.")
             return
-        self.analyze_btn.setEnabled(False)
+        if not self._label_values:
+            self._append("Run 'Scan label values' first.")
+            return
+        self._set_busy(True)
         self._append("Analyzing density…")
 
         def job(progress):
@@ -425,7 +455,7 @@ class DatasetsPage(QWidget):
         self.worker.start(job)
 
     def _on_analyzed(self, stats):
-        self.analyze_btn.setEnabled(True)
+        self._set_busy(False)
         recs = analysis.recommend(stats)
         chunk = next(iter(recs.values())).get("chunk_xy", 0.0)
         self.analyze_label.setText(
@@ -532,7 +562,7 @@ class DatasetsPage(QWidget):
             return
         name, classes, ignored = plan["name"], plan["classes"], plan["ignored"]
         split, out_root = plan["split"], plan["out_root"]
-        self.tile_btn.setEnabled(False)
+        self._set_busy(True)
         hag = "  + HAG" if plan["compute_hag"] else ""
         self._append(f"Building '{name}'{hag} ({len(classes)} classes, "
                      f"val={split.val_frac:.0%} test={split.test_frac:.0%} {split.mode} "
@@ -553,7 +583,7 @@ class DatasetsPage(QWidget):
 
     def _on_converted(self, staged: Path):
         self._staged_dir = staged
-        self.tile_btn.setEnabled(True)
+        self._set_busy(False)
         appstate.remember_dataset(staged.name, {
             "staged_dir": str(staged),
             "meta_path": str(staged / "dataset_meta.json"),
@@ -596,7 +626,8 @@ class DatasetsPage(QWidget):
         self._start_upload(staged)
 
     def _delete_saved(self):
-        """Forget the selected dataset and best-effort delete its staged copy, after confirm."""
+        """Forget the selected dataset and delete its DATA on disk, keeping any
+        runs/ + infer/ for record keeping, after confirm."""
         items = self.known_list.selectedItems()
         if not items:
             self._append("Select a saved dataset to delete.")
@@ -604,8 +635,9 @@ class DatasetsPage(QWidget):
         name = items[0].text()
         resp = QMessageBox.question(
             self, "Delete dataset",
-            f"Delete '{name}'? Removes it from the list and deletes its staged folder. "
-            f"Can't be undone.",
+            f"Delete '{name}'? Removes it from the list and deletes its data "
+            f"(train/val/test + cache). Any training runs (runs/) and inference jobs "
+            f"(infer/) are KEPT for your records. Can't be undone.",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if resp != QMessageBox.Yes:
             return
@@ -613,12 +645,12 @@ class DatasetsPage(QWidget):
         self._reload_known()
         self.stats_label.setText("")
         if err:
-            self._append(f"Removed '{name}' from the list, but files at {staged} "
+            self._append(f"Removed '{name}' from the list, but some data at {staged} "
                          f"couldn't be deleted:\n  {err}\n  Close anything using them "
-                         f"(viewer, training run) and delete the folder manually.")
+                         f"(viewer, training run) and delete manually.")
         else:
-            self._append(f"Deleted '{name}' - removed from the list and deleted "
-                         f"{staged or 'nothing on disk'}.")
+            self._append(f"Deleted '{name}' data - removed from the list. Kept any "
+                         f"runs/ + infer/ under {staged or 'nothing on disk'} for records.")
 
     def _start_upload(self, staged: Path):
         # Each dataset gets its own Modal volume named after it; mounted at
@@ -655,9 +687,7 @@ class DatasetsPage(QWidget):
 
     def _on_worker_error(self, tb: str):
         self._done_cb = None
-        self.scan_btn.setEnabled(True)
-        self.analyze_btn.setEnabled(True)
-        self.tile_btn.setEnabled(True)
+        self._set_busy(False)
         self._append("✗ Error - see the dialog.")
         QMessageBox.critical(self, "Dataset error", tb)
 

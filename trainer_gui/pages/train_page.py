@@ -70,11 +70,12 @@ class TrainPage(QWidget):
         self.smoke_chk = QCheckBox("Smoke run (2 epochs × 50 steps)")
         self.smoke_chk.toggled.connect(self._apply_smoke)
         form.addRow("Options", self.smoke_chk)
-        # Output folder bind-mounted to /outputs; runs/<id>/ land here on the host.
+        # Base folder for output; a run lands at <base>/<dataset>/runs/<id> on the host.
         self.out_edit = QLineEdit()
-        self.out_edit.setText(appstate.get("local_train_out", ""))
-        self.out_edit.setPlaceholderText(
-            f"default: {appstate.default_download_dir().as_posix()}")
+        self.out_edit.setText(appstate.get("local_train_out") or str(appstate.workspace_dir()))
+        self.out_edit.setPlaceholderText("default: workspace folder")
+        self.out_edit.setToolTip("Base folder for training output. Each run is written "
+                                 "to <this>/<dataset>/runs/<id>.")
         out_row = QHBoxLayout()
         out_row.addWidget(self.out_edit)
         out_btn = QPushButton("Browse…")
@@ -314,8 +315,8 @@ class TrainPage(QWidget):
 
     def _pick_out(self):
         d = QFileDialog.getExistingDirectory(
-            self, "Output folder for runs",
-            self.out_edit.text() or str(appstate.default_download_dir()))
+            self, "Base output folder for runs",
+            self.out_edit.text() or str(appstate.workspace_dir()))
         if d:
             self.out_edit.setText(d)
 
@@ -590,16 +591,24 @@ class TrainPage(QWidget):
 
     def _start_local_run(self, p):
         b, flags, name, info = p["backbone"], p["flags"], p["dataset"], p["info"]
-        out_root = self.out_edit.text().strip() or str(appstate.default_download_dir())
+        staged = info.get("staged_dir", "")
+        # Runs nest per dataset: bind <base>/<dataset> -> /outputs so the container's
+        # /outputs/runs/<id> lands at <base>/<dataset>/runs/<id>. Base defaults to the
+        # workspace (shown in the field), so for a workspace dataset that's
+        # <workspace>/<dataset>/runs, right beside its data.
+        base = self.out_edit.text().strip() or str(appstate.workspace_dir())
+        out_root = str(Path(base) / name)
         os.makedirs(out_root, exist_ok=True)
         appstate.put("local_train_out", self.out_edit.text().strip())
         extra_mounts = []
-        staged = info.get("staged_dir", "")
-        if staged and os.path.isdir(staged):
-            extra_mounts.append((staged, f"/datasets/{name}"))
-        else:
+        if not (staged and os.path.isdir(staged)):
             self._append(f"[local] ⚠ No staged copy of '{name}' - "
                          f"container won't find /datasets/{name}.")
+        elif Path(staged).parent != Path(appstate.local_config()["datasets_root"]):
+            # Dataset lives outside the workspace (pre-existing/relocated); the base
+            # /datasets mount won't expose it, so bind it explicitly. A nested dataset
+            # needs no extra mount — base /datasets = workspace already covers it.
+            extra_mounts.append((staged, f"/datasets/{name}"))
         prog, args = local_cli.run_script(b.script, flags, b, repo_root=self.repo_root,
                                           extra_mounts=extra_mounts, outputs_root=out_root,
                                           env=p.get("env", {}))
