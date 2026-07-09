@@ -660,7 +660,10 @@ class DatasetsPage(QWidget):
         self._uploading = staged
         name = staged.name
         self.upload_saved_btn.setEnabled(False)
-        self._append(f"\nUploading -> {modal_cli.DATASETS_VOLUME}:/{name} …")
+        self._append(f"\nUploading -> {modal_cli.DATASETS_VOLUME}:/{name} …\n"
+                     f"(first ensuring the volume exists — a \"Volume "
+                     f"'{modal_cli.DATASETS_VOLUME}' already exists\" error here is "
+                     f"EXPECTED and harmless; the upload continues right after)")
         prog, args = modal_cli.volume_put(modal_cli.DATASETS_VOLUME, str(staged), f"/{name}")
         self.uploader.start(prog, args, cwd=self.repo_root,
                             pre=modal_cli.volume_create(modal_cli.DATASETS_VOLUME))

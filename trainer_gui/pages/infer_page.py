@@ -852,11 +852,16 @@ class InferPage(QWidget):
         if appstate.get_exec_mode() == "local":
             self._start_local_infer()
             return
-        self._append(f"[2/4] Uploading scenes -> {modal_cli.DATASETS_VOLUME}:/_infer/{self._job_id}…")
+        self._append(f"[2/4] Uploading scenes -> {modal_cli.DATASETS_VOLUME}:/_infer/{self._job_id}… "
+                     "(a 'volume already exists' message here is expected and harmless)")
         self._stage = "upload_scenes"
         prog, args = modal_cli.volume_put(modal_cli.DATASETS_VOLUME, str(staged),
                                           f"/_infer/{self._job_id}")
-        self.runner.start(prog, args, cwd=self.repo_root)
+        # pre-create so inference works even on an account that has never
+        # uploaded a dataset (put errors on a missing volume; create's
+        # already-exists error is ignored by JobRunner's pre stage).
+        self.runner.start(prog, args, cwd=self.repo_root,
+                          pre=modal_cli.volume_create(modal_cli.DATASETS_VOLUME))
 
     def _on_stage_done(self, code: int):
         if code != 0:
