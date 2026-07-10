@@ -413,6 +413,18 @@ def main():
         check("infer: _manifest_in reads run.json from a downloaded run folder",
               _manifest_in(mdir)["backbone"] == "ptv3"
               and _manifest_in(tmp / "no_such_run") is None)
+        # Post-conversion channel report: flags scenes missing intensity/hag —
+        # the scene npz is the model's literal input, so this is the attribute check.
+        from trainer_gui.pages.infer_page import _scene_channel_report
+        cdir = tmp / "chan_job" / "scenes"
+        cdir.mkdir(parents=True)
+        np.savez(cdir / "with_i.npz", xyz=make_xyz(5),
+                 intensity=np.linspace(0, 1, 5, dtype=np.float32))
+        np.savez(cdir / "no_i.npz", xyz=make_xyz(5))
+        rep = "\n".join(_scene_channel_report(tmp / "chan_job", expect_hag=True))
+        check("infer: channel report flags missing intensity + hag by scene",
+              "no_i" in rep and "with_i" not in rep.split("intensity channel in:")[1].split("\n")[0]
+              and "hag missing" in rep)
         check("infer: _entry_name reads path/Filename/name across CLI shapes",
               _entry_name({"path": "/ds/dataset_meta.json"}) == "dataset_meta.json"
               and _entry_name({"Filename": "train/"}) == "train"

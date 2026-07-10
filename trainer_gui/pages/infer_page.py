@@ -212,11 +212,12 @@ class InferPage(QWidget):
         # tta_row.addWidget(QLabel("extra views"))
         # tta_row.addStretch(1)
         # iform.addRow("", _wrap(tta_row))
-        # Prediction output folder; empty falls back to Downloads.
+        # Prediction output folder; empty falls back to <workspace>/inference —
+        # the same spot 'Download run…' uses, so runs + their predictions co-locate.
         self.out_edit = QLineEdit()
         self.out_edit.setText(appstate.get("infer_out", ""))
         self.out_edit.setPlaceholderText(
-            f"default: {appstate.default_download_dir().as_posix()}")
+            f"default: {(appstate.workspace_dir() / 'inference').as_posix()}")
         out_row = QHBoxLayout()
         out_row.addWidget(self.out_edit, 1)
         out_btn = QPushButton("Browse…")
@@ -812,7 +813,7 @@ class InferPage(QWidget):
     def _pick_out(self):
         d = QFileDialog.getExistingDirectory(
             self, "Output folder for predictions",
-            self.out_edit.text() or str(appstate.default_download_dir()))
+            self.out_edit.text() or str(appstate.workspace_dir() / "inference"))
         if d:
             self.out_edit.setText(d)
 
@@ -909,7 +910,14 @@ class InferPage(QWidget):
         self.run_btn.setEnabled(False)
         # Runs enter history at train START, so may lack final_model.pth. Check weights
         # exist before converting/uploading/paying for GPU. Runs in a worker.
+        # A run already fetched with 'Download run…' was pulled OFF the volume, so
+        # its weights provably exist there — no network round-trip needed.
         if modal and weights_run_id:
+            if self._has_local_run_copy(weights_run_id):
+                self._append(f"[0/4] Weights verified from the local download of "
+                             f"'{weights_run_id}' — skipping the Modal check.")
+                self._start_conversion(input_dir)
+                return
             self._pending_input = input_dir
             self._pending_run_id = weights_run_id
             wvol = weights_vol or self._backbone().outputs_volume
@@ -917,6 +925,13 @@ class InferPage(QWidget):
             self.preflight.start(_check_weights_present, wvol, weights_run_id)
             return
         self._start_conversion(input_dir)
+
+    def _has_local_run_copy(self, rid: str) -> bool:
+        """final_model.pth from a 'Download run…' / Runs-page fetch of this run?"""
+        dirs = [appstate.workspace_dir() / "inference" / rid]
+        rd = appstate.runs_dir()
+        dirs += [b / rid for b in (rd.iterdir() if rd.exists() else [])]
+        return any((d / "final_model.pth").is_file() for d in dirs)
 
     def _start_conversion(self, input_dir: str):
         # p95 end-to-end; honor a legacy norm recorded in run.json.
@@ -969,6 +984,8 @@ class InferPage(QWidget):
 
     def _on_converted(self, staged: Path):
         self._staged = staged
+        for line in _scene_channel_report(staged, expect_hag=self.hag_chk.isChecked()):
+            self._append(line)
         if appstate.get_exec_mode() == "local":
             self._start_local_infer()
             return
@@ -1004,7 +1021,8 @@ class InferPage(QWidget):
         elif self._stage == "run":
             # Predictions on the datasets volume at _infer/<job_id>/predictions.
             # Download to the chosen folder; job-id subfolder avoids collisions.
-            base = self.out_edit.text().strip() or str(appstate.default_download_dir())
+            base = self.out_edit.text().strip() \
+                or str(appstate.workspace_dir() / "inference")
             appstate.put("infer_out", self.out_edit.text().strip())
             self._dl_dest = Path(base) / f"predictions_{self._job_id}"
             self._dl_dest.mkdir(parents=True, exist_ok=True)
@@ -1080,16 +1098,16 @@ class InferPage(QWidget):
         b = self._backbone()
         # Scenes (and where predictions get written) are self._staged on the host.
         extra_mounts = [(str(self._staged), f"/datasets/_infer/{self._job_id}")]
-        # Predictions: user folder mounted over the container's predictions dir, else staging.
+        # Predictions: the chosen folder, else <workspace>/inference/predictions_<job>
+        # (same default as the Modal download), mounted over the container's
+        # predictions dir either way.
         out = self.out_edit.text().strip()
         appstate.put("infer_out", out)
-        if out:
-            self._pred_dir = Path(out)
-            self._pred_dir.mkdir(parents=True, exist_ok=True)
-            extra_mounts.append(
-                (str(self._pred_dir), f"/datasets/_infer/{self._job_id}/predictions"))
-        else:
-            self._pred_dir = self._staged / "predictions"
+        self._pred_dir = Path(out) if out else (
+            appstate.workspace_dir() / "inference" / f"predictions_{self._job_id}")
+        self._pred_dir.mkdir(parents=True, exist_ok=True)
+        extra_mounts.append(
+            (str(self._pred_dir), f"/datasets/_infer/{self._job_id}/predictions"))
         # Weights: the picked .pth or run.json's sibling; mount its dir.
         wpath = Path(self.pth_edit.text().strip()) if self.from_file_radio.isChecked() \
             else self._resolved_weights()
@@ -1343,6 +1361,47 @@ def _localize_paths(text: str, job_id: str, pred_dir, staged) -> str:
         for p in (f"/datasets/_infer/{job_id}", f"_infer/{job_id}"):
             text = text.replace(p, str(staged))
     return text
+
+
+def _scene_channel_report(staged, expect_hag: bool = False) -> list[str]:
+    """Log lines verifying the converted scenes carry what the trainers read.
+    The scene npz IS the model's input (fixed contract), so what's in it is
+    exactly what inference sees — xyz always; intensity fed by every model
+    (missing = zeros = degraded accuracy); hag only for *_hag weights."""
+    import numpy as np
+    scenes = sorted(Path(staged).glob("scenes/*.npz"))
+    if not scenes:
+        return [f"⚠ no converted scenes under {staged} to check."]
+    missing_i, missing_h, keys0 = [], [], []
+    for p in scenes:
+        with np.load(p) as z:
+            names = set(z.files)
+        if not keys0:
+            keys0 = sorted(names)
+        if "intensity" not in names:
+            missing_i.append(p.stem)
+        if expect_hag and "hag" not in names:
+            missing_h.append(p.stem)
+    lines = [f"[check] {len(scenes)} scene(s) carry: {', '.join(keys0)} — this npz "
+             f"is exactly what the model reads."]
+    if missing_i:
+        lines.append(f"⚠ no intensity channel in: {', '.join(missing_i)} — the source "
+                     f"file(s) had no intensity field. Models trained with intensity "
+                     f"see zeros here and accuracy will suffer.")
+    else:
+        # ponytail: value sanity from scene 0 only — full scan if this ever misleads
+        with np.load(scenes[0]) as z:
+            i = z["intensity"]
+        lines.append(f"✓ intensity in all scenes ({scenes[0].stem}: "
+                     f"min {float(i.min()):.2f}, max {float(i.max()):.2f})")
+        if float(i.max()) <= 0.0:
+            lines.append("⚠ intensity is all zeros — the source's intensity field is "
+                         "empty; expect degraded accuracy.")
+    if expect_hag:
+        lines.append("✓ hag in all scenes" if not missing_h else
+                     f"⚠ hag missing in: {', '.join(missing_h)} — the *_hag model "
+                     f"will refuse these scenes.")
+    return lines
 
 
 def _manifest_in(rdir: Path) -> dict | None:

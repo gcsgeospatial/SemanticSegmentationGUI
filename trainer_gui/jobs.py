@@ -110,16 +110,23 @@ class JobRunner(QObject):
             self.proc.kill()
 
     def _on_output(self):
-        data = bytes(self.proc.readAllStandardOutput()).decode("utf-8", "replace")
-        self.output.emit(data)
+        # Read from the emitting process, not self.proc: a finished-slot may have
+        # already started the NEXT stage (or nulled the handle) by the time a
+        # queued readyRead from the old process fires.
+        proc = self.sender()
+        if proc is not None:
+            self.output.emit(bytes(proc.readAllStandardOutput())
+                             .decode("utf-8", "replace"))
 
     def _on_finished(self, code, _status):
         if self._stage == "pre":      # ignore create's exit; run the real command
             self._stage = "main"
             self._launch(*self._main)
             return
-        self.finished.emit(int(code))
+        # Null BEFORE emitting: the finished slot often calls start() for the next
+        # stage, and nulling after would discard that new live process's handle.
         self.proc = None
+        self.finished.emit(int(code))
 
 
 class Stopped(Exception):
