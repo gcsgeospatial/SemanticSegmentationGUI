@@ -64,17 +64,6 @@ image = (
         "torch-cluster",
         find_links="https://data.pyg.org/whl/torch-2.5.0+cu124.html",
     )
-    .run_commands(
-        # FlashAttention: install the prebuilt wheel matching this image exactly
-        # (torch 2.5 / cu12 / cp310 / cxx11abiFALSE — PyTorch's pip wheels use the
-        # pre-cxx11 ABI). Plain `pip install flash-attn` compiles from source and
-        # reliably fails on debian_slim here; the matched wheel installs in
-        # seconds. build_model still probes `import flash_attn` and falls back to
-        # standard attention if it's ever absent.
-        "pip install --no-deps "
-        "https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/"
-        "flash_attn-2.7.4.post1+cu12torch2.5cxx11abiFALSE-cp310-cp310-linux_x86_64.whl",
-    )
     .env({"PYTHONUNBUFFERED": "1"})
 )
 
@@ -128,52 +117,25 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
     """Modal shell: provision the GPU container + volumes, then run the LOCAL
     trainer. All training/inference logic lives in local_train_ptv3_hag.py — this only
     shells out to it, so local and cloud run byte-identical code."""
-    import subprocess
     import sys
-    import threading
-
-    cmd = [sys.executable, "/root/local_train_ptv3_hag.py"]
-    for _flag, _val in (
-        ("--dataset", dataset),
-        ("--grid", grid),
-        ("--epochs", epochs),
-        ("--batch", batch),
-        ("--steps-per-epoch", steps_per_epoch),
-        ("--chunk-xy", chunk_xy),
-        ("--mode", mode),
-        ("--weights", weights),
-        ("--infer-input", infer_input),
-    ):
-        if _val is not None:
-            cmd += [_flag, str(_val)]
-    env = dict(os.environ)
-    if env_json:
-        import json
-        _ov = {str(k): str(v) for k, v in json.loads(env_json).items()}
-        env.update(_ov)
-        print("[modal-shell] env overrides: " + " ".join(sorted(_ov)), flush=True)
-    print("[modal-shell] " + " ".join(cmd), flush=True)
-
-    # Persist checkpoints + prep cache mid-run so an uncatchable spconv CUDA
-    # device-assert (the reason this function has retries) still leaves the
-    # latest state on the volumes for the local trainer's auto-resume on the
-    # retry. ponytail: time-based commit; the trainer's 2-checkpoint retention
-    # covers the rare case of snapshotting a half-written .pth.
-    _stop = threading.Event()
-
-    def _commit_loop():
-        while not _stop.wait(120):
-            outputs_volume.commit()
-            datasets_volume.commit()
-
-    _t = threading.Thread(target=_commit_loop, daemon=True)
-    _t.start()
-    try:
-        subprocess.run(cmd, check=True, env=env)
-    finally:
-        _stop.set()
-        outputs_volume.commit()
-        datasets_volume.commit()
+    sys.path.insert(0, "/root")
+    import train_common
+    train_common.modal_shell_run(
+        "/root/local_train_ptv3_hag.py",
+        [
+            ("--dataset", dataset),
+            ("--grid", grid),
+            ("--epochs", epochs),
+            ("--batch", batch),
+            ("--steps-per-epoch", steps_per_epoch),
+            ("--chunk-xy", chunk_xy),
+            ("--mode", mode),
+            ("--weights", weights),
+            ("--infer-input", infer_input),
+        ],
+        env_json,
+        [outputs_volume, datasets_volume],
+    )
 
 
 @app.local_entrypoint()

@@ -232,7 +232,7 @@ def main():
               all(sorted(msc["splits"][sp]["scenes"]) == sorted(msc2["splits"][sp]["scenes"])
                   for sp in ("train", "val", "test")))
         # Worker cap stays sane: >=1, never more than the file count (3 here).
-        wc = dataset._worker_cap(list(sc_src.glob("*.laz")))
+        wc = dataset._worker_cap_detail(list(sc_src.glob("*.laz")))[0]
         check(f"convert: worker cap RAM/core-clamped (got {wc})", 1 <= wc <= 3)
 
         # ---------------- single-cloud split: one cloud is tile-measured and
@@ -308,7 +308,7 @@ def main():
 
         # ---------------- backbones + appstate (imports used below)
         from trainer_gui import appstate
-        from trainer_gui.backbones import BACKBONES, infer_backbones
+        from trainer_gui.backbones import BACKBONES
 
         # intensity normalization modes differ: p95 scales hotter than max
         one = dataset.discover_scenes(txt_root / "val")[0]
@@ -319,20 +319,16 @@ def main():
         check("convert: p95-norm intensity >= max-norm and <= 2",
               ip95.max() >= imax.max() and ip95.max() <= 2.0)
 
-        # ---------------- backbones: infer-readiness contracts
-        check("backbones: folder-infer set = the 8 cold/hag scripts",
-              set(infer_backbones()) == {"ptv3", "randlanet", "ptv3_hag", "randlanet_hag",
-                                         "kpconvx_cold", "kpconvx_cold_hag",
-                                         "kpconv", "kpconv_hag"})
+        # ---------------- backbones: registry contracts
+        check("backbones: registry = the 8 cold/hag scripts",
+              set(BACKBONES) == {"ptv3", "randlanet", "ptv3_hag", "randlanet_hag",
+                                 "kpconvx_cold", "kpconvx_cold_hag",
+                                 "kpconv", "kpconv_hag"})
         check("backbones: randlanet uses --sub-grid and has no --chunk-xy",
               BACKBONES["randlanet"].grid_flag == "sub-grid"
               and not BACKBONES["randlanet"].has_chunk)
         check("backbones: ptv3 uses --grid and has --chunk-xy",
               BACKBONES["ptv3"].grid_flag == "grid" and BACKBONES["ptv3"].has_chunk)
-        check("backbones: kpconvx is folder-inferable and canonical-trainable",
-              BACKBONES["kpconvx_cold"].folder_infer and BACKBONES["kpconvx_cold"].ready
-              and BACKBONES["kpconvx_cold_hag"].folder_infer
-              and BACKBONES["kpconvx_cold_hag"].ready)
         check("backbones: outputs volumes follow the renamed apps",
               BACKBONES["ptv3"].outputs_volume == "ptv3-outputs"
               and BACKBONES["randlanet"].outputs_volume == "randlanet-cold-outputs"
@@ -535,6 +531,15 @@ def main():
         check("convert_infer_job(hag, ground_value): hag baked, no label key",
               "hag" in zjh.files and "label" not in zjh.files
               and zjh["hag"].shape[0] == zjh["xyz"].shape[0])
+        # smrf_fill (the "fill ground gaps with SMRF" box): threads through
+        # convert_infer_job, and the grid method ignores it — identical HAG to
+        # the labeled run. (The PDAL union itself needs python-pdal to execute.)
+        job_f = dataset.convert_infer_job("hag_fill_job", str(laz_root / "val"),
+                                          tmp / "staging", hag=True, hag_filter="grid",
+                                          ground_value=2, smrf_fill=True)
+        zjf = np.load(next((job_f / "scenes").glob("*.npz")))
+        check("convert_infer_job(smrf_fill): accepted; grid method unaffected",
+              "hag" in zjf.files and np.allclose(zjf["hag"], zjh["hag"]))
         # Ground from the labels must NOT equal ground from detection — otherwise
         # ground_value silently isn't reaching hag_for_cloud's ground_mask.
         job_d = dataset.convert_infer_job("hag_detect_job", str(laz_root / "val"),
@@ -669,9 +674,8 @@ def main():
 
         # the modal shim must import every training script (no torch / no cloud)
         # and expose its @app.local_entrypoint main + the recorded Image recipe.
-        SCRIPTS = ["modal_train_ptv3", "modal_train_ptv3_hag", "modal_train_randlanet",
-                   "modal_train_randlanet_hag", "modal_train_kpconvx_cold",
-                   "modal_train_kpconvx_cold_hag"]
+        # Derived from the registry so a new backbone is covered automatically.
+        SCRIPTS = [Path(b.script).stem for b in BB.values()]
         shim_ok, recipe_ok = True, True
         for nm in SCRIPTS:
             _modal_shim.install()
@@ -689,7 +693,7 @@ def main():
                 shim_ok = False
             if img is None or not getattr(img, "steps", None):
                 recipe_ok = False
-        check("local: modal shim imports all 6 train scripts + finds main", shim_ok)
+        check(f"local: modal shim imports all {len(SCRIPTS)} train scripts + finds main", shim_ok)
         check("local: every script records an Image recipe for Dockerfile gen", recipe_ok)
         # the shim's catch-all __getattr__ must RAISE on dunders, else inspect.getmodule
         # reads modal.__file__ as a function and torch's import blows up (endswith bug).
@@ -700,9 +704,7 @@ def main():
 
         # decoupling: every local_train_X.py imports with NO modal (torch lives in
         # the body) and exposes its train fn with no-op Volume stand-ins.
-        LOCAL = ["local_train_ptv3", "local_train_ptv3_hag", "local_train_randlanet",
-                 "local_train_randlanet_hag", "local_train_kpconvx_cold",
-                 "local_train_kpconvx_cold_hag"]
+        LOCAL = [s.replace("modal_train_", "local_train_") for s in SCRIPTS]
         local_ok = True
         for nm in LOCAL:
             try:
@@ -714,7 +716,7 @@ def main():
             # Volumes are a Modal concept; the local scripts must carry NO stand-ins.
             if fn is None or hasattr(lm, "outputs_volume") or hasattr(lm, "datasets_volume"):
                 local_ok = False
-        check("local: all 6 local_train_*.py import + expose train fn + no volume stubs", local_ok)
+        check(f"local: all {len(LOCAL)} local_train_*.py import + expose train fn + no volume stubs", local_ok)
         # --mode infer labels arbitrary clouds from weights, so it must NOT demand a
         # --dataset (the class count/names come from the checkpoint + its run.json).
         # Calling with dataset=None must fault PAST the dataset gate (missing weights /
@@ -729,7 +731,7 @@ def main():
             except Exception as e:               # noqa: BLE001
                 if "dataset is required" in str(e).lower():
                     infer_gate_ok = False
-        check("local: --mode infer runs dataset-free (all 6 backbones)", infer_gate_ok)
+        check(f"local: --mode infer runs dataset-free (all {len(LOCAL)} backbones)", infer_gate_ok)
         with open(importlib.import_module("local_train_ptv3").__file__, encoding="utf-8") as f:
             _lt_src = f.read()
         check("local: local_train_ptv3.py has no 'import modal' (source is decoupled)",
@@ -747,7 +749,7 @@ def main():
 
         # gen_dockerfiles: recipe -> a buildable Dockerfile (cuda base, ctx, quoting)
         import tools.gen_dockerfiles as gen
-        df, contexts = gen.build_dockerfile("ptv3", "modal_train_ptv3.py")
+        df = gen.build_dockerfile("ptv3", "modal_train_ptv3.py")
         check("gen: ptv3 Dockerfile uses a CUDA devel base + python bootstrap",
               "FROM nvidia/cuda:" in df and "-devel-ubuntu22.04" in df
               and "ln -sf /usr/bin/python3 /usr/bin/python" in df)
@@ -757,10 +759,10 @@ def main():
               "'numpy<2.0'" in df and "'pandas<3'" in df)
         check("gen: model repo is a pinned upstream clone (no build-contexts)",
               "git clone https://github.com/Pointcept/PointTransformerV3.git /opt/ptv3" in df
-              and "checkout --detach" in df and not contexts)
+              and "checkout --detach" in df and "COPY --from" not in df)
         check("gen: local_train script is NOT baked (bind-mounted at /workspace locally)",
               "local_train" not in df)
-        dfr, _ = gen.build_dockerfile("randlanet", "modal_train_randlanet.py")
+        dfr = gen.build_dockerfile("randlanet", "modal_train_randlanet.py")
         check("gen: multi-line run command emitted as a RUN heredoc",
               "RUN <<'TT_EOT'" in dfr and "build_ext --inplace" in dfr)
 
@@ -781,8 +783,6 @@ def main():
             check("appstate: exec mode defaults to modal", appstate.get_exec_mode() == "modal")
             appstate.set_exec_mode("local")
             check("appstate: exec mode persists to local", appstate.get_exec_mode() == "local")
-            check("appstate: selectable_datasets == the saved registry (no builtins)",
-                  appstate.selectable_datasets() == appstate.known_datasets())
 
             # delete_dataset: forget a saved entry AND remove its staged copy on disk
             del_dir = tmp / "to_delete_ds"

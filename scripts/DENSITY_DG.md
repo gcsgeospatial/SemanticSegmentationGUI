@@ -55,14 +55,14 @@ DG_INFER_TTA     = 0       # D5: number of extra density/scale views to average 
 All four "WIRE" rows are reachable in the local training scripts and need no library edits.
 `density.py` (helper dir) holds the verified primitives; `python density.py` runs its self-checks.
 
-## Wiring map (file:line landmarks)
+## Wiring map (per-script landmarks)
 
-KPConvX `local_train_kpconvx_cold.py`: grid_subsample 244 · build_feat/INPUT_CHANNELS 102 ·
-model build 601-648 · train forward 1143-1146 · `_predict_points` 871-902 · infer block 910-967.
-PTv3 `local_train_ptv3.py`: voxel dedup 918 · `augment_xyz` 863 · build_model 423-455 ·
-train forward 1139-1156 · `to_ptv3_batch` 884-937 · `_predict_scene` 481-520.
-RandLA `local_train_randlanet.py`: grid_subsample 329 · build_net 181-188 · train forward
-1010-1021 · `tf_map` 469-504 · `_predict_scene` 597-663.
+KPConvX `local_train_kpconvx_cold.py`: `grid_subsample` · `build_feat`/`INPUT_CHANNELS` ·
+model build · train forward · `_predict_points` · infer block.
+PTv3 `local_train_ptv3.py`: voxel dedup · `augment_xyz` · `build_model` ·
+train forward · `to_ptv3_batch` · `_predict_scene`.
+RandLA `local_train_randlanet.py`: `grid_subsample` · `build_net` · train forward ·
+`tf_map` · `_predict_scene`.
 `--hag` runs share the base script; the `hag` companion array must be sliced by the same
 index whenever points are dropped/subsampled.
 
@@ -111,8 +111,14 @@ model input dim by 1 — retrain-only (old weights won't load); KPConvX feeds it
   (or a monkey-patch shim) before they can be wired.
 - **D0/D0b explicit knob** — all three backbones already grid-canonicalize density at inference, so a
   separate knob is a no-op for the current grids; expose only if a deploy needs a g0 ≠ the model grid.
+- **GUI wiring for train-time DG** — the Train-page DG panel is hidden and injects no `DG_*` env;
+  the scripts' `DG_*` env route is the supported path until the GUI wiring is re-enabled.
 
-**How to turn on — three ways (all the same `DG_*` knobs).** The GUI is split by lifecycle:
+**How to turn on — three ways (all the same `DG_*` knobs).** The GUI is split by lifecycle.
+> **Note:** train-time DG is currently **disabled in the GUI** — the Train-page panel is hidden
+> and no `DG_*` env is injected at launch. Route 2 (direct `DG_*` env vars on the standalone
+> `local_train_*.py` scripts) remains fully functional. The inference-side AdaBN/TTA toggles are
+> also hidden for now; only the run.json logdk recovery is live.
 - **Train-time** (`density_aug`, `logdk`) — bake into the weights:
 1. **GUI**: Datasets page -> select a saved dataset -> **"Density generalization (advanced)"** panel.
    It reads the dataset's stored density, takes your **target inference density**, and **Recommend**
@@ -136,9 +142,9 @@ Cheapest first read on how much density hurts today — no retrain: `DG_INFER_AD
 
 **Plumbing:** `scripts/helper/density.py` `env_*` helpers + per-script env-shadow block;
 `train_common.py` `_dg_block`/`write_run_manifest` (records the `dg` block in run.json) + `infer_meta`
-(reads it back); `trainer_gui/analysis.py` `dg_recommend`/`dg_config_to_env` (train-time only);
-`pages/train_page.py` per-run DG panel + injection (train-time toggles);
-`pages/infer_page.py` `_infer_dg_env` (AdaBN/TTA toggles + logdk
-recovery); `local_cli.run_script(env=)` (used by BOTH train and infer launches).
-Modal note: env lands client-side — the modal shell still needs to forward `DG_*` into the
-container subprocess (local docker already does via `-e`). Modal is frozen (`scripts/modal/DEPRECATED.md`).
+(reads it back); `trainer_gui/analysis.py` `dg_recommend`/`dg_config_to_env` (train-time only —
+currently no production caller: train-time DG is disabled in the GUI, panel hidden, no `DG_*` env
+injected); `pages/infer_page.py` `_infer_dg_env` (logdk recovery; the AdaBN/TTA toggles are hidden);
+`local_cli.run_script(env=)` (used by BOTH train and infer launches).
+Modal note: the modal shells forward `DG_*` to the trainer subprocess via the GUI's `--env-json`
+passthrough (see `scripts/modal/README.md`); local docker forwards via `-e`.

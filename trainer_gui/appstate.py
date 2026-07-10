@@ -91,16 +91,6 @@ def local_runs_dir() -> Path:
     return d
 
 
-def default_download_dir() -> Path:
-    """A *findable* default for downloaded artifacts — the user's Downloads folder
-    (or home if that's missing). Deliberately NOT a hidden app dir: settings live
-    under %APPDATA%/.config, but downloads the user has to open should land where
-    they'll actually look. It's only the default — every download path is an
-    editable, user-pickable field."""
-    dl = Path.home() / "Downloads"
-    return dl if dl.exists() else Path.home()
-
-
 # ---- execution mode: "modal" (cloud) | "local" (Docker on a GPU host) --------
 
 def get_exec_mode() -> str:
@@ -174,9 +164,6 @@ def backbone_enabled(key: str) -> bool:
     return en is None or key in en
 
 
-_STATE_PATH = None  # resolved lazily so tests can monkeypatch APPDATA
-
-
 def _state_path() -> Path:
     return app_dir() / "state.json"
 
@@ -208,12 +195,6 @@ def put(key: str, value: Any) -> None:
 
 def known_datasets() -> dict:
     return get("datasets", {})
-
-
-def selectable_datasets() -> dict:
-    """Datasets offered for a job — the saved registry (every dataset is converted
-    on the Datasets page, so all of them are selectable)."""
-    return known_datasets()
 
 
 def remember_dataset(name: str, info: dict) -> None:

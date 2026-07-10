@@ -3,8 +3,7 @@ epoch metrics. Two backends, chosen by the sidebar's Execution backend switch:
 local (docker run on your GPU; output folder on the host) and Modal (modal run
 on a cloud GPU; dataset read from / run written to Modal volumes). Dataset
 check verifies the train/val/test standard; per-model image status/pull live
-in a popup; DG training knobs are per run (inference-time DG is on the Infer
-page). Loss / class-balance / DG knobs reach the trainer as env either way
+in a popup. Loss / class-balance knobs reach the trainer as env either way
 (docker -e locally, --env-json through the modal shell in the cloud).
 """
 
@@ -14,11 +13,11 @@ import json
 import os
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog, QFileDialog,
-                               QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
-                               QPlainTextEdit, QPushButton, QTableWidget, QTableWidgetItem,
-                               QVBoxLayout, QWidget)
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog, QDoubleSpinBox,
+                               QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QHeaderView,
+                               QLabel, QLineEdit, QPlainTextEdit, QPushButton, QSpinBox,
+                               QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
 from .. import analysis, appstate, local_cli, modal_cli, theme, ui
 from ..backbones import BACKBONES, GPU_CHOICES
@@ -26,8 +25,6 @@ from ..jobs import FuncWorker, JobRunner, LogParser
 
 
 class TrainPage(QWidget):
-    models_changed = Signal()   # kept for main.py; no longer emitted
-
     def __init__(self, repo_root: str):
         super().__init__()
         self.repo_root = repo_root
@@ -70,7 +67,7 @@ class TrainPage(QWidget):
         self.cfg_btn.setToolTip("Docker image status + pull.")
         self.cfg_btn.clicked.connect(self._open_model_config)
         model_row.addWidget(self.cfg_btn)
-        form.addRow("Model", _wrap(model_row))
+        form.addRow("Model", ui.wrap(model_row))
         self.smoke_chk = QCheckBox("Smoke run (2 epochs × 50 steps)")
         self.smoke_chk.toggled.connect(self._apply_smoke)
         form.addRow("Options", self.smoke_chk)
@@ -101,7 +98,7 @@ class TrainPage(QWidget):
         out_btn = QPushButton("Browse…")
         out_btn.clicked.connect(self._pick_out)
         out_row.addWidget(out_btn)
-        self.out_row_w = _wrap(out_row)
+        self.out_row_w = ui.wrap(out_row)
         form.addRow("Output folder", self.out_row_w)
 
         self.params_box = QGroupBox("Parameters (pre-filled)")
@@ -123,9 +120,8 @@ class TrainPage(QWidget):
         config_col = QVBoxLayout()
         config_col.addWidget(form_box)
         config_col.addWidget(self.params_box)
-        # TODO(not ready): domain-generalization UI hidden until reviewed. The
-        # _dg_* methods stay defined but unused; no DG env is sent (see _launch).
-        # config_col.addWidget(self._dg_box())
+        # TODO(not ready): train-time DG UI disabled pending review; no DG env is
+        # sent. analysis.dg_recommend/dg_config_to_env remain the backend hooks.
         config_col.addWidget(self._loss_box())
         config_col.addWidget(self.warn_label)
         config_col.addLayout(run_row)
@@ -146,7 +142,7 @@ class TrainPage(QWidget):
         metrics_col.addWidget(self.metrics_table, 1)
 
         body = ui.hsplit(self.log, ui.wrap(metrics_col), sizes=[680, 340])
-        root.addWidget(ui.vsplit(ui.scrollable(ui.wrap(config_col)), body,
+        root.addWidget(ui.vsplit(ui.wrap(config_col), body,
                                  sizes=[400, 360]), 1)
 
         self.runner.output.connect(self._on_output)
@@ -303,7 +299,7 @@ class TrainPage(QWidget):
         current = self.dataset_combo.currentText()
         self.dataset_combo.blockSignals(True)
         self.dataset_combo.clear()
-        for name in sorted(appstate.selectable_datasets()):
+        for name in sorted(appstate.known_datasets()):
             self.dataset_combo.addItem(name)
         self.dataset_combo.blockSignals(False)
         if current:
@@ -327,7 +323,6 @@ class TrainPage(QWidget):
             text, role, ready = self._local_split_status(info)
             self._set_ds_status(text, role)
             self._ds_ready = ready
-        # self._dg_bind_density()   # TODO(not ready): DG UI hidden
         self._reload_backbones()
 
     def _local_split_status(self, info: dict):
@@ -374,8 +369,7 @@ class TrainPage(QWidget):
         self.backbone_combo.blockSignals(True)
         self.backbone_combo.clear()
         for key, b in BACKBONES.items():
-            self.backbone_combo.addItem(
-                b.label + ("" if b.ready else "  (not wired yet)"), key)
+            self.backbone_combo.addItem(b.label, key)
         i = self.backbone_combo.findData(prev)
         if i >= 0:
             self.backbone_combo.setCurrentIndex(i)
@@ -400,13 +394,13 @@ class TrainPage(QWidget):
         for spec in b.params:
             value = recs.get(spec.recommend_key, spec.default) if spec.recommend_key else spec.default
             if spec.kind == "float":
-                w = ui.NoWheelDoubleSpinBox()
+                w = QDoubleSpinBox()
                 w.setDecimals(spec.decimals)
                 w.setSingleStep(spec.step)
                 w.setRange(spec.lo, 1_000_000.0)   # spec.hi is a reco band, not a cap
                 w.setValue(float(value))
             else:
-                w = ui.NoWheelSpinBox()
+                w = QSpinBox()
                 w.setRange(int(spec.lo), 100_000_000)
                 w.setValue(int(value))
             label = spec.label + ("  ★" if spec.recommend_key and spec.recommend_key in recs else "")
@@ -419,101 +413,6 @@ class TrainPage(QWidget):
             self.warn_label.setText("")
         self._apply_smoke()          # re-lock epochs/steps for smoke runs
         self._update_cfg_dialog()    # sync popup with model
-
-    # ------------------------------------------------- domain generalization (per run)
-    def _dg_box(self) -> QGroupBox:
-        box = QGroupBox("Domain generalization (training) - this run")
-        box.setToolTip("Robustness to a different inference point density than trained on. "
-                       "Set per run; not saved.")
-        lay = QVBoxLayout(box)
-        self.dg_train_lbl = QLabel("Pick a dataset to see training density.")
-        theme.set_accent(self.dg_train_lbl, "muted")
-        lay.addWidget(self.dg_train_lbl)
-
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Target inference density (pts/m²):"))
-        self.dg_infer = ui.NoWheelDoubleSpinBox()
-        self.dg_infer.setRange(0.01, 100000.0)
-        self.dg_infer.setDecimals(2)
-        self.dg_infer.setValue(2.0)
-        row.addWidget(self.dg_infer)
-        self.dg_reco_btn = QPushButton("Recommend")
-        self.dg_reco_btn.clicked.connect(self._dg_recommend)
-        row.addWidget(self.dg_reco_btn)
-        row.addStretch(1)
-        lay.addLayout(row)
-
-        self.dg_rationale = QLabel("")
-        self.dg_rationale.setWordWrap(True)
-        theme.set_accent(self.dg_rationale, "muted")
-        lay.addWidget(self.dg_rationale)
-
-        self.dg_aug = QCheckBox("Density augmentation - train across the range")
-        self.dg_coarsen = ui.NoWheelDoubleSpinBox()
-        self.dg_coarsen.setRange(1.0, 6.0)
-        self.dg_coarsen.setSingleStep(0.1)
-        self.dg_coarsen.setValue(2.5)
-        self.dg_pnative = ui.NoWheelDoubleSpinBox()
-        self.dg_pnative.setRange(0.0, 1.0)
-        self.dg_pnative.setSingleStep(0.05)
-        self.dg_pnative.setValue(0.5)
-        r1 = QHBoxLayout()
-        r1.addWidget(self.dg_aug)
-        r1.addWidget(QLabel("coarsen ×"))
-        r1.addWidget(self.dg_coarsen)
-        r1.addWidget(QLabel("native P"))
-        r1.addWidget(self.dg_pnative)
-        r1.addStretch(1)
-        lay.addLayout(r1)
-
-        self.dg_logdk = QCheckBox("log d_k density channel - changes input dim")
-        self.dg_k = ui.NoWheelSpinBox()
-        self.dg_k.setRange(1, 64)
-        self.dg_k.setValue(8)
-        r2 = QHBoxLayout()
-        r2.addWidget(self.dg_logdk)
-        r2.addWidget(QLabel("k"))
-        r2.addWidget(self.dg_k)
-        r2.addStretch(1)
-        lay.addLayout(r2)
-
-        hint = QLabel("AdaBN & density-TTA are inference-time (no retrain) - set them "
-                      "on the Inference page.")
-        hint.setWordWrap(True)
-        theme.set_accent(hint, "muted")
-        lay.addWidget(hint)
-        return box
-
-    def _dg_bind_density(self):
-        d = float((self._meta or {}).get("stats", {}).get("mean_pts_per_m2") or 0) or None
-        if d:
-            self.dg_train_lbl.setText(f"Training density: {d:.1f} pts/m²")
-        else:
-            self.dg_train_lbl.setText("No stored density - set DG features manually "
-                                      "(Recommend needs a density).")
-        self.dg_reco_btn.setEnabled(bool(d))
-        self.dg_rationale.setText("")
-
-    def _dg_recommend(self):
-        d = float((self._meta or {}).get("stats", {}).get("mean_pts_per_m2") or 0) or None
-        if not d:
-            self.dg_rationale.setText("No stored density to recommend from.")
-            return
-        rec = analysis.dg_recommend(d, self.dg_infer.value())
-        self.dg_aug.setChecked(rec["density_aug"])
-        self.dg_coarsen.setValue(rec["coarsen_max"])
-        self.dg_pnative.setValue(rec["p_native"])
-        self.dg_logdk.setChecked(rec["logdk"])
-        self.dg_k.setValue(rec["logdk_k"])
-        self.dg_rationale.setText(rec["rationale"])
-
-    def _dg_collect(self) -> dict:
-        return {"infer_density": round(self.dg_infer.value(), 2),
-                "density_aug": self.dg_aug.isChecked(),
-                "coarsen_max": round(self.dg_coarsen.value(), 2),
-                "p_native": round(self.dg_pnative.value(), 2),
-                "logdk": self.dg_logdk.isChecked(),
-                "logdk_k": self.dg_k.value()}
 
     # ------------------------------------------- loss / class balance (per run)
     def _loss_box(self) -> QGroupBox:
@@ -539,7 +438,7 @@ class TrainPage(QWidget):
         self.loss_focal = QCheckBox("Use focal loss instead of weighted cross-entropy")
         self.loss_focal.setToolTip("Down-weights easy points to focus on hard/rare ones. "
                                    "Off by default (weighted CE + Lovász).")
-        self.loss_gamma = ui.NoWheelDoubleSpinBox()
+        self.loss_gamma = QDoubleSpinBox()
         self.loss_gamma.setRange(0.0, 5.0)
         self.loss_gamma.setSingleStep(0.5)
         self.loss_gamma.setValue(2.0)
@@ -554,7 +453,7 @@ class TrainPage(QWidget):
 
         self.loss_cw = QCheckBox("Weight classes by inverse frequency")
         self.loss_cw.setChecked(True)
-        self.loss_beta = ui.NoWheelDoubleSpinBox()
+        self.loss_beta = QDoubleSpinBox()
         self.loss_beta.setRange(0.0, 1.0)
         self.loss_beta.setSingleStep(0.05)
         self.loss_beta.setValue(0.5)
@@ -588,9 +487,6 @@ class TrainPage(QWidget):
         if b is None:
             self._append("Pick a model first.")
             return
-        if not b.ready:
-            self._append(f"{b.label} isn't wired yet - pick a ready model.")
-            return
         name = self.dataset_combo.currentText()
         if not name:
             self._append("Create a dataset on the Datasets page first.")
@@ -611,16 +507,12 @@ class TrainPage(QWidget):
             flags["epochs"] = 2
             flags["steps-per-epoch"] = 50
 
-        dg_env = {}   # TODO(not ready): DG UI hidden; was analysis.dg_config_to_env(self._dg_collect())
         loss_env = analysis.loss_config_to_env(self._loss_collect())
-        env = {**dg_env, **loss_env}
+        env = loss_env
         self.log.clear()
         self.metrics_table.setRowCount(0)
         self._last_run_id = None
         self.launch_btn.setEnabled(False)
-        if dg_env:
-            self._append("[dg] on: "
-                         + " ".join(f"{k}={v}" for k, v in sorted(dg_env.items())))
         if loss_env:
             self._append("[loss] overrides: "
                          + " ".join(f"{k}={v}" for k, v in sorted(loss_env.items())))
@@ -782,10 +674,3 @@ class TrainPage(QWidget):
 
     def _append(self, text: str, newline: bool = True):
         ui.append_log(self.log, text, newline)
-
-
-def _wrap(layout) -> QWidget:
-    w = QWidget()
-    layout.setContentsMargins(0, 0, 0, 0)
-    w.setLayout(layout)
-    return w

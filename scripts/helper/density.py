@@ -19,7 +19,7 @@ import os
 import numpy as np
 
 __all__ = [
-    "effective_grid", "voxel_first_idx", "decimate_mask",
+    "effective_grid", "voxel_first_idx",
     "local_density_logdk", "adabn_recalibrate",
     "env_bool", "env_float", "env_int", "env_str",
 ]
@@ -86,21 +86,6 @@ def voxel_first_idx(xyz, g):
     keys = np.floor(np.asarray(xyz)[:, :3] / float(g)).astype(np.int64)
     _, idx = np.unique(keys, axis=0, return_index=True)
     return np.sort(idx)            # preserve original point order
-
-
-# --------------------------------------------------------------------------- #
-# D1 — random point dropout to a kept fraction (occupancy-down only). For grid
-# backbones a keep-fraction is mostly absorbed by the voxel cap, so prefer
-# effective_grid() there; dropout is the right knob for fine-grid / pre-voxel use.
-# --------------------------------------------------------------------------- #
-def decimate_mask(n, keep_frac, rng=None):
-    """Boolean mask keeping ~keep_frac of n points (i.i.d.). Guarantees >=1 kept."""
-    rng = rng or np.random.default_rng()
-    keep_frac = float(np.clip(keep_frac, 0.0, 1.0))
-    mask = rng.random(int(n)) < keep_frac
-    if not mask.any():
-        mask[rng.integers(int(n))] = True
-    return mask
 
 
 # --------------------------------------------------------------------------- #
@@ -197,11 +182,6 @@ def _demo():
     assert 0.6 < out_o <= 1.0, out_o                                     # ~1 pt per cell
     denser = rng.uniform(0, side, size=(120000, 3)); denser[:, 2] = 0.0
     assert abs(len(voxel_first_idx(denser, g0)) - len(idx)) < 0.1 * len(idx)  # cap: 3x density, ~same out
-
-    # decimate_mask keeps ~frac and never empties.
-    m = decimate_mask(10000, 0.3, rng)
-    assert 0.25 < m.mean() < 0.35 and m.any()
-    assert decimate_mask(10000, 0.0, rng).sum() == 1
 
     # local_density_logdk: sparser cloud -> larger log d_k.
     sparse = rng.uniform(0, side, size=(2000, 3)); sparse[:, 2] = 0.0

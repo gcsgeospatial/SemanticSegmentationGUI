@@ -7,8 +7,7 @@ a dataset_meta.json (num_classes / class_names). NUM_CLASSES / CLASS_NAMES come
 from that metadata; val = in-distribution selection holdout, test = final report.
 
 Uses the standalone PTv3 model.py from testSem/PointTransformerV3 directly (no
-full Pointcept install). The fast path uses FlashAttention; if the GPU doesn't
-support it the script falls back to PTv3 with enable_flash=False.
+full Pointcept install), on standard attention (enable_flash=False).
 
 Recipe (PTv3's published outdoor-LiDAR suite — Wu et al., CVPR 2024): full data
 augmentation, loss = weighted CE (+ optional focal / label smoothing) + Lovász-
@@ -32,27 +31,15 @@ Usage:
         [--epochs N] [--batch B] [--steps-per-epoch S] [--hag]
     python local_train_ptv3.py --dataset NAME --mode infer
         --weights runs/<id>/final_model.pth --infer-input <job_id>
-
-Timeout comes from the TT_TIMEOUT_HOURS env var.
 """
 
-import os
 from typing import Optional
-
-
-def gpu_name() -> str:
-    """Real CUDA device name for logs/metadata (replaces the old fixed cloud GPU_TYPE)."""
-    import torch
-    return torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
-
 
 # ============================================================================
 # Configuration
 # ============================================================================
-APP_NAME      = "ptv3"
 N_EPOCHS      = 100             # smoke test; PTv3 outdoor recipe trains ~50 epochs
 BATCH_SIZE    = 4
-TIMEOUT_HOURS = int(os.environ.get("TT_TIMEOUT_HOURS", "24"))
 
 GRID_SIZE     = 0.5            # voxel grid (m). PTv3's 0.05 m outdoor default is
                                # for dense near-sensor LiDAR; airborne ALS is
@@ -61,7 +48,9 @@ GRID_SIZE     = 0.5            # voxel grid (m). PTv3's 0.05 m outdoor default i
                                # positional-encoding conv with empty kernels (no
                                # point falls within a few voxels of another).
                                # 0.5 m ≈ the actual point spacing. Override --grid.
-USE_FLASH_ATTN = False   # PTv3 runs on standard attention; no flash-attn dep
+USE_FLASH_ATTN = False   # PTv3 runs on standard attention — flash serialized-attn
+                         # patch-gather OOB'd mid-train (disabled after a real
+                         # crash, commit 98cc344; not a missing-dep workaround)
 
 # ----------------------------------------------------------------------------
 # Regularization / optimizer — PTv3's published outdoor-LiDAR recipe
@@ -129,13 +118,6 @@ RESUME           = False   # force-resume the latest matching run (see AUTO_RESU
 AUTO_RESUME      = False    # auto-continue an unfinished run (no DONE marker) on
                           # relaunch / auto-retry, so an intermittent crash
                           # never loses the run — only epochs since last checkpoint
-DEBUG_CUDA       = False   # ONE-OFF diagnostic: CUDA_LAUNCH_BLOCKING + dump the
-                          # offending batch's stats + no retries (set True to debug).
-STEM_KERNEL      = 5       # PTv3's faithful 5x5x5 stem. (Shrinking it to 3 was a
-                          # failed workaround for the cu124 spconv conv-backward
-                          # device-assert; that bug is fixed properly by moving to
-                          # the spconv-cu118 build, so the original stem is restored.
-                          # Set 3 only if a large-kernel spconv issue ever recurs.)
 
 DATASETS_ROOT = "/datasets"   # bind-mounted datasets root (trainer_gui canonical datasets)
 
@@ -155,32 +137,17 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "helper"))
     import density as dg
     import train_common as tc
-    # DG flags: env-overridable (GUI "Density generalization" panel / DG_*=1 in the shell).
-    DG_DENSITY_AUG = dg.env_bool("DG_DENSITY_AUG", globals()["DG_DENSITY_AUG"])
-    DG_COARSEN_MAX = dg.env_float("DG_COARSEN_MAX", globals()["DG_COARSEN_MAX"])
-    DG_P_NATIVE    = dg.env_float("DG_P_NATIVE", globals()["DG_P_NATIVE"])
-    DG_LOGDK_FEAT  = dg.env_bool("DG_LOGDK_FEAT", globals()["DG_LOGDK_FEAT"])
-    DG_LOGDK_K     = dg.env_int("DG_LOGDK_K", globals()["DG_LOGDK_K"])
-    DG_INFER_TTA   = dg.env_int("DG_INFER_TTA", globals()["DG_INFER_TTA"])
-    # Loss / class-balance overrides (GUI "Loss & class balance" panel -> LOSS_*/
-    # RARE_* env; mirrors the DG env pattern). Unset env -> the script constants.
-    USE_FOCAL       = dg.env_bool("LOSS_FOCAL", globals()["USE_FOCAL"])
-    FOCAL_GAMMA     = dg.env_float("LOSS_FOCAL_GAMMA", globals()["FOCAL_GAMMA"])
-    CLASS_WEIGHTING = dg.env_bool("LOSS_CLASS_WEIGHTING", globals()["CLASS_WEIGHTING"])
-    WEIGHT_BETA     = dg.env_float("LOSS_WEIGHT_BETA", globals()["WEIGHT_BETA"])
-    RARE_OVERSAMPLE = dg.env_bool("RARE_OVERSAMPLE", globals()["RARE_OVERSAMPLE"])
-    RARE_CENTER_PROB = dg.env_float("RARE_CENTER_PROB", globals()["RARE_CENTER_PROB"])
-    from plyfile import PlyData
+    # Env-overridable knobs (GUI "Density generalization" + "Loss & class
+    # balance" panels; see train_common._ENV_KNOBS). Local shadows: the nested
+    # closures capture these, defaulting to the module constants.
+    (DG_DENSITY_AUG, DG_COARSEN_MAX, DG_P_NATIVE, DG_LOGDK_FEAT, DG_LOGDK_K,
+     DG_INFER_TTA, USE_FOCAL, FOCAL_GAMMA, CLASS_WEIGHTING, WEIGHT_BETA,
+     RARE_OVERSAMPLE, RARE_CENTER_PROB) = tc.env_overrides(globals(), [
+        "DG_DENSITY_AUG", "DG_COARSEN_MAX", "DG_P_NATIVE", "DG_LOGDK_FEAT",
+        "DG_LOGDK_K", "DG_INFER_TTA", "USE_FOCAL", "FOCAL_GAMMA",
+        "CLASS_WEIGHTING", "WEIGHT_BETA", "RARE_OVERSAMPLE", "RARE_CENTER_PROB"])
 
     sys.path.insert(0, "/opt")          # so `import ptv3.model` resolves
-
-    if globals().get("DEBUG_CUDA"):
-        # Synchronous CUDA: the device-side assert then fires AT the real op, so
-        # the Python traceback is correct (instead of surfacing async in spconv).
-        os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
-        os.environ["TORCH_USE_CUDA_DSA"] = "1"
-        print("  [debug] CUDA_LAUNCH_BLOCKING=1 (synchronous; slower) — diagnostic run.",
-              flush=True)
 
     # --- resolve config: CLI args override the module defaults ---------------
     GRID_SIZE   = grid if grid is not None else globals()["GRID_SIZE"]
@@ -197,23 +164,8 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
     # count/names straight from the checkpoint (+ its run.json), so skip the meta.
     if dataset:
         ds_root = f"{DATASETS_ROOT}/{dataset}"
-        meta_path = f"{ds_root}/dataset_meta.json"
-        if not os.path.exists(meta_path):
-            raise FileNotFoundError(f"{meta_path} not found — build the dataset "
-                                    f"with the trainer_gui app first.")
-        with open(meta_path) as f:
-            ds_meta = json.load(f)
-        NUM_CLASSES = int(ds_meta["num_classes"])
-        CLASS_NAMES = list(ds_meta["class_names"])
-        if HAG and not ds_meta.get("has_hag"):
-            raise ValueError(
-                f"--hag needs a dataset with a real HeightAboveGround channel, but "
-                f"'{dataset}' has none (has_hag=false). Rebuild it with the Datasets "
-                f"page 'Compute Height-Above-Ground' box, or train the plain PTv3.")
-        # --hag: the dataset's real HAG. (Legacy datasets recorded no method; the
-        # PDAL nearest-neighbour filter was the only one back then.)
-        HAG_SOURCE = (((ds_meta.get("source") or {}).get("hag_source") or "pdal_hag_nn")
-                      if HAG else None)
+        ds_meta, NUM_CLASSES, CLASS_NAMES, HAG_SOURCE = tc.load_dataset_meta(
+            dataset, HAG, "train the plain PTv3.")
         if not ds_meta.get("has_intensity"):
             color_src = "rgb" if ds_meta.get("has_rgb") else "gray"
         # --hag gets its own cache family (tiles carry a "hag" array), keyed by the
@@ -224,24 +176,8 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
         PREP_DIR = f"{ds_root}/prep/ptv3_{color_src}{_hag_tag}_chunk{int(CHUNK_XY)}"
 
     # --- Preprocessing ------------------------------------------------------
-    def load_ply(path):
-        ply = PlyData.read(path)
-        v = ply["vertex"]
-        names = set(p.name for p in v.properties)
-        xyz = np.stack([v["x"], v["y"], v["z"]], -1).astype(np.float32)
-        if {"red", "green", "blue"}.issubset(names):
-            rgb = np.stack([v["red"], v["green"], v["blue"]], -1).astype(np.float32)
-        else:
-            rgb = np.full((xyz.shape[0], 3), 128.0, dtype=np.float32)
-        for key in ("scalar_label", "label", "class"):
-            if key in names:
-                lab = np.asarray(v[key]).astype(np.int64); break
-        else:
-            lab = np.zeros(xyz.shape[0], dtype=np.int64)
-        return xyz, rgb, lab
-
     def load_canonical(npz_path):
-        """Canonical trainer_gui scene -> the (xyz, rgb, lab) tuple load_ply produces.
+        """Canonical trainer_gui scene -> an (xyz, rgb, lab) tuple.
         color_src picks what fills the 3 color channels: intensity-first for new
         runs, rgb for old RGB-trained checkpoints at inference. Missing signals
         fall through (intensity -> rgb -> mid-gray). Intensity is npz-normalized
@@ -262,19 +198,13 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
             else np.full(len(xyz), -1, np.int64)
         return xyz, rgb, lab
 
-    def load_scene(path):
-        # canonical .npz -> trainer_gui loader; else PLY.
-        if path.endswith(".npz"):
-            return load_canonical(path)
-        return load_ply(path)
-
     def tile_and_save(src_paths, out_dir, chunk_xy, stride):
         os.makedirs(out_dir, exist_ok=True)
         for fi, src in enumerate(src_paths):
             scene = os.path.splitext(os.path.basename(src))[0]
             t0 = time.time()
             try:
-                xyz, rgb, lab = load_scene(src)
+                xyz, rgb, lab = load_canonical(src)
             except Exception as e:
                 print(f"  skip {src}: {e}", flush=True); continue
             # --hag: per-point HAG from the source scene npz rides into the cache
@@ -340,24 +270,8 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
 
     # --- Model builder + prediction helpers ----------------------------------
     from ptv3.model import PointTransformerV3
-
-    # PTv3's stem is a 5x5x5 SubMConv (indice_key="stem", kernel_volume 125).
-    # spconv's Native conv backward device-asserts on that large kernel on this
-    # cu124 build (confirmed by the diagnostic: clean batch, OOB in
-    # ConvGemmOps.indice_conv_backward), and the implicit-GEMM path can't
-    # NVRTC-compile here. Every 3x3x3 conv (the xCPE) backward-passes fine, so
-    # shrink ONLY the stem to STEM_KERNEL by patching the SubMConv3d ctor.
-    if STEM_KERNEL and STEM_KERNEL != 5:
-        import spconv.pytorch as _spc
-        if not getattr(_spc.SubMConv3d, "_stem_patched", False):
-            _orig_subm = _spc.SubMConv3d.__init__
-            def _subm_init(self, *a, **kw):
-                if kw.get("indice_key") == "stem":
-                    kw["kernel_size"] = STEM_KERNEL
-                _orig_subm(self, *a, **kw)
-            _spc.SubMConv3d.__init__ = _subm_init
-            _spc.SubMConv3d._stem_patched = True
-            print(f"  [spconv] PTv3 stem SubMConv3d kernel 5 -> {STEM_KERNEL}", flush=True)
+    # PTv3's 5x5x5 stem needs the spconv-cu118 build — cu124's conv backward
+    # device-asserts on it (the STEM_KERNEL=3 workaround lives in git history).
 
     def _hag_of(z_or_files, xyz):
         """Per-point real HeightAboveGround for a cached tile (--hag).
@@ -373,20 +287,6 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
         return np.zeros(len(xyz), np.float32)   # plain PTv3: never reaches the net
 
     def build_model(num_classes):
-        # FlashAttention is optional — the image installs it best-effort
-        # (`pip install flash-attn || echo ...`), so it may be absent. PTv3's
-        # SerializedAttention asserts when enable_flash=True but flash_attn can't
-        # be imported, so probe it and fall back to standard attention (identical
-        # results, just slower) instead of crashing the whole run.
-        use_flash = USE_FLASH_ATTN
-        if use_flash:
-            try:
-                import flash_attn  # noqa: F401
-                print("  flash_attn enabled.", flush=True)
-            except Exception:
-                use_flash = False
-                print("  flash_attn unavailable — falling back to "
-                      "enable_flash=False (slower attention).", flush=True)
         backbone = PointTransformerV3(
             in_channels=6 + (1 if HAG else 0) + (1 if DG_LOGDK_FEAT else 0),   # xyz + rgb (+ HAG, --hag) (+ log d_k, D3b)
             order=("z", "z-trans", "hilbert", "hilbert-trans"),
@@ -400,7 +300,7 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
             dec_num_head=(4, 4, 8, 16),
             dec_patch_size=(1024, 1024, 1024, 1024),
             drop_path=DROP_PATH,
-            enable_flash=use_flash,
+            enable_flash=USE_FLASH_ATTN,
             cls_mode=False,
         ).cuda()
         head = torch.nn.Linear(64, num_classes).cuda()
@@ -412,9 +312,9 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
         def _predict_scene(scene_path):
             # Tile into CHUNK_XY windows, voxel-downsample tracking the inverse
             # map, scatter per-voxel predictions back, NN-fill stragglers.
-            xyz, rgb, _ = load_scene(scene_path)
+            xyz, rgb, _ = load_canonical(scene_path)
             # --hag: real per-point HAG, written by convert_infer_job. The scene npz
-            # stores xyz unreordered, so z["hag"] aligns 1:1 with load_scene's xyz.
+            # stores xyz unreordered, so z["hag"] aligns 1:1 with load_canonical's xyz.
             hag = None
             if HAG:
                 _z = np.load(scene_path) if scene_path.endswith(".npz") else None
@@ -475,21 +375,12 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
         wpath = f"/outputs/{weights}"
         if not os.path.exists(wpath):
             raise FileNotFoundError(f"weights not found under /outputs: {wpath}")
-        try:   # weights_only=True: a hand-picked .pth can't run code on load
-            ckpt = torch.load(wpath, map_location="cpu", weights_only=True)
-        except Exception as e:
-            raise RuntimeError(
-                f"Failed to load weights '{wpath}': {e}\n"
-                f"  (loaded safely with weights_only=True — a full-model pickle or a "
-                f"checkpoint from another script is rejected; re-export as a state_dict.)"
-            ) from e
+        ckpt = tc.load_ckpt_safe(wpath, map_location="cpu")
         bsd, hsd = ckpt["backbone"], ckpt["head"]
         num_classes = int(hsd["weight"].shape[0])
         class_names = [f"class_{i}" for i in range(num_classes)]
-        import os as _os, sys as _sys   # read the run's run.json (single manifest) beside the weights
-        _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "helper"))
-        from train_common import infer_meta
-        meta = infer_meta(wpath)
+        # read the run's run.json (single manifest) beside the weights
+        meta = tc.infer_meta(wpath)
         # Feed the checkpoint the color signal it was trained on. Manifests from
         # before intensity-first carry no color_source -> those runs saw RGB.
         color_src = (meta or {}).get("color_source") or "rgb"
@@ -520,41 +411,25 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                      "infer_input": infer_input, "num_classes": num_classes,
                      "class_names": class_names, "grid_size": GRID_SIZE,
                      "color_source": color_src,
-                     "chunk_xy": CHUNK_XY, "hag": HAG, "gpu": gpu_name(),
+                     "chunk_xy": CHUNK_XY, "hag": HAG, "gpu": tc.gpu_name(),
                      "started_utc": datetime.utcnow().isoformat() + "Z"}
 
         predict_scene = make_predict_scene(backbone, head, num_classes)
-        print(f"  [infer] labeling {len(scenes)} scene(s) -> {pred_dir}", flush=True)
-        scene_stats = []
-        for pc_path in scenes:
-            name = os.path.splitext(os.path.basename(pc_path))[0]
-            t0 = time.time()
-            xyz, pred, inten = predict_scene(pc_path)
-            tc.write_pred(f"{pred_dir}/{name}_pred.npz", xyz, pred, inten)
-            scene_stats.append({"scene": os.path.basename(pc_path),
-                                "points": int(len(xyz)),
-                                "seconds": round(time.time() - t0, 3)})
-            tc.write_infer_run(run_dir, infer_cfg, scene_stats)   # crash-safe: per scene
-            print(f"  [infer] {name}: {len(xyz):,} pts in {time.time()-t0:.1f}s", flush=True)
-        print(f"  [infer] done — predictions in _infer/{infer_input}/predictions", flush=True)
+        tc.run_infer_scenes(scenes, predict_scene, pred_dir, run_dir, infer_cfg)
         return
 
     # ==========================================================================
     # TRAINING MODE
     # ==========================================================================
     print("=" * 70)
-    print(f"  PTv3  {dataset}  ({gpu_name()}, {N_EPOCHS} ep, batch {BATCH_SIZE})")
+    print(f"  PTv3  {dataset}  ({tc.gpu_name()}, {N_EPOCHS} ep, batch {BATCH_SIZE})")
     print("=" * 70)
     print(f"  CUDA: {torch.cuda.is_available()}  "
           f"{torch.cuda.get_device_name(0) if torch.cuda.is_available() else ''}")
     ensure_prep()
 
     tag = dataset
-    # Namespace runs by stem kernel: shrinking the stem (STEM_KERNEL != 5) changes
-    # the architecture, so old 5x5x5-stem checkpoints are incompatible — give them
-    # a distinct tag so AUTO_RESUME starts a fresh lineage instead of trying (and
-    # failing) to load mismatched weights.
-    _pt = "ptv3" if STEM_KERNEL == 5 else f"ptv3k{STEM_KERNEL}"
+    _pt = "ptv3"
     if HAG:
         _pt += "_hag"   # exact pre-merge twin suffix at the default 5x5x5 stem
 
@@ -602,7 +477,7 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
             cfg = {
                 "backbone": "PTv3", "n_epochs": N_EPOCHS, "batch_size": BATCH_SIZE,
                 "dataset": dataset,
-                "mode": mode, "gpu": gpu_name(),
+                "mode": mode, "gpu": tc.gpu_name(),
                 "num_classes": NUM_CLASSES, "grid_size": GRID_SIZE,
                 "class_names": CLASS_NAMES,
                 "color_source": color_src,
@@ -661,156 +536,56 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
     # CANONICAL: the dataset stage decided the 3-way split and materialized
     # train/val/test; read the three PREP folders verbatim and NEVER re-carve.
     # val = in-distribution selection holdout, test = final-report set.
-    synth_train_tiles = sorted(glob.glob(f"{PREP_DIR}/train/*.npz"))
-    synth_test_tiles  = sorted(glob.glob(f"{PREP_DIR}/val/*.npz"))   # = val tiles
-    real_test_tiles   = sorted(glob.glob(f"{PREP_DIR}/test/*.npz"))
-    hold = {_scene_of(p) for p in synth_test_tiles}
-    real_train_tiles = []
-    val_tile_dir = f"{PREP_DIR}/val"
-    test_raw_split, test_tile_dir = "test", f"{PREP_DIR}/test"
-    print(f"  train: {len(synth_train_tiles)}   val(holdout {len(hold)} scenes): "
-          f"{len(synth_test_tiles)}   test: {len(real_test_tiles)}", flush=True)
+    train_tiles = sorted(glob.glob(f"{PREP_DIR}/train/*.npz"))
+    val_tiles   = sorted(glob.glob(f"{PREP_DIR}/val/*.npz"))
+    test_tiles  = sorted(glob.glob(f"{PREP_DIR}/test/*.npz"))
+    hold = {_scene_of(p) for p in val_tiles}
+    print(f"  train: {len(train_tiles)}   val(holdout {len(hold)} scenes): "
+          f"{len(val_tiles)}   test: {len(test_tiles)}", flush=True)
 
-    # --- class balance: scan training tiles for inverse-frequency weights +
-    # rare-class tile flags. The per-tile np.load over the dataset dir is the
-    # bottleneck (~45k tiles -> minutes), so read in parallel AND cache the raw
-    # scan to PREP_DIR (keyed on the tile set) — instant on every later launch. -
-    train_pool = synth_train_tiles + real_train_tiles
-    cache_path = f"{PREP_DIR}/class_balance_cache.npz"
-    pool_names = np.array([os.path.basename(p) for p in train_pool])
-
-    def _scan_tile(tp):
-        lab = np.load(tp)["lab"]
-        v = lab[(lab >= 0) & (lab < NUM_CLASSES)]
-        return (np.bincount(v, minlength=NUM_CLASSES).astype(np.int64)
-                if v.size else np.zeros(NUM_CLASSES, np.int64))
-
-    class_counts = present_mask = None
-    if os.path.exists(cache_path):
-        try:
-            cz = np.load(cache_path, allow_pickle=False)
-            if (cz["tile_names"].shape == pool_names.shape
-                    and bool(np.all(cz["tile_names"] == pool_names))
-                    and int(cz["num_classes"]) == NUM_CLASSES):
-                class_counts = cz["class_counts"].astype(np.int64)
-                present_mask = cz["present_mask"].astype(bool)
-                print(f"  class balance: loaded cache ({len(train_pool)} tiles)", flush=True)
-        except Exception as e:
-            print(f"  class balance: ignoring unreadable cache ({e})", flush=True)
-
-    if class_counts is None:
-        from concurrent.futures import ThreadPoolExecutor
-        print(f"  scanning {len(train_pool)} train tiles for class balance (parallel)…",
-              flush=True)
-        per_tile = np.zeros((len(train_pool), NUM_CLASSES), np.int64)
-        with ThreadPoolExecutor(max_workers=32) as _ex:
-            for i, counts in enumerate(_ex.map(_scan_tile, train_pool)):
-                per_tile[i] = counts
-        class_counts = per_tile.sum(0)
-        present_mask = per_tile > 0
-        try:
-            np.savez(cache_path, tile_names=pool_names, class_counts=class_counts,
-                     present_mask=present_mask, num_classes=np.int64(NUM_CLASSES))
-            print(f"  class balance: cached scan -> {cache_path}", flush=True)
-        except Exception as e:
-            print(f"  class balance: could not write cache ({e})", flush=True)
+    # --- class balance: one (parallel, PREP_DIR-cached) scan of the training
+    # tiles -> inverse-frequency weights + rare-class tile flags. -------------
+    class_counts, present_mask = tc.scan_class_balance(
+        train_tiles, NUM_CLASSES, cache_path=f"{PREP_DIR}/class_balance_cache.npz")
 
     def _name(c):
         return CLASS_NAMES[c] if CLASS_NAMES else c
-    print(f"  class counts: {dict(zip([_name(c) for c in range(NUM_CLASSES)], class_counts.tolist()))}",
-          flush=True)
+    names = [_name(c) for c in range(NUM_CLASSES)]
+    print(f"  class counts: {dict(zip(names, class_counts.tolist()))}", flush=True)
 
     # Rare classes: explicit RARE_CLASSES, else auto — present classes whose
     # frequency is below RARE_FREQ_FRAC x the median present-class frequency.
     if RARE_CLASSES is not None:
         rare_set = set(RARE_CLASSES)
     elif RARE_OVERSAMPLE:
-        present_freq = class_counts[class_counts > 0]
-        thresh = RARE_FREQ_FRAC * float(np.median(present_freq)) if present_freq.size else 0.0
-        rare_set = {c for c in range(NUM_CLASSES)
-                    if 0 < class_counts[c] < thresh}
+        rare_set = set(tc.auto_rare_classes(class_counts, RARE_FREQ_FRAC))
     else:
         rare_set = set()
     rare_cols = sorted(rare_set)
     if RARE_OVERSAMPLE and rare_cols:
-        rare_tiles = [train_pool[i] for i in np.nonzero(present_mask[:, rare_cols].any(1))[0]]
+        rare_tiles = [train_tiles[i] for i in np.nonzero(present_mask[:, rare_cols].any(1))[0]]
     else:
         rare_tiles = []
     print(f"  rare classes: {sorted(_name(c) for c in rare_set)}  "
-          f"({len(rare_tiles)}/{len(train_pool)} tiles)", flush=True)
+          f"({len(rare_tiles)}/{len(train_tiles)} tiles)", flush=True)
 
     if CLASS_WEIGHTING:
-        # w = 1/sqrt(freq) (inverse-sqrt-frequency): sub-linear, mean-normalized,
-        # capped to [1/CAP, CAP]. Same scheme as the KPConvX cold script.
-        freq = class_counts / max(int(class_counts.sum()), 1)
-        w = (1.0 / np.maximum(freq, 1e-6)) ** WEIGHT_BETA
-        w[class_counts == 0] = 1.0          # don't up-weight absent classes
-        w = w / w[class_counts > 0].mean() if (class_counts > 0).any() else w
-        w = np.clip(w, 1.0 / WEIGHT_CAP, WEIGHT_CAP)
+        # Inverse-sqrt-frequency, absent classes pinned at 1.0 (never up-weight
+        # a class with no train points), mean-normalized over present classes.
+        w = tc.class_weights_np(class_counts, WEIGHT_BETA, WEIGHT_CAP,
+                                absent_to_one=True)
         class_weights = torch.tensor(w, dtype=torch.float32).cuda()
         print(f"  class weights: "
-              f"{dict(zip([_name(c) for c in range(NUM_CLASSES)], [round(float(x),3) for x in w]))}",
-              flush=True)
+              f"{dict(zip(names, [round(float(x), 3) for x in w]))}", flush=True)
     else:
         class_weights = None
 
-    # Torch-native weighted (label-smoothed) CE — matches KPConvX's SmoothCE.
-    ce_loss = torch.nn.CrossEntropyLoss(weight=class_weights, ignore_index=-1,
-                                        label_smoothing=LABEL_SMOOTH)
-
-    # --- Lovász-Softmax (Berman et al. 2018): differentiable mIoU surrogate,
-    # per-class equally weighted, added on top of CE — PTv3's outdoor loss is
-    # literally CE + Lovász. Pure-torch flat form (logits (N,C), labels (N,)). --
-    def _lovasz_grad(gt_sorted):
-        p = len(gt_sorted)
-        gts = gt_sorted.sum()
-        intersection = gts - gt_sorted.float().cumsum(0)
-        union = gts + (1 - gt_sorted).float().cumsum(0)
-        jaccard = 1.0 - intersection / union
-        if p > 1:
-            jaccard[1:p] = jaccard[1:p] - jaccard[0:-1].clone()
-        return jaccard
-
-    def lovasz_softmax_flat(probas, labels):
-        if probas.numel() == 0:
-            return probas.sum() * 0.0
-        losses = []
-        for c in torch.unique(labels):
-            fg = (labels == c).float()
-            errors = (fg - probas[:, int(c)]).abs()
-            errors_sorted, perm = torch.sort(errors, 0, descending=True)
-            losses.append(torch.dot(errors_sorted, _lovasz_grad(fg[perm])))
-        if not losses:
-            return probas.sum() * 0.0
-        return torch.stack(losses).mean()
-
-    # alpha-balanced multiclass focal loss (alpha = inverse-sqrt class weights).
-    def focal_loss(logits, labels):
-        valid = labels >= 0
-        if not valid.any():
-            return logits.sum() * 0.0
-        lg, lb = logits[valid], labels[valid]
-        logp = torch.log_softmax(lg, dim=1)
-        logpt = logp.gather(1, lb.unsqueeze(1)).squeeze(1)
-        pt = logpt.exp()
-        loss = -((1.0 - pt) ** FOCAL_GAMMA) * logpt
-        if class_weights is not None:
-            loss = loss * class_weights[lb]
-        return loss.mean()
-
-    def seg_loss(logits, labels):
-        loss = focal_loss(logits, labels) if USE_FOCAL else ce_loss(logits, labels)
-        if LOVASZ_WEIGHT > 0:
-            valid = labels >= 0
-            if valid.any():
-                probas = torch.softmax(logits[valid], dim=1)
-                loss = loss + LOVASZ_WEIGHT * lovasz_softmax_flat(probas, labels[valid])
-        return loss
-
-    def pick_train_tile():
-        if rare_tiles and np.random.rand() < RARE_TILE_PROB:
-            return rare_tiles[np.random.randint(len(rare_tiles))]
-        return synth_train_tiles[np.random.randint(len(synth_train_tiles))]
+    # Shared loss recipe: weighted (label-smoothed) CE or focal, + Lovász —
+    # PTv3's outdoor loss is literally CE + Lovász (train_common.make_seg_loss).
+    seg_loss = tc.make_seg_loss(class_weights, LABEL_SMOOTH, USE_FOCAL,
+                                FOCAL_GAMMA, LOVASZ_WEIGHT)
+    pick_train_tile = tc.make_tile_picker(train_tiles, rare_tiles,
+                                          RARE_TILE_PROB)
 
     # --- PTv3 outdoor augmentation suite (was entirely absent before) ---------
     def augment_xyz(xyz):
@@ -931,9 +706,9 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
         HAG isn't needed here — raw scoring only uses raw xyz + raw GT."""
         return lambda: load_canonical(f"{ds_root}/{split}/{name}.npz")
 
-    val_items = [(n, _raw_loader("val", n), val_tile_dir) for n in sorted(hold)]
-    test_items = [(n, _raw_loader(test_raw_split, n), test_tile_dir)
-                  for n in sorted({_scene_of(p) for p in real_test_tiles})]
+    val_items = [(n, _raw_loader("val", n), f"{PREP_DIR}/val") for n in sorted(hold)]
+    test_items = [(n, _raw_loader("test", n), f"{PREP_DIR}/test")
+                  for n in sorted({_scene_of(p) for p in test_tiles})]
     print(f"  eval set: {len(val_items)} holdout(val) + {len(test_items)} test scenes",
           flush=True)
 
@@ -1017,42 +792,18 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                 v = (raw_lab >= 0) & (raw_lab < NUM_CLASSES)
                 rp, rl = raw_pred[v], raw_lab[v]
                 correct += int((rp == rl).sum()); total += int(v.sum())
-                for c in range(NUM_CLASSES):
-                    t_inter[c] += int(((rp == c) & (rl == c)).sum())
-                    t_union[c] += int(((rp == c) | (rl == c)).sum())
-                    t_gt[c]    += int((rl == c).sum())
+                i_, u_, g_ = tc.score_ious(rp, rl, NUM_CLASSES)
+                t_inter += i_; t_union += u_; t_gt += g_
                 n_scenes += 1
-        with np.errstate(invalid="ignore"):
-            iou_per = t_inter / np.maximum(t_union, 1)
-        gt_counts = [int(x) for x in t_gt.tolist()]
-        present = [c for c in range(NUM_CLASSES) if gt_counts[c] > 0]
-        absent  = [c for c in range(NUM_CLASSES) if gt_counts[c] == 0]
-        present_iou = [float(iou_per[c]) for c in present]
-        present_mIoU = float(np.mean(present_iou)) if present_iou else 0.0
-        m = {
-            "overall_acc": correct / max(total, 1),
-            "overall_mIoU": float(np.mean(iou_per)),
-            "present_classes_mIoU": present_mIoU,
-            "per_class_iou": {_name(c): float(iou_per[c]) for c in range(NUM_CLASSES)},
-            "per_class_gt_count": {_name(c): gt_counts[c] for c in range(NUM_CLASSES)},
-            "present_classes": [_name(c) for c in present],
-            "absent_classes": [_name(c) for c in absent],
-            "total_test_seconds": time.time() - t_test,
-            "num_scenes": n_scenes,
-            "num_raw_points_scored": int(total),
-            "skipped_tiles": n_skipped_tiles,
-            "skipped_scenes": n_skipped_scenes,
-            "scored_on": "raw_points",
-            "voted_overlap": True,
-            "vote_weighting": "center_tapered_softmax",
-            "reprojection": "nearest_voxel_representative_to_raw",
-        }
-        print(f"  [{label}] acc={m['overall_acc']:.4f}  "
-              f"mIoU({NUM_CLASSES}-way)={m['overall_mIoU']:.4f}  "
-              f"mIoU(present {len(present)})={m['present_classes_mIoU']:.4f}  "
-              f"absent={m['absent_classes']}  raw_pts={total:,}  "
-              f"skipped(tiles={n_skipped_tiles},scenes={n_skipped_scenes})", flush=True)
-        return m
+        return tc.eval_metrics(
+            t_inter, t_union, t_gt, correct, total, names, t_test,
+            n_scenes, label,
+            extra={"skipped_tiles": n_skipped_tiles,
+                   "skipped_scenes": n_skipped_scenes,
+                   "scored_on": "raw_points",
+                   "voted_overlap": True,
+                   "vote_weighting": "center_tapered_softmax",
+                   "reprojection": "nearest_voxel_representative_to_raw"})
 
     val_csv = f"{run_dir}/val_metrics.csv"
     if not os.path.exists(val_csv):
@@ -1061,13 +812,10 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                 ["epoch", "val_acc", "val_miou"] +
                 [f"iou_{_name(c)}" for c in range(NUM_CLASSES)])
 
-    import os as _os, sys as _sys   # scripts/helper is a sibling dir (flat /root in the container image)
-    _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "helper"))
-    from train_common import BestCheckpoint, write_run_manifest
-    best = BestCheckpoint(run_dir)
+    best = tc.BestCheckpoint(run_dir)
     # the single inference manifest (run.json); the _hag key keeps the Infer
     # page mapping HAG runs back to the HAG entry point exactly as before.
-    write_run_manifest(run_dir, "ptv3_hag" if HAG else "ptv3", dataset)
+    tc.write_run_manifest(run_dir, "ptv3_hag" if HAG else "ptv3", dataset)
 
     def run_eval(ep, write_json=False):
         # Periodic pass scores the held-out VAL scenes only (no test peeking) and
@@ -1078,10 +826,7 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
         # (most-recent) weights, matching the periodic curve.
         backbone.eval(); head.eval()
         m = evaluate(val_items, f"val@ep{ep}")
-        ious = [m["per_class_iou"][_name(c)] for c in range(NUM_CLASSES)]
-        with open(val_csv, "a", newline="") as f:
-            csv.writer(f).writerow([ep, f"{m['overall_acc']:.4f}",
-                                    f"{m['present_classes_mIoU']:.4f}"] + [f"{x:.4f}" for x in ious])
+        tc.append_val_row(val_csv, ep, m, names)
         if best.update(m["present_classes_mIoU"]):
             torch.save({"backbone": backbone.state_dict(),
                         "head": head.state_dict(), "epoch": ep}, best.final)
@@ -1119,22 +864,8 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
         print(f"  ep {ep:3d} starting (lr={cur_lr:.2e})…", flush=True)
         for step in range(STEPS):
             picks = [pick_train_tile() for _ in range(BATCH_SIZE)]
-            _dbg = None
             try:
                 batch, label = to_ptv3_batch(picks, training=True)
-                if DEBUG_CUDA:
-                    # Snapshot the batch on CPU BEFORE the forward (GPU still
-                    # healthy). If the step then asserts, this is the culprit.
-                    gc, co = batch["grid_coord"], batch["coord"]
-                    _dbg = {"picks": [os.path.basename(p) for p in picks],
-                            "n_pts": int(co.shape[0]), "offset": batch["offset"].tolist(),
-                            "grid_min": gc.min(0).values.tolist(),
-                            "grid_max": gc.max(0).values.tolist(),
-                            "grid_unique": int(torch.unique(gc, dim=0).shape[0]),
-                            "coord_min": [round(float(x), 2) for x in co.min(0).values.tolist()],
-                            "coord_max": [round(float(x), 2) for x in co.max(0).values.tolist()],
-                            "coord_finite": bool(torch.isfinite(co).all().item()),
-                            "lab_min": int(label.min().item()), "lab_max": int(label.max().item())}
                 point = backbone(batch)
                 feat = point["feat"] if isinstance(point, dict) else point.feat
                 logits = head(feat)
@@ -1160,9 +891,6 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
             except RuntimeError as e:
                 if "out of memory" in str(e).lower():
                     torch.cuda.empty_cache(); continue
-                if _dbg is not None:
-                    print(f"  [debug] CRASH at ep {ep} step {step} — offending batch:\n"
-                          f"          {json.dumps(_dbg)}", flush=True)
                 raise
         sec_per_iter = (time.time() - t_ep) / max(n_steps, 1)
         sec_per_epoch = time.time() - t_ep

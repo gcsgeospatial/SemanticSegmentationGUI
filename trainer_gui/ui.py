@@ -12,8 +12,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QTextCursor
-from PySide6.QtWidgets import (QDoubleSpinBox, QHBoxLayout, QPlainTextEdit, QScrollArea, QSpinBox,
-                               QVBoxLayout, QWidget)
+from PySide6.QtWidgets import QHBoxLayout, QPlainTextEdit, QScrollArea, QVBoxLayout, QWidget
 
 
 def append_log(log: QPlainTextEdit, text: str, newline: bool = True):
@@ -27,19 +26,6 @@ def append_log(log: QPlainTextEdit, text: str, newline: bool = True):
     log.insertPlainText(text + ("\n" if newline else ""))
     if at_bottom:
         bar.setValue(bar.maximum())
-
-
-class NoWheelSpinBox(QSpinBox):
-    """A QSpinBox that ignores the scroll wheel — values change by typing or the
-    arrows only, so scrolling the page never silently nudges a number."""
-    def wheelEvent(self, e):  # noqa: N802 (Qt signature)
-        e.ignore()
-
-
-class NoWheelDoubleSpinBox(QDoubleSpinBox):
-    """QDoubleSpinBox twin of NoWheelSpinBox — wheel scrolling is ignored."""
-    def wheelEvent(self, e):  # noqa: N802 (Qt signature)
-        e.ignore()
 
 
 def vsplit(*widgets: QWidget, sizes: list[int] | None = None) -> QWidget:
@@ -78,12 +64,6 @@ def wrap(layout) -> QWidget:
     layout.setContentsMargins(0, 0, 0, 0)
     w.setLayout(layout)
     return w
-
-
-def scrollable(widget: QWidget) -> QWidget:
-    """No-op: the whole page now scrolls (see scroll_v), so inner scroll areas
-    would just nest. Kept so existing call sites need no change."""
-    return widget
 
 
 def polish_forms(root: QWidget) -> None:

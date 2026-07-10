@@ -60,10 +60,6 @@ def run_script(script: str, flags: dict, detach: bool = False,
     return modal_exe(), args
 
 
-def app_logs(app_name: str) -> tuple[str, list[str]]:
-    return modal_exe(), ["app", "logs", app_name]
-
-
 # ---- thin synchronous helpers (background threads only — they block) ----
 
 def fetch_run_manifest(volume: str, run_id: str, timeout: int = 60) -> dict | None:

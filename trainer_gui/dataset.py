@@ -364,7 +364,8 @@ def _hag_from_cloud(cloud: Cloud) -> np.ndarray | None:
 def _convert_one(cloud: Cloud, raw: np.ndarray | None, value_to_index: dict[int, int],
                  out_path: Path, intensity_norm: str = "max",
                  compute_hag: bool = False, ground_value: int | None = None,
-                 use_smrf: bool = True, hag_filter: str = "grid") -> dict:
+                 use_smrf: bool = True, hag_filter: str = "grid",
+                 smrf_fill: bool = False) -> dict:
     """Write one (already-read, already-cropped) cloud to a canonical npz.
 
     compute_hag: also store a per-point real HeightAboveGround ("hag", SMRF->hag)
@@ -405,7 +406,7 @@ def _convert_one(cloud: Cloud, raw: np.ndarray | None, value_to_index: dict[int,
         from . import pretrain
         gmask = (raw == int(ground_value)) if (raw is not None and ground_value is not None) else None
         h = pretrain.hag_for_cloud(cloud, ground_mask=gmask, use_smrf=use_smrf,
-                                   hag_filter=hag_filter)
+                                   hag_filter=hag_filter, smrf_fill=smrf_fill)
         if h is not None and len(h) == cloud.n:
             out["hag"] = h.astype(np.float32)
 
@@ -430,13 +431,15 @@ def _convert_one(cloud: Cloud, raw: np.ndarray | None, value_to_index: dict[int,
 def convert_scene(path: Path, spec: LabelSpec | None, value_to_index: dict[int, int],
                   out_path: Path, intensity_norm: str = "max",
                   compute_hag: bool = False, ground_value: int | None = None,
-                  use_smrf: bool = True, hag_filter: str = "grid") -> dict:
+                  use_smrf: bool = True, hag_filter: str = "grid",
+                  smrf_fill: bool = False) -> dict:
     """Read one source file and convert the whole cloud (no cropping)."""
     cloud = read_points(path)
     raw = read_labels(path, cloud, spec) if spec is not None else None
     return _convert_one(cloud, raw, value_to_index, out_path, intensity_norm,
                         compute_hag=compute_hag, ground_value=ground_value,
-                        use_smrf=use_smrf, hag_filter=hag_filter)
+                        use_smrf=use_smrf, hag_filter=hag_filter,
+                        smrf_fill=smrf_fill)
 
 
 def _available_ram_bytes() -> int | None:
@@ -491,11 +494,6 @@ def _worker_cap_detail(files: list[Path]) -> tuple[int, str]:
                 reason = (f"RAM-limited: {ram / 1e9:.1f} GB free, "
                           f"~{biggest * _RAM_PER_FILE_FACTOR / 1e9:.1f} GB/worker")
     return cap, reason
-
-
-def _worker_cap(files: list[Path]) -> int:
-    """Thread count that won't OOM. Falls back to the core/file cap when RAM is unreadable."""
-    return _worker_cap_detail(files)[0]
 
 
 def _convert_many(files: list[Path], dest_for, spec, value_to_index, intensity_norm, say,
@@ -816,7 +814,7 @@ _GROUND_FIELD_CANDIDATES = ("classification", "Classification", "scalar_label",
 def convert_infer_job(job_id: str, input_dir: str, staging_root: Path, progress=None,
                       intensity_norm: str = "p95", hag: bool = False,
                       hag_filter: str = "grid", ground_value: int | None = None,
-                      out_dir: Path | None = None) -> Path:
+                      smrf_fill: bool = False, out_dir: Path | None = None) -> Path:
     """Label-less conversion for inference-only jobs -> <staging>/_infer/<job_id>/,
     or to `out_dir` when given (the caller nests it under the owning dataset, e.g.
     <dataset>/infer/<job_id>). The container mount name stays /datasets/_infer/<job>
@@ -828,13 +826,16 @@ def convert_infer_job(job_id: str, input_dir: str, staging_root: Path, progress=
 
     `hag=True` (required by *_hag weights) computes a per-point "hag" channel with
     `hag_filter`. `ground_value` names the classification value that means ground —
-    those points become the ONLY ground source, exactly as on the Datasets page.
-    Left None, ground is detected instead (grid's opening heuristic, or PDAL SMRF).
-    A PDAL filter without PDAL installed falls back to grid.
+    those points become the ONLY ground source, exactly as on the Datasets page,
+    unless `smrf_fill` opts into unioning SMRF-detected ground with the labels to
+    fill holes (PDAL filters only; the grid method ignores it). Left None, ground
+    is detected instead (grid's opening heuristic, or PDAL SMRF). A PDAL filter
+    without PDAL installed falls back to grid.
 
-    use_smrf is deliberately not a parameter: hag_for_cloud already forces it off
-    once a usable ground mask arrives, and a scene that happens to contain none of
-    `ground_value` degrades to detection rather than producing no HAG at all.
+    use_smrf itself is deliberately not a parameter: hag_for_cloud forces it off
+    once a usable ground mask arrives (absent smrf_fill), and a scene that happens
+    to contain none of `ground_value` degrades to detection rather than producing
+    no HAG at all.
     """
     say = progress or (lambda s: None)
     if hag:
@@ -843,7 +844,9 @@ def convert_infer_job(job_id: str, input_dir: str, staging_root: Path, progress=
             say(f"  ⚠ {hag_filter} needs PDAL (not installed) - using the grid method "
                 "instead (approximate HAG).")
             hag_filter = "grid"
-        src = (f"ground=class {ground_value}" if ground_value is not None
+        fill = smrf_fill and ground_value is not None and hag_filter != "grid"
+        src = (f"ground=class {ground_value}" + (" + SMRF gap fill" if fill else "")
+               if ground_value is not None
                else ("grid detection" if hag_filter == "grid" else "SMRF"))
         say(f"  computing HeightAboveGround per scene ({src} -> {hag_filter}) …")
     out_root = Path(out_dir) if out_dir else (staging_root / "_infer" / job_id)
@@ -870,7 +873,7 @@ def convert_infer_job(job_id: str, input_dir: str, staging_root: Path, progress=
         say(f"  converting {path.name} ...")
         st = convert_scene(path, spec, {}, out_path, intensity_norm=intensity_norm,
                            compute_hag=hag, ground_value=ground_value,
-                           hag_filter=hag_filter)
+                           hag_filter=hag_filter, smrf_fill=smrf_fill)
         st["scene"] = out_path.name
         st["source_file"] = str(path)
         scenes.append(out_path.name)

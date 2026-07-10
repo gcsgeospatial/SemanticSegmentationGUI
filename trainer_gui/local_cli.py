@@ -51,16 +51,6 @@ def image_for(backbone) -> str:
     return f"{reg}/{base}" if reg else base
 
 
-def image_available(backbone) -> bool:
-    """True if the backbone's Docker image is present locally (built or pulled)."""
-    try:
-        r = subprocess.run([docker_exe(), "image", "inspect", image_for(backbone)],
-                           capture_output=True, timeout=15)
-        return r.returncode == 0
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-
-
 def is_pullable(backbone) -> bool:
     """True if image_for() is a registry tag `docker run` can auto-pull (a registry
     prefix is configured, or the override names a registry host)."""
@@ -173,14 +163,14 @@ def run_script(script: str, flags: dict, backbone, *, repo_root: str,
 
 def pull(backbone) -> tuple[str, list[str]]:
     """`docker pull <tag>` for a backbone's image. Reuses image_for so the pulled
-    tag is exactly the one `docker run` (and image_available) will look for."""
+    tag is exactly the one `docker run` will look for."""
     return docker_exe(), ["pull", image_for(backbone)]
 
 
 def present_images() -> set[str]:
     """`repo:tag` of every image present locally, from ONE `docker images` call —
-    the bulk path for the GUI's status refresh (image_available is per-image and
-    each can block to its timeout if the daemon is down)."""
+    the bulk path for the GUI's status refresh (per-image `docker image inspect`
+    calls can each block to their timeout when the daemon is down)."""
     try:
         r = subprocess.run([docker_exe(), "images", "--format", "{{.Repository}}:{{.Tag}}"],
                            capture_output=True, text=True, timeout=15)

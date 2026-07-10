@@ -62,7 +62,7 @@ no CUDA).
 scripts/local/    the real trainers/inferencers — plain argparse, no modal.
                   Edit these. Run standalone: python scripts/local/local_train_ptv3.py --dataset X
 scripts/modal/    thin shells that bake the local twin into a modal.Image
-                  and subprocess it in the cloud. Frozen — don't touch.
+                  and subprocess it in the cloud (train_common.modal_shell_run).
 scripts/helper/   train_common.py (shared training/manifest logic),
                   density.py, _modal_shim.py (used only by gen_dockerfiles.py)
 ```
@@ -77,12 +77,13 @@ One image per model, generated — never hand-write a Dockerfile:
 ```bash
 python tools/gen_dockerfiles.py          # regenerate docker/*.Dockerfile + build/pull/push scripts
                                           # RE-RUN after editing any script's image recipe
-bash docker/build_all.sh                  # build (needs the model repos + NVIDIA GPU + Buildx)
+bash docker/build_all.sh                  # build — works on any machine with Docker + Buildx
 ```
 
-Model source is pulled in at **build** time via `--build-context` (edit the paths
-in `build_all.sh`). Only the build machine needs the model repos; every other
-machine just needs the built image.
+Model sources are **git-cloned at pinned SHAs during the build** — no local
+model checkouts and no GPU needed at build time (an NVIDIA GPU is still
+required at **run** time; the images are CUDA-based). Every other machine just
+needs the built image.
 
 **Distribute build-once-run-anywhere:**
 
@@ -105,6 +106,8 @@ use Hugging Face / S3 for the `.pth` weights. Full details: `docker/README.md`.
 | RandLA-Net + HAG | `randlanet_hag` | `scripts/local/local_train_randlanet_hag.py` |
 | KPConvX-L | `kpconvx_cold` | `scripts/local/local_train_kpconvx_cold.py` |
 | KPConvX-L + HAG | `kpconvx_cold_hag` | `scripts/local/local_train_kpconvx_cold_hag.py` |
+| KPConv | `kpconv` | `scripts/local/local_train_kpconv.py` |
+| KPConv + HAG | `kpconv_hag` | `scripts/local/local_train_kpconv_hag.py` |
 
 `_hag` = an extra **HeightAboveGround** input channel (PDAL SMRF ground → `hag_nn`).
 The `_hag` scripts are thin wrappers that run the base script with `--hag` — one

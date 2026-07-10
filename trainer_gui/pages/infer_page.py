@@ -18,12 +18,12 @@ from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (QCheckBox, QColorDialog, QComboBox, QDialog, QDialogButtonBox,
                                QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout,
                                QHeaderView, QLabel, QLineEdit, QPlainTextEdit, QPushButton,
-                               QRadioButton, QSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout,
+                               QRadioButton, QTableWidget, QTableWidgetItem, QVBoxLayout,
                                QWidget)
 
 from .. import appstate, dataset, local_cli, modal_cli, pretrain, ui
-from ..backbones import BACKBONES, infer_backbones
-from ..jobs import FuncWorker, JobRunner, LogParser
+from ..backbones import BACKBONES
+from ..jobs import FuncWorker, JobRunner
 
 PROJECT_DIR = str(Path(__file__).resolve().parents[2])
 
@@ -39,12 +39,10 @@ class InferPage(QWidget):
         self.preflight = FuncWorker(self)
         self.exporter = FuncWorker(self)   # npz -> chosen prediction format (host-side)
         self.runner = JobRunner(self)
-        self.parser = LogParser(self)
         self._stage = ""
         self._job_id = ""
         self._staged: Path | None = None
         self._weights_remote = ""
-        self._run_id = ""
         self._dl_dest: Path | None = None
         self._pred_dir: Path | None = None   # where local predictions land (host)
         self._manifest: dict | None = None         # the picked run.json (local runs)
@@ -77,7 +75,7 @@ class InferPage(QWidget):
         radio_row.addWidget(self.from_run_radio)
         radio_row.addWidget(self.from_file_radio)
         radio_row.addStretch()
-        wf.addRow("Source", _wrap(radio_row))
+        wf.addRow("Source", ui.wrap(radio_row))
         # LOCAL: pick run.json — arch, grid, tile, intensity, HAG, weights path come from it.
         self.runjson_edit = QLineEdit()
         self.runjson_edit.setPlaceholderText("…/local_runs/runs/<id>/run.json")
@@ -89,7 +87,7 @@ class InferPage(QWidget):
         rj_btn = QPushButton("Browse…")
         rj_btn.clicked.connect(self._pick_runjson)
         rj_row.addWidget(rj_btn)
-        self.runjson_row_w = _wrap(rj_row)
+        self.runjson_row_w = ui.wrap(rj_row)
         wf.addRow("Run file (run.json)", self.runjson_row_w)
         # Weights default to the .pth named in run.json; can point anywhere.
         self.weights_edit = QLineEdit()
@@ -99,7 +97,7 @@ class InferPage(QWidget):
         w_btn = QPushButton("Browse…")
         w_btn.clicked.connect(self._pick_weights)
         w_row.addWidget(w_btn)
-        self.weights_row_w = _wrap(w_row)
+        self.weights_row_w = ui.wrap(w_row)
         wf.addRow("Weights file", self.weights_row_w)
         # MODAL: pick/paste a run id (weights live on the cloud outputs volume).
         self.run_combo = QComboBox()
@@ -117,7 +115,7 @@ class InferPage(QWidget):
                                    "for backup, local inference later, or the class legend.")
         self.dl_run_btn.clicked.connect(self._download_run)
         run_row.addWidget(self.dl_run_btn)
-        self.run_row_w = _wrap(run_row)
+        self.run_row_w = ui.wrap(run_row)
         wf.addRow("Run", self.run_row_w)
         self.pth_edit = QLineEdit()
         pth_row = QHBoxLayout()
@@ -125,7 +123,7 @@ class InferPage(QWidget):
         pth_btn = QPushButton("Browse…")
         pth_btn.clicked.connect(self._pick_pth)
         pth_row.addWidget(pth_btn)
-        self.pth_row_w = _wrap(pth_row)
+        self.pth_row_w = ui.wrap(pth_row)
         wf.addRow("File", self.pth_row_w)
         self.backbone_combo = QComboBox()
         self.backbone_combo.currentIndexChanged.connect(self._sync_controls)
@@ -133,7 +131,7 @@ class InferPage(QWidget):
         wf.addRow("Architecture", self.backbone_combo)
 
         ibox = QGroupBox("Input")
-        iform = self.iform = QFormLayout(ibox)
+        iform = QFormLayout(ibox)
         iform.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
         self.input_edit = QLineEdit()
         in_row = QHBoxLayout()
@@ -144,7 +142,7 @@ class InferPage(QWidget):
         file_btn.clicked.connect(self._pick_input_file)
         in_row.addWidget(fold_btn)
         in_row.addWidget(file_btn)
-        iform.addRow("Point clouds (folder or file)", _wrap(in_row))
+        iform.addRow("Point clouds (folder or file)", ui.wrap(in_row))
         self.grid_spin = QDoubleSpinBox()
         self.grid_spin.setRange(0.02, 1_000_000.0)
         self.grid_spin.setSingleStep(0.05)
@@ -177,13 +175,23 @@ class InferPage(QWidget):
         self.hag_ground.setToolTip("Classification value in the input clouds that means "
                                    "ground (e.g. 2). When set, those points are the only "
                                    "ground source. Blank = detect ground instead.")
+        # Opt-in SMRF union: with a ground class + a PDAL method, also run SMRF
+        # and union its ground with the labels to fill holes (no ground returns
+        # under buildings, water). Unticked = labels stay the only ground source.
+        self.hag_smrf_fill = QCheckBox("fill ground gaps with SMRF")
+        self.hag_smrf_fill.setToolTip(
+            "With a ground class set, also run SMRF and union its detected ground "
+            "with the labeled points to fill holes (areas with no labeled ground "
+            "returns). Needs a PDAL method (hag_nn / hag_delaunay); the grid "
+            "method ignores it. With no ground class, SMRF already detects ground.")
         hag_row = QHBoxLayout()
         hag_row.addWidget(QLabel("method"))
         hag_row.addWidget(self.hag_filter)
         hag_row.addWidget(QLabel("ground class"))
         hag_row.addWidget(self.hag_ground)
+        hag_row.addWidget(self.hag_smrf_fill)
         hag_row.addStretch()
-        self.hag_opts_w = _wrap(hag_row)
+        self.hag_opts_w = ui.wrap(hag_row)
         self.hag_opts_w.setVisible(False)
         iform.addRow("", self.hag_opts_w)
         if not pretrain.pdal_available():
@@ -191,27 +199,8 @@ class InferPage(QWidget):
             # if a PDAL filter is picked anyway.
             self.hag_chk.setText("Compute Height-Above-Ground (HAG) - grid only, "
                                  "PDAL not installed")
-        # TODO(not ready): inference-time density-adapt UI (AdaBN / density TTA)
-        # hidden until reviewed; _infer_dg_env sends no AdaBN/TTA env for now.
-        # Density generalization: inference-time, label-free, no retrain. Any model.
-        # self.dg_adabn_chk = QCheckBox("AdaBN - re-fit norm stats to this cloud (KPConvX / RandLA)")
-        # self.dg_adabn_chk.setToolTip(
-        #     "Re-fit BatchNorm stats to the target tiles before predicting. "
-        #     "Label-free, no retrain. No-op for PTv3.")
-        # iform.addRow("Density adapt", self.dg_adabn_chk)
-        # self.dg_tta_chk = QCheckBox("Density TTA - average over")
-        # self.dg_tta_chk.setToolTip(
-        #     "Average softmax over several density/scale resamplings of each tile. "
-        #     "Label-free, no retrain. More views = slower.")
-        # self.dg_tta_spin = QSpinBox()
-        # self.dg_tta_spin.setRange(1, 9)
-        # self.dg_tta_spin.setValue(3)
-        # tta_row = QHBoxLayout()
-        # tta_row.addWidget(self.dg_tta_chk)
-        # tta_row.addWidget(self.dg_tta_spin)
-        # tta_row.addWidget(QLabel("extra views"))
-        # tta_row.addStretch(1)
-        # iform.addRow("", _wrap(tta_row))
+        # TODO(not ready): AdaBN/TTA infer UI hidden until reviewed; backend reads
+        # DG_INFER_ADABN / DG_INFER_TTA — see scripts/DENSITY_DG.md.
         # Prediction output folder; empty falls back to <workspace>/inference —
         # the same spot 'Download run…' uses, so runs + their predictions co-locate.
         self.out_edit = QLineEdit()
@@ -223,7 +212,9 @@ class InferPage(QWidget):
         out_btn = QPushButton("Browse…")
         out_btn.clicked.connect(self._pick_out)
         out_row.addWidget(out_btn)
-        self.out_row_w = _wrap(out_row)
+        self.out_row_w = ui.wrap(out_row)
+        # Shown in both modes (Modal: download target), unlike train_page's
+        # mode-dependent output row.
         iform.addRow("Output folder (predictions)", self.out_row_w)
         # Prediction file format — every option is xyz + classification only
         # (no RGB: colour/palette is a viewer concern, not the deliverable's).
@@ -281,7 +272,7 @@ class InferPage(QWidget):
         out_box.addLayout(actions)
         out_box.addWidget(self.legend_label)
 
-        root.addWidget(ui.vsplit(ui.scrollable(ui.wrap(forms_col)), self.log,
+        root.addWidget(ui.vsplit(ui.wrap(forms_col), self.log,
                                  ui.wrap(out_box), sizes=[340, 340, 84]), 1)
 
         self.converter.output.connect(self._append)
@@ -301,7 +292,6 @@ class InferPage(QWidget):
         self.runner.output.connect(self._on_output)
         self.runner.finished.connect(self._on_stage_done)
         self.runner.failed.connect(self._on_runner_failed)
-        self.parser.run_id.connect(self._on_run_id)
         self.dl_runner = JobRunner(self)   # run download, independent of the infer stages
         self.dl_runner.output.connect(lambda s: self._append(s, newline=False))
         self.dl_runner.finished.connect(self._on_run_downloaded)
@@ -322,8 +312,6 @@ class InferPage(QWidget):
             + ("Pick a run.json (or a local .pth), a folder of clouds, and run in Docker."
                if local else
                "Pick a run (or a local .pth), a folder of clouds, and run on Modal."))
-        # Output folder shown in both modes (Modal: download target).
-        self.iform.setRowVisible(self.out_row_w, True)
         self._sync_source_rows()
         self.reload_backbones()
 
@@ -343,7 +331,7 @@ class InferPage(QWidget):
         prev = self.backbone_combo.currentData()
         self.backbone_combo.blockSignals(True)
         self.backbone_combo.clear()
-        for key, b in infer_backbones().items():
+        for key, b in BACKBONES.items():
             if appstate.backbone_enabled(key):
                 self.backbone_combo.addItem(b.label, key)
         i = self.backbone_combo.findData(prev)
@@ -357,10 +345,6 @@ class InferPage(QWidget):
     #   infer_palette          -> chosen name source key
     #   palette_name_overrides -> {source_key: [name, …]}
     #   palette_overrides      -> {source_key: [[r,g,b], …]}
-    def reload_palettes(self):
-        """Refresh the legend (called from reload_runs / apply_exec_mode)."""
-        self._refresh_legend()
-
     def _set_run_classes(self, names):
         """Adopt the run's class names and select that source."""
         self._run_class_names = list(names) if names else None
@@ -466,7 +450,7 @@ class InferPage(QWidget):
 
     # ------------------------------------------------------------- inputs
     def reload_runs(self):
-        self.reload_palettes()
+        self._refresh_legend()
         prev = self.run_combo.currentText()   # keep a typed/pasted ref across reloads
         self.run_combo.blockSignals(True)
         self.run_combo.clear()
@@ -580,16 +564,12 @@ class InferPage(QWidget):
     def _infer_dg_env(self) -> dict:
         """DG_* env for inference. logdk recovered from run.json (it changed the input
         width, so must be recomputed or the load fails). AdaBN/TTA toggles are hidden
-        for now (not ready) — see the commented-out controls in __init__."""
+        for now (not ready); no DG_INFER_ADABN / DG_INFER_TTA env is sent — see the
+        TODO in __init__."""
         env: dict[str, str] = {}
         if self._dg.get("logdk"):
             env["DG_LOGDK_FEAT"] = "1"
             env["DG_LOGDK_K"] = str(int(self._dg.get("logdk_k", 8)))
-        # TODO(not ready): density-adapt UI hidden; no AdaBN/TTA env for now.
-        # if self.dg_adabn_chk.isChecked():
-        #     env["DG_INFER_ADABN"] = "1"
-        # if self.dg_tta_chk.isChecked():
-        #     env["DG_INFER_TTA"] = str(self.dg_tta_spin.value())
         if env:
             self._append("[dg] inference: " + " ".join(f"{k}={v}" for k, v in sorted(env.items())))
         return env
@@ -879,9 +859,6 @@ class InferPage(QWidget):
                 self._append(f"✗ Weights not found ({w}). Set the 'Weights file' box.")
                 return
             bkey = self._manifest.get("backbone")
-            if bkey in BACKBONES and not BACKBONES[bkey].folder_infer:
-                self._append(f"✗ {BACKBONES[bkey].label} doesn't support folder inference.")
-                return
         else:
             # MODAL: weights live on the cloud volume, keyed by run id. The typed
             # text wins — currentData() keeps returning the last picked item even
@@ -894,9 +871,6 @@ class InferPage(QWidget):
             bkey = (h.get("backbone") if isinstance(h, dict)
                     and h.get("run_id") == run_id else None) \
                 or self.backbone_combo.currentData()
-            if bkey in BACKBONES and not BACKBONES[bkey].folder_infer:
-                self._append(f"✗ {BACKBONES[bkey].label} doesn't support folder inference.")
-                return
             self._weights_remote = f"runs/{run_id}/final_model.pth"
             weights_run_id = run_id
             weights_vol = pasted_vol
@@ -905,7 +879,6 @@ class InferPage(QWidget):
             return
 
         self._job_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self._run_id = ""
         self.log.clear()
         self.run_btn.setEnabled(False)
         # Runs enter history at train START, so may lack final_model.pth. Check weights
@@ -941,8 +914,10 @@ class InferPage(QWidget):
         # HAG/model mismatch, and the ground value parsed there.
         hag_on = self.hag_chk.isChecked()
         hag_filter = self.hag_filter.currentText() if hag_on else "grid"
+        smrf_fill = hag_on and self.hag_smrf_fill.isChecked()
         if hag_on:
             src = (f"ground = class {self._hag_ground_value}"
+                   + (" + SMRF gap fill" if smrf_fill else "")
                    if self._hag_ground_value is not None else "ground detected")
             self._append(f"[1/4] Computing HeightAboveGround ({hag_filter}, {src}) "
                          "for the input scenes.")
@@ -952,7 +927,8 @@ class InferPage(QWidget):
         self.converter.start(dataset.convert_infer_job, self._job_id, input_dir,
                              appstate.workspace_dir(), intensity_norm=norm,
                              hag=hag_on, hag_filter=hag_filter,
-                             ground_value=self._hag_ground_value, out_dir=job_root)
+                             ground_value=self._hag_ground_value,
+                             smrf_fill=smrf_fill, out_dir=job_root)
 
     def _infer_out_dir(self) -> Path:
         """Nest this infer job under its owning dataset (<dataset>/infer/<job>) when
@@ -1152,11 +1128,6 @@ class InferPage(QWidget):
         disp = (_localize_paths(text, self._job_id, self._pred_dir, self._staged)
                 if self._stage == "run_local" else text)
         self._append(disp, newline=False)
-        if self._stage in ("run", "run_local"):
-            self.parser.feed(text)   # parser sees the raw text
-
-    def _on_run_id(self, run_id: str):
-        self._run_id = run_id
 
     def _on_error(self, tb: str):
         self.run_btn.setEnabled(True)
@@ -1459,10 +1430,3 @@ def _check_weights_present(volume: str, run_id: str, progress=None):
     if not entries:
         return None
     return any(_entry_name(e) == "final_model.pth" for e in entries)
-
-
-def _wrap(layout) -> QWidget:
-    w = QWidget()
-    layout.setContentsMargins(0, 0, 0, 0)
-    w.setLayout(layout)
-    return w

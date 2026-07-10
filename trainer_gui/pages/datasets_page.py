@@ -19,7 +19,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
                                QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel,
                                QLineEdit, QListWidget, QMessageBox, QPlainTextEdit, QPushButton,
-                               QSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
+                               QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
 from .. import analysis, appstate, dataset, modal_cli, pretrain, theme, ui
 from ..dataset import LabelSpec, SplitConfig
@@ -117,7 +117,7 @@ class DatasetsPage(QWidget):
             b = QPushButton(text)
             b.clicked.connect(slot)
             in_row.addWidget(b)
-        form.addRow("Input", _wrap(in_row))
+        form.addRow("Input", ui.wrap(in_row))
         self.field_combo = QComboBox()
         self.field_combo.setEditable(True)
         form.addRow("Label field", self.field_combo)
@@ -186,10 +186,6 @@ class DatasetsPage(QWidget):
         form.addRow("Split mode", self.mode_combo)
         # TODO(not ready): split-seed UI hidden until reviewed; seed is fixed at 42
         # in _split_config for now.
-        # self.seed_spin = QSpinBox()
-        # self.seed_spin.setRange(0, 2_000_000_000)
-        # self.seed_spin.setValue(42)
-        # form.addRow("Split seed", self.seed_spin)
         # Explicit val + test folders bypass allocation (train = inputs).
         self.split_provided_chk = QCheckBox("Separate train/val/test folders (use as-is)")
         self.split_provided_chk.toggled.connect(self._on_split_changed)
@@ -227,7 +223,7 @@ class DatasetsPage(QWidget):
         hag_row.addWidget(QLabel("ground class"))
         hag_row.addWidget(self.hag_ground)
         hag_row.addStretch()
-        self.hag_opts_w = _wrap(hag_row)
+        self.hag_opts_w = ui.wrap(hag_row)
         self.hag_opts_w.setVisible(False)
         form.addRow("", self.hag_opts_w)
         if not pretrain.pdal_available():
@@ -237,18 +233,6 @@ class DatasetsPage(QWidget):
                                  "PDAL not installed")
         # TODO(not ready): parallel-worker UI hidden until reviewed; conversion runs
         # single-process (max_workers=1 forced in _conversion_plan).
-        # Scenes to convert concurrently. 0 = Auto (clamp to cores + free RAM); a
-        # positive value is a hard override.
-        # self.workers_spin = QSpinBox()
-        # self.workers_spin.setRange(0, max((os.cpu_count() or 4) * 2, 16))
-        # self.workers_spin.setSpecialValueText("Auto")
-        # self.workers_spin.setValue(0)
-        # self.workers_spin.setMaximumWidth(110)
-        # self.workers_spin.setToolTip(
-        #     f"Scenes converted in parallel. Auto clamps to cores and free RAM "
-        #     f"(this machine: {os.cpu_count()} cores). A number forces exactly that many; "
-        #     f"each worker holds a whole cloud in RAM, so too many can OOM.")
-        # form.addRow("Parallel workers", self.workers_spin)
         self.tile_btn = QPushButton("Build dataset")
         self.tile_btn.setObjectName("primary")
         self.tile_btn.clicked.connect(self._start_tiling)
@@ -261,7 +245,7 @@ class DatasetsPage(QWidget):
         row.addWidget(self.tile_btn)
         row.addWidget(self.stop_btn)
         row.addStretch()
-        form.addRow("", _wrap(row))
+        form.addRow("", ui.wrap(row))
         return box
 
     # ============================================================= shared console
@@ -308,7 +292,7 @@ class DatasetsPage(QWidget):
         btn = QPushButton("Browse…")
         btn.clicked.connect(slot)
         row.addWidget(btn)
-        return edit, _wrap(row)
+        return edit, ui.wrap(row)
 
     def _on_split_changed(self):
         # Provided mode reveals the val + test folder rows; else fractions drive
@@ -699,7 +683,7 @@ class DatasetsPage(QWidget):
     # ------------------------------------------------------------- known list
     def _reload_known(self):
         self.known_list.clear()
-        for name in sorted(appstate.selectable_datasets()):
+        for name in sorted(appstate.known_datasets()):
             self.known_list.addItem(name)
 
     def _show_known(self):
@@ -745,10 +729,3 @@ class DatasetsPage(QWidget):
 def _parse_values(text: str) -> list[int]:
     """Source-value cell -> ints. Handles one value ("5") or a list ("5,6" / "5 6")."""
     return [int(t) for t in text.replace(",", " ").split() if t]
-
-
-def _wrap(layout) -> QWidget:
-    w = QWidget()
-    layout.setContentsMargins(0, 0, 0, 0)
-    w.setLayout(layout)
-    return w

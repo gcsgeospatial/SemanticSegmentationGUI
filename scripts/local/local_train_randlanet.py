@@ -20,28 +20,16 @@ Flags:
   --dataset NAME    (required) canonical dataset under /datasets
   --sub-grid / --num-points / --epochs / --batch / --steps-per-epoch / --hag
   --mode infer --weights runs/<id>/final_model.pth --infer-input <job_id>
-
-Timeout comes from the TT_TIMEOUT_HOURS env var.
 """
 
-import os
 from typing import Optional
-
-
-def gpu_name() -> str:
-    """Real CUDA device name for logs/metadata (replaces the old fixed cloud GPU_TYPE)."""
-    import torch
-    return torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
-
 
 # ============================================================================
 # Configuration
 # ============================================================================
-APP_NAME      = "randlanet-cold"
 N_EPOCHS      = 100              # was 5 (smoke test); 250-300 for a full run
 BATCH_SIZE    = 6
 VAL_BATCH     = 12
-TIMEOUT_HOURS = int(os.environ.get("TT_TIMEOUT_HOURS", "24"))
 
 NUM_POINTS    = 45056            # 4096*11, RandLA SemKITTI default
 SUB_GRID_SIZE = 0.30             # 30 cm — sparse aerial LiDAR (~2 pts/m²) vs KITTI
@@ -112,23 +100,17 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "helper"))
     import density as dg
     import train_common as tc
-    # DG flags: env-overridable (GUI "Density generalization" panel / DG_*=1 in the shell).
-    DG_DENSITY_AUG = dg.env_bool("DG_DENSITY_AUG", globals()["DG_DENSITY_AUG"])
-    DG_COARSEN_MAX = dg.env_float("DG_COARSEN_MAX", globals()["DG_COARSEN_MAX"])
-    DG_P_NATIVE    = dg.env_float("DG_P_NATIVE", globals()["DG_P_NATIVE"])
-    DG_LOGDK_FEAT  = dg.env_bool("DG_LOGDK_FEAT", globals()["DG_LOGDK_FEAT"])
-    DG_LOGDK_K     = dg.env_int("DG_LOGDK_K", globals()["DG_LOGDK_K"])
-    DG_INFER_ADABN = dg.env_bool("DG_INFER_ADABN", globals()["DG_INFER_ADABN"])
-    DG_INFER_TTA   = dg.env_int("DG_INFER_TTA", globals()["DG_INFER_TTA"])
-    EVAL_VOTES     = dg.env_int("EVAL_VOTES", globals()["EVAL_VOTES"])
-    # Loss / class-balance overrides (GUI "Loss & class balance" panel -> LOSS_*/
-    # RARE_* env; mirrors the DG env pattern). Unset env -> the script constants.
-    USE_FOCAL       = dg.env_bool("LOSS_FOCAL", globals()["USE_FOCAL"])
-    FOCAL_GAMMA     = dg.env_float("LOSS_FOCAL_GAMMA", globals()["FOCAL_GAMMA"])
-    CLASS_WEIGHTING = dg.env_bool("LOSS_CLASS_WEIGHTING", globals()["CLASS_WEIGHTING"])
-    WEIGHT_BETA     = dg.env_float("LOSS_WEIGHT_BETA", globals()["WEIGHT_BETA"])
-    RARE_OVERSAMPLE = dg.env_bool("RARE_OVERSAMPLE", globals()["RARE_OVERSAMPLE"])
-    RARE_CENTER_PROB = dg.env_float("RARE_CENTER_PROB", globals()["RARE_CENTER_PROB"])
+    # Env-overridable knobs (GUI "Density generalization" + "Loss & class
+    # balance" panels; see train_common._ENV_KNOBS). Local shadows: the nested
+    # closures capture these, defaulting to the module constants.
+    (DG_DENSITY_AUG, DG_COARSEN_MAX, DG_P_NATIVE, DG_LOGDK_FEAT, DG_LOGDK_K,
+     DG_INFER_ADABN, DG_INFER_TTA, EVAL_VOTES, USE_FOCAL, FOCAL_GAMMA,
+     CLASS_WEIGHTING, WEIGHT_BETA, RARE_OVERSAMPLE,
+     RARE_CENTER_PROB) = tc.env_overrides(globals(), [
+        "DG_DENSITY_AUG", "DG_COARSEN_MAX", "DG_P_NATIVE", "DG_LOGDK_FEAT",
+        "DG_LOGDK_K", "DG_INFER_ADABN", "DG_INFER_TTA", "EVAL_VOTES",
+        "USE_FOCAL", "FOCAL_GAMMA", "CLASS_WEIGHTING", "WEIGHT_BETA",
+        "RARE_OVERSAMPLE", "RARE_CENTER_PROB"])
     import torch.nn as nn
     import torch.optim as optim
     from torch.utils.data import DataLoader, Dataset
@@ -146,23 +128,8 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     STEPS         = steps_per_epoch if steps_per_epoch is not None else 500
     if dataset:
         ds_root = f"{DATASETS_ROOT}/{dataset}"
-        meta_path = f"{ds_root}/dataset_meta.json"
-        if not os.path.exists(meta_path):
-            raise FileNotFoundError(f"{meta_path} not found — build the dataset "
-                                    f"with the trainer_gui app first.")
-        with open(meta_path) as f:
-            ds_meta = json.load(f)
-        NUM_CLASSES = int(ds_meta["num_classes"])
-        CLASS_NAMES = list(ds_meta["class_names"])
-        if HAG and not ds_meta.get("has_hag"):
-            raise ValueError(
-                f"--hag needs a dataset with a real HeightAboveGround channel, but "
-                f"'{dataset}' has none (has_hag=false). Rebuild it with the Datasets "
-                f"page 'Compute Height-Above-Ground' box, or train the plain RandLA-Net.")
-        # --hag: the dataset's real HAG. (Legacy datasets recorded no method; the
-        # PDAL nearest-neighbour filter was the only one back then.)
-        HAG_SOURCE = (((ds_meta.get("source") or {}).get("hag_source") or "pdal_hag_nn")
-                      if HAG else None)
+        ds_meta, NUM_CLASSES, CLASS_NAMES, HAG_SOURCE = tc.load_dataset_meta(
+            dataset, HAG, "train the plain RandLA-Net.")
         # No "warm" in the name: the cold sibling shares this cache (identical prep).
         # --hag gets its own cache family (tiles carry a "hag" array).
         PREP_DIR = (f"{ds_root}/prep/randlanet{'_hag' if HAG else ''}"
@@ -198,57 +165,11 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
             net_.fc0 = pt_utils.Conv1d(in_dim, 8, kernel_size=1, bn=True)
         return net_.to(device)
 
-    # --- Lovász-Softmax (Berman et al. 2018): differentiable surrogate for the
-    # mIoU/Jaccard index. Operates per-class on softmax probabilities, treating
-    # every present class equally, which is exactly what CE fails to do under
-    # heavy imbalance. Pure-PyTorch flat implementation (no extra deps). -------
-    def _lovasz_grad(gt_sorted):
-        # gradient of the Lovász extension of the Jaccard loss w.r.t. sorted errors
-        p = len(gt_sorted)
-        gts = gt_sorted.sum()
-        intersection = gts - gt_sorted.float().cumsum(0)
-        union = gts + (1 - gt_sorted).float().cumsum(0)
-        jaccard = 1.0 - intersection / union
-        if p > 1:
-            jaccard[1:p] = jaccard[1:p] - jaccard[0:-1].clone()
-        return jaccard
-
-    def lovasz_softmax_flat(probas, labels):
-        # probas: (N, C) softmax probabilities; labels: (N,) in [0, C). Averages
-        # the per-class loss over classes actually present in the batch.
-        if probas.numel() == 0:
-            return probas.sum() * 0.0   # scalar 0 (not (0,C)): an all-ignored batch must
-            #                             not make `loss` empty -> `not isfinite(loss)` crash
-        C = probas.size(1)
-        losses = []
-        for c in torch.unique(labels):
-            fg = (labels == c).float()                 # foreground mask for class c
-            class_pred = probas[:, int(c)]
-            errors = (fg - class_pred).abs()
-            errors_sorted, perm = torch.sort(errors, 0, descending=True)
-            grad = _lovasz_grad(fg[perm])
-            losses.append(torch.dot(errors_sorted, grad))
-        if not losses:
-            return probas.sum() * 0.0
-        return torch.stack(losses).mean()
-
-    # alpha-balanced multiclass focal loss. logits (M, C) / labels (M,) already
-    # valid (no -1). alpha = _class_w (inverse-sqrt class weights) when set.
-    def focal_loss(logits, labels):
-        if logits.numel() == 0:
-            return logits.sum() * 0.0
-        logp = torch.log_softmax(logits, dim=1)
-        logpt = logp.gather(1, labels.unsqueeze(1)).squeeze(1)
-        pt = logpt.exp()
-        loss = -((1.0 - pt) ** FOCAL_GAMMA) * logpt
-        if _class_w is not None:
-            loss = loss * _class_w[labels]
-        return loss.mean()
-
     # The upstream network/loss_func.compute_loss hardcodes label==0 as ignored
     # (SemanticKITTI convention). Our labels are already remapped to 0..K-1
     # at preprocessing with the ignored value(s) -> -1. Pointwise term is focal
-    # or weighted CE (ignore_index=-1), optionally combined with Lovász.
+    # or weighted CE (ignore_index=-1), optionally combined with Lovász — the
+    # loss primitives live in train_common (shared with the other backbones).
     _class_w = None
     _ce = nn.CrossEntropyLoss(ignore_index=-1)
     def compute_loss(end_points, num_classes):
@@ -258,12 +179,12 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         valid_logits = logits[valid_mask]
         valid_labels = labels[valid_mask]
         if USE_FOCAL:
-            loss = focal_loss(valid_logits, valid_labels)
+            loss = tc.focal_loss(valid_logits, valid_labels, FOCAL_GAMMA, _class_w)
         else:
             loss = _ce(valid_logits, valid_labels)
         if LOVASZ_WEIGHT > 0:
             probas = torch.softmax(valid_logits, dim=1)
-            loss = loss + LOVASZ_WEIGHT * lovasz_softmax_flat(probas, valid_labels)
+            loss = loss + LOVASZ_WEIGHT * tc.lovasz_softmax_flat(probas, valid_labels)
         end_points["valid_logits"] = valid_logits
         end_points["valid_labels"] = valid_labels
         end_points["loss"] = loss
@@ -295,7 +216,8 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     # --- canonical scene loader ---------------------------------------------
     def load_canonical(npz_path):
         """Canonical trainer_gui scene -> (xyz, intensity, return_number, label).
-        RandLA only consumes xyz + labels; the rest is kept for cache parity."""
+        intensity and return_number are network input channels (IN_DIM=5;
+        --hag / DG_LOGDK_FEAT append more)."""
         z = np.load(npz_path)
         xyz = z["xyz"].astype(np.float32)
         intensity = z["intensity"].astype(np.float32) if "intensity" in z \
@@ -305,9 +227,6 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         lab = z["label"].astype(np.int32) if "label" in z \
             else np.full(len(xyz), -1, np.int32)
         return xyz, intensity, ret_num, lab
-
-    def load_scene(pc_path, cls_path=None):
-        return load_canonical(pc_path)
 
     def load_canonical_hag(npz_path, xyz):
         # --hag: real per-point HAG from the dataset's npz. The startup guard already
@@ -322,21 +241,6 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         keys = np.floor(xyz / grid).astype(np.int64)
         uniq = tc.voxel_unique(keys)
         return xyz[uniq], intensity[uniq], ret_num[uniq], hag[uniq], lab[uniq]
-
-    def _split_scenes():
-        """Read the dataset's three materialized whole-scene folders verbatim
-        (train = fit, val = selection holdout, test = final report) — the split
-        is the dataset's, never re-carved here. Returns (name, pc_path, None)
-        lists."""
-        stem = lambda p: os.path.splitext(os.path.basename(p))[0]
-        def _items(split):
-            return [(stem(p), p, None)
-                    for p in sorted(glob.glob(f"{ds_root}/{split}/*.npz"))]
-        train_items, val_items, test_items = (
-            _items("train"), _items("val"), _items("test"))
-        if not train_items:
-            raise FileNotFoundError(f"No canonical scenes under {ds_root}/train")
-        return train_items, val_items, test_items
 
     def _cache_signature():
         # Everything that changes what a cached scene .npz contains. A mismatch
@@ -360,48 +264,17 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         sig["split_mode"] = sp.get("mode")
         return sig
 
-    def _validate_cache(lists):
-        """Refuse to reuse a cache built with different settings (grid, split,
-        dataset, feature recipe …) instead of silently mixing incompatible
-        data. Migrate a pre-validation cache by stamping .done markers for
-        already-saved scenes. Returns True if the signature file was newly
-        written (so the caller can report fresh work)."""
-        meta_path = f"{PREP_DIR}/cache_meta.json"
-        cur = _cache_signature()
-        if os.path.exists(meta_path):
-            with open(meta_path) as f:
-                old = json.load(f)
-            if old != cur:
-                diffs = {k: [old.get(k), cur.get(k)]
-                         for k in sorted(set(old) | set(cur)) if old.get(k) != cur.get(k)}
-                raise RuntimeError(
-                    f"Preprocess cache at {PREP_DIR} was built with DIFFERENT settings "
-                    f"(mismatched: {diffs}). Reusing it would silently mix incompatible "
-                    f"data. Point PREP_DIR / --dataset at a fresh path or delete the cache.")
-            return False
-        legacy = False
-        for split, items in lists:
-            d = f"{PREP_DIR}/{split}"
-            for name, _, _ in items:
-                npz = f"{d}/{name}.npz"
-                if os.path.exists(npz) and not os.path.exists(npz + ".done"):
-                    open(npz + ".done", "w").close(); legacy = True
-        with open(meta_path, "w") as f:
-            json.dump(cur, f, indent=2)
-        if legacy:
-            print(f"  migrated existing cache at {PREP_DIR}: stamped .done markers + "
-                  f"signature (assumed to match current settings).", flush=True)
-        return True
-
     def ensure_prep():
         # Per-scene idempotency keyed on a .done marker (written only after a
         # clean save) so a run interrupted mid-scene is redone, not left partial.
         print(f"  ensuring preprocessed cache -> {PREP_DIR}", flush=True)
         for split in ("train", "val", "test"):
             os.makedirs(f"{PREP_DIR}/{split}", exist_ok=True)
-        train_list, val_list, test_list = _split_scenes()
-        any_new = _validate_cache([("train", train_list), ("val", val_list),
-                                   ("test", test_list)])
+        train_list, val_list, test_list = tc.split_scenes(ds_root)
+        any_new = tc.validate_cache(
+            PREP_DIR, _cache_signature(),
+            [("train", train_list), ("val", val_list), ("test", test_list)],
+            lambda d, name: (f"{d}/{name}.npz", f"{d}/{name}.npz.done"))
         for split, items in (("train", train_list), ("val", val_list),
                              ("test", test_list)):
             print(f"  [{split}] {len(items)} scenes", flush=True)
@@ -411,7 +284,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                     continue
                 t0 = time.time()
                 try:
-                    xyz, intensity, ret_num, lab = load_scene(pc_path, cls_path)
+                    xyz, intensity, ret_num, lab = load_canonical(pc_path)
                     n_in = len(xyz)
                     # --hag: the scene's real per-point HAG rides through the
                     # subsample and is saved into the cache tiles; without --hag
@@ -441,8 +314,6 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
 
     # --- batch assembly (standalone so inference can reuse it) ---------------
     def tf_map(batch_pc, batch_label, batch_pc_idx, batch_cloud_idx):
-        # Features = xyz (3ch) to match the SemKITTI pretrained encoder.
-        features = batch_pc
         input_points, input_neighbors, input_pools, input_up = [], [], [], []
         for i in range(cfg.num_layers):
             neigh = DP.knn_search(batch_pc, batch_pc, cfg.k_n)
@@ -454,7 +325,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
             input_pools.append(pool_i);    input_up.append(up_i)
             batch_pc = sub_points
         flat = (input_points + input_neighbors + input_pools + input_up
-                + [features, batch_label, batch_pc_idx, batch_cloud_idx])
+                + [batch_label, batch_pc_idx, batch_cloud_idx])
         return flat
 
     def collate_fn(batch):
@@ -472,9 +343,9 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         for t in flat[3*n:4*n]:      d["interp_idx"].append(torch.from_numpy(t).long())
         full_feat = np.concatenate([pcs, feats], axis=2)        # (B, N, IN_DIM)
         d["features"] = torch.from_numpy(full_feat).float().transpose(1, 2)
-        d["labels"]   = torch.from_numpy(flat[4*n+1]).long()
-        d["input_inds"] = torch.from_numpy(flat[4*n+2]).long()
-        d["cloud_inds"] = torch.from_numpy(flat[4*n+3]).long()
+        d["labels"]   = torch.from_numpy(flat[4*n]).long()
+        d["input_inds"] = torch.from_numpy(flat[4*n+1]).long()
+        d["cloud_inds"] = torch.from_numpy(flat[4*n+2]).long()
         return d
 
     # --- Dataset ------------------------------------------------------------
@@ -561,18 +432,6 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     import traceback
     from scipy.spatial import cKDTree
 
-    def scene_hag(z, pc_path, n):
-        """Real per-point HAG from an inference scene npz (--hag); None when plain.
-        convert_infer_job writes it when the HAG box is ticked."""
-        if not HAG:
-            return None
-        if "hag" not in z.files or len(z["hag"]) != n:
-            raise ValueError(
-                f"{os.path.basename(pc_path)} has no per-point 'hag' channel, which this "
-                f"HAG model requires. Tick 'Compute Height-Above-Ground' on the Inference "
-                f"page and run again.")
-        return z["hag"].astype(np.float32)
-
     def make_predict_scene(net, num_classes):
         def _predict_scene(pc_path):
             # RandLA works on fixed NUM_POINTS samples: grid-subsample the scene,
@@ -580,12 +439,8 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
             # (reusing the collate), then NN-propagate to all original points.
             z = np.load(pc_path)
             xyz0 = z["xyz"].astype(np.float32)
-            itn0 = z["intensity"].astype(np.float32) if "intensity" in z \
-                else np.full(len(xyz0), 0.5, np.float32)
-            ret0 = z["return_number"].astype(np.float32) if "return_number" in z \
-                else (z["ret_num"].astype(np.float32) if "ret_num" in z
-                      else np.zeros(len(xyz0), np.float32))
-            hag0 = scene_hag(z, pc_path, len(xyz0))
+            itn0, ret0 = tc.scene_arrays(z, len(xyz0))
+            hag0 = tc.scene_hag(z, pc_path, len(xyz0), HAG)
             keys = np.floor(xyz0 / SUB_GRID_SIZE).astype(np.int64)
             uniq = tc.voxel_unique(keys)
             sub_xyz = xyz0[uniq]
@@ -661,22 +516,13 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         wpath = f"/outputs/{weights}"
         if not os.path.exists(wpath):
             raise FileNotFoundError(f"weights not found under /outputs: {wpath}")
-        try:   # weights_only=True: a hand-picked .pth can't run code on load
-            ckpt = torch.load(wpath, map_location=device, weights_only=True)
-        except Exception as e:
-            raise RuntimeError(
-                f"Failed to load weights '{wpath}': {e}\n"
-                f"  (loaded safely with weights_only=True — a full-model pickle or a "
-                f"checkpoint from another script is rejected; re-export as a state_dict.)"
-            ) from e
+        ckpt = tc.load_ckpt_safe(wpath, map_location=device)
         sd = ckpt.get("model", ckpt.get("model_state_dict", ckpt.get("state_dict", ckpt)))
         fc3_key = next((k for k in sd if k.startswith("fc3.") and k.endswith("weight")), None)
         num_classes = int(sd[fc3_key].shape[0]) if fc3_key else NUM_CLASSES
         class_names = [f"class_{i}" for i in range(num_classes)]
-        import os as _os, sys as _sys   # read the run's run.json (single manifest) beside the weights
-        _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "helper"))
-        from train_common import infer_meta
-        meta = infer_meta(wpath)
+        # read the run's run.json (single manifest) beside the weights
+        meta = tc.infer_meta(wpath)
         if meta:
             class_names = meta.get("class_names") or class_names
             if meta.get("grid") is not None:
@@ -710,11 +556,10 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         infer_cfg = {"backbone": "RandLA-Net", "mode": "infer", "weights": weights,
                      "infer_input": infer_input, "num_classes": num_classes,
                      "class_names": class_names, "sub_grid_size": SUB_GRID_SIZE,
-                     "hag": HAG, "gpu": gpu_name(),
+                     "hag": HAG, "gpu": tc.gpu_name(),
                      "started_utc": datetime.utcnow().isoformat() + "Z"}
 
         predict_scene = make_predict_scene(net, num_classes)
-        print(f"  [infer] labeling {len(scenes)} scene(s) -> {pred_dir}", flush=True)
         if DG_INFER_ADABN:
             # D2b: re-estimate BN running stats on the target tiles (label-free) so the
             # source-density stats stop mis-normalizing at a different inference density.
@@ -728,12 +573,8 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                         return
                     z = np.load(pc_path)
                     xyz0 = z["xyz"].astype(np.float32)
-                    itn0 = (z["intensity"].astype(np.float32) if "intensity" in z
-                            else np.full(len(xyz0), 0.5, np.float32))
-                    ret0 = (z["return_number"].astype(np.float32) if "return_number" in z
-                            else (z["ret_num"].astype(np.float32) if "ret_num" in z
-                                  else np.zeros(len(xyz0), np.float32)))
-                    hag0 = scene_hag(z, pc_path, len(xyz0))
+                    itn0, ret0 = tc.scene_arrays(z, len(xyz0))
+                    hag0 = tc.scene_hag(z, pc_path, len(xyz0), HAG)
                     keys = np.floor(xyz0 / SUB_GRID_SIZE).astype(np.int64)
                     uniq = tc.voxel_unique(keys)
                     sx, si, sr = xyz0[uniq], itn0[uniq], ret0[uniq]
@@ -768,18 +609,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                         yield batch
             dg.adabn_recalibrate(net, _target_batches(), forward=lambda m, b: m(b))
             net.eval()
-        scene_stats = []
-        for pc_path in scenes:
-            name = os.path.splitext(os.path.basename(pc_path))[0]
-            t0 = time.time()
-            xyz, pred, inten = predict_scene(pc_path)
-            tc.write_pred(f"{pred_dir}/{name}_pred.npz", xyz, pred, inten)
-            scene_stats.append({"scene": os.path.basename(pc_path),
-                                "points": int(len(xyz)),
-                                "seconds": round(time.time() - t0, 3)})
-            tc.write_infer_run(run_dir, infer_cfg, scene_stats)   # crash-safe: per scene
-            print(f"  [infer] {name}: {len(xyz):,} pts in {time.time()-t0:.1f}s", flush=True)
-        print(f"  [infer] done — predictions in _infer/{infer_input}/predictions", flush=True)
+        tc.run_infer_scenes(scenes, predict_scene, pred_dir, run_dir, infer_cfg)
         return
 
     # ==========================================================================
@@ -787,7 +617,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     # ==========================================================================
     print("=" * 70)
     print(f"  RandLA-Net{' +HAG' if HAG else ''}  {dataset}  "
-          f"({gpu_name()}, {N_EPOCHS} ep, batch {BATCH_SIZE})")
+          f"({tc.gpu_name()}, {N_EPOCHS} ep, batch {BATCH_SIZE})")
     print("=" * 70)
     train_list, val_list, test_list = ensure_prep()
     tag = dataset
@@ -800,7 +630,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         json.dump({
             "backbone": "RandLA-Net", "warm_start": False,
             "dataset": dataset,
-            "mode": mode, "gpu": gpu_name(),
+            "mode": mode, "gpu": tc.gpu_name(),
             "n_epochs": N_EPOCHS,
             "batch_size": BATCH_SIZE, "num_points": NUM_POINTS,
             "sub_grid_size": SUB_GRID_SIZE, "in_dim": IN_DIM,
@@ -850,14 +680,9 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     print(f"  class counts: {dict(zip(CLASS_NAMES, class_counts.tolist()))}", flush=True)
     print(f"  rare classes: {[CLASS_NAMES[c] for c in rare_classes]}", flush=True)
     if CLASS_WEIGHTING:
-        # Inverse-frequency raised to WEIGHT_BETA. beta=0.5 -> w = 1/sqrt(freq),
-        # the inverse-sqrt-frequency scheme (sub-linear: boosts rare classes
-        # without the instability of raw 1/freq). Mean-normalized, then capped.
-        w = (1.0 / np.maximum(freq, 1e-6)) ** WEIGHT_BETA
-        w = w / w.mean()
-        w = np.clip(w, 1.0 / WEIGHT_CAP, WEIGHT_CAP)
-        # Rebind the weight tensor + loss used by compute_loss / focal_loss
-        # (closures over _class_w and _ce in the enclosing scope).
+        # Inverse-sqrt-frequency weights (shared scheme). Rebind the weight
+        # tensor + loss used by compute_loss (closures over _class_w and _ce).
+        w = tc.class_weights_np(class_counts, WEIGHT_BETA, WEIGHT_CAP)
         _class_w = torch.tensor(w, dtype=torch.float32).to(device)
         _ce = nn.CrossEntropyLoss(weight=_class_w, ignore_index=-1)
         print(f"  class weights: "
@@ -983,7 +808,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                 if src is None or not got.any():
                     n_skipped += 1; continue
                 try:
-                    raw_xyz, _, _, raw_lab = load_scene(*src)
+                    raw_xyz, _, _, raw_lab = load_canonical(src[0])
                 except Exception as ex:
                     print(f"  [{label}] skip {name}: raw reload failed: {ex}", flush=True)
                     n_skipped += 1; continue
@@ -992,49 +817,23 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                 v = raw_lab >= 0
                 rp, rl = raw_pred[v], raw_lab[v]
                 correct += int((rp == rl).sum()); total += int(v.sum())
-                for c in range(NUM_CLASSES):
-                    t_inter[c] += int(((rp == c) & (rl == c)).sum())
-                    t_union[c] += int(((rp == c) | (rl == c)).sum())
-                    t_gt[c]    += int((rl == c).sum())
+                i_, u_, g_ = tc.score_ious(rp, rl, NUM_CLASSES)
+                t_inter += i_; t_union += u_; t_gt += g_
                 n_scenes += 1
-        with np.errstate(invalid="ignore"):
-            iou_per = t_inter / np.maximum(t_union, 1)
-        gt_counts = [int(x) for x in t_gt.tolist()]
-        present = [c for c in range(NUM_CLASSES) if gt_counts[c] > 0]
-        absent  = [c for c in range(NUM_CLASSES) if gt_counts[c] == 0]
-        present_iou = [float(iou_per[c]) for c in present]
-        present_mIoU = float(np.mean(present_iou)) if present_iou else 0.0
-        m = {
-            "overall_acc": correct / max(total, 1),
-            "overall_mIoU": float(np.mean(iou_per)),
-            "present_classes_mIoU": present_mIoU,
-            "per_class_iou": {CLASS_NAMES[c]: float(iou_per[c]) for c in range(NUM_CLASSES)},
-            "per_class_gt_count": {CLASS_NAMES[c]: gt_counts[c] for c in range(NUM_CLASSES)},
-            "present_classes": [CLASS_NAMES[c] for c in present],
-            "absent_classes":  [CLASS_NAMES[c] for c in absent],
-            "total_test_seconds": time.time() - t_test,
-            "num_scenes": n_scenes,
-            "num_raw_points_scored": int(total),
-            "skipped_scenes": n_skipped,
-            "scored_on": "raw_points",
-            "full_coverage": True,
-            "reprojection": "nearest_subsampled_point_to_raw",
-        }
-        print(f"  [{label}] acc={m['overall_acc']:.4f}  "
-              f"mIoU({NUM_CLASSES}-way)={m['overall_mIoU']:.4f}  "
-              f"mIoU(present {len(present)})={m['present_classes_mIoU']:.4f}  "
-              f"absent={m['absent_classes']}  raw_pts={total:,}  skipped={n_skipped}", flush=True)
-        return m
+        return tc.eval_metrics(
+            t_inter, t_union, t_gt, correct, total, CLASS_NAMES, t_test,
+            n_scenes, label,
+            extra={"skipped_scenes": n_skipped,
+                   "scored_on": "raw_points",
+                   "full_coverage": True,
+                   "reprojection": "nearest_subsampled_point_to_raw"})
 
     val_src = {n: (p, c) for n, p, c in val_list}
 
-    import os as _os, sys as _sys   # scripts/helper is a sibling dir (flat /root in the container image)
-    _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "helper"))
-    from train_common import BestCheckpoint, write_run_manifest
-    best = BestCheckpoint(run_dir)
+    best = tc.BestCheckpoint(run_dir)
     # the single inference manifest (run.json); the _hag key keeps the Infer
     # page mapping HAG runs back to the HAG entry point exactly as before.
-    write_run_manifest(run_dir, "randlanet_hag" if HAG else "randlanet", dataset)
+    tc.write_run_manifest(run_dir, "randlanet_hag" if HAG else "randlanet", dataset)
 
     def run_eval(ep, write_json=False):
         # VAL always scores the current (most-recent) weights. The final
@@ -1063,10 +862,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         dg.adabn_recalibrate(net, _bn_batches(), forward=lambda mdl, b: mdl(b))
         net.eval()
         m = evaluate(val_ds, val_src, f"eval@ep{ep}")
-        ious = [m["per_class_iou"][CLASS_NAMES[c]] for c in range(NUM_CLASSES)]
-        with open(val_csv, "a", newline="") as f:
-            csv.writer(f).writerow([ep, f"{m['overall_acc']:.4f}",
-                                    f"{m['present_classes_mIoU']:.4f}"] + [f"{x:.4f}" for x in ious])
+        tc.append_val_row(val_csv, ep, m, CLASS_NAMES)
         if best.update(m["present_classes_mIoU"]):
             torch.save({"model": net.state_dict(), "epoch": ep}, best.final)
         if write_json:

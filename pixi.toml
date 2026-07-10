@@ -13,7 +13,7 @@ python = "3.11.*"
 numpy = "<2"
 scipy = "*"             # kNN/cKDTree for density analysis + local normal estimation
 pyside6 = "*"           # desktop UI
-matplotlib = "*"        # metrics dashboard (plot_run_metrics.py) + viewer fallback
+matplotlib = "*"        # metrics dashboard (trainer_gui/plots.py + pages/plotting_page.py) + viewer fallback
 python-pdal = "*"       # Pretraining tab: HeightAboveGround (SMRF -> hag_nn), LAZ I/O
 pip = "*"
 

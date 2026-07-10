@@ -135,52 +135,25 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     """Modal shell: provision the GPU container + volumes, then run the LOCAL
     trainer. All training/inference logic lives in local_train_randlanet_hag.py — this only
     shells out to it, so local and cloud run byte-identical code."""
-    import subprocess
     import sys
-    import threading
-
-    cmd = [sys.executable, "/root/local_train_randlanet_hag.py"]
-    for _flag, _val in (
-        ("--dataset", dataset),
-        ("--sub-grid", sub_grid),
-        ("--num-points", num_points),
-        ("--epochs", epochs),
-        ("--batch", batch),
-        ("--steps-per-epoch", steps_per_epoch),
-        ("--mode", mode),
-        ("--weights", weights),
-        ("--infer-input", infer_input),
-    ):
-        if _val is not None:
-            cmd += [_flag, str(_val)]
-    env = dict(os.environ)
-    if env_json:
-        import json
-        _ov = {str(k): str(v) for k, v in json.loads(env_json).items()}
-        env.update(_ov)
-        print("[modal-shell] env overrides: " + " ".join(sorted(_ov)), flush=True)
-    print("[modal-shell] " + " ".join(cmd), flush=True)
-
-    # Persist checkpoints + prep cache mid-run so an uncatchable spconv CUDA
-    # device-assert (the reason this function has retries) still leaves the
-    # latest state on the volumes for the local trainer's auto-resume on the
-    # retry. ponytail: time-based commit; the trainer's 2-checkpoint retention
-    # covers the rare case of snapshotting a half-written .pth.
-    _stop = threading.Event()
-
-    def _commit_loop():
-        while not _stop.wait(120):
-            outputs_volume.commit()
-            datasets_volume.commit()
-
-    _t = threading.Thread(target=_commit_loop, daemon=True)
-    _t.start()
-    try:
-        subprocess.run(cmd, check=True, env=env)
-    finally:
-        _stop.set()
-        outputs_volume.commit()
-        datasets_volume.commit()
+    sys.path.insert(0, "/root")
+    import train_common
+    train_common.modal_shell_run(
+        "/root/local_train_randlanet_hag.py",
+        [
+            ("--dataset", dataset),
+            ("--sub-grid", sub_grid),
+            ("--num-points", num_points),
+            ("--epochs", epochs),
+            ("--batch", batch),
+            ("--steps-per-epoch", steps_per_epoch),
+            ("--mode", mode),
+            ("--weights", weights),
+            ("--infer-input", infer_input),
+        ],
+        env_json,
+        [outputs_volume, datasets_volume],
+    )
 
 
 @app.local_entrypoint()
