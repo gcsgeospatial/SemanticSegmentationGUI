@@ -4,7 +4,9 @@ on a canonical trainer_gui --dataset (3-folder train/val/test), deformable
 KPFCNN, cold start.
 
   Features  : 4 = [1, intensity, return_number, height], where height is
-              tile-relative (z - tile_min_z).
+              tile-relative (z - tile_min_z). FEAT_CHANNELS env overrides the
+              spec (ordered csv incl. dataset feat_* channels); run.json
+              "features" records the resolved list.
   --hag     : swaps the 4th channel to real PDAL HeightAboveGround, which the
               dataset (or the Inference page's HAG box) must supply. Same 4
               channels / param count -> a clean A/B of tile-relative height vs
@@ -106,7 +108,11 @@ RARE_CLASSES    = None       # explicit class indices, or None -> auto from trai
 RARE_FREQ_FRAC  = 0.5        # auto-rare threshold: freq < frac x median present freq
 RARE_TILE_PROB  = 0.25       # P(draw the next train tile from a rare-class tile)
 
-INPUT_CHANNELS = 4           # [1, intensity, return_number, height]
+# Input-feature spec (FEAT_CHANNELS env, GUI picker): comma-separated ordered
+# names; "" = the legacy [intensity, return_number, height] recipe. The
+# constant-1 bias channel is always first and not part of the spec; --hag
+# still swaps what feeds "height", exactly as before.
+FEAT_CHANNELS = ""
 
 # Geometry — original KPConv deformable KPFCNN (train_S3DIS.py constants),
 # scaled to aerial LiDAR exactly like the KPConvX sibling (GRID 2.0 / 100 m tiles).
@@ -256,10 +262,12 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
     # closures capture these, defaulting to the module constants.
     (DG_DENSITY_AUG, DG_COARSEN_MAX, DG_P_NATIVE, DG_LOGDK_FEAT, DG_LOGDK_K,
      DG_INFER_ADABN, DG_INFER_TTA, USE_FOCAL, FOCAL_GAMMA, CLASS_WEIGHTING,
-     WEIGHT_BETA, RARE_OVERSAMPLE) = tc.env_overrides(globals(), [
+     WEIGHT_BETA, RARE_OVERSAMPLE, VAL_EVERY,
+     FEAT_CHANNELS) = tc.env_overrides(globals(), [
         "DG_DENSITY_AUG", "DG_COARSEN_MAX", "DG_P_NATIVE", "DG_LOGDK_FEAT",
         "DG_LOGDK_K", "DG_INFER_ADABN", "DG_INFER_TTA", "USE_FOCAL",
-        "FOCAL_GAMMA", "CLASS_WEIGHTING", "WEIGHT_BETA", "RARE_OVERSAMPLE"])
+        "FOCAL_GAMMA", "CLASS_WEIGHTING", "WEIGHT_BETA", "RARE_OVERSAMPLE",
+        "VAL_EVERY", "FEAT_CHANNELS"])
 
     sys.path.insert(0, _kpconv_root())
     EVAL_ONLY = (mode == "eval")
@@ -279,6 +287,12 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
     PACK_N      = batch if batch is not None else globals()["PACK_N"]
     HAG = bool(hag)   # --hag: local vars named `hag` below are per-point ARRAYS
     FEATURE_MODE = "native_hag" if HAG else globals()["FEATURE_MODE"]
+    # Input-feature spec: FEAT_CHANNELS env at train (the infer block below
+    # overrides it from run.json — env is ignored at infer). "height" is fed by
+    # real HAG under --hag, the tile-relative height otherwise, as always.
+    FEAT_LEGACY = ["intensity", "return_number", "height"]
+    FEAT_SPEC = (list(FEAT_LEGACY) if INFER    # env ignored at infer
+                 else tc.parse_feat_spec(FEAT_CHANNELS, FEAT_LEGACY))
     # KPConv pyramid geometry: module constants, restored from run.json at infer
     # so the rebuilt model matches the weights exactly.
     CONV_RADIUS   = globals()["CONV_RADIUS"]
@@ -296,7 +310,9 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
             dataset, HAG,
             "train the plain KPConv (its 4th channel is the tile-relative "
             "height, which needs no HAG).")
-        PREP_DIR = f"{ds_root}/prep/kpconv{'_hag' if HAG else ''}_grid{GRID:g}_c{int(CHUNK_XY)}"
+        PREP_DIR = (f"{ds_root}/prep/kpconv{'_hag' if HAG else ''}"
+                    f"_grid{GRID:g}_c{int(CHUNK_XY)}"
+                    f"{tc.feat_spec_tag(FEAT_SPEC, FEAT_LEGACY)}")
     else:
         # Folder inference (--mode infer): no --dataset. Reproduce the TRAINED
         # geometry, class layout AND neighbor_limits from the run's run.json (the
@@ -338,11 +354,28 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
                 DEFORMABLE    = bool(rj.get("deformable", DEFORMABLE))
                 if rj.get("neighbor_limits"):
                     NEIGHBOR_LIMITS = [int(x) for x in rj["neighbor_limits"]]
+                # rebuild the EXACT assembly recorded with the weights (env is
+                # ignored at infer); manifests without "features" = legacy runs.
+                mf = rj.get("features")
+                try:
+                    FEAT_SPEC = (tc.parse_feat_spec(",".join(mf), FEAT_LEGACY)
+                                 if mf else list(FEAT_LEGACY))
+                except ValueError:
+                    FEAT_SPEC = list(FEAT_LEGACY)
+
+    if "rgb" in FEAT_SPEC:
+        raise ValueError("the KPConv tile pipeline has no rgb channel — use "
+                         "intensity (rgb is folded into it when a scene has "
+                         "no intensity)")
+    # bias + spec channels (+ log d_k below); every kp spec name is width 1.
+    IN_CH = 1 + len(FEAT_SPEC)
 
     def _cache_signature():
         # Everything that changes what a cached tile contains — plus the KPConv
         # pyramid geometry, because neighbor_limits.json is keyed by this same
-        # signature and stale limits silently change the pyramid.
+        # signature and stale limits silently change the pyramid. The
+        # spec-derived recipe string reproduces the legacy spellings
+        # byte-for-byte, so every existing cache stays valid.
         sp = ds_meta.get("split", {})
         sig = {
             "format_version": 1,
@@ -355,8 +388,10 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
             "min_pts_mask": 64,
             "min_pts_sub": 32,
             "intensity_norm": "p95_clip2",
-            "feature_recipe": ("bias,intensity,ret_num,hag" if HAG
-                               else "bias,intensity,ret_num,height"),
+            "feature_recipe": "bias," + ",".join(
+                "hag" if (n == "height" and HAG)
+                else "ret_num" if n == "return_number" else n
+                for n in FEAT_SPEC),
             "conv_radius": CONV_RADIUS,
             "deform_radius": DEFORM_RADIUS,
             "arch_hash": arch_hash(_arch(DEFORMABLE)),
@@ -428,7 +463,7 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
     from models.architectures import KPFCNN, p2p_fitting_regularizer
     from datasets.common import PointCloudDataset   # needs the compiled C++ wrappers
 
-    IN_DIM = INPUT_CHANNELS + (1 if DG_LOGDK_FEAT else 0)   # +log d_k (D3b)
+    IN_DIM = IN_CH + (1 if DG_LOGDK_FEAT else 0)   # +log d_k (D3b)
     cfg = make_cfg(NUM_CLASSES, IN_DIM, GRID,
                    conv_radius=CONV_RADIUS, deform_radius=DEFORM_RADIUS,
                    kp_extent=KP_EXTENT, num_kp=NUM_KP, first_feat=FIRST_FEAT,
@@ -478,10 +513,10 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
 
     # ------------------------------------------------------------------------
     # Features + tile sampling (shared KP-family pipeline; also feeds the
-    # calibration probe). A new feature channel goes into kp_tile_and_save +
-    # kp_make_build_feat in train_common.py, nothing here.
+    # calibration probe). Dataset feat_* channels are cached by
+    # kp_tile_and_save and fed by the spec, nothing here.
     # ------------------------------------------------------------------------
-    build_feat = tc.kp_make_build_feat(DG_LOGDK_FEAT, DG_LOGDK_K)
+    build_feat = tc.kp_make_build_feat(DG_LOGDK_FEAT, DG_LOGDK_K, FEAT_SPEC)
     sample_tile = tc.kp_make_sample_tile(
         build_feat, HAG, GRID, max_pts=MAX_TILE_PTS, aug_color=AUG_COLOR,
         density_aug=DG_DENSITY_AUG, coarsen_max=DG_COARSEN_MAX,
@@ -564,7 +599,10 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
                 "backbone": "KPConv",
                 "warm_start": False,
                 "feature_mode": FEATURE_MODE,
-                "input_channels": INPUT_CHANNELS,
+                "input_channels": IN_CH,
+                # resolved input spec (bias/HAG/log-dk ride outside it) —
+                # inference rebuilds this exact assembly from here.
+                "features": FEAT_SPEC,
                 "dataset": dataset,
                 **({"hag_source": HAG_SOURCE} if HAG else {}),
                 "n_epochs": N_EPOCHS, "epoch_steps": EPOCH_STEPS,
@@ -690,10 +728,12 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
 
     # Sliding-window inference over already-normalized features (--mode infer),
     # with the D5 density-TTA view averaging (shared KP-family pipeline).
+    SAVE_PROBS = os.environ.get("TT_SAVE_PROBS") == "1"
     _predict_points = tc.kp_make_predict_points(
         lambda cxyz, feat: torch.softmax(net(_kp_batch(cxyz, feat), cfg).float(),
                                          -1).cpu().numpy(),
-        build_feat, GRID, CHUNK_XY, NUM_CLASSES, DG_INFER_TTA)
+        build_feat, GRID, CHUNK_XY, NUM_CLASSES, DG_INFER_TTA,
+        save_probs=SAVE_PROBS)
 
     # ------------------------------------------------------------------------
     # Arbitrary-folder inference: label the staged npz scenes and stop.
@@ -734,7 +774,10 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
             xyz = z["xyz"].astype(np.float32)
             intensity_n, ret_num = tc.scene_arrays(z, len(xyz))
             hag = tc.scene_hag(z, pc_path, len(xyz), HAG)   # --hag: real HAG; plain: None
-            return xyz, _predict_points(xyz, intensity_n, ret_num, hag=hag), intensity_n
+            extras = tc.feat_extras(z, FEAT_SPEC, os.path.basename(pc_path))
+            pred, conf, probs = _predict_points(xyz, intensity_n, ret_num,
+                                                hag=hag, extras=extras)
+            return xyz, pred, intensity_n, conf, probs
 
         tc.run_infer_scenes(scenes, _predict, pred_dir, run_dir, infer_cfg, cls_txt=True)
         return

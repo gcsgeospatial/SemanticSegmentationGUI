@@ -4,14 +4,16 @@
 Datasets page bakes it into a dataset during conversion, and the Inference page
 bakes it into the scenes a *_hag model is about to label.
 
-  - "grid"  : pure numpy/scipy raster (ground = per-cell low-percentile Z, roofs
-              rejected by a grey opening). Fast, no PDAL.
-  - hag_nn / hag_delaunay : PDAL filters, with SMRF detecting ground when no
-              ground mask is supplied. Accurate, needs python-pdal.
+Two independent axes, never mixed:
+  - ground SOURCE: a caller-supplied ground_mask (the file's own ground class,
+    trusted labels) wins outright; with no mask, SMRF detects ground — for every
+    interpolation method. Never a union of the two.
+  - HAG INTERPOLATION: "grid" (pure numpy/scipy raster — fast, no PDAL) or
+    hag_nn / hag_delaunay (PDAL filters — accurate, needs python-pdal).
 
-Ground comes from ONE source, never a union: a caller-supplied ground_mask
-(trusted labels) wins outright and disables SMRF. Returns None on any failure —
-callers then write no "hag" key, and the *_hag models refuse to run.
+Without PDAL there is no SMRF; the grid method then falls back to its own
+percentile+opening detection heuristic. Returns None on any failure — callers
+then write no "hag" key, and the *_hag models refuse to run.
 
 `pdal` is imported lazily, so this module (and the GUI) load fine without it.
 """
@@ -108,11 +110,11 @@ def hag_grid_for_cloud(cloud, *, ground_mask=None,
     """Approximate per-point HeightAboveGround from a rasterized ground surface.
     Pure numpy/scipy, no PDAL, a few O(n) passes — the fast default method.
 
-    ground_mask given (trusted labels): the raster is the per-cell mean Z of the
-    labeled ground points; label-less cells (e.g. under buildings) are filled
-    from the NEAREST labeled cell — this replaces the old SMRF union as the
-    hole-filler, so SMRF never runs when a ground class exists.
-    No mask (detection): per-cell low-percentile Z, then a grey opening rejects
+    ground_mask given (trusted labels or SMRF-detected ground): the raster is
+    the per-cell mean Z of the masked points; mask-less cells (e.g. under
+    buildings) are filled from the NEAREST masked cell — interpolation fills
+    the gaps, never a second ground source.
+    No mask (the no-PDAL fallback): per-cell low-percentile Z, then a grey opening rejects
     cells whose lowest return sits on a structure (roofs); rejected + empty
     cells are nearest-filled the same way.
 
@@ -184,24 +186,40 @@ def hag_grid_for_cloud(cloud, *, ground_mask=None,
     return (z - ground_at).astype(np.float32)
 
 
-def hag_for_cloud(cloud, *, ground_mask=None, use_smrf: bool = True,
-                  hag_filter: str = "grid", smrf_cell: float = 2.0,
-                  smrf_fill: bool = False) -> "np.ndarray | None":
+def smrf_ground_mask(cloud, cell: float = 2.0) -> "np.ndarray | None":
+    """Detect ground with PDAL's SMRF filter -> boolean mask aligned 1:1 to
+    cloud.xyz, or None (no PDAL, pipeline failure, or reordered output). The
+    only ground-detection path when the input carries no ground class."""
+    if not pdal_available():
+        return None
+    import pdal
+    try:
+        arr = _structured_from_cloud(cloud)
+        smrf = pdal.Pipeline(json.dumps([{"type": "filters.smrf", "cell": cell}]),
+                             arrays=[arr])
+        smrf.execute()
+        sarr = smrf.arrays[0]
+        if len(sarr) != cloud.n:
+            return None
+        mask = np.asarray(sarr["Classification"]) == 2
+        return mask if mask.any() else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def hag_for_cloud(cloud, *, ground_mask=None, hag_filter: str = "grid",
+                  smrf_cell: float = 2.0) -> "np.ndarray | None":
     """Per-point HeightAboveGround aligned 1:1 to cloud.xyz — the ONE engine
     behind dataset builds, per-tile HAG and inference (so train and infer can't
     diverge in method).
 
-    hag_filter picks the method: "grid" (default, hag_grid_for_cloud — fast
-    raster approximation, no PDAL) or a PDAL filter ("hag_nn"/"hag_delaunay",
-    the accurate path). Ground comes from ONE source by default:
-      - ground_mask: points the dataset LABELS as ground. Trusted labels win —
-        SMRF does not run when a usable mask exists (holes the labels miss are
-        spanned by the grid's nearest-fill / the PDAL filter's interpolation) —
-        UNLESS smrf_fill opts in: then SMRF also runs and its detected ground is
-        UNIONED with the labeled mask to fill holes (areas with no labeled
-        ground returns). PDAL filters only; the grid method ignores it.
-      - use_smrf (PDAL filters only, no mask): SMRF detects ground. The grid
-        method does its own detection and ignores use_smrf.
+    Ground SOURCE (one, never a union): ground_mask — the file's own ground
+    class, trusted outright — else SMRF detection, for every method. No PDAL
+    means no SMRF: the grid method then falls back to its own detection
+    heuristic, the PDAL filters return None.
+    hag_filter picks the INTERPOLATION: "grid" (default, hag_grid_for_cloud —
+    fast raster approximation, no PDAL) or a PDAL filter ("hag_nn" /
+    "hag_delaunay", the accurate path).
 
     Returns float32 length cloud.n, or None when no method can produce an
     aligned result — callers then write no "hag" key, and the *_hag models fail
@@ -212,34 +230,20 @@ def hag_for_cloud(cloud, *, ground_mask=None, use_smrf: bool = True,
         raise ValueError(f"hag_filter must be one of {HAG_METHODS}, got {hag_filter!r}")
     if ground_mask is not None:
         ground_mask = np.asarray(ground_mask, dtype=bool).reshape(-1)
-        if len(ground_mask) != cloud.n:
-            return None
-        if not ground_mask.any():
+        if len(ground_mask) != cloud.n or not ground_mask.any():
             ground_mask = None                        # unusable mask -> detection
-        else:
-            # trusted labels win; smrf_fill opts into the SMRF-union gap fill
-            use_smrf = use_smrf and smrf_fill
+    if ground_mask is None:
+        ground_mask = smrf_ground_mask(cloud, smrf_cell)   # None without PDAL
     if hag_filter == "grid":
+        # mask=None here means no labels AND no SMRF -> the grid heuristic.
         return hag_grid_for_cloud(cloud, ground_mask=ground_mask)
-    if not pdal_available():
-        return None
-    if ground_mask is None and not use_smrf:
+    if ground_mask is None or not pdal_available():
         return None                                   # nothing to anchor HAG to
     import pdal
     try:
         arr = _structured_from_cloud(cloud)           # always has a Classification dim
-        ground = np.zeros(cloud.n, dtype=bool)
-        if ground_mask is not None:
-            ground |= ground_mask
-        if use_smrf:                                  # detect ground (no labels, or smrf_fill union)
-            smrf = pdal.Pipeline(json.dumps([{"type": "filters.smrf", "cell": smrf_cell}]), arrays=[arr])
-            smrf.execute()
-            sarr = smrf.arrays[0]
-            if len(sarr) == cloud.n:
-                ground |= (np.asarray(sarr["Classification"]) == 2)
-        if not ground.any():
-            return None                               # no ground points -> no HAG
-        arr["Classification"] = np.where(ground, 2, 1).astype(arr["Classification"].dtype)
+        arr["Classification"] = np.where(ground_mask, 2, 1).astype(
+            arr["Classification"].dtype)
         pipe = pdal.Pipeline(json.dumps([{"type": f"filters.{hag_filter}"}]), arrays=[arr])
         pipe.execute()
         out = pipe.arrays[0]

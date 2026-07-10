@@ -18,7 +18,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
                                QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel,
-                               QLineEdit, QListWidget, QMessageBox, QPlainTextEdit, QPushButton,
+                               QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QPlainTextEdit, QPushButton,
                                QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
 from .. import analysis, appstate, dataset, modal_cli, pretrain, theme, ui
@@ -62,6 +62,11 @@ class DatasetsPage(QWidget):
         self.known_list.setMaximumWidth(360)
         self.known_list.itemSelectionChanged.connect(self._show_known)
         sd_col.addWidget(self.known_list)
+        # Register an already-converted folder (moved from another box, restored
+        # backup, …) without re-converting; must hold a valid dataset_meta.json.
+        self.add_existing_btn = QPushButton("Add existing dataset…")
+        self.add_existing_btn.clicked.connect(self._add_existing)
+        sd_col.addWidget(self.add_existing_btn)
         # Re-upload a converted dataset without re-converting; survives restart
         # (staged_dir is remembered in state.json).
         self.upload_saved_btn = QPushButton("Upload selected to Modal")
@@ -121,10 +126,7 @@ class DatasetsPage(QWidget):
         self.field_combo = QComboBox()
         self.field_combo.setEditable(True)
         form.addRow("Label field", self.field_combo)
-        self.out_edit, out_row = self._dir_row(self._pick_out)
-        self.out_edit.setText(str(appstate.workspace_dir()))   # show the default
-        self.out_edit.setToolTip("Base folder. A dataset builds into <this>/<name>.")
-        form.addRow("Output folder", out_row)
+        # Datasets always build into <workspace>/<name> — no per-build output pick.
         return box
 
     # ============================================================= 2. Classes
@@ -202,21 +204,23 @@ class DatasetsPage(QWidget):
                                 "channel.")
         self.hag_chk.toggled.connect(lambda on: self.hag_opts_w.setVisible(on))
         form.addRow("Height-Above-Ground", self.hag_chk)
-        # grid = fast raster approximation (no PDAL); hag_nn/hag_delaunay = the
-        # accurate PDAL path (SMRF ground detection when no ground class is set).
+        # Interpolation only — the ground SOURCE is the labeled class when set,
+        # else SMRF detection (any method; grid heuristic = the PDAL-less fallback).
         self.hag_filter = QComboBox()
         self.hag_filter.addItems(list(pretrain.HAG_METHODS))
-        self.hag_filter.setToolTip("grid: fast raster approximation, no PDAL needed. "
-                                   "hag_nn / hag_delaunay: accurate PDAL filters (SMRF "
-                                   "detects ground when no ground class is set).")
+        self.hag_filter.setToolTip("How HAG is interpolated from the ground points. "
+                                   "grid: fast raster approximation, no PDAL needed. "
+                                   "hag_nn / hag_delaunay: accurate PDAL filters.")
         # Which class is ground (raw Source value from the Classes table). When set,
-        # the labels are the ONLY ground source — SMRF never runs.
+        # the labels are the ONLY ground source — never mixed with detection.
         self.hag_ground = QLineEdit()
-        self.hag_ground.setPlaceholderText("blank = detect")
+        self.hag_ground.setPlaceholderText("blank = detect (SMRF)")
         self.hag_ground.setMaximumWidth(90)
         self.hag_ground.setToolTip("Source value that means ground (from the Classes table, "
                                    "e.g. 2). When set, those labels are the only ground source "
-                                   "(gaps are nearest-filled). Blank = detect ground instead.")
+                                   "(gaps are nearest-filled). Blank = SMRF detects ground "
+                                   "instead (needs PDAL; without it the grid method's own "
+                                   "heuristic is the fallback).")
         hag_row = QHBoxLayout()
         hag_row.addWidget(QLabel("method"))
         hag_row.addWidget(self.hag_filter)
@@ -231,6 +235,23 @@ class DatasetsPage(QWidget):
             # if a PDAL filter is picked anyway.
             self.hag_chk.setText("Compute Height-Above-Ground (HAG) - grid only, "
                                  "PDAL not installed")
+        # Optional: bake extra per-point source fields into every scene as
+        # feat_<name> (p95(|v|)-normalized, like intensity). Hidden until the
+        # input carries candidate fields; collapsed (unchecked) by default.
+        self.feat_group = QGroupBox("Extra feature channels")
+        self.feat_group.setCheckable(True)
+        self.feat_group.setChecked(False)
+        self.feat_group.setToolTip("Carry extra per-point fields (e.g. eigenvalue features) "
+                                   "into every scene as feat_<name>. Every scene must have "
+                                   "the field - a missing one fails the build.")
+        self.feat_list = QListWidget()
+        self.feat_list.setMaximumHeight(110)
+        feat_lay = QVBoxLayout(self.feat_group)
+        feat_lay.addWidget(self.feat_list)
+        self.feat_group.toggled.connect(self.feat_list.setVisible)  # collapse w/ the checkbox
+        self.feat_list.setVisible(False)
+        self.feat_group.setVisible(False)
+        form.addRow("", self.feat_group)
         # TODO(not ready): parallel-worker UI hidden until reviewed; conversion runs
         # single-process (max_workers=1 forced in _conversion_plan).
         self.tile_btn = QPushButton("Build dataset")
@@ -338,15 +359,6 @@ class DatasetsPage(QWidget):
         if d:
             self.test_edit.setText(d)
 
-    def _pick_out(self):
-        d = QFileDialog.getExistingDirectory(self, "Local output folder")
-        if d:
-            self.out_edit.setText(d)
-
-    def _output_root(self) -> Path:
-        txt = self.out_edit.text().strip()
-        return Path(txt) if txt else appstate.workspace_dir()
-
     def _populate_fields(self, path: str):
         self.field_combo.clear()
         files = dataset.expand_inputs(path)
@@ -364,6 +376,17 @@ class DatasetsPage(QWidget):
             if i >= 0:
                 self.field_combo.setCurrentIndex(i)
                 break
+        # Extra-channel candidates: every field except the label field (a late
+        # label-field change is re-filtered at build time in _conversion_plan).
+        self.feat_list.clear()
+        for f in fields:
+            if f == self.field_combo.currentText():
+                continue
+            it = QListWidgetItem(f)
+            it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
+            it.setCheckState(Qt.Unchecked)
+            self.feat_list.addItem(it)
+        self.feat_group.setVisible(self.feat_list.count() > 0)
 
     # ------------------------------------------------------------- config
     def _spec(self) -> LabelSpec:
@@ -527,15 +550,20 @@ class DatasetsPage(QWidget):
             self._append(f"Ground class '{gtxt}' isn't an integer - clear it or enter a "
                          f"Source value from the Classes table.")
             return None
+        label_field = self.field_combo.currentText().strip()
+        feats = [self.feat_list.item(i).text() for i in range(self.feat_list.count())
+                 if self.feat_list.item(i).checkState() == Qt.Checked
+                 and self.feat_list.item(i).text() != label_field
+                 ] if self.feat_group.isChecked() else []
         return {
             "name": name, "in_path": in_path, "split": split,
             "val_inputs": val_inputs, "test_inputs": test_inputs,
             "classes": classes, "ignored": ignored, "spec": self._spec(),
-            "out_root": self._output_root(),
+            "out_root": appstate.workspace_dir(),
             "compute_hag": self.hag_chk.isChecked(),
             "ground_value": gv,
-            "use_smrf": gv is None,     # labels win; SMRF only ever detects
             "hag_filter": self.hag_filter.currentText(),
+            "feature_fields": feats or None,
             "max_workers": 1,   # TODO(not ready): parallel UI hidden; force single-process
         }
 
@@ -557,9 +585,10 @@ class DatasetsPage(QWidget):
                 out_root, val_inputs=plan["val_inputs"],
                 test_inputs=plan["test_inputs"], split=split,
                 intensity_norm="p95", compute_hag=plan["compute_hag"],
-                ground_value=plan["ground_value"], use_smrf=plan["use_smrf"],
-                hag_filter=plan["hag_filter"], max_workers=plan["max_workers"],
-                progress=progress)
+                ground_value=plan["ground_value"],
+                hag_filter=plan["hag_filter"],
+                feature_fields=plan["feature_fields"],
+                max_workers=plan["max_workers"], progress=progress)
 
         self._done_cb = self._on_converted
         self.worker.start(job)
@@ -580,6 +609,39 @@ class DatasetsPage(QWidget):
         else:
             self._append(f"✓ Built{hag} -> {staged}. Select it under Saved Datasets to upload.")
 
+    @staticmethod
+    def _register_dataset(staged: Path) -> bool:
+        """Validate + remember a converted dataset folder. It must hold a readable
+        dataset_meta.json; False (nothing recorded) when it doesn't."""
+        try:
+            with open(staged / "dataset_meta.json", "r", encoding="utf-8") as f:
+                json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return False
+        appstate.remember_dataset(staged.name, {
+            "staged_dir": str(staged),
+            "meta_path": str(staged / "dataset_meta.json"),
+            "uploaded": False,
+        })
+        return True
+
+    def _add_existing(self):
+        """Register an already-converted dataset folder under Saved Datasets."""
+        picked = QFileDialog.getExistingDirectory(
+            self, "Converted dataset folder (must contain dataset_meta.json)",
+            str(appstate.workspace_dir()))
+        if not picked:
+            return
+        staged = Path(picked)
+        if not self._register_dataset(staged):
+            QMessageBox.warning(
+                self, "Not a dataset",
+                f"{staged} has no readable dataset_meta.json — not a converted "
+                f"dataset. Build it with 'Build dataset' first.")
+            return
+        self._reload_known()
+        self._append(f"✓ Added '{staged.name}' from {staged}.")
+
     def _upload_saved(self):
         """Upload a saved dataset from its remembered staged_dir, no re-conversion.
         If that folder moved or was deleted, ask where it is now (must hold
@@ -598,14 +660,9 @@ class DatasetsPage(QWidget):
             if not picked:
                 return
             staged = Path(picked)
-            if not (staged / "dataset_meta.json").exists():
+            if not self._register_dataset(staged):
                 self._append(f"✗ {staged} has no dataset_meta.json - not a dataset.")
                 return
-            appstate.remember_dataset(staged.name, {
-                "staged_dir": str(staged),
-                "meta_path": str(staged / "dataset_meta.json"),
-                "uploaded": False,
-            })
         self._start_upload(staged)
 
     def _delete_saved(self):
@@ -630,7 +687,7 @@ class DatasetsPage(QWidget):
         if err:
             self._append(f"Removed '{name}' from the list, but some data at {staged} "
                          f"couldn't be deleted:\n  {err}\n  Close anything using them "
-                         f"(viewer, training run) and delete manually.")
+                         f"(point-cloud viewer, training run) and delete manually.")
         else:
             self._append(f"Deleted '{name}' data - removed from the list. Kept any "
                          f"runs/ + infer/ under {staged or 'nothing on disk'} for records.")
@@ -711,11 +768,13 @@ class DatasetsPage(QWidget):
             n_va = len(spl.get("val", {}).get("scenes", []))
             n_te = len(spl.get("test", {}).get("scenes", []))
             hag = "  ·  HAG ✓" if meta.get("has_hag") else ""
+            fc = meta.get("source", {}).get("feature_channels") or []
+            extra = ("\nextra channels: " + ", ".join(c["name"] for c in fc)) if fc else ""
             self.stats_label.setText(
                 f"{meta['name']}: {meta['num_classes']} classes "
                 f"({', '.join(meta['class_names'])})  ·  "
                 f"{s.get('mean_pts_per_m2', 0):.2f} pts/m²  ·  "
-                f"train {n_tr}, val {n_va}, test {n_te} scenes{hag}\n{status}")
+                f"train {n_tr}, val {n_va}, test {n_te} scenes{hag}{extra}\n{status}")
         else:
             self.stats_label.setText(f"{items[0].text()}\n{status}")
 

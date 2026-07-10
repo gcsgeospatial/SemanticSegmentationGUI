@@ -13,20 +13,20 @@ python = "3.11.*"
 numpy = "<2"
 scipy = "*"             # kNN/cKDTree for density analysis + local normal estimation
 pyside6 = "*"           # desktop UI
-matplotlib = "*"        # metrics dashboard (trainer_gui/plots.py + pages/plotting_page.py) + viewer fallback
+matplotlib = "*"        # metrics dashboard (trainer_gui/plots.py + pages/plotting_page.py)
 python-pdal = "*"       # Pretraining tab: HeightAboveGround (SMRF -> hag_nn), LAZ I/O
 pip = "*"
 
 [pypi-dependencies]
 modal = "*"
-open3d = ">=0.18"       # 3D viewer
+open3d = ">=0.18"       # .pcd reader (trainer_gui/readers.py)
 laspy = { version = ">=2.5", extras = ["lazrs"] }
 plyfile = ">=1.0"
 trainer-gui = { path = ".", editable = true }
 
 [activation.env]
 # Don't scatter __pycache__/ dirs across the source tree: Python writes bytecode
-# caches whenever it imports a module, so running the GUI/viewer/tests via pixi
+# caches whenever it imports a module, so running the GUI/tests via pixi
 # would litter them everywhere. This disables that for anything launched in the
 # env (negligible import-speed cost for a local app).
 PYTHONDONTWRITEBYTECODE = "1"

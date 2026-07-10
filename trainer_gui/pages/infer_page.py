@@ -1,34 +1,26 @@
-"""Inference page: pick weights + input folder, run --mode infer, view predictions.
+"""Inference page: pick weights + input folder, run --mode infer.
 
 Stages (one JobRunner):
-  Modal: convert -> upload scenes -> [upload weights] -> run -> download -> view.
-  Local: convert -> docker run (scenes mounted, predictions to host) -> view.
+  Modal: convert -> upload scenes -> [upload weights] -> run -> download.
+  Local: convert -> docker run (scenes mounted, predictions to host).
 """
 
 from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QProcess, Qt
-from PySide6.QtGui import QColor
-from PySide6.QtWidgets import (QCheckBox, QColorDialog, QComboBox, QDialog, QDialogButtonBox,
-                               QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout,
-                               QHeaderView, QLabel, QLineEdit, QPlainTextEdit, QPushButton,
-                               QRadioButton, QTableWidget, QTableWidgetItem, QVBoxLayout,
-                               QWidget)
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout,
+                               QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget,
+                               QPlainTextEdit, QPushButton, QRadioButton, QVBoxLayout, QWidget)
 
-from .. import appstate, dataset, local_cli, modal_cli, pretrain, ui
+from .. import analysis, appstate, dataset, local_cli, modal_cli, pretrain, ui
 from ..backbones import BACKBONES
 from ..jobs import FuncWorker, JobRunner
-
-PROJECT_DIR = str(Path(__file__).resolve().parents[2])
-
-# Generic 'class i' count when no run/dataset supplies class names.
-_FALLBACK_NUM_CLASSES = 5
 
 
 class InferPage(QWidget):
@@ -50,9 +42,15 @@ class InferPage(QWidget):
         self._local_weights: Path | None = None    # weights = the run.json's sibling
         self._dg: dict = {}                         # DG settings baked into the weights (run.json["dg"])
         self._run_class_names: list | None = None   # the loaded run's own classes (run.json)
+        self._manifest_features: list | None = None  # run.json "features" (None = legacy run)
         self._hag_ground_value: int | None = None   # parsed in _check_hag, used by the converter
         self._modal_cfg_run = ""                    # run id whose fetched config is applied
         self._pending_cfg_run = ""                  # run id the cfg_fetcher is out for
+        # Ensemble (Phase 3): captured members + the run-time member queue state.
+        self._ens_members: list[dict] = []
+        self._ens_running = False                   # True from launch until export/failure
+        self._ens_idx = -1                          # index of the member currently running
+        self._ens_dirs: list[Path] = []             # completed members' prediction dirs
 
         root = QVBoxLayout(self)
         title = QLabel("Inference")
@@ -112,7 +110,7 @@ class InferPage(QWidget):
         self.dl_run_btn = QPushButton("Download run…")
         self.dl_run_btn.setToolTip("Fetch runs/<id> (weights + run.json + metrics) from the "
                                    "model's outputs volume to <workspace>/inference/<id> — "
-                                   "for backup, local inference later, or the class legend.")
+                                   "for backup, local inference later, or the class names.")
         self.dl_run_btn.clicked.connect(self._download_run)
         run_row.addWidget(self.dl_run_btn)
         self.run_row_w = ui.wrap(run_row)
@@ -129,6 +127,34 @@ class InferPage(QWidget):
         self.backbone_combo.currentIndexChanged.connect(self._sync_controls)
         # populated at the end of __init__ (reload_backbones needs grid_spin etc.)
         wf.addRow("Architecture", self.backbone_combo)
+        # Ensemble (Phase 3): vote over several runs. Members are captured from the
+        # normal weights inputs above ('Add current selection'), then run
+        # sequentially over the once-staged scenes and soft-voted.
+        # ponytail: LOCAL backend only — the per-member Modal download loop isn't
+        # wired through the stage machine; the group is disabled in modal mode
+        # (tooltip says so) rather than half-supported.
+        self.ens_box = QGroupBox("Ensemble (vote over several runs)")
+        self.ens_box.setCheckable(True)
+        self.ens_box.setChecked(False)
+        ecol = QVBoxLayout(self.ens_box)
+        self.ens_list = QListWidget()
+        self.ens_list.setMaximumHeight(96)
+        ecol.addWidget(self.ens_list)
+        erow = QHBoxLayout()
+        ens_add = QPushButton("Add current selection")
+        ens_add.setToolTip("Capture the model configured above (backbone + weights + "
+                           "run.json) as an ensemble member.")
+        ens_add.clicked.connect(self._add_ens_member)
+        ens_del = QPushButton("Remove selected")
+        ens_del.clicked.connect(self._remove_ens_member)
+        erow.addWidget(ens_add)
+        erow.addWidget(ens_del)
+        erow.addStretch()
+        ecol.addLayout(erow)
+        ens_hint = QLabel("3+ models recommended; runtime scales with model count.")
+        ens_hint.setObjectName("pageSub")   # muted, same style as the page subtitle
+        ecol.addWidget(ens_hint)
+        wf.addRow(self.ens_box)
 
         ibox = QGroupBox("Input")
         iform = QFormLayout(ibox)
@@ -166,30 +192,22 @@ class InferPage(QWidget):
         iform.addRow("Height-Above-Ground", self.hag_chk)
         self.hag_filter = QComboBox()
         self.hag_filter.addItems(list(pretrain.HAG_METHODS))
-        self.hag_filter.setToolTip("grid: fast raster approximation, no PDAL needed. "
-                                   "hag_nn / hag_delaunay: accurate PDAL filters (SMRF "
-                                   "detects ground when no ground class is set).")
+        self.hag_filter.setToolTip("How HAG is interpolated from the ground points. "
+                                   "grid: fast raster approximation, no PDAL needed. "
+                                   "hag_nn / hag_delaunay: accurate PDAL filters.")
         self.hag_ground = QLineEdit()
-        self.hag_ground.setPlaceholderText("blank = detect")
+        self.hag_ground.setPlaceholderText("blank = detect (SMRF)")
         self.hag_ground.setMaximumWidth(90)
         self.hag_ground.setToolTip("Classification value in the input clouds that means "
-                                   "ground (e.g. 2). When set, those points are the only "
-                                   "ground source. Blank = detect ground instead.")
-        # Opt-in SMRF union: with a ground class + a PDAL method, also run SMRF
-        # and union its ground with the labels to fill holes (no ground returns
-        # under buildings, water). Unticked = labels stay the only ground source.
-        self.hag_smrf_fill = QCheckBox("fill ground gaps with SMRF")
-        self.hag_smrf_fill.setToolTip(
-            "With a ground class set, also run SMRF and union its detected ground "
-            "with the labeled points to fill holes (areas with no labeled ground "
-            "returns). Needs a PDAL method (hag_nn / hag_delaunay); the grid "
-            "method ignores it. With no ground class, SMRF already detects ground.")
+                                   "ground (e.g. 2). When set, those points are the ONLY "
+                                   "ground source — never mixed with detection. Blank = "
+                                   "SMRF detects ground instead (needs PDAL; without it "
+                                   "the grid method's own heuristic is the fallback).")
         hag_row = QHBoxLayout()
         hag_row.addWidget(QLabel("method"))
         hag_row.addWidget(self.hag_filter)
         hag_row.addWidget(QLabel("ground class"))
         hag_row.addWidget(self.hag_ground)
-        hag_row.addWidget(self.hag_smrf_fill)
         hag_row.addStretch()
         self.hag_opts_w = ui.wrap(hag_row)
         self.hag_opts_w.setVisible(False)
@@ -201,23 +219,10 @@ class InferPage(QWidget):
                                  "PDAL not installed")
         # TODO(not ready): AdaBN/TTA infer UI hidden until reviewed; backend reads
         # DG_INFER_ADABN / DG_INFER_TTA — see scripts/DENSITY_DG.md.
-        # Prediction output folder; empty falls back to <workspace>/inference —
-        # the same spot 'Download run…' uses, so runs + their predictions co-locate.
-        self.out_edit = QLineEdit()
-        self.out_edit.setText(appstate.get("infer_out", ""))
-        self.out_edit.setPlaceholderText(
-            f"default: {(appstate.workspace_dir() / 'inference').as_posix()}")
-        out_row = QHBoxLayout()
-        out_row.addWidget(self.out_edit, 1)
-        out_btn = QPushButton("Browse…")
-        out_btn.clicked.connect(self._pick_out)
-        out_row.addWidget(out_btn)
-        self.out_row_w = ui.wrap(out_row)
-        # Shown in both modes (Modal: download target), unlike train_page's
-        # mode-dependent output row.
-        iform.addRow("Output folder (predictions)", self.out_row_w)
+        # Predictions always land under <workspace>/inference — the same spot
+        # 'Download run…' uses, so runs + their predictions co-locate.
         # Prediction file format — every option is xyz + classification only
-        # (no RGB: colour/palette is a viewer concern, not the deliverable's).
+        # (no RGB colour columns: the deliverable carries classes, not colours).
         self.fmt_combo = QComboBox()
         for label, key in (("LAS (.las)", "las"), ("LAZ (.laz)", "laz"),
                            ("PLY (.ply)", "ply"), ("Text (.txt)", "txt"),
@@ -228,6 +233,26 @@ class InferPage(QWidget):
         self.fmt_combo.setToolTip("Predictions are written as xyz + classification "
                                   "(no colour columns).")
         iform.addRow("Prediction format", self.fmt_combo)
+        # Confidence gate at export: low-confidence points become ASPRS class 1.
+        self.unclass_chk = QCheckBox("Mark low-confidence points Unclassified")
+        self.unclass_chk.setChecked(True)
+        self.unclass_spin = QDoubleSpinBox()
+        self.unclass_spin.setRange(0.0, 1.0)
+        self.unclass_spin.setSingleStep(0.05)
+        self.unclass_spin.setDecimals(2)
+        self.unclass_spin.setValue(0.50)
+        tip = ("Raw max-softmax confidence: points below the cut export as ASPRS "
+               "class 1 (Unclassified — processed, no class assigned). The .npz "
+               "keeps the raw prediction, so re-exporting at a new threshold "
+               "never re-runs inference.")
+        self.unclass_chk.setToolTip(tip)
+        self.unclass_spin.setToolTip(tip)
+        self.unclass_chk.toggled.connect(self.unclass_spin.setEnabled)
+        uc_row = QHBoxLayout()
+        uc_row.addWidget(self.unclass_chk)
+        uc_row.addWidget(self.unclass_spin)
+        uc_row.addStretch()
+        iform.addRow("Confidence", ui.wrap(uc_row))
 
         run_row = QHBoxLayout()
         self.run_btn = QPushButton("Run inference")
@@ -247,30 +272,16 @@ class InferPage(QWidget):
         self.log.setObjectName("log")
         self.log.setPlaceholderText("Conversion and run logs appear here…")
 
-        # Action bar + one-line legend; comparison metrics print to the log.
-        self.view_btn = QPushButton("View a point cloud…")
-        self.view_btn.clicked.connect(self._view_file)
+        # Action bar; comparison metrics print to the log.
         self.compare_btn = QPushButton("Compare to ground truth…")
+        self.compare_btn.setToolTip("Pick a prediction + its ground truth; accuracy, "
+                                    "mIoU and per-class IoU print to the log.")
         self.compare_btn.clicked.connect(self._compare_gt)
-        self.export_btn = QPushButton("Export comparison PLY…")
-        self.export_btn.clicked.connect(self._export_gt)
-        self.palette_btn = QPushButton("Class colours & names…")
-        self.palette_btn.setToolTip("Pick the name source (run / dataset / Auto), "
-                                    "rename classes, and set colours.")
-        self.palette_btn.clicked.connect(self._configure_palette)
         actions = QHBoxLayout()
-        actions.addWidget(self.view_btn)
         actions.addWidget(self.compare_btn)
-        actions.addWidget(self.export_btn)
         actions.addStretch(1)
-        actions.addWidget(self.palette_btn)
-        # Swatch legend — the colours the viewer paints.
-        self.legend_label = QLabel()
-        self.legend_label.setWordWrap(True)
-        self.legend_label.setToolTip("Class colours used by the viewer.")
         out_box = QVBoxLayout()
         out_box.addLayout(actions)
-        out_box.addWidget(self.legend_label)
 
         root.addWidget(ui.vsplit(ui.wrap(forms_col), self.log,
                                  ui.wrap(out_box), sizes=[340, 340, 84]), 1)
@@ -284,6 +295,10 @@ class InferPage(QWidget):
         self.exporter.output.connect(self._append)
         self.exporter.done.connect(self._on_exported)
         self.exporter.error.connect(self._on_export_error)
+        self.voter = FuncWorker(self)   # ensemble vote over the member prediction dirs
+        self.voter.output.connect(self._append)
+        self.voter.done.connect(self._on_voted)
+        self.voter.error.connect(self._on_vote_error)
         self.cfg_fetcher = FuncWorker(self)   # modal run.json fetch for a typed run id
         self.cfg_fetcher.output.connect(self._append)
         self.cfg_fetcher.done.connect(self._on_cfg_fetched)
@@ -312,6 +327,15 @@ class InferPage(QWidget):
             + ("Pick a run.json (or a local .pth), a folder of clouds, and run in Docker."
                if local else
                "Pick a run (or a local .pth), a folder of clouds, and run on Modal."))
+        # ponytail: ensemble ships local-only — modal would need a per-member
+        # download loop through the stage machine; disabled with a tooltip instead.
+        self.ens_box.setEnabled(local)
+        self.ens_box.setToolTip(
+            "" if local else "Ensemble runs on the LOCAL backend only — the "
+            "per-member Modal download loop isn't wired. Switch execution to "
+            "local on the Settings page to use it.")
+        if not local:
+            self.ens_box.setChecked(False)
         self._sync_source_rows()
         self.reload_backbones()
 
@@ -340,17 +364,10 @@ class InferPage(QWidget):
         self.backbone_combo.blockSignals(False)
         self._sync_controls()
 
-    # ------------------------------------------------- class palette & names
-    # Per-class table (source + name + colour). appstate keys, all keyed by source:
-    #   infer_palette          -> chosen name source key
-    #   palette_name_overrides -> {source_key: [name, …]}
-    #   palette_overrides      -> {source_key: [[r,g,b], …]}
+    # ------------------------------------------------------------- class names
     def _set_run_classes(self, names):
-        """Adopt the run's class names and select that source."""
+        """Adopt the run's class names (they label the per-class IoU stats)."""
         self._run_class_names = list(names) if names else None
-        if self._run_class_names:
-            appstate.put("infer_palette", "__run__")
-        self._refresh_legend()
 
     @staticmethod
     def _names_from_manifest(m: dict) -> list | None:
@@ -361,96 +378,8 @@ class InferPage(QWidget):
         n = m.get("num_classes")
         return [f"class {i}" for i in range(int(n))] if n else None
 
-    def _source_options(self) -> list:
-        """(label, key) name-source choices: run, Auto, then datasets with class names."""
-        opts = []
-        if self._run_class_names:
-            opts.append((f"Loaded run ({len(self._run_class_names)} classes)", "__run__"))
-        opts.append(("Auto (names in file, else class i)", "__auto__"))
-        for nm, info in sorted(appstate.known_datasets().items()):
-            if os.path.exists(info.get("meta_path", "") or ""):
-                opts.append((nm, nm))
-        return opts
-
-    def _current_source_key(self) -> str:
-        k = appstate.get("infer_palette") or ""
-        if k == "__run__" and not self._run_class_names:
-            k = ""
-        return k or ("__run__" if self._run_class_names else "__auto__")
-
-    def _names_for_key(self, key: str) -> list:
-        """Base class names for a source key; generic 'class i' if none."""
-        from ..palette import generic_names
-        if key == "__run__":
-            return list(self._run_class_names or generic_names(_FALLBACK_NUM_CLASSES))
-        if key in (None, "", "__auto__"):
-            return generic_names(_FALLBACK_NUM_CLASSES)
-        info = appstate.known_datasets().get(key, {})
-        mp = info.get("meta_path", "")
-        if mp and os.path.exists(mp):
-            try:
-                with open(mp, "r", encoding="utf-8") as f:
-                    meta = json.load(f)
-                if meta.get("class_names"):
-                    return list(meta["class_names"])
-                if meta.get("num_classes"):
-                    return generic_names(int(meta["num_classes"]))
-            except (OSError, json.JSONDecodeError):
-                pass
-        return generic_names(_FALLBACK_NUM_CLASSES)
-
-    def _apply_name_overrides(self, key: str, base: list) -> list:
-        ov = appstate.get("palette_name_overrides", {}).get(key)
-        if isinstance(ov, list):
-            return [(ov[i] if i < len(ov) and ov[i] else base[i]) for i in range(len(base))]
-        return list(base)
-
-    def _effective_names(self) -> list:
-        key = self._current_source_key()
-        return self._apply_name_overrides(key, self._names_for_key(key))
-
-    def _default_colors(self, n: int) -> list:
-        from ..palette import palette_for
-        return palette_for(n).tolist()
-
-    def _colors_for(self, key: str, names: list) -> list:
-        ov = appstate.get("palette_overrides", {}).get(key)
-        if isinstance(ov, list) and len(ov) == len(names):
-            return [[int(x) for x in c] for c in ov]
-        return self._default_colors(len(names))
-
-    def _palette_colors(self) -> list:
-        return self._colors_for(self._current_source_key(), self._effective_names())
-
-    def _refresh_legend(self):
-        """One-line swatch legend."""
-        parts = "".join(
-            f'<span style="font-size:14px;color:#{r:02x}{g:02x}{b:02x}">■</span>'
-            f'<span>&nbsp;{name}</span>&nbsp;&nbsp;&nbsp;'
-            for name, (r, g, b) in zip(self._effective_names(), self._palette_colors()))
-        self.legend_label.setText(parts)
-
-    def _configure_palette(self):
-        """Open the class menu; persist source, renames and colours."""
-        dlg = ClassPaletteDialog(self, self)
-        if not dlg.exec():
-            return
-        key = dlg.source_key()
-        appstate.put("infer_palette", "" if key == "__auto__" else key)
-        base = self._names_for_key(key)
-        edited = dlg.names()
-        names_ov = dict(appstate.get("palette_name_overrides", {}))
-        names_ov[key] = [edited[i] if i < len(edited) and edited[i] != base[i] else ""
-                         for i in range(len(base))]
-        appstate.put("palette_name_overrides", names_ov)
-        cols_ov = dict(appstate.get("palette_overrides", {}))
-        cols_ov[key] = dlg.colors()
-        appstate.put("palette_overrides", cols_ov)
-        self._refresh_legend()
-
     # ------------------------------------------------------------- inputs
     def reload_runs(self):
-        self._refresh_legend()
         prev = self.run_combo.currentText()   # keep a typed/pasted ref across reloads
         self.run_combo.blockSignals(True)
         self.run_combo.clear()
@@ -516,7 +445,7 @@ class InferPage(QWidget):
     def _download_run(self):
         """Modal: fetch runs/<id> (weights + run.json + metrics) from the model's
         outputs volume to <workspace>/inference/<id> — the folder reload_runs and
-        the class-legend lookup also read, and where local inference can pick the
+        the class-name lookup also read, and where local inference can pick the
         run.json straight back up."""
         b = self._backbone()
         vol, run_id = self._combo_run_ref()
@@ -557,19 +486,22 @@ class InferPage(QWidget):
     def _invalidate_manifest(self):
         """Drop the loaded manifest so a run can't proceed stale."""
         self._manifest = self._manifest_path = self._local_weights = None
+        self._manifest_features = None
         self._dg = {}
         self._modal_cfg_run = ""
         self._apply_manifest_lock(False)   # run-derived inputs editable again
 
-    def _infer_dg_env(self) -> dict:
+    def _infer_dg_env(self, dg: dict | None = None) -> dict:
         """DG_* env for inference. logdk recovered from run.json (it changed the input
         width, so must be recomputed or the load fails). AdaBN/TTA toggles are hidden
         for now (not ready); no DG_INFER_ADABN / DG_INFER_TTA env is sent — see the
-        TODO in __init__."""
+        TODO in __init__. `dg` overrides the loaded run's block (ensemble members
+        carry their own)."""
+        dg = self._dg if dg is None else dg
         env: dict[str, str] = {}
-        if self._dg.get("logdk"):
+        if dg.get("logdk"):
             env["DG_LOGDK_FEAT"] = "1"
-            env["DG_LOGDK_K"] = str(int(self._dg.get("logdk_k", 8)))
+            env["DG_LOGDK_K"] = str(int(dg.get("logdk_k", 8)))
         if env:
             self._append("[dg] inference: " + " ".join(f"{k}={v}" for k, v in sorted(env.items())))
         return env
@@ -644,7 +576,14 @@ class InferPage(QWidget):
         if self._dg.get("logdk"):
             self._append(f"[dg] trained with the log-d_k density channel "
                          f"(k={self._dg.get('logdk_k', 8)}); recomputed at inference.")
-        # Label legend + viewer with the model's own classes.
+        # The run's ordered input spec (run.json "features"); None = legacy run.
+        # Custom feat_* channels must be baked into the converted scenes.
+        self._manifest_features = m.get("features")
+        custom = [n for n in (self._manifest_features or []) if n.startswith("feat_")]
+        if custom:
+            self._append(f"[feat] run trained with custom channel(s): {', '.join(custom)} "
+                         f"— the input clouds must carry the matching source field(s).")
+        # Label the comparison stats with the model's own classes.
         self._set_run_classes(self._names_from_manifest(m))
         return True
 
@@ -790,13 +729,6 @@ class InferPage(QWidget):
         if f:
             self.input_edit.setText(f)
 
-    def _pick_out(self):
-        d = QFileDialog.getExistingDirectory(
-            self, "Output folder for predictions",
-            self.out_edit.text() or str(appstate.workspace_dir() / "inference"))
-        if d:
-            self.out_edit.setText(d)
-
     def _backbone(self):
         # The run.json's backbone is authoritative for LOCAL inference so no deprecated backbones
         if (self._manifest and self.from_run_radio.isChecked()
@@ -834,6 +766,140 @@ class InferPage(QWidget):
             return False
         return True
 
+    # ------------------------------------------------------------- ensemble
+    def _add_ens_member(self):
+        """Capture the currently configured model as an ensemble member — the same
+        resolution _run's local branch uses (backbone + resolved weights +
+        run.json), snapshotted so later UI edits don't drift the member."""
+        if self.from_file_radio.isChecked():
+            # A bare .pth has no run.json: no class names to clamp on (its trainer
+            # writes placeholder class_0… names that would fail the voter's exact
+            # clamp only AFTER every member burned a full inference pass) and no
+            # dataset to resolve feature channels from. Refuse early and loudly.
+            self._append("✗ ensemble: members must come from training runs "
+                         "(run.json) — a bare .pth carries no class/dataset info "
+                         "to check compatibility against.")
+            return
+        if not (self._manifest and self._manifest_path):
+            self._append("✗ ensemble: pick a run.json first.")
+            return
+        w = self._resolved_weights()
+        if not (w and w.is_file()):
+            self._append(f"✗ ensemble: weights not found ({w}).")
+            return
+        bkey = self._manifest.get("backbone")
+        manifest, mpath = dict(self._manifest), str(self._manifest_path)
+        # CLAMP: members must share one class set AND one dataset — feature
+        # channels and intensity_norm are resolved through the first member's
+        # dataset meta, so a different dataset would silently stage feat_*
+        # columns from the wrong source field for the other members.
+        new_n = manifest.get("num_classes")
+        new_names = self._names_from_manifest(manifest)
+        new_ds = manifest.get("dataset")
+        for m in self._ens_members:
+            mm = m.get("manifest") or {}
+            old_n = mm.get("num_classes")
+            old_names = self._names_from_manifest(mm)
+            if (old_n and new_n and int(old_n) != int(new_n)) or \
+                    (old_names and new_names and old_names != new_names):
+                self._append(f"✗ ensemble: class mismatch — '{Path(m['weights']).name}' "
+                             f"predicts {old_n} classes {old_names}, this run {new_n} "
+                             f"{new_names}. Members must share one class set.")
+                return
+            old_ds = mm.get("dataset")
+            if old_ds and new_ds and old_ds != new_ds:
+                self._append(f"✗ ensemble: dataset mismatch — '{Path(m['weights']).name}' "
+                             f"was trained on '{old_ds}', this run on '{new_ds}'. "
+                             f"Members must share one dataset (feature channels and "
+                             f"intensity normalization come from its meta).")
+                return
+        self._ens_members.append({
+            "backbone": bkey, "weights": str(w), "manifest_path": mpath,
+            "manifest": manifest, "dg": (manifest or {}).get("dg") or {},
+            # grid/tile as currently configured (a loaded run.json sets both)
+            "grid": self.grid_spin.value(), "chunk": self.chunk_spin.value()})
+        src = Path(mpath).parent.name if mpath else w.name
+        self.ens_list.addItem(f"{bkey} — {src}")
+        self._append(f"[ensemble] member {len(self._ens_members)}: {bkey} ({w})")
+
+    def _remove_ens_member(self):
+        row = self.ens_list.currentRow()
+        if row < 0:
+            return
+        self.ens_list.takeItem(row)
+        self._ens_members.pop(row)
+
+    def _run_ensemble(self, input_dir: str):
+        """Ensemble launch: validate members, stage scenes ONCE, then run the
+        members sequentially through the normal local stage machine."""
+        n = len(self._ens_members)
+        if n < 2:
+            self._append("✗ ensemble needs at least 2 members — 'Add current "
+                         "selection' for each model, or untick the group.")
+            return
+        for m in self._ens_members:
+            if not Path(m["weights"]).is_file():
+                self._append(f"✗ ensemble: weights missing for {m['backbone']}: "
+                             f"{m['weights']}")
+                return
+            if not self._check_hag(m["backbone"]):   # all-HAG or all-plain members
+                return
+        self._job_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.log.clear()
+        self.run_btn.setEnabled(False)
+        self._ens_running, self._ens_idx, self._ens_dirs = True, -1, []
+        if n == 2:
+            self._append("[ensemble] ⚠ only 2 members — disagreements fall to the "
+                         "more confident (then earlier) model; 3+ recommended.")
+        self._append(f"[ensemble] {n} members; scenes staged once, models run "
+                     f"sequentially (runtime scales with model count).")
+        self._start_conversion(input_dir)
+
+    def _start_next_member(self):
+        self._ens_idx += 1
+        m = self._ens_members[self._ens_idx]
+        self._append(f"\n[ensemble] member {self._ens_idx + 1}/{len(self._ens_members)}: "
+                     f"{m['backbone']} ({Path(m['weights']).name})")
+        self._start_local_infer(member=m)
+
+    def _on_member_done(self):
+        """A member's local run exited 0: keep its infer_run.json beside its
+        predictions (the vote's class clamp reads it), then next member or vote."""
+        if not list(self._pred_dir.glob("*_pred.npz")):
+            self._ens_running = False
+            self.run_btn.setEnabled(True)
+            self._append(f"\n✗ ensemble: member {self._ens_idx + 1} wrote no "
+                         f"predictions in {self._pred_dir}. Check the log above.")
+            return
+        # The trainers write infer_run.json to the job dir (= the staged mount),
+        # one level above the predictions mount — copy the member's snapshot in.
+        src = Path(self._staged) / "infer_run.json"
+        if src.is_file():
+            try:
+                shutil.copy2(src, self._pred_dir / "infer_run.json")
+            except OSError as e:
+                self._append(f"[ensemble] (couldn't copy infer_run.json: {e})")
+        self._ens_dirs.append(self._pred_dir)
+        if self._ens_idx + 1 < len(self._ens_members):
+            self._start_next_member()
+            return
+        ens_dir = (appstate.workspace_dir() / "inference"
+                   / f"predictions_{self._job_id}_ensemble")
+        self._append(f"\n[ensemble] voting over {len(self._ens_dirs)} member "
+                     f"run(s) -> {ens_dir}…")
+        self.voter.start(_vote_members, [str(d) for d in self._ens_dirs], str(ens_dir))
+
+    def _on_voted(self, ens_dir):
+        # _ens_running stays True through the export so the class map comes from
+        # the members' manifest; _on_exported/_on_export_error reset it.
+        self._report_predictions(Path(ens_dir))
+
+    def _on_vote_error(self, tb: str):
+        self._ens_running = False
+        self.run_btn.setEnabled(True)
+        self._append(f"\n✗ ensemble vote failed — the per-member predictions "
+                     f"remain in their predictions_{self._job_id}_m<k> folders.\n{tb}")
+
     # ------------------------------------------------------------- run chain
     def _run(self):
         input_dir = self.input_edit.text().strip()
@@ -841,6 +907,9 @@ class InferPage(QWidget):
             self._append("Choose an input folder or file first.")
             return
         modal = appstate.get_exec_mode() != "local"
+        if self.ens_box.isChecked() and not modal:   # modal keeps the group unchecked
+            self._run_ensemble(input_dir)
+            return
         weights_run_id = ""
         weights_vol = ""   # a pasted <volume>/runs/<id> names it; else the backbone's
         if self.from_file_radio.isChecked():
@@ -908,17 +977,21 @@ class InferPage(QWidget):
 
     def _start_conversion(self, input_dir: str):
         # p95 end-to-end; honor a legacy norm recorded in run.json.
-        norm = (self._manifest or {}).get("intensity_norm", "p95") \
-            if (self.from_run_radio.isChecked() and self._manifest) else "p95"
+        if self._ens_running:
+            # ponytail: the FIRST member's manifest speaks for the ensemble
+            # (norm/dataset) — members are same-dataset runs in practice.
+            norm = (self._ens_members[0].get("manifest") or {}).get(
+                "intensity_norm") or "p95"
+        else:
+            norm = (self._manifest or {}).get("intensity_norm", "p95") \
+                if (self.from_run_radio.isChecked() and self._manifest) else "p95"
         # HAG comes from the checkbox, never from the run — _run() already refused a
         # HAG/model mismatch, and the ground value parsed there.
         hag_on = self.hag_chk.isChecked()
         hag_filter = self.hag_filter.currentText() if hag_on else "grid"
-        smrf_fill = hag_on and self.hag_smrf_fill.isChecked()
         if hag_on:
             src = (f"ground = class {self._hag_ground_value}"
-                   + (" + SMRF gap fill" if smrf_fill else "")
-                   if self._hag_ground_value is not None else "ground detected")
+                   if self._hag_ground_value is not None else "ground detected (SMRF)")
             self._append(f"[1/4] Computing HeightAboveGround ({hag_filter}, {src}) "
                          "for the input scenes.")
         job_root = self._infer_out_dir()
@@ -928,15 +1001,50 @@ class InferPage(QWidget):
                              appstate.workspace_dir(), intensity_norm=norm,
                              hag=hag_on, hag_filter=hag_filter,
                              ground_value=self._hag_ground_value,
-                             smrf_fill=smrf_fill, out_dir=job_root)
+                             feature_fields=self._infer_feature_fields(),
+                             out_dir=job_root)
+
+    def _run_features(self) -> list | None:
+        """The loaded run's ordered input spec (run.json "features"), or None
+        (loose .pth / legacy run -> legacy channel handling). During an ensemble
+        run: the UNION of every member's features, so the once-staged scenes
+        carry (and the channel report checks) what any member needs."""
+        if self._ens_running:
+            feats: list = []
+            for m in self._ens_members:
+                for f in (m.get("manifest") or {}).get("features") or []:
+                    if f not in feats:
+                        feats.append(f)
+            return feats or None
+        return self._manifest_features \
+            if (self.from_run_radio.isChecked() and self._manifest) else None
+
+    def _infer_feature_fields(self) -> list | None:
+        """Raw source-field names for the run's custom feat_* channels, resolved
+        through the dataset meta's source.feature_channels. Unresolvable (loose
+        .pth / meta missing) -> the sanitized name sans feat_ (conversion matches
+        case-insensitively and fails loud on a truly missing field)."""
+        custom = [n for n in (self._run_features() or []) if n.startswith("feat_")]
+        if not custom:
+            return None
+        chans = ((self._dataset_meta() or {}).get("source") or {}).get("feature_channels") or []
+        by_name = {c.get("name"): c.get("source_field") for c in chans}
+        fields = []
+        for n in custom:
+            src = by_name.get(n[len("feat_"):])
+            if not src:
+                src = n[len("feat_"):]
+                self._append(f"[feat] no dataset meta maps '{n}' to a raw field — "
+                             f"assuming the inputs carry a field named '{src}'.")
+            fields.append(src)
+        return fields
 
     def _infer_out_dir(self) -> Path:
         """Nest this infer job under its owning dataset (<dataset>/infer/<job>) when
         the run names a known, on-disk dataset; else a findable workspace scratch
         spot (loose .pth has no linked dataset). The container still mounts it at
         /datasets/_infer/<job> regardless."""
-        name = (self._manifest or {}).get("dataset") \
-            if (self.from_run_radio.isChecked() and self._manifest) else None
+        name = self._owning_dataset()
         staged = appstate.known_datasets().get(name or "", {}).get("staged_dir", "")
         if staged and os.path.isdir(staged):
             return appstate.dataset_root(name) / "infer" / self._job_id
@@ -960,10 +1068,23 @@ class InferPage(QWidget):
 
     def _on_converted(self, staged: Path):
         self._staged = staged
-        for line in _scene_channel_report(staged, expect_hag=self.hag_chk.isChecked()):
+        lines, blocked = _scene_channel_report(staged, expect_hag=self.hag_chk.isChecked(),
+                                               features=self._run_features())
+        for line in lines:
             self._append(line)
+        if blocked:
+            # Same shape as the HAG refusal: a clear log line, button back, stop.
+            self._append("✗ Aborting — the input clouds lack channel(s) this run was "
+                         "trained on (see above). Re-export the inputs with those "
+                         "fields, or pick a run that doesn't need them.")
+            self._ens_running = False
+            self.run_btn.setEnabled(True)
+            return
         if appstate.get_exec_mode() == "local":
-            self._start_local_infer()
+            if self._ens_running:
+                self._start_next_member()
+            else:
+                self._start_local_infer()
             return
         self._append(f"[2/4] Uploading scenes -> {modal_cli.DATASETS_VOLUME}:/_infer/{self._job_id}… "
                      "(a 'volume already exists' message here is expected and harmless)")
@@ -978,6 +1099,10 @@ class InferPage(QWidget):
 
     def _on_stage_done(self, code: int):
         if code != 0:
+            if self._ens_running:
+                self._append(f"\n✗ ensemble member {self._ens_idx + 1} failed "
+                             f"(exit {code}) — ensemble aborted.")
+                self._ens_running = False
             self._append(f"\n✗ Stage '{self._stage}' failed (exit {code}).")
             self.run_btn.setEnabled(True)
             return
@@ -996,11 +1121,9 @@ class InferPage(QWidget):
             self._start_modal_run()
         elif self._stage == "run":
             # Predictions on the datasets volume at _infer/<job_id>/predictions.
-            # Download to the chosen folder; job-id subfolder avoids collisions.
-            base = self.out_edit.text().strip() \
-                or str(appstate.workspace_dir() / "inference")
-            appstate.put("infer_out", self.out_edit.text().strip())
-            self._dl_dest = Path(base) / f"predictions_{self._job_id}"
+            # Download under <workspace>/inference; job-id subfolder avoids collisions.
+            self._dl_dest = (appstate.workspace_dir() / "inference"
+                             / f"predictions_{self._job_id}")
             self._dl_dest.mkdir(parents=True, exist_ok=True)
             self._append(f"[4/4] Downloading predictions -> {self._dl_dest}…")
             self._stage = "download"
@@ -1010,7 +1133,10 @@ class InferPage(QWidget):
             self.runner.start(prog, args, cwd=self.repo_root)
         elif self._stage == "run_local":
             # Local: predictions already on the host, no download.
-            self._report_predictions(self._pred_dir)
+            if self._ens_running:
+                self._on_member_done()
+            else:
+                self._report_predictions(self._pred_dir)
         elif self._stage == "download":
             self._report_predictions(self._dl_dest / "predictions")
 
@@ -1020,32 +1146,72 @@ class InferPage(QWidget):
         worker thread; _on_exported prints the final green report."""
         pred_dir = Path(pred_dir) if pred_dir else None
         if not (pred_dir and pred_dir.is_dir()):
+            self._ens_running = False
             self.run_btn.setEnabled(True)
             self._append(f"\n✗ No predictions folder at {pred_dir}.")
             return
         preds = [p for p in sorted(pred_dir.iterdir())
                  if p.suffix.lower() in (".ply", ".npz")]
         if not preds:
+            self._ens_running = False
             self.run_btn.setEnabled(True)
             self._append(f"\n✗ No prediction files in {pred_dir}. Check the log above.")
             return
         appstate.put("last_view_dir", str(pred_dir))
         fmt = self.fmt_combo.currentData()
         appstate.put("infer_format", fmt)
+        thr = self.unclass_spin.value() if self.unclass_chk.isChecked() else None
         self._append(f"\n[export] writing predictions as {fmt} (xyz + classification)…")
-        self.exporter.start(dataset.export_predictions, pred_dir, fmt)
+        self.exporter.start(dataset.export_predictions, pred_dir, fmt,
+                            class_map=self._class_map(), unclass_threshold=thr)
+
+    def _owning_dataset(self) -> str | None:
+        """Dataset name the active weights belong to: the loaded run.json's, or —
+        during an ensemble run — the first member's (members share a class set,
+        so one dataset meta speaks for all)."""
+        if self._ens_running:
+            return (self._ens_members[0].get("manifest") or {}).get("dataset")
+        return (self._manifest or {}).get("dataset") \
+            if (self.from_run_radio.isChecked() and self._manifest) else None
+
+    def _dataset_meta(self) -> dict | None:
+        """The run's dataset_meta.json as a dict, or None when it can't be
+        resolved (loose .pth / unknown dataset)."""
+        name = self._owning_dataset()
+        mp = appstate.known_datasets().get(name or "", {}).get("meta_path", "")
+        try:
+            with open(mp, encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    def _class_map(self) -> dict | None:
+        """{model index: source classification value} from the run's dataset meta,
+        so exports carry the input's own codes. None (identity) when the dataset
+        can't be resolved (loose .pth / unknown dataset) — logged once."""
+        try:
+            cmap = {int(c["index"]): int(c["source_value"])
+                    for c in (self._dataset_meta() or {}).get("classes", [])}
+        except (ValueError, KeyError, TypeError):
+            cmap = None
+        if not cmap:
+            self._append("[export] no dataset meta for these weights — exported "
+                         "codes are raw model indices.")
+            return None
+        return cmap
 
     def _on_exported(self, written):
+        self._ens_running = False   # an ensemble job ends at its export
         self.run_btn.setEnabled(True)
         if not written:
             self._append("✗ Nothing exported (no *_pred.npz in the predictions folder).")
             return
         self._append(f"\n✓ Done - {len(written)} prediction file(s) in {written[0].parent}.\n"
-                     f"  'View a point cloud…' to open one, or 'Compare to ground "
-                     f"truth…' for accuracy + mIoU.")
+                     f"  'Compare to ground truth…' for accuracy + mIoU.")
 
     def _on_export_error(self, tb: str):
         # Predictions still exist as the scripts' raw .npz; only the rewrite failed.
+        self._ens_running = False
         self.run_btn.setEnabled(True)
         self._append(f"\n✗ Format conversion failed — predictions remain as raw "
                      f".npz files.\n{tb}")
@@ -1069,55 +1235,64 @@ class InferPage(QWidget):
         self._append(f"$ modal {' '.join(args)}\n")
         self.runner.start(prog, args, cwd=self.repo_root)
 
-    def _start_local_infer(self):
-        """Local Docker inference: scenes bind-mounted, predictions to host. No up/download."""
-        b = self._backbone()
+    def _start_local_infer(self, member: dict | None = None):
+        """Local Docker inference: scenes bind-mounted, predictions to host. No
+        up/download. `member` (an ensemble member dict) overrides the UI-derived
+        backbone/weights/grid and lands predictions in its own _m<k> dir."""
+        b = BACKBONES[member["backbone"]] if member else self._backbone()
         # Scenes (and where predictions get written) are self._staged on the host.
         extra_mounts = [(str(self._staged), f"/datasets/_infer/{self._job_id}")]
-        # Predictions: the chosen folder, else <workspace>/inference/predictions_<job>
-        # (same default as the Modal download), mounted over the container's
-        # predictions dir either way.
-        out = self.out_edit.text().strip()
-        appstate.put("infer_out", out)
-        self._pred_dir = Path(out) if out else (
-            appstate.workspace_dir() / "inference" / f"predictions_{self._job_id}")
+        # Predictions: <workspace>/inference/predictions_<job> (same spot as the
+        # Modal download), mounted over the container's predictions dir.
+        suffix = f"_m{self._ens_idx + 1}" if member else ""
+        self._pred_dir = (appstate.workspace_dir() / "inference"
+                          / f"predictions_{self._job_id}{suffix}")
         self._pred_dir.mkdir(parents=True, exist_ok=True)
         extra_mounts.append(
             (str(self._pred_dir), f"/datasets/_infer/{self._job_id}/predictions"))
         # Weights: the picked .pth or run.json's sibling; mount its dir.
-        wpath = Path(self.pth_edit.text().strip()) if self.from_file_radio.isChecked() \
-            else self._resolved_weights()
+        if member:
+            wpath = Path(member["weights"])
+        else:
+            wpath = Path(self.pth_edit.text().strip()) \
+                if self.from_file_radio.isChecked() else self._resolved_weights()
         extra_mounts.append((str(wpath.parent), "/outputs/_local_weights"))
         weights = f"_local_weights/{wpath.name}"
         flags = {
             "mode": "infer",
             "weights": weights,
             "infer-input": self._job_id,
-            b.grid_flag: self.grid_spin.value(),
+            b.grid_flag: member["grid"] if member else self.grid_spin.value(),
         }
         if b.has_chunk:
-            flags["chunk-xy"] = self.chunk_spin.value()
+            flags["chunk-xy"] = member["chunk"] if member else self.chunk_spin.value()
+        env = self._infer_dg_env(member["dg"]) if member else self._infer_dg_env()
+        if member:
+            env["TT_SAVE_PROBS"] = "1"   # the soft vote averages the saved dists
         self._stage = "run_local"
         prog, args = local_cli.run_script(b.script, flags, b, repo_root=self.repo_root,
-                                          extra_mounts=extra_mounts, env=self._infer_dg_env())
+                                          extra_mounts=extra_mounts, env=env)
         self._append(f"[local] Running inference in Docker ({b.label})…")
         self._append(f"[local] $ {local_cli.preview(prog, args)}\n")
         if not local_cli.have_docker():
             self._append("[local] docker not found on PATH; printed the command only. "
                          "On a Docker+GPU host predictions land in "
                          f"{self._pred_dir.as_posix()}.")
+            self._ens_running = False
             self.run_btn.setEnabled(True)
             return
         gok, gmsg = local_cli.gpu_preflight()   # CUDA-only — fail clearly, not cryptically
         if gmsg:
             self._append(gmsg)
         if not gok:
+            self._ens_running = False
             self.run_btn.setEnabled(True)
             return
         ok, msg = local_cli.image_preflight(b)
         if msg:
             self._append(msg)
         if not ok:
+            self._ens_running = False
             self.run_btn.setEnabled(True)
             return
         self.runner.start(prog, args, cwd=self.repo_root)
@@ -1130,72 +1305,50 @@ class InferPage(QWidget):
         self._append(disp, newline=False)
 
     def _on_error(self, tb: str):
+        self._ens_running = False
         self.run_btn.setEnabled(True)
         self._append(f"\n✗ Conversion error:\n{tb}")
 
     def _on_runner_failed(self, err: str):
         # FailedToStart fires `failed` not `finished`; re-enable the button.
+        self._ens_running = False
         self.run_btn.setEnabled(True)
         self._append(f"\n✗ Failed to start: {err}")
 
-    # ------------------------------------------------------------- view
-    def _open_viewer(self, *args: str):
-        QProcess.startDetached(sys.executable, ["-m", "trainer_gui.viewer", *args], PROJECT_DIR)
-
-    def _view_file(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Point cloud to view", appstate.get("last_view_dir", ""),
-            "Point clouds (*.ply *.npz *.las *.laz *.txt *.pcd);;All files (*)")
-        if not path:
-            return
-        appstate.put("last_view_dir", str(Path(path).parent))
-        names = self._effective_names()
-        pal = ";".join(f"{r},{g},{b}" for r, g, b in self._palette_colors())
-        self._open_viewer(path, "--class-names", ",".join(names), "--palette", pal)
-        self._append(f"Opened viewer for {Path(path).name}.")
-
+    # ------------------------------------------------------------- compare
     def _pick_pred_gt(self):
         """Prompt for a prediction cloud then its ground-truth labels.
         Returns (pred, gt) or None if cancelled."""
+        flt = "Labeled clouds (*.npz *.las *.laz *.ply *.txt *.csv);;All files (*)"
         pred, _ = QFileDialog.getOpenFileName(
-            self, "Prediction cloud to compare", appstate.get("last_view_dir", ""),
-            "Prediction cloud (*.ply *.npz);;All files (*)")
+            self, "Prediction cloud to compare", appstate.get("last_view_dir", ""), flt)
         if not pred:
             return None
         appstate.put("last_view_dir", str(Path(pred).parent))
         gt, _ = QFileDialog.getOpenFileName(
-            self, "Ground truth for this scene",
-            appstate.get("truth_file", ""),
-            "Ground truth (*.ply *.npz);;All files (*)")
+            self, "Ground truth for this scene", appstate.get("truth_file", ""), flt)
         if not gt:
             return None
         appstate.put("truth_file", gt)
         return pred, gt
 
     def _compare_gt(self):
-        """Prompt for a prediction + ground truth and open the error map
-        (yellow where the predicted class differs)."""
+        """Prompt for a prediction + ground truth (both must carry explicit
+        per-point classes) and print accuracy + mIoU to the log."""
         picked = self._pick_pred_gt()
         if not picked:
             return
         pred, gt = picked
-        self._open_viewer(pred, "--gt", gt)
-        self._show_stats(pred, gt)
-        self._append(f"Comparing {Path(pred).name} to {Path(gt).name} "
-                     f"(yellow = predicted class differs).")
-
-    def _show_stats(self, pred: str, gt: str):
-        """Print accuracy + mIoU of prediction vs ground truth to the log."""
-        from .. import viewer
-        self._append("  computing accuracy + mIoU…")
+        self._append(f"\nComparing {Path(pred).name} to {Path(gt).name} — "
+                     f"computing accuracy + mIoU…")
         try:
-            m = viewer.prediction_metrics(pred, gt)
+            m = analysis.prediction_metrics(pred, gt)
         except Exception as e:  # noqa: BLE001
             self._append(f"  ✗ couldn't compute stats: {e}")
             return
-        names = self._effective_names()
+        names = self._run_class_names or []
         nm = lambda c: names[c] if 0 <= c < len(names) else f"class {c}"
-        lines = [f"\n── {m['scene'] or Path(pred).stem} vs ground truth ──",
+        lines = [f"── {m['scene'] or Path(pred).stem} vs ground truth ──",
                  f"  accuracy : {m['accuracy']:.4f}",
                  f"  mIoU     : {m['miou']:.4f}   (over {len(m['per_class_iou'])} present classes)",
                  f"  labeled  : {m['labeled']:,} pts",
@@ -1212,113 +1365,31 @@ class InferPage(QWidget):
             lines.append(f"  (couldn't save metrics json: {e})")
         self._append("\n".join(lines))
 
-    def _export_gt(self):
-        """Prompt for a prediction + ground truth and write the error-map cloud
-        to a .ply (yellow = wrong, intensity-shaded grey = correct)."""
-        picked = self._pick_pred_gt()
-        if not picked:
-            return
-        pred, gt = picked
-        default = str(Path(pred).with_name(Path(pred).stem + "_vs_gt.ply"))
-        out, _ = QFileDialog.getSaveFileName(
-            self, "Save comparison PLY", default, "PLY (*.ply)")
-        if not out:
-            return
-        self._open_viewer(pred, "--gt", gt, "--save", out)
-        self._append(f"Exporting {Path(pred).name} vs {Path(gt).name} -> {out}")
-
     # ------------------------------------------------------------- helpers
     def _append(self, text: str, newline: bool = True):
         ui.append_log(self.log, text, newline)
 
 
-class ClassPaletteDialog(QDialog):
-    """Class menu: pick the name source, rename classes, set colours.
-    source_key()/names()/colors() are read back on accept."""
-
-    def __init__(self, page, parent=None):
-        super().__init__(parent)
-        self.page = page
-        self.setWindowTitle("Class colours & names")
-        self.resize(440, 440)
-
-        lay = QVBoxLayout(self)
-        top = QHBoxLayout()
-        top.addWidget(QLabel("Names from:"))
-        self.src = QComboBox()
-        for label, key in page._source_options():
-            self.src.addItem(label, key)
-        i = self.src.findData(page._current_source_key())
-        self.src.setCurrentIndex(i if i >= 0 else 0)
-        self.src.currentIndexChanged.connect(self._rebuild)
-        top.addWidget(self.src, 1)
-        lay.addLayout(top)
-
-        self.table = QTableWidget(0, 3)
-        self.table.setHorizontalHeaderLabels(["Class", "Name", "Colour"])
-        self.table.verticalHeader().setVisible(False)
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
-        lay.addWidget(self.table)
-
-        foot = QHBoxLayout()
-        reset = QPushButton("Reset colours")
-        reset.clicked.connect(self._reset_colors)
-        foot.addWidget(reset)
-        foot.addStretch()
-        lay.addLayout(foot)
-        box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        box.accepted.connect(self.accept)
-        box.rejected.connect(self.reject)
-        lay.addWidget(box)
-
-        self._colors: list = []
-        self._name_edits: list = []
-        self._color_btns: list = []
-        self._rebuild()
-
-    def _rebuild(self):
-        key = self.src.currentData()
-        names = self.page._apply_name_overrides(key, self.page._names_for_key(key))
-        self._colors = self.page._colors_for(key, names)
-        self._name_edits, self._color_btns = [], []
-        self.table.setRowCount(len(names))
-        for r, nm in enumerate(names):
-            idx = QTableWidgetItem(str(r))
-            idx.setFlags(idx.flags() & ~Qt.ItemIsEditable)
-            self.table.setItem(r, 0, idx)
-            edit = QLineEdit(nm)
-            self._name_edits.append(edit)
-            self.table.setCellWidget(r, 1, edit)
-            btn = QPushButton()
-            btn.setFixedHeight(20)
-            btn.clicked.connect(lambda _=False, i=r: self._pick(i))
-            self._color_btns.append(btn)
-            self.table.setCellWidget(r, 2, btn)
-        self.table.resizeColumnToContents(0)
-        self._refresh_swatches()
-
-    def _refresh_swatches(self):
-        for b, c in zip(self._color_btns, self._colors):
-            b.setStyleSheet(f"background-color: rgb({c[0]},{c[1]},{c[2]}); border: 1px solid #888;")
-
-    def _pick(self, idx: int):
-        col = QColorDialog.getColor(QColor(*self._colors[idx]), self, "Pick a class colour")
-        if col.isValid():
-            self._colors[idx] = [col.red(), col.green(), col.blue()]
-            self._refresh_swatches()
-
-    def _reset_colors(self):
-        self._colors = self.page._default_colors(len(self._colors))
-        self._refresh_swatches()
-
-    def source_key(self) -> str:
-        return self.src.currentData()
-
-    def names(self) -> list:
-        return [e.text().strip() or f"class {i}" for i, e in enumerate(self._name_edits)]
-
-    def colors(self) -> list:
-        return [list(c) for c in self._colors]
+def _vote_members(member_dirs: list, out_dir: str, progress=None):
+    """FuncWorker body: run scripts/local/ensemble_vote.py over the member
+    prediction dirs, then strip the big float16 'probs' payload from each member
+    npz (the classification/confidence npz is kept for re-export/compare)."""
+    import numpy as np
+    scripts_local = str(Path(__file__).resolve().parents[2] / "scripts" / "local")
+    if scripts_local not in sys.path:
+        sys.path.insert(0, scripts_local)
+    import ensemble_vote
+    say = progress or print
+    ensemble_vote.ensemble(member_dirs, out_dir, log=say)
+    for d in member_dirs:
+        for p in Path(d).glob("*_pred.npz"):
+            with np.load(p) as z:
+                if "probs" not in z.files:
+                    continue
+                slim = {k: z[k] for k in z.files if k != "probs"}
+            np.savez(p, **slim)
+    say("  (dropped the per-member probs payloads; classification npz kept)")
+    return Path(out_dir)
 
 
 def _localize_paths(text: str, job_id: str, pred_dir, staged) -> str:
@@ -1334,32 +1405,43 @@ def _localize_paths(text: str, job_id: str, pred_dir, staged) -> str:
     return text
 
 
-def _scene_channel_report(staged, expect_hag: bool = False) -> list[str]:
-    """Log lines verifying the converted scenes carry what the trainers read.
-    The scene npz IS the model's input (fixed contract), so what's in it is
-    exactly what inference sees — xyz always; intensity fed by every model
-    (missing = zeros = degraded accuracy); hag only for *_hag weights."""
+def _scene_channel_report(staged, expect_hag: bool = False,
+                          features: list | None = None) -> tuple[list[str], bool]:
+    """(log lines, blocking) — verifies the converted scenes carry what the
+    trainers read. The scene npz IS the model's input (fixed contract), so what's
+    in it is exactly what inference sees. `features` is the run's ordered spec
+    (run.json "features"): x/y/z/height cost nothing (xyz always present),
+    intensity missing = zeros + a warning, return_number / rgb / feat_* are HARD
+    requirements -> blocking=True names which scenes lack what. None = legacy
+    behavior (xyz + intensity + optional hag), never blocking."""
     import numpy as np
     scenes = sorted(Path(staged).glob("scenes/*.npz"))
     if not scenes:
-        return [f"⚠ no converted scenes under {staged} to check."]
+        return [f"⚠ no converted scenes under {staged} to check."], False
+    hard = [n for n in (features or [])
+            if n in ("return_number", "rgb") or n.startswith("feat_")]
+    want_i = features is None or "intensity" in features
     missing_i, missing_h, keys0 = [], [], []
+    missing_hard: dict[str, list[str]] = {}
     for p in scenes:
         with np.load(p) as z:
             names = set(z.files)
         if not keys0:
             keys0 = sorted(names)
-        if "intensity" not in names:
+        if want_i and "intensity" not in names:
             missing_i.append(p.stem)
         if expect_hag and "hag" not in names:
             missing_h.append(p.stem)
+        for ch in hard:
+            if ch not in names:
+                missing_hard.setdefault(ch, []).append(p.stem)
     lines = [f"[check] {len(scenes)} scene(s) carry: {', '.join(keys0)} — this npz "
              f"is exactly what the model reads."]
-    if missing_i:
+    if want_i and missing_i:
         lines.append(f"⚠ no intensity channel in: {', '.join(missing_i)} — the source "
                      f"file(s) had no intensity field. Models trained with intensity "
                      f"see zeros here and accuracy will suffer.")
-    else:
+    elif want_i:
         # ponytail: value sanity from scene 0 only — full scan if this ever misleads
         with np.load(scenes[0]) as z:
             i = z["intensity"]
@@ -1372,7 +1454,11 @@ def _scene_channel_report(staged, expect_hag: bool = False) -> list[str]:
         lines.append("✓ hag in all scenes" if not missing_h else
                      f"⚠ hag missing in: {', '.join(missing_h)} — the *_hag model "
                      f"will refuse these scenes.")
-    return lines
+    for ch, lost in missing_hard.items():
+        lines.append(f"✗ required channel '{ch}' missing in: {', '.join(lost)} — "
+                     f"this run was trained with it; predicting without it would "
+                     f"be garbage.")
+    return lines, bool(missing_hard)
 
 
 def _manifest_in(rdir: Path) -> dict | None:

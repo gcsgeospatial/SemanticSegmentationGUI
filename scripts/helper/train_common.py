@@ -12,17 +12,23 @@ import os
 import time
 
 
-def write_pred(path, xyz, pred, intensity=None):
+def write_pred(path, xyz, pred, intensity=None, confidence=None, probs=None):
     """Write one inferred scene as a compact npz — xyz + per-point class index
-    (+ optional intensity). The host exporter (dataset.export_predictions) writes
-    the user's chosen file type straight from this, so there's no intermediate
-    coloured PLY to render and then reparse. Class is stored losslessly (the raw
-    prediction), not encoded as palette colour."""
+    (+ optional intensity, per-point confidence = max of the normalized class
+    distribution, and the full float16 distribution when TT_SAVE_PROBS=1). The
+    host exporter (dataset.export_predictions) writes the user's chosen file
+    type straight from this, so there's no intermediate coloured PLY to render
+    and then reparse. Class is stored losslessly (the raw prediction), not
+    encoded as palette colour."""
     import numpy as np
     d = {"xyz": np.asarray(xyz, np.float32),
          "classification": np.asarray(pred, np.int32)}
     if intensity is not None:
         d["intensity"] = np.asarray(intensity, np.float32)
+    if confidence is not None:
+        d["confidence"] = np.asarray(confidence, np.float32)
+    if probs is not None:
+        d["probs"] = np.asarray(probs, np.float16)
     np.savez(path, **d)
 
 
@@ -169,7 +175,8 @@ def infer_meta(weights_path):
         except (OSError, ValueError):
             return None
         return {k: m.get(k) for k in ("num_classes", "class_names", "grid", "chunk_xy",
-                                      "hag_source", "num_points", "dg")}
+                                      "hag_source", "num_points", "dg",
+                                      "features", "color_source")}
     if os.path.exists(rc_path):
         try:
             with open(rc_path, encoding="utf-8") as f:
@@ -551,17 +558,20 @@ def scene_hag(z, pc_path, n, enabled):
 
 
 def run_infer_scenes(scenes, predict, pred_dir, run_dir, infer_cfg, cls_txt=False):
-    """The --mode infer scene loop: predict(pc_path) -> (xyz, pred, intensity),
-    written as <name>_pred.npz (+ optional _pred_CLS.txt), with the crash-safe
-    per-scene infer_run.json rewrite."""
+    """The --mode infer scene loop: predict(pc_path) ->
+    (xyz, pred, intensity, confidence, probs) — confidence is the float32
+    per-point max of the normalized class distribution (0.0 where nothing was
+    predicted), probs the float16 distribution or None — written as
+    <name>_pred.npz (+ optional _pred_CLS.txt), with the crash-safe per-scene
+    infer_run.json rewrite."""
     import numpy as np
     print(f"  [infer] labeling {len(scenes)} scene(s) -> {pred_dir}", flush=True)
     scene_stats = []
     for pc_path in scenes:
         name = os.path.splitext(os.path.basename(pc_path))[0]
         t0 = time.time()
-        xyz, pred, inten = predict(pc_path)
-        write_pred(f"{pred_dir}/{name}_pred.npz", xyz, pred, inten)
+        xyz, pred, inten, conf, probs = predict(pc_path)
+        write_pred(f"{pred_dir}/{name}_pred.npz", xyz, pred, inten, conf, probs)
         if cls_txt:
             np.savetxt(f"{pred_dir}/{name}_pred_CLS.txt", pred, fmt="%d")
         scene_stats.append({"scene": os.path.basename(pc_path),
@@ -577,15 +587,16 @@ def run_infer_scenes(scenes, predict, pred_dir, run_dir, infer_cfg, cls_txt=Fals
 
 # ============================================================================
 # KPConv-family shared pipeline — the prep/feature/eval core the kpconv and
-# kpconvx_cold twins used to duplicate. To add a new per-point feature channel
-# (e.g. linearity), touch kp_tile_and_save (cache it) and kp_make_build_feat
-# (feed it) — nothing else.
+# kpconvx_cold twins used to duplicate. Dataset feat_* channels are automatic:
+# kp_tile_and_save caches every feat_* the canonical scene carries, and
+# kp_make_build_feat feeds whichever ones the FEAT_CHANNELS spec names.
 # ============================================================================
 
 def kp_load_canonical(npz_path):
-    """Canonical trainer_gui scene (.npz) -> (xyz, intensity, ret_num, lab).
-    xyz is origin-offset (per-scene floor-min) before the float32 cast so
-    projected (UTM) coords keep sub-meter precision."""
+    """Canonical trainer_gui scene (.npz) -> (xyz, intensity, ret_num, lab,
+    extras), extras = every feat_* channel the scene carries (Phase 2a writes
+    them). xyz is origin-offset (per-scene floor-min) before the float32 cast
+    so projected (UTM) coords keep sub-meter precision."""
     import numpy as np
     z = np.load(npz_path)
     xyz = (z["xyz"] - np.floor(z["xyz"].min(0))).astype(np.float32)
@@ -598,7 +609,8 @@ def kp_load_canonical(npz_path):
     ret_num = np.zeros(len(xyz), np.float32)
     lab = z["label"].astype(np.int32) if "label" in z.files \
         else np.full(len(xyz), -1, np.int32)
-    return xyz, intensity, ret_num, lab
+    extras = {k: z[k].astype(np.float32) for k in z.files if k.startswith("feat_")}
+    return xyz, intensity, ret_num, lab, extras
 
 
 def kp_grid_subsample(xyz, attrs, lab, voxel, num_classes):
@@ -643,13 +655,14 @@ def kp_augment(xyz, scale_min=0.9, scale_max=1.1, sym_x=True, noise=0.05):
 
 def kp_tile_and_save(name, pc_path, out_dir, chunk_xy, stride, grid, num_classes, hag_on):
     """One scene -> overlapping chunk_xy tiles, grid-subsampled and cached as
-    .npz (xyz + intensity + ret_num [+ hag] + lab). Returns the tile count, or
-    None when the scene failed to load (left unmarked so it retries)."""
+    .npz (xyz + intensity + ret_num [+ hag] [+ every feat_* the scene carries,
+    mean-pooled like the other attrs] + lab). Returns the tile count, or None
+    when the scene failed to load (left unmarked so it retries)."""
     import numpy as np
     os.makedirs(out_dir, exist_ok=True)
     t0 = time.time()
     try:                              # canonical .npz (label + optional hag embedded)
-        xyz, intensity, ret_num, lab = kp_load_canonical(pc_path)
+        xyz, intensity, ret_num, lab, extras = kp_load_canonical(pc_path)
         hag = None
         if hag_on:   # --hag: the scene's real per-point HAG (startup guard vouches for it)
             z = np.load(pc_path)
@@ -676,8 +689,11 @@ def kp_tile_and_save(name, pc_path, out_dir, chunk_xy, stride, grid, num_classes
             # tiles are sparse — a higher cut would delete them from training.
             if mask.sum() < 64:
                 continue
+            fnames = sorted(extras)          # deterministic cache column order
             attrs = np.stack([intensity_n[mask], ret_num[mask]]
-                             + ([hag[mask]] if hag_on else []), axis=1).astype(np.float32)
+                             + ([hag[mask]] if hag_on else [])
+                             + [extras[n][mask] for n in fnames],
+                             axis=1).astype(np.float32)
             sx, sa, sl = kp_grid_subsample(xyz[mask], attrs, lab[mask], grid, num_classes)
             if len(sx) < 32:
                 continue
@@ -688,6 +704,9 @@ def kp_tile_and_save(name, pc_path, out_dir, chunk_xy, stride, grid, num_classes
             )
             if hag_on:
                 tile["hag"] = sa[:, 2].astype(np.float32)
+            base = 2 + (1 if hag_on else 0)
+            for i, n in enumerate(fnames):
+                tile[n] = sa[:, base + i].astype(np.float32)
             tile["lab"] = sl.astype(np.int32)
             np.savez_compressed(
                 os.path.join(out_dir, f"{name}_x{int(x0)}_y{int(y0)}.npz"), **tile)
@@ -735,29 +754,42 @@ def kp_hag_of(z):
     return z["hag"].astype("float32")
 
 
-def kp_make_build_feat(logdk_feat, logdk_k):
-    """build_feat(xyz, intensity, ret_num, hag=None, drop=False) ->
-    [1, intensity, return_number, height] (+ log d_k when D3b is on).
+def kp_make_build_feat(logdk_feat, logdk_k,
+                       spec=("intensity", "return_number", "height")):
+    """build_feat(xyz, intensity, ret_num, hag=None, drop=False, extras=None)
+    -> [1, *spec] (+ log d_k when D3b is on). The constant-1 bias is ALWAYS
+    first and not part of the spec (default spec = the legacy
+    [intensity, return_number, height] recipe).
 
-    height is the passed per-point `hag` array (--hag: real HeightAboveGround);
-    when None this is the PLAIN recipe, whose 4th channel is z - min(z) over
-    the tile. With `drop`, zero the non-bias channels (feature-drop)."""
+    "height" is the passed per-point `hag` array (--hag: real
+    HeightAboveGround); when None this is the PLAIN recipe: z - min(z) over
+    the tile. `extras` feeds the feat_<name> dataset channels. With `drop`,
+    zero all but the first spec channel (feature-drop; legacy: keep
+    intensity)."""
     import numpy as np
     import density as dg
+    spec = list(spec)
 
-    def build_feat(xyz, intensity, ret_num, hag=None, drop=False):
+    def build_feat(xyz, intensity, ret_num, hag=None, drop=False, extras=None):
         bias = np.ones((len(xyz), 1), np.float32)
         if hag is None:
             hag = (xyz[:, 2] - xyz[:, 2].min()).astype(np.float32)   # native height
-        attrs = np.concatenate([intensity[:, None], ret_num[:, None],
-                                hag[:, None]], axis=1).astype(np.float32)
+        src = {"x": xyz[:, 0], "y": xyz[:, 1], "z": xyz[:, 2], "height": hag,
+               "intensity": intensity, "return_number": ret_num,
+               **(extras or {})}
+        missing = [n for n in spec if n not in src]
+        if missing:
+            raise ValueError(f"feature channel(s) {missing} not available "
+                             f"here; have {sorted(src)}")
+        attrs = np.stack([src[n] for n in spec], axis=1).astype(np.float32)
         if drop:
-            attrs[:, 1:] = 0.0   # keep intensity; drop ret_num/height
+            attrs[:, 1:] = 0.0   # feature-drop: keep the first spec channel only
         cols = [bias, attrs]
         if logdk_feat:           # D3b: never dropped — the density signal to condition on
             cols.append(dg.local_density_logdk(xyz, logdk_k)[:, None])
         return np.concatenate(cols, axis=1).astype(np.float32)
 
+    build_feat.spec = spec       # the KP helpers read which feat_* they must load
     return build_feat
 
 
@@ -774,12 +806,14 @@ def kp_make_sample_tile(build_feat, hag_on, grid, max_pts, aug_color,
         z = np.load(tile_path)
         xyz, intensity, ret_num, lab = z["xyz"], z["intensity"], z["ret_num"], z["lab"]
         hag = kp_hag_of(z) if hag_on else None
+        extras = feat_extras(z, build_feat.spec, os.path.basename(tile_path))
         if len(xyz) < min_pts:
             return None
         idx = np.arange(len(xyz))
         if len(idx) > max_pts:
             idx = np.random.choice(idx, max_pts, replace=False)
         xyz, intensity, ret_num, lab = xyz[idx], intensity[idx], ret_num[idx], lab[idx]
+        extras = {n: v[idx] for n, v in extras.items()}
         if hag_on:
             hag = hag[idx]
         # D1 density jitter: coarsen-only re-subsample; index-consistent across
@@ -789,10 +823,11 @@ def kp_make_sample_tile(build_feat, hag_on, grid, max_pts, aug_color,
             if g_eff > grid:
                 keep = dg.voxel_first_idx(xyz, g_eff)
                 xyz, intensity, ret_num, lab = xyz[keep], intensity[keep], ret_num[keep], lab[keep]
+                extras = {n: v[keep] for n, v in extras.items()}
                 if hag_on:
                     hag = hag[keep]
         drop = (training and np.random.rand() > aug_color)
-        feat = build_feat(xyz, intensity, ret_num, hag, drop=drop)
+        feat = build_feat(xyz, intensity, ret_num, hag, drop=drop, extras=extras)
         geo_xyz = kp_augment(xyz) if training else xyz
         geo_xyz = (geo_xyz - geo_xyz.mean(0)).astype(np.float32)
         return geo_xyz, feat, lab.astype(np.int64)
@@ -884,7 +919,9 @@ def kp_make_evaluate(forward, build_feat, hag_on, grid, chunk_xy, num_classes,
                     if len(xyz) < 32:
                         continue
                     feat = build_feat(xyz, z["intensity"], z["ret_num"],
-                                      kp_hag_of(z) if hag_on else None)
+                                      kp_hag_of(z) if hag_on else None,
+                                      extras=feat_extras(z, build_feat.spec,
+                                                         os.path.basename(tile)))
                     cxyz = (xyz - xyz.mean(0)).astype(np.float32)
                     try:
                         lg = forward(cxyz, feat)
@@ -911,7 +948,7 @@ def kp_make_evaluate(forward, build_feat, hag_on, grid, chunk_xy, num_classes,
                 pred_u = votes.argmax(1)
                 rep_xyz = P[first]                      # one representative coord per voxel
                 try:
-                    raw_xyz, _, _, raw_lab = kp_load_canonical(pc_path)
+                    raw_xyz, _, _, raw_lab, _ = kp_load_canonical(pc_path)
                 except Exception as ex:
                     print(f"  [{label}] skip {name}: raw reload failed: {ex}", flush=True)
                     n_skipped_scenes += 1
@@ -938,28 +975,38 @@ def kp_make_evaluate(forward, build_feat, hag_on, grid, chunk_xy, num_classes,
 
 
 def kp_make_predict_points(forward_prob, build_feat, grid, chunk_xy,
-                           num_classes, tta):
-    """Sliding-window inference over already-normalized features; returns
-    per-raw-point class indices (--mode infer). forward_prob(cxyz, feat) ->
-    (N, C) softmax ndarray; an exception skips the window. D5 density-TTA:
-    average softmax over `tta` extra density(scale) views."""
+                           num_classes, tta, save_probs=False):
+    """Sliding-window inference over already-normalized features (--mode infer);
+    returns (pred, confidence, probs) per raw point — confidence is the max of
+    the view-summed softmax normalized to sum 1 (0.0 where nothing was
+    predicted), probs the float16 normalized distribution when save_probs else
+    None. forward_prob(cxyz, feat) -> (N, C) softmax ndarray; an exception
+    skips the window. D5 density-TTA: average softmax over `tta` extra
+    density(scale) views."""
     import numpy as np
     import torch
     from scipy.spatial import cKDTree
 
-    def predict_points(xyz, intensity_n, ret_num, hag=None):
+    feat_names = [n for n in getattr(build_feat, "spec", []) if n.startswith("feat_")]
+
+    def predict_points(xyz, intensity_n, ret_num, hag=None, extras=None):
         pred = np.full(len(xyz), -1, np.int64)
+        conf = np.zeros(len(xyz), np.float32)
+        probs = np.zeros((len(xyz), num_classes), np.float16) if save_probs else None
         with torch.no_grad():
             for idx in xy_chunk_groups(xyz, chunk_xy, min_pts=64):
                 cols = [intensity_n[idx], ret_num[idx]]
                 if hag is not None:
                     cols.append(hag[idx])          # carry real HAG through the voxel mean
+                cols += [extras[n][idx] for n in feat_names]   # feat_* ride along too
                 attrs = np.stack(cols, axis=1).astype(np.float32)
                 sx, sa, _ = kp_grid_subsample(xyz[idx], attrs, None, grid, num_classes)
                 if len(sx) < 32:
                     continue
                 sub_hag = sa[:, 2] if hag is not None else None
-                feat = build_feat(sx, sa[:, 0], sa[:, 1], sub_hag)
+                base = 2 + (1 if hag is not None else 0)
+                sub_ex = {n: sa[:, base + i] for i, n in enumerate(feat_names)}
+                feat = build_feat(sx, sa[:, 0], sa[:, 1], sub_hag, extras=sub_ex)
                 base = (sx - sx.mean(0)).astype(np.float32)
                 views = [1.0] + (list(np.linspace(0.85, 1.2, tta)) if tta else [])
                 try:
@@ -967,16 +1014,21 @@ def kp_make_predict_points(forward_prob, build_feat, grid, chunk_xy,
                     for s in views:
                         p = forward_prob((base * s).astype(np.float32), feat)
                         prob = p if prob is None else prob + p
+                    # view sums exceed 1 — renormalize to a distribution
+                    prob /= np.maximum(prob.sum(-1, keepdims=True), 1e-12)
                     sub_pred = prob.argmax(-1)
                 except Exception:
                     continue
                 _, nn = cKDTree(sx).query(xyz[idx])
                 pred[idx] = sub_pred[nn]
+                conf[idx] = prob.max(-1)[nn]
+                if save_probs:
+                    probs[idx] = prob[nn].astype(np.float16)
         miss = pred < 0
         if miss.any() and (~miss).any():
             _, nn = cKDTree(xyz[~miss]).query(xyz[miss])
-            pred[miss] = pred[~miss][nn]
-        return np.clip(pred, 0, num_classes - 1)
+            pred[miss] = pred[~miss][nn]           # conf/probs stay 0: no votes
+        return np.clip(pred, 0, num_classes - 1), conf, probs
 
     return predict_points
 
@@ -988,6 +1040,8 @@ def kp_make_target_batches(scenes, make_batch, build_feat, hag_on, grid,
     model batch; an exception skips the window."""
     import numpy as np
 
+    feat_names = [n for n in getattr(build_feat, "spec", []) if n.startswith("feat_")]
+
     def target_batches():
         seen = 0
         for pc_path in scenes:
@@ -997,16 +1051,21 @@ def kp_make_target_batches(scenes, make_batch, build_feat, hag_on, grid,
             txyz = z["xyz"].astype(np.float32)
             tin, trn = scene_arrays(z, len(txyz))
             thag = scene_hag(z, pc_path, len(txyz), hag_on)
+            tex = feat_extras(z, feat_names, os.path.basename(pc_path))
             for idx in xy_chunk_groups(txyz, chunk_xy, min_pts=64):
                 if seen >= cap:
                     return
-                cols = [tin[idx], trn[idx]] + ([thag[idx]] if hag_on else [])
+                cols = ([tin[idx], trn[idx]] + ([thag[idx]] if hag_on else [])
+                        + [tex[n][idx] for n in feat_names])
                 attrs = np.stack(cols, 1).astype(np.float32)
                 sx, sa, _ = kp_grid_subsample(txyz[idx], attrs, None, grid, num_classes)
                 if len(sx) < 32:
                     continue
                 # BN stats must see the same feature predict will be fed.
-                feat = build_feat(sx, sa[:, 0], sa[:, 1], sa[:, 2] if hag_on else None)
+                base = 2 + (1 if hag_on else 0)
+                sub_ex = {n: sa[:, base + i] for i, n in enumerate(feat_names)}
+                feat = build_feat(sx, sa[:, 0], sa[:, 1],
+                                  sa[:, 2] if hag_on else None, extras=sub_ex)
                 cxyz = (sx - sx.mean(0)).astype(np.float32)
                 try:
                     b = make_batch(cxyz, feat)
@@ -1023,6 +1082,58 @@ def kp_make_target_batches(scenes, make_batch, build_feat, hag_on, grid,
 # shells (this file is baked into every image as /root/train_common.py).
 # ============================================================================
 
+# Input-feature spec vocabulary (FEAT_CHANNELS env / run.json "features").
+# Widths: rgb = 3, everything else 1 (PTv3 additionally expands a
+# single-channel color entry to 3 — its arch rule). `hag` and `logdk` are NOT
+# spec names: they stay driven by --hag / DG_LOGDK_FEAT and append after the
+# spec channels.
+FEAT_VOCAB = ("x", "y", "z", "height", "intensity", "return_number", "rgb")
+
+
+def parse_feat_spec(env_value, legacy_default):
+    """FEAT_CHANNELS csv ("a,b,c") -> ordered channel-name list. Empty/unset ->
+    the trainer's exact legacy default. Valid names: FEAT_VOCAB or feat_<name>
+    (a dataset feature channel stored under that npz key)."""
+    import re
+    names = [s.strip() for s in (env_value or "").split(",") if s.strip()]
+    if not names:
+        return list(legacy_default)
+    bad = [n for n in names if n not in FEAT_VOCAB
+           and not re.fullmatch(r"feat_[A-Za-z0-9_]+", n)]
+    if bad:
+        raise ValueError(
+            f"unknown FEAT_CHANNELS name(s) {bad}: valid names are "
+            f"{list(FEAT_VOCAB)} or feat_<name> dataset channels")
+    return names
+
+
+def feat_spec_tag(spec, legacy):
+    """Short PREP_DIR suffix for a non-default feature spec, so custom-spec
+    prep caches never collide with (or invalidate) the legacy ones. "" when
+    the spec IS the legacy default — every existing cache path stays valid."""
+    import hashlib
+    if list(spec) == list(legacy):
+        return ""
+    return "_f" + hashlib.sha1(",".join(spec).encode()).hexdigest()[:6]
+
+
+def feat_extras(z, spec, where):
+    """The feat_* arrays `spec` needs from an npz (tile or scene). A missing
+    key is a clear error naming the channel and what IS available."""
+    import numpy as np
+    out = {}
+    for n in spec:
+        if not n.startswith("feat_"):
+            continue
+        if n not in z.files:
+            avail = [k for k in z.files if k.startswith("feat_")]
+            raise ValueError(
+                f"{where} has no '{n}' channel (available feat_*: "
+                f"{avail or 'none'}). Rebuild the dataset/prep cache with this "
+                f"feature or drop it from FEAT_CHANNELS.")
+        out[n] = z[n].astype(np.float32)
+    return out
+
 # One central table: trainer global name -> (env var, density.env_* parser).
 # Trainers opt in by name via env_overrides(); unknown names fail loudly.
 _ENV_KNOBS = {
@@ -1034,6 +1145,7 @@ _ENV_KNOBS = {
     "DG_INFER_ADABN":   ("DG_INFER_ADABN",       "env_bool"),
     "DG_INFER_TTA":     ("DG_INFER_TTA",         "env_int"),
     "EVAL_VOTES":       ("EVAL_VOTES",           "env_int"),
+    "VAL_EVERY":        ("VAL_EVERY",            "env_int"),
     "USE_FOCAL":        ("LOSS_FOCAL",           "env_bool"),
     "FOCAL_GAMMA":      ("LOSS_FOCAL_GAMMA",     "env_float"),
     "CLASS_WEIGHTING":  ("LOSS_CLASS_WEIGHTING", "env_bool"),
@@ -1042,6 +1154,7 @@ _ENV_KNOBS = {
     "RARE_CENTER_PROB": ("RARE_CENTER_PROB",     "env_float"),
     "KP_AGGREGATION":   ("KP_AGGREGATION",       "env_str"),
     "KP_NORM":          ("KP_NORM",              "env_str"),
+    "FEAT_CHANNELS":    ("FEAT_CHANNELS",        "env_str"),
 }
 
 
@@ -1265,12 +1378,35 @@ def _demo():  # ponytail: one runnable check -- `python train_common.py`
     assert len(sx) == 2 and abs(sa[0, 0] - 0.5) < 1e-6 and list(sl) == [1, 0]
     assert kp_augment(sx).shape == sx.shape
 
+    # feature spec: empty -> legacy default; names validated against the vocab
+    assert parse_feat_spec("", ["intensity", "return_number", "height"]) \
+        == ["intensity", "return_number", "height"]
+    assert parse_feat_spec(" intensity , feat_ndvi ", []) == ["intensity", "feat_ndvi"]
+    try:
+        parse_feat_spec("bogus", [])
+        raise AssertionError("unknown spec name must raise")
+    except ValueError as e:
+        assert "bogus" in str(e) and "intensity" in str(e)   # lists the vocabulary
+
     bf = kp_make_build_feat(False, 8)
     xyz10 = np.random.RandomState(0).rand(10, 3).astype(np.float32)
     f = bf(xyz10, np.ones(10, np.float32), np.zeros(10, np.float32))
     assert f.shape == (10, 4) and np.all(f[:, 0] == 1.0)
     assert np.all(bf(xyz10, np.ones(10, np.float32), np.ones(10, np.float32),
                      drop=True)[:, 2:] == 0.0)          # drop keeps bias+intensity
+    # spec-ordered assembly (bias always first, not in the spec)
+    bfs = kp_make_build_feat(False, 8, spec=["height", "intensity", "feat_q"])
+    fq = np.arange(10, dtype=np.float32)
+    fs = bfs(xyz10, np.full(10, 0.5, np.float32), np.zeros(10, np.float32),
+             extras={"feat_q": fq})
+    assert fs.shape == (10, 4) and np.all(fs[:, 0] == 1.0)
+    assert np.allclose(fs[:, 1], xyz10[:, 2] - xyz10[:, 2].min())   # native height
+    assert np.all(fs[:, 2] == 0.5) and np.array_equal(fs[:, 3], fq)
+    try:
+        bfs(xyz10, fq, fq)                              # spec wants feat_q -> must raise
+        raise AssertionError("missing extras must raise")
+    except ValueError as e:
+        assert "feat_q" in str(e)
 
     # end-to-end prep -> sample -> voted eval on a synthetic canonical dataset
     ds = tempfile.mkdtemp()
@@ -1280,6 +1416,7 @@ def _demo():  # ponytail: one runnable check -- `python train_common.py`
         np.savez(f"{ds}/{split}/s0.npz",
                  xyz=rng.uniform(0, 60, (4000, 3)).astype(np.float32),
                  intensity=rng.rand(4000).astype(np.float32),
+                 feat_demo=np.full(4000, 0.25, np.float32),
                  label=rng.randint(0, 3, 4000).astype(np.int32))
     prep = os.path.join(ds, "prep")
     sig = {"pipeline": "demo", "grid": 2.0}
@@ -1304,6 +1441,20 @@ def _demo():  # ponytail: one runnable check -- `python train_common.py`
     s = st(train_tiles[0], training=False)
     assert s and s[0].shape == (len(s[2]), 3) and s[1].shape[1] == 4
     assert abs(s[0].mean()) < 1e-3                      # centered
+    # feat_* channels ride the tile cache (mean-pooled) and land where the
+    # spec puts them; requesting an absent one is a clear error naming it.
+    zt = np.load(train_tiles[0])
+    assert "feat_demo" in zt.files and np.allclose(zt["feat_demo"], 0.25)
+    st3 = kp_make_sample_tile(kp_make_build_feat(False, 8,
+                                                 spec=["intensity", "feat_demo"]),
+                              False, 2.0, 500, 1.0, False, 2.5, 0.5)
+    s3 = st3(train_tiles[0], training=False)
+    assert s3[1].shape[1] == 3 and np.allclose(s3[1][:, 2], 0.25)
+    try:
+        feat_extras(zt, ["feat_nope"], "t0")
+        raise AssertionError("absent feat_* must raise")
+    except ValueError as e:
+        assert "feat_nope" in str(e) and "feat_demo" in str(e)
 
     fwd = lambda cxyz, feat: np.tile([5.0, 0.0, 0.0], (len(cxyz), 1)).astype(np.float32)
     ev = kp_make_evaluate(fwd, bf, False, 2.0, 30.0, 3, ["a", "b", "c"])
@@ -1313,10 +1464,12 @@ def _demo():  # ponytail: one runnable check -- `python train_common.py`
                / sum(m_kp["per_class_gt_count"].values())) < 0.02   # all-a predictions
     pp = kp_make_predict_points(
         lambda cxyz, feat: np.tile([1.0, 0.0, 0.0], (len(cxyz), 1)).astype(np.float32),
-        bf, 2.0, 30.0, 3, 0)
+        bf, 2.0, 30.0, 3, 0, save_probs=True)
     z0 = np.load(f"{ds}/val/s0.npz")
-    pr = pp(z0["xyz"], z0["intensity"], np.zeros(4000, np.float32))
+    pr, cf, pb = pp(z0["xyz"], z0["intensity"], np.zeros(4000, np.float32))
     assert pr.shape == (4000,) and set(pr.tolist()) == {0}
+    assert cf.shape == (4000,) and cf.dtype == np.float32 and cf.max() <= 1.0 + 1e-6
+    assert pb.shape == (4000, 3) and pb.dtype == np.float16
 
     # scene_arrays fallbacks + scene_hag gate + the infer scene loop
     zi, zr = scene_arrays({"files": []} and np.load(f"{ds}/val/s0.npz"), 4000)
@@ -1333,11 +1486,14 @@ def _demo():  # ponytail: one runnable check -- `python train_common.py`
     ij = tempfile.mkdtemp()
     os.makedirs(f"{ij}/predictions")
     run_infer_scenes([f"{ds}/val/s0.npz"],
-                     lambda p: (z0["xyz"], pr, z0["intensity"]),
+                     lambda p: (z0["xyz"], pr, z0["intensity"], cf, pb),
                      f"{ij}/predictions", ij, {"backbone": "demo"}, cls_txt=True)
     assert (os.path.exists(f"{ij}/predictions/s0_pred.npz")
             and os.path.exists(f"{ij}/predictions/s0_pred_CLS.txt")
             and json.load(open(f"{ij}/infer_run.json"))["total_points"] == 4000)
+    zp = np.load(f"{ij}/predictions/s0_pred.npz")
+    assert (zp["confidence"].dtype == np.float32
+            and zp["probs"].dtype == np.float16 and zp["probs"].shape == (4000, 3))
 
     # env_overrides: env wins over the module default, order preserved
     os.environ["LOSS_FOCAL_GAMMA"] = "3.5"

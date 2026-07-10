@@ -14,14 +14,34 @@ import os
 from pathlib import Path
 
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog, QDoubleSpinBox,
-                               QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QHeaderView,
-                               QLabel, QLineEdit, QPlainTextEdit, QPushButton, QSpinBox,
+                               QFormLayout, QGroupBox, QHBoxLayout, QHeaderView,
+                               QLabel, QLineEdit, QListWidget, QListWidgetItem,
+                               QPlainTextEdit, QPushButton, QSpinBox,
                                QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
 from .. import analysis, appstate, local_cli, modal_cli, theme, ui
 from ..backbones import BACKBONES, GPU_CHOICES
 from ..jobs import FuncWorker, JobRunner, LogParser
+
+# Input-feature picker: the arch-appropriate standard channel names per base
+# backbone (offered in the list) and each trainer's exact legacy default
+# (pre-checked). Mirrors the local_train_* scripts' FEAT_LEGACY lists; the
+# PTv3 default color entry follows the dataset (intensity-first), see
+# _rebuild_feat_list. Dataset feat_* channels are appended unchecked.
+_FEAT_STANDARD = {
+    "randlanet":    ["x", "y", "z", "intensity", "return_number"],
+    "kpconvx_cold": ["intensity", "return_number", "height", "x", "y", "z"],
+    "kpconv":       ["intensity", "return_number", "height", "x", "y", "z"],
+    "ptv3":         ["x", "y", "z", "intensity", "rgb"],
+}
+_FEAT_DEFAULTS = {
+    "randlanet":    ["x", "y", "z", "intensity", "return_number"],
+    "kpconvx_cold": ["intensity", "return_number", "height"],
+    "kpconv":       ["intensity", "return_number", "height"],
+    "ptv3":         ["x", "y", "z", "intensity"],   # color slot swapped per dataset
+}
 
 
 class TrainPage(QWidget):
@@ -87,22 +107,21 @@ class TrainPage(QWidget):
                                   "model's recommendation when you switch models.")
         form.addRow("GPU (Modal)", self.gpu_combo)
         self.backbone_combo.currentIndexChanged.connect(self._sync_gpu_default)
-        # Base folder for output; a run lands at <base>/<dataset>/runs/<id> on the host.
-        self.out_edit = QLineEdit()
-        self.out_edit.setText(appstate.get("local_train_out") or str(appstate.workspace_dir()))
-        self.out_edit.setPlaceholderText("default: workspace folder")
-        self.out_edit.setToolTip("Base folder for training output. Each run is written "
-                                 "to <this>/<dataset>/runs/<id>.")
-        out_row = QHBoxLayout()
-        out_row.addWidget(self.out_edit)
-        out_btn = QPushButton("Browse…")
-        out_btn.clicked.connect(self._pick_out)
-        out_row.addWidget(out_btn)
-        self.out_row_w = ui.wrap(out_row)
-        form.addRow("Output folder", self.out_row_w)
 
         self.params_box = QGroupBox("Parameters (pre-filled)")
         self.params_form = QFormLayout(self.params_box)
+        # Validation cadence (VAL_EVERY env; trainer default 10 emits nothing).
+        self.val_every = QSpinBox()
+        self.val_every.setRange(1, 100)
+        self.val_every.setValue(10)
+        self.val_every.setToolTip(
+            "Run the held-out validation pass every N epochs. Lower N = slower "
+            "training but finer best-checkpoint selection (the best model is "
+            "picked among validated epochs only); higher N = faster, coarser.")
+        val_row = QHBoxLayout()
+        val_row.addWidget(QLabel("Validate every N epochs"))
+        val_row.addWidget(self.val_every)
+        val_row.addStretch(1)
         self.warn_label = QLabel("")
         self.warn_label.setWordWrap(True)
         theme.set_accent(self.warn_label, "warn")
@@ -120,9 +139,11 @@ class TrainPage(QWidget):
         config_col = QVBoxLayout()
         config_col.addWidget(form_box)
         config_col.addWidget(self.params_box)
+        config_col.addLayout(val_row)
         # TODO(not ready): train-time DG UI disabled pending review; no DG env is
         # sent. analysis.dg_recommend/dg_config_to_env remain the backend hooks.
         config_col.addWidget(self._loss_box())
+        config_col.addWidget(self._features_box())
         config_col.addWidget(self.warn_label)
         config_col.addLayout(run_row)
         config_col.addStretch()
@@ -153,6 +174,7 @@ class TrainPage(QWidget):
         self.pull_runner.failed.connect(self._on_pull_failed)
         self.status_worker.done.connect(self._apply_statuses)
         self.parser.epoch.connect(self._on_epoch)
+        self.parser.val_metrics.connect(self._on_val)
         self.parser.run_id.connect(self._on_run_id)
         self.modal_worker.done.connect(self._on_modal_preflight)
         self.modal_worker.error.connect(self._on_modal_preflight_error)
@@ -171,7 +193,6 @@ class TrainPage(QWidget):
                "Runs on a Modal cloud GPU — upload the dataset from the Datasets page "
                "first; the finished run lands on the model's outputs volume."))
         self.cfg_btn.setVisible(local)                      # docker image mgmt
-        self.form.setRowVisible(self.out_row_w, local)      # host output folder
         self.form.setRowVisible(self.gpu_combo, not local)  # cloud GPU pick
         self.form.setRowVisible(self.detach_chk, not local) # parallel cloud launches
         self.reload_datasets()
@@ -346,13 +367,6 @@ class TrainPage(QWidget):
         theme.set_accent(self.ds_status, role)
         self.ds_status.setText(text)
 
-    def _pick_out(self):
-        d = QFileDialog.getExistingDirectory(
-            self, "Base output folder for runs",
-            self.out_edit.text() or str(appstate.workspace_dir()))
-        if d:
-            self.out_edit.setText(d)
-
     def _apply_smoke(self):
         """Lock epochs=2, steps=50 while the smoke box is checked."""
         on = self.smoke_chk.isChecked()
@@ -388,6 +402,7 @@ class TrainPage(QWidget):
         b = self._backbone()
         if b is None:
             self.warn_label.setText("")
+            self._rebuild_feat_list()
             self._update_cfg_dialog()
             return
         recs = (self._meta or {}).get("recommendations", {}).get(b.key, {})
@@ -412,6 +427,7 @@ class TrainPage(QWidget):
         else:
             self.warn_label.setText("")
         self._apply_smoke()          # re-lock epochs/steps for smoke runs
+        self._rebuild_feat_list()    # feature picker follows model + dataset
         self._update_cfg_dialog()    # sync popup with model
 
     # ------------------------------------------- loss / class balance (per run)
@@ -437,11 +453,17 @@ class TrainPage(QWidget):
 
         self.loss_focal = QCheckBox("Use focal loss instead of weighted cross-entropy")
         self.loss_focal.setToolTip("Down-weights easy points to focus on hard/rare ones. "
-                                   "Off by default (weighted CE + Lovász).")
+                                   "Off by default (weighted CE + Lovász).\n"
+                                   "↑ (on): focuses training on hard/rare points; can "
+                                   "starve easy classes. Off = weighted CE + Lovász "
+                                   "(default).")
         self.loss_gamma = QDoubleSpinBox()
         self.loss_gamma.setRange(0.0, 5.0)
         self.loss_gamma.setSingleStep(0.5)
         self.loss_gamma.setValue(2.0)
+        self.loss_gamma.setToolTip("↑ γ = harder focus on misclassified points, risk of "
+                                   "instability; ↓ γ = closer to plain CE. 2.0 is the "
+                                   "standard default.")
         self.loss_gamma.setEnabled(False)
         self.loss_focal.toggled.connect(self.loss_gamma.setEnabled)
         r1 = QHBoxLayout()
@@ -453,12 +475,17 @@ class TrainPage(QWidget):
 
         self.loss_cw = QCheckBox("Weight classes by inverse frequency")
         self.loss_cw.setChecked(True)
+        self.loss_cw.setToolTip("On = rare classes count more in the loss; off = every "
+                                "point equal (majority classes dominate).")
         self.loss_beta = QDoubleSpinBox()
         self.loss_beta.setRange(0.0, 1.0)
         self.loss_beta.setSingleStep(0.05)
         self.loss_beta.setValue(0.5)
         self.loss_beta.setToolTip("0 = none, 0.5 = inverse-sqrt (default), "
-                                  "1 = full inverse-frequency (most aggressive).")
+                                  "1 = full inverse-frequency (most aggressive).\n"
+                                  "↑ β = stronger boost for rare classes (risk: noisy "
+                                  "rare labels get amplified); ↓ β = closer to "
+                                  "unweighted.")
         self.loss_cw.toggled.connect(self.loss_beta.setEnabled)
         r2 = QHBoxLayout()
         r2.addWidget(self.loss_cw)
@@ -469,6 +496,8 @@ class TrainPage(QWidget):
 
         self.loss_rare = QCheckBox("Oversample rare-class tiles (auto-detected)")
         self.loss_rare.setChecked(True)
+        self.loss_rare.setToolTip("On = tiles containing rare classes are drawn more "
+                                  "often; off = uniform tile sampling.")
         lay.addWidget(self.loss_rare)
         return box
 
@@ -480,6 +509,77 @@ class TrainPage(QWidget):
                 "class_weighting": self.loss_cw.isChecked(),
                 "weight_beta": round(self.loss_beta.value(), 2),
                 "rare_oversample": self.loss_rare.isChecked()}
+
+    # -------------------------------------------- input features (per run)
+    def _features_box(self) -> QGroupBox:
+        box = QGroupBox("Input features (advanced)")
+        box.setCheckable(True)
+        box.setChecked(False)
+        outer = QVBoxLayout(box)
+        inner = QWidget()
+        lay = QVBoxLayout(inner)
+        lay.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(inner)
+        box.toggled.connect(inner.setVisible)
+        inner.setVisible(False)
+        self.feat_box = box      # unchecked = off, use the trainer's legacy defaults
+
+        hint = QLabel("Check the channels the model eats, drag to reorder "
+                      "(top-to-bottom = channel order). Unchecked box = the "
+                      "model's built-in defaults. Sent as FEAT_CHANNELS; "
+                      "recorded in run.json.")
+        hint.setWordWrap(True)
+        theme.set_accent(hint, "muted")
+        lay.addWidget(hint)
+
+        self.feat_list = QListWidget()
+        self.feat_list.setDragDropMode(QAbstractItemView.InternalMove)
+        self.feat_list.setDefaultDropAction(Qt.MoveAction)
+        lay.addWidget(self.feat_list)
+        return box
+
+    def _rebuild_feat_list(self):
+        """Repopulate the checklist for the selected backbone + dataset: the
+        arch's standard names (legacy defaults pre-checked) plus the dataset's
+        meta feature_channels as feat_* entries (unchecked)."""
+        if not hasattr(self, "feat_list"):
+            return
+        self.feat_list.clear()
+        b = self._backbone()
+        if b is None:
+            return
+        base = b.key[:-4] if b.key.endswith("_hag") else b.key
+        std = _FEAT_STANDARD.get(base, [])
+        defaults = list(_FEAT_DEFAULTS.get(base, std))
+        meta = self._meta or {}
+        if base == "ptv3" and not meta.get("has_intensity", True) \
+                and meta.get("has_rgb"):
+            defaults = ["x", "y", "z", "rgb"]   # the trainer's rgb-dataset legacy
+        extra = ((meta.get("source") or {}).get("feature_channels")
+                 if isinstance(meta.get("source"), dict) else None) or []
+        names = std + [n if str(n).startswith("feat_") else f"feat_{n}"
+                       for n in extra]
+        for n in names:
+            it = QListWidgetItem(str(n))
+            it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
+            it.setCheckState(Qt.Checked if n in defaults else Qt.Unchecked)
+            self.feat_list.addItem(it)
+        tip = ("Channel spec for this run (FEAT_CHANNELS). feat_* entries are "
+               "the dataset's extra feature channels.")
+        if b.key.endswith("_hag"):
+            tip += ("\nHAG is not in this list: it rides separately via the "
+                    "_hag model choice and is appended after these channels.")
+        self.feat_box.setToolTip(tip)
+
+    def _feat_collect(self) -> str:
+        """Checked names in list order -> FEAT_CHANNELS csv; '' = don't emit
+        (group off, or nothing checked -> trainer legacy defaults)."""
+        if not self.feat_box.isChecked():
+            return ""
+        names = [self.feat_list.item(i).text()
+                 for i in range(self.feat_list.count())
+                 if self.feat_list.item(i).checkState() == Qt.Checked]
+        return ",".join(names)
 
     # ------------------------------------------------------------- launch
     def _launch(self):
@@ -508,7 +608,12 @@ class TrainPage(QWidget):
             flags["steps-per-epoch"] = 50
 
         loss_env = analysis.loss_config_to_env(self._loss_collect())
-        env = loss_env
+        env = dict(loss_env)
+        if self.val_every.value() != 10:   # default emits nothing (script default)
+            env["VAL_EVERY"] = str(self.val_every.value())
+        feat_csv = self._feat_collect()    # '' = no env (trainer legacy defaults)
+        if feat_csv:
+            env["FEAT_CHANNELS"] = feat_csv
         self.log.clear()
         self.metrics_table.setRowCount(0)
         self._last_run_id = None
@@ -516,6 +621,8 @@ class TrainPage(QWidget):
         if loss_env:
             self._append("[loss] overrides: "
                          + " ".join(f"{k}={v}" for k, v in sorted(loss_env.items())))
+        if feat_csv:
+            self._append(f"[features] FEAT_CHANNELS={feat_csv}")
         payload = {"backbone": b, "flags": flags, "dataset": name,
                    "env": env, "info": info}
         if appstate.get_exec_mode() == "local":
@@ -526,14 +633,12 @@ class TrainPage(QWidget):
     def _start_local_run(self, p):
         b, flags, name, info = p["backbone"], p["flags"], p["dataset"], p["info"]
         staged = info.get("staged_dir", "")
-        # Runs nest per dataset: bind <base>/<dataset> -> /outputs so the container's
-        # /outputs/runs/<id> lands at <base>/<dataset>/runs/<id>. Base defaults to the
-        # workspace (shown in the field), so for a workspace dataset that's
-        # <workspace>/<dataset>/runs, right beside its data.
-        base = self.out_edit.text().strip() or str(appstate.workspace_dir())
+        # Runs nest per dataset in the workspace: bind <workspace>/<dataset> ->
+        # /outputs so the container's /outputs/runs/<id> lands at
+        # <workspace>/<dataset>/runs/<id>, right beside the dataset's data.
+        base = str(appstate.workspace_dir())
         out_root = str(Path(base) / name)
         os.makedirs(out_root, exist_ok=True)
-        appstate.put("local_train_out", self.out_edit.text().strip())
         extra_mounts = []
         if not (staged and os.path.isdir(staged)):
             self._append(f"[local] ⚠ No staged copy of '{name}' - "
@@ -661,6 +766,20 @@ class TrainPage(QWidget):
                                    f"{m['acc']:.4f}", f"{m['miou']:.4f}")):
             item = QTableWidgetItem(val)
             item.setTextAlignment(Qt.AlignCenter)
+            self.metrics_table.setItem(r, col, item)
+        self.metrics_table.scrollToBottom()
+
+    def _on_val(self, m: dict):
+        """Grey starred row for a held-out val pass: no train loss, val acc/mIoU
+        (present-classes). Colored at insert time from the current theme."""
+        grey = QBrush(QColor(theme.colors(appstate.get("ui_theme", "system"))["muted"]))
+        r = self.metrics_table.rowCount()
+        self.metrics_table.insertRow(r)
+        for col, val in enumerate((f"{m['epoch']}★", "—",
+                                   f"{m['acc']:.4f}", f"{m['miou']:.4f}")):
+            item = QTableWidgetItem(val)
+            item.setTextAlignment(Qt.AlignCenter)
+            item.setForeground(grey)
             self.metrics_table.setItem(r, col, item)
         self.metrics_table.scrollToBottom()
 

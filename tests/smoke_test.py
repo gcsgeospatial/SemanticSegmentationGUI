@@ -5,7 +5,7 @@ Run:  python tests/smoke_test.py   (from the trainer_gui/ project dir)
 Covers: synthetic LAZ/PLY/ASCII scenes -> canonical conversion (field + companion
 label specs), npz contract, meta + recommendations, inference-job conversion
 (incl. opt-in HAG), density-generalization manifest round-trip, training-log
-parsing, viewer loading, Dockerfile generation, local Docker backend.
+parsing, ground-truth comparison stats, Dockerfile generation, local Docker backend.
 
 Every check here guards code the shipped app reaches. If a function's only caller
 is this file, delete the function — don't add a check for it.
@@ -47,7 +47,7 @@ def make_xyz(n=20_000, extent=100.0):
     return xyz
 
 
-def write_laz(path, xyz, labels, intensity):
+def write_laz(path, xyz, labels, intensity, extra=None):
     import laspy
     header = laspy.LasHeader(point_format=3, version="1.2")
     header.offsets = xyz.min(0)
@@ -59,6 +59,9 @@ def write_laz(path, xyz, labels, intensity):
     las.red = (RNG.uniform(0, 65535, len(xyz))).astype(np.uint16)
     las.green = (RNG.uniform(0, 65535, len(xyz))).astype(np.uint16)
     las.blue = (RNG.uniform(0, 65535, len(xyz))).astype(np.uint16)
+    for name, vals in (extra or {}).items():   # float Extra Bytes dims
+        las.add_extra_dim(laspy.ExtraBytesParams(name=name, type=np.float32))
+        las[name] = vals.astype(np.float32)
     las.write(str(path))
 
 
@@ -417,10 +420,68 @@ def main():
         np.savez(cdir / "with_i.npz", xyz=make_xyz(5),
                  intensity=np.linspace(0, 1, 5, dtype=np.float32))
         np.savez(cdir / "no_i.npz", xyz=make_xyz(5))
-        rep = "\n".join(_scene_channel_report(tmp / "chan_job", expect_hag=True))
+        rep_lines, rep_block = _scene_channel_report(tmp / "chan_job", expect_hag=True)
+        rep = "\n".join(rep_lines)
         check("infer: channel report flags missing intensity + hag by scene",
               "no_i" in rep and "with_i" not in rep.split("intensity channel in:")[1].split("\n")[0]
-              and "hag missing" in rep)
+              and "hag missing" in rep and rep_block is False)
+
+        # ---------------- feature channels (Phase 2): user-picked extra dims ride
+        # as feat_<name> npz keys, meta records the raw-field mapping, inference
+        # bakes them, and the channel report BLOCKS scenes missing a required one.
+        feat_root = tmp / "feat_src"
+        for split, k in (("train", 2), ("val", 1)):
+            d = feat_root / split
+            d.mkdir(parents=True)
+            for i in range(k):
+                xyz = make_xyz(4_000)
+                labels = RNG.choice([0, 2, 5, 6], len(xyz))
+                write_laz(d / f"f{i}.laz", xyz, labels, RNG.uniform(0, 4000, len(xyz)),
+                          extra={"eig_lin": RNG.uniform(0, 1, len(xyz))})
+        staged_ft = dataset.convert_dataset("feat_demo", str(feat_root / "train"), spec,
+                                            classes, [0], tmp / "staging",
+                                            val_inputs=[str(feat_root / "val")],
+                                            feature_fields=["eig_lin"])
+        zft = np.load(sorted((staged_ft / "train").glob("*.npz"))[0])
+        check("feat: staged npz carries feat_eig_lin f32 within [-2,2]",
+              "feat_eig_lin" in zft.files and zft["feat_eig_lin"].dtype == np.float32
+              and zft["feat_eig_lin"].min() >= -2.0 and zft["feat_eig_lin"].max() <= 2.0)
+        mft = json.loads((staged_ft / "dataset_meta.json").read_text())
+        check("feat: meta source.feature_channels records name + source_field + norm",
+              mft["source"]["feature_channels"]
+              == [{"name": "eig_lin", "source_field": "eig_lin", "norm": "p95abs"}])
+        job_ft = dataset.convert_infer_job("feat_job", str(feat_root / "val"),
+                                           tmp / "staging", feature_fields=["eig_lin"])
+        zjf = np.load(next((job_ft / "scenes").glob("*.npz")))
+        check("feat: convert_infer_job bakes feat_eig_lin, still no label key",
+              "feat_eig_lin" in zjf.files and "label" not in zjf.files)
+        try:
+            dataset.convert_infer_job("feat_missing", str(laz_root / "val"),
+                                      tmp / "staging", feature_fields=["eig_lin"])
+            feat_raised = False
+        except ValueError:
+            feat_raised = True
+        check("feat: requesting a source field the inputs lack raises ValueError",
+              feat_raised)
+        FSPEC = ["x", "y", "z", "intensity", "feat_eig_lin"]
+        ok_lines, ok_block = _scene_channel_report(job_ft, features=FSPEC)
+        check("feat: channel report passes scenes carrying the required channel",
+              ok_block is False and not any("missing" in s and "feat_eig_lin" in s
+                                            for s in ok_lines))
+        bad_lines, bad_block = _scene_channel_report(tmp / "chan_job", features=FSPEC)
+        check("feat: channel report blocks + names scenes missing feat_eig_lin",
+              bad_block is True
+              and any("feat_eig_lin" in s and "no_i" in s and "with_i" in s
+                      for s in bad_lines))
+        check("feat: parse_feat_spec resolves an ordered csv spec",
+              train_common.parse_feat_spec("intensity,feat_eig_lin", [])
+              == ["intensity", "feat_eig_lin"])
+        try:
+            train_common.parse_feat_spec("bogus", [])
+            pfs_raised = False
+        except ValueError:
+            pfs_raised = True
+        check("feat: parse_feat_spec raises on an unknown channel name", pfs_raised)
         check("infer: _entry_name reads path/Filename/name across CLI shapes",
               _entry_name({"path": "/ds/dataset_meta.json"}) == "dataset_meta.json"
               and _entry_name({"Filename": "train/"}) == "train"
@@ -437,7 +498,8 @@ def main():
         # ---------------- prediction export (Inference page format picker)
         # The scripts' *_pred.npz (xyz + class, straight from inference) -> chosen
         # format carrying xyz + classification; the inferred data is transformed
-        # directly into the target type (no coloured PLY); the source npz is consumed.
+        # directly into the target type (no coloured PLY); the source npz is KEPT
+        # (raw indices + confidence) so a new threshold re-exports without inference.
         exd = tmp / "pred_export"
         exd.mkdir()
         ex_cls = np.array([0, 1, 2, 3, 4, 2, 0], np.int64)
@@ -452,23 +514,122 @@ def main():
         import laspy
         _mk_pred()
         las_out = dataset.export_predictions(exd, "las")[0]
-        check("export: las carries the inferred classes, source npz consumed",
+        check("export: las carries the inferred classes, source npz kept for re-export",
               las_out.suffix == ".las"
               and list(laspy.read(str(las_out)).classification) == list(ex_cls)
-              and not (exd / "sceneX_pred.npz").exists())
-        _mk_pred()
+              and (exd / "sceneX_pred.npz").exists())
         csv_out = dataset.export_predictions(exd, "csv")[0]
         rows = np.genfromtxt(csv_out, delimiter=",", names=True)
         check("export: csv has an x,y,z,classification header + the classes",
               set(rows.dtype.names) == {"x", "y", "z", "classification"}
               and list(rows["classification"].astype(int)) == list(ex_cls))
-        _mk_pred()
         from plyfile import PlyData
         ply_out = dataset.export_predictions(exd, "ply")[0]
         pv = PlyData.read(str(ply_out))["vertex"]
         check("export: ply carries only xyz + a classification column",
               {p.name for p in pv.properties} == {"x", "y", "z", "classification"}
               and list(np.asarray(pv["classification"]).astype(int)) == list(ex_cls))
+        (exd / "sceneX_pred.npz").unlink()
+
+        # write_pred (Phase 0): confidence + probs ride in the npz with the
+        # dtype/shape contract the export threshold below depends on.
+        train_common.write_pred(exd / "sceneC_pred.npz", ex_xyz, ex_cls,
+                                confidence=np.linspace(0.1, 1.0, 7, dtype=np.float32),
+                                probs=RNG.random((7, 5)).astype(np.float16))
+        with np.load(exd / "sceneC_pred.npz") as zc:
+            check("export: write_pred carries confidence f32 (N,) + probs f16 (N,C)",
+                  zc["confidence"].dtype == np.float32 and zc["confidence"].shape == (7,)
+                  and zc["probs"].dtype == np.float16 and zc["probs"].shape == (7, 5))
+        (exd / "sceneC_pred.npz").unlink()
+
+        # confidence threshold + class remap at export: model indices map to the
+        # dataset's source values; points under the cut become ASPRS class 1
+        # (Unclassified); confidence rides into the LAS as an Extra Bytes dim.
+        from trainer_gui import readers
+        np.savez(exd / "sceneT_pred.npz", xyz=make_xyz(3).astype(np.float32),
+                 classification=np.array([0, 1, 2], np.int32),
+                 confidence=np.array([0.9, 0.3, 0.8], np.float32))
+        thr_out = dataset.export_predictions(exd, "las", class_map={0: 10, 1: 11, 2: 12},
+                                             unclass_threshold=0.5)[0]
+        tcloud = readers.read_points(thr_out)
+        check("export: remap + threshold -> low-confidence point exports as class 1",
+              list(tcloud.fields["classification"].astype(int)) == [10, 1, 12])
+        check("export: confidence survives the LAS round-trip (extra-bytes dim)",
+              np.allclose(tcloud.fields["confidence"], [0.9, 0.3, 0.8], atol=1e-6))
+        thr0_out = dataset.export_predictions(exd, "las", class_map={0: 10, 1: 11, 2: 12},
+                                              unclass_threshold=0.0)[0]
+        c0 = readers.read_points(thr0_out).fields["classification"].astype(int)
+        check("export: re-export of the kept npz at threshold 0.0 marks nothing",
+              list(c0) == [10, 11, 12])
+
+        # ---------------- ensemble vote (Phase 3): soft vote over saved probs,
+        # class clamp, confidence-weighted fallback, agreement. Drives the
+        # functions the GUI's ensemble mode calls; the Qt member loop itself is
+        # GUI-side and not smoke-testable.
+        import ensemble_vote as evote
+        _q = lambda s: None   # quiet log for the ensemble() calls
+
+        # soft vote overturns a 2-1 hard majority when the majority is unsure
+        sv_lab, sv_conf = evote.soft_vote(np.array(
+            [[[0.9, 0.1]], [[0.45, 0.55]], [[0.45, 0.55]]], np.float32))
+        hv_lab, _ = evote.weighted_vote(np.array([[0], [1], [1]]),
+                                        np.ones((3, 1), np.float32))
+        check("ensemble: soft vote overturns the 2-1 hard majority via confidence",
+              hv_lab.tolist() == [1] and sv_lab.tolist() == [0]
+              and abs(float(sv_conf[0]) - 0.6) < 1e-6)
+        wv_lab, wv_conf = evote.weighted_vote(
+            np.array([[0, 0], [1, 0], [1, 0]]),
+            np.array([[0.9, 1.0], [0.2, 1.0], [0.2, 1.0]], np.float32))
+        check("ensemble: weighted-hard vote flips on confidence; conf = winning share",
+              wv_lab.tolist() == [0, 0] and abs(float(wv_conf[0]) - 0.9 / 1.3) < 1e-6
+              and float(wv_conf[1]) == 1.0)
+
+        # synthetic 3-model trio end-to-end: infer_run.json clamp + npz payload
+        ens = tmp / "ens"
+        ex3 = make_xyz(3).astype(np.float32)
+        EP = [np.array([[0.9, 0.1], [0.6, 0.4], [0.2, 0.8]], np.float32),
+              np.array([[0.45, 0.55], [0.7, 0.3], [0.3, 0.7]], np.float32),
+              np.array([[0.45, 0.55], [0.8, 0.2], [0.4, 0.6]], np.float32)]
+        for k, p in enumerate(EP):
+            d = ens / f"m{k}"
+            d.mkdir(parents=True)
+            np.savez(d / "s_pred.npz", xyz=ex3,
+                     classification=p.argmax(1).astype(np.int32),
+                     confidence=p.max(1), probs=p.astype(np.float16))
+            (d / "infer_run.json").write_text(json.dumps(
+                {"num_classes": 2, "class_names": ["a", "b"], "backbone": f"m{k}"}),
+                encoding="utf-8")
+        edirs = [str(ens / f"m{k}") for k in range(3)]
+        evote.ensemble(edirs, str(ens / "out"), log=_q)
+        with np.load(ens / "out" / "s_pred.npz") as ez:
+            check("ensemble: output npz carries confidence f32 + agreement f32",
+                  ez["confidence"].dtype == np.float32
+                  and ez["agreement"].dtype == np.float32)
+            check("ensemble: 3-model soft vote — labels, confidence, agreement exact",
+                  ez["classification"].tolist() == [0, 0, 1]
+                  and np.allclose(ez["confidence"], [0.6, 0.7, 0.7], atol=2e-3)
+                  and np.allclose(ez["agreement"], [1 / 3, 1.0, 1.0]))
+        # clamp: mismatched class_names across infer_run.json refuse loudly
+        (ens / "m1" / "infer_run.json").write_text(json.dumps(
+            {"num_classes": 2, "class_names": ["a", "c"]}), encoding="utf-8")
+        try:
+            evote.ensemble(edirs, str(ens / "out2"), log=_q)
+            clamp_raised = False
+        except ValueError:
+            clamp_raised = True
+        check("ensemble: class clamp refuses mismatched class_names", clamp_raised)
+        (ens / "m1" / "infer_run.json").write_text(json.dumps(
+            {"num_classes": 2, "class_names": ["a", "b"]}), encoding="utf-8")
+        # one member without probs -> confidence-weighted hard vote for the scene
+        with np.load(ens / "m2" / "s_pred.npz") as zslim:
+            slim = {k: zslim[k] for k in zslim.files if k != "probs"}
+        np.savez(ens / "m2" / "s_pred.npz", **slim)
+        evote.ensemble(edirs, str(ens / "out3"), log=_q)
+        with np.load(ens / "out3" / "s_pred.npz") as ez3:
+            # point 0: w(0)=0.9 vs w(1)=0.55+0.55 -> label 1, share 1.1/2.0
+            check("ensemble: probs missing anywhere -> weighted-hard fallback",
+                  ez3["classification"].tolist() == [1, 0, 1]
+                  and np.allclose(ez3["confidence"], [0.55, 1.0, 1.0], atol=1e-6))
 
         # ---------------- plots: read val curves, build figures, average runs
         from trainer_gui import plots
@@ -509,7 +670,7 @@ def main():
         staged_ih = dataset.convert_dataset(
             "laz_hag_inline", str(laz_root / "train"), spec, classes, [0], tmp / "staging",
             val_inputs=[str(laz_root / "val")], test_inputs=[str(laz_root / "test")],
-            compute_hag=True, ground_value=2, use_smrf=True, progress=print)
+            compute_hag=True, ground_value=2, progress=print)
         zih = np.load(staged_ih / "train" / "scene0.npz")
         check("convert_dataset(compute_hag): tiles carry a hag channel inline",
               "hag" in zih.files and zih["hag"].shape[0] == zih["xyz"].shape[0])
@@ -531,15 +692,14 @@ def main():
         check("convert_infer_job(hag, ground_value): hag baked, no label key",
               "hag" in zjh.files and "label" not in zjh.files
               and zjh["hag"].shape[0] == zjh["xyz"].shape[0])
-        # smrf_fill (the "fill ground gaps with SMRF" box): threads through
-        # convert_infer_job, and the grid method ignores it — identical HAG to
-        # the labeled run. (The PDAL union itself needs python-pdal to execute.)
-        job_f = dataset.convert_infer_job("hag_fill_job", str(laz_root / "val"),
-                                          tmp / "staging", hag=True, hag_filter="grid",
-                                          ground_value=2, smrf_fill=True)
-        zjf = np.load(next((job_f / "scenes").glob("*.npz")))
-        check("convert_infer_job(smrf_fill): accepted; grid method unaffected",
-              "hag" in zjf.files and np.allclose(zjf["hag"], zjh["hag"]))
+        # Ground SOURCE and interpolation are separate axes now; the old smrf_fill
+        # union is gone — a ground class means labels only, no second source.
+        import inspect
+        from trainer_gui import pretrain
+        check("hag: smrf_fill union removed from the whole chain",
+              "smrf_fill" not in inspect.signature(dataset.convert_infer_job).parameters
+              and "smrf_fill" not in inspect.signature(pretrain.hag_for_cloud).parameters
+              and "use_smrf" not in inspect.signature(pretrain.hag_for_cloud).parameters)
         # Ground from the labels must NOT equal ground from detection — otherwise
         # ground_value silently isn't reaching hag_for_cloud's ground_mask.
         job_d = dataset.convert_infer_job("hag_detect_job", str(laz_root / "val"),
@@ -573,97 +733,22 @@ def main():
               and seen["epochs"][0]["epoch"] == 12 and abs(seen["epochs"][0]["miou"] - 0.7012) < 1e-9)
         check("parser: run id extracted", seen["run"] == "20260611_010101_demo_ptv3")
 
-        # ---------------- viewer loader on a synthetic prediction npz
-        pred_path = tmp / "scene_pred.npz"
-        np.savez_compressed(pred_path, xyz=make_xyz(1000).astype(np.float32),
-                            pred=RNG.integers(0, 3, 1000).astype(np.int32),
-                            class_names=np.array(["Ground", "Veg", "Building"]))
-        from trainer_gui.viewer import _load
-        xyz, rgb01, key = _load(pred_path)
-        check("viewer: pred npz loads colored with a 3-class colour key",
-              rgb01 is not None and len(key) == 3
-              and all(isinstance(lab, str) and len(col) == 3 for lab, col in key))
-
-        # canonical dataset tile (xyz + label, -1=ignore) must colour by class too
-        from trainer_gui.palette import palette_for
-        lbl_path = tmp / "scene_label.npz"
-        lab = np.array([-1, 0, 1, 2, 0], np.int32)
-        np.savez_compressed(lbl_path, xyz=make_xyz(5).astype(np.float32), label=lab)
-        _, rgb_l, key_l = _load(lbl_path)
-        pal3 = palette_for(3)
-        check("viewer: label npz colours by class, -1 stays grey",
-              rgb_l is not None
-              and np.allclose(rgb_l[1], pal3[0] / 255.0)     # class 0 -> palette[0]
-              and np.allclose(rgb_l[0], 0.55)                # ignore -> grey
-              and len(key_l) == 3)
-
-        # ---------------- existing repo prediction as a viewer fixture
-        jax = Path(__file__).resolve().parents[2] / "JAX_066_pred.ply"
-        if jax.exists():
-            xyz2, rgb2, _ = _load(jax)
-            check("viewer: JAX_066_pred.ply loads with colors",
-                  len(xyz2) > 0 and rgb2 is not None)
-
-        # ---------------- ground-truth comparison (error map)
-        from trainer_gui.palette import class_from_rgb, palette_for
-        from trainer_gui.viewer import compare_clouds, error_colors
-        # class_from_rgb losslessly inverts the categorical palette used to colour
-        # prediction PLYs (so a class-coloured cloud decodes back to class indices).
-        cls = np.array([0, 1, 2, 3, 4, 0, 2], np.int64)
-        check("palette: class_from_rgb inverts palette_for colours",
-              list(class_from_rgb(palette_for(5)[cls])) == list(cls))
-        ec = error_colors(np.array([0, 1, 2, 3]), np.array([0, 2, 2, -1]))
-        check("viewer: error_colors yellow on mismatch, grey on correct + no-GT",
-              tuple(ec[1]) == (1.0, 1.0, 0.0)        # wrong -> yellow
-              and abs(ec[0][0] - 0.55) < 1e-9        # correct -> grey
-              and abs(ec[2][0] - 0.55) < 1e-9        # correct -> grey
-              and abs(ec[3][0] - 0.55) < 1e-9)       # no GT  -> grey
-        ec_i = error_colors(np.array([0, 1, 2, 3]), np.array([9, 9, 2, 3]),  # pt0,1 wrong
-                            intensity=np.array([0.0, 1.0, 0.0, 1.0]))
-        check("viewer: both wrong (yellow) and correct (grey) vary with intensity",
-              ec_i[0][2] == 0.0 and ec_i[1][2] == 0.0        # wrong -> yellow (no blue)
-              and ec_i[0][0] == ec_i[0][1]                   # wrong is yellow (R=G)
-              and ec_i[0][0] != ec_i[1][0]                   # wrong brightness varies w/ intensity
-              and ec_i[2][2] > 0.0 and ec_i[3][2] > 0.0      # correct -> grey (has blue)
-              and ec_i[2][0] != ec_i[3][0])                  # correct brightness varies
-        # end-to-end: a palette-coloured prediction PLY vs a class-coloured .ply GT
-        cmp = tmp / "cmp"
-        cmp.mkdir()
-        pal5 = palette_for(5)
-        hdr = ("ply\nformat ascii 1.0\nelement vertex 7\nproperty float x\nproperty float y\n"
-               "property float z\nproperty uchar red\nproperty uchar green\n"
-               "property uchar blue\nend_header")
-        pred_cls = np.array([0, 1, 2, 3, 4, 0, 2], np.int64)
-        np.savetxt(cmp / "scene900_pred.ply",
-                   np.column_stack([make_xyz(7).astype(np.float32), pal5[pred_cls]]),
-                   fmt=["%.3f"] * 3 + ["%d"] * 3, header=hdr, comments="")
-        gt_cls = np.array([0, 1, 2, 3, 4, 0, 1], np.int64)   # only pt 6 differs (pred 2 vs gt 1)
-        np.savetxt(cmp / "scene900_gt.ply",
-                   np.column_stack([make_xyz(7).astype(np.float32), pal5[gt_cls]]),
-                   fmt=["%.3f"] * 3 + ["%d"] * 3, header=hdr, comments="")
-        _, vc_ply, ckey = compare_clouds(cmp / "scene900_pred.ply", cmp / "scene900_gt.ply")
-        check("viewer: compare_clouds flags exactly the mismatched point yellow",
-              int((np.abs(vc_ply - np.array([1.0, 1.0, 0.0])).sum(1) < 1e-9).sum()) == 1)
-        check("viewer: compare key is just wrong (yellow) + correct (grey)",
-              ckey == [("wrong prediction", (1.0, 1.0, 0.0)), ("correct", (0.55, 0.55, 0.55))])
-
-        # chosen-dataset palette (Inference menu): a prediction coloured with the
-        # shared categorical palette is labelled with the picked class names, and a
-        # raw RGB cloud gets no spurious legend.
-        from trainer_gui.palette import palette_for
-        from trainer_gui.viewer import _key_for_names, _load
-        names3, pal3 = ["A", "B", "C"], palette_for(3)
-        kc = _key_for_names(pal3[np.array([0, 1, 2, 1, 0])], names3)   # palette-coloured
-        check("viewer: _key_for_names labels a chosen-palette cloud with all class names",
-              [n for n, _ in kc] == names3 and np.allclose(kc[0][1], pal3[0] / 255.0))
-        check("viewer: _key_for_names gives no key for a non-palette (raw RGB) cloud",
-              _key_for_names(np.array([[1, 2, 3], [4, 5, 6]], np.uint8), names3) == [])
-        nn = tmp / "pred_nonames.npz"
-        np.savez_compressed(nn, xyz=make_xyz(5).astype(np.float32),
-                            pred=np.array([0, 1, 2, 1, 0], np.int32))   # no class_names
-        _, _, k_nn = _load(nn, ["X", "Y", "Z"])
-        check("viewer: _load applies chosen class names to an npz lacking class_names",
-              [n for n, _ in k_nn] == ["X", "Y", "Z"])
+        # ---------------- ground-truth comparison stats (Inference page)
+        # analysis.prediction_metrics scores explicit per-point classifications
+        # only (a prediction npz 'classification'/'pred' vs a GT npz 'label' /
+        # LAS classification) — RGB-palette decoding is gone with the viewer.
+        gtc = tmp / "gtcmp"
+        gtc.mkdir()
+        np.savez(gtc / "sceneY_pred.npz", xyz=make_xyz(5).astype(np.float32),
+                 classification=np.array([0, 1, 2, 2, 0], np.int32))
+        np.savez(gtc / "sceneY_gt.npz", xyz=make_xyz(5).astype(np.float32),
+                 label=np.array([0, 1, 1, 2, -1], np.int32))
+        gm = analysis.prediction_metrics(gtc / "sceneY_pred.npz", gtc / "sceneY_gt.npz")
+        check("analysis: prediction_metrics scores accuracy + per-class IoU on labeled pts",
+              gm["scene"] == "sceneY" and gm["labeled"] == 4
+              and abs(gm["accuracy"] - 0.75) < 1e-9
+              and gm["per_class_iou"] == {0: 1.0, 1: 0.5, 2: 0.5}
+              and abs(gm["miou"] - 2 / 3) < 1e-9)
 
         # ================= LOCAL (Docker) backend =================
         import importlib
@@ -732,6 +817,25 @@ def main():
                 if "dataset is required" in str(e).lower():
                     infer_gate_ok = False
         check(f"local: --mode infer runs dataset-free (all {len(LOCAL)} backbones)", infer_gate_ok)
+        # Phase 0 contract: every backbone's infer path funnels through
+        # train_common.run_infer_scenes, so each produced *_pred.npz must carry a
+        # per-point max-softmax confidence in (0, 1] (the export threshold reads it).
+        # The trainers above fault at missing weights before predicting, so drive
+        # the shared loop with a stub predict instead of a GPU run.
+        il_dir = tmp / "infer_loop"
+        il_dir.mkdir()
+        _il_conf = np.array([0.4, 1.0, 0.7], np.float32)
+        train_common.run_infer_scenes(
+            ["a.npz", "b.npz"],
+            lambda p: (make_xyz(3).astype(np.float32), np.array([0, 1, 0], np.int64),
+                       None, _il_conf, np.full((3, 2), 0.5, np.float16)),
+            str(il_dir), str(il_dir), {"mode": "infer"})
+        il_preds = sorted(il_dir.glob("*_pred.npz"))
+        check("local: infer loop writes confidence in (0,1] into every *_pred.npz",
+              len(il_preds) == 2
+              and all("confidence" in (z := np.load(f)).files
+                      and 0.0 < float(z["confidence"].min())
+                      and float(z["confidence"].max()) <= 1.0 for f in il_preds))
         with open(importlib.import_module("local_train_ptv3").__file__, encoding="utf-8") as f:
             _lt_src = f.read()
         check("local: local_train_ptv3.py has no 'import modal' (source is decoupled)",

@@ -109,7 +109,8 @@ use Hugging Face / S3 for the `.pth` weights. Full details: `docker/README.md`.
 | KPConv | `kpconv` | `scripts/local/local_train_kpconv.py` |
 | KPConv + HAG | `kpconv_hag` | `scripts/local/local_train_kpconv_hag.py` |
 
-`_hag` = an extra **HeightAboveGround** input channel (PDAL SMRF ground → `hag_nn`).
+`_hag` = an extra **HeightAboveGround** input channel (ground = the file's ground
+class when set, else PDAL SMRF detection; interpolated by grid / `hag_nn` / `hag_delaunay`).
 The `_hag` scripts are thin wrappers that run the base script with `--hag` — one
 trainer per backbone, so recipe changes land in one file.
 
@@ -144,8 +145,9 @@ top to bottom:
    (train = the remainder), **Split mode** (Balanced mirrors the class mix /
    Random fills by point count), and the **seed** (default 42). Already have
    split folders? Tick **Separate train/val/test folders (use as-is)**. Optional
-   **Compute Height-Above-Ground (HAG)** bakes a per-point HAG channel (PDAL SMRF
-   ground, optional labeled-ground class) — only the `_hag` models read it.
+   **Compute Height-Above-Ground (HAG)** bakes a per-point HAG channel (ground =
+   your labeled ground class when set, else SMRF detection; never a mix) — only
+   the `_hag` models read it.
 
 Hit **Build dataset**. It writes `train/ val/ test/` `.npz` to staging; progress
 streams in the console. Done → the dataset appears under **Saved Datasets** and is

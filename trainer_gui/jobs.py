@@ -14,13 +14,21 @@ EPOCH_RE = re.compile(
     r"ep\s+(\d+):\s+loss=([\d.]+)\s+acc=([\d.]+)\s+miou=([\d.]+)"
     r"(?:\s+lr=[\d.eE+-]+)?"   # PTv3 cold recipe prints lr= here; skip it
     r"(?:\s+s/iter=([\d.]+))?(?:\s+s/ep=([\d.]+))?")
+# Held-out val passes print (tc.eval_metrics in scripts/helper/train_common.py):
+#   [val@ep9] acc=0.8123  mIoU(5-way)=0.4012  mIoU(present 4)=0.4550  absent=[...]  raw_pts=1,234
+# RandLA-Net labels its val pass eval@epN; the final test pass is test@epN and
+# deliberately does NOT match.
+VAL_RE = re.compile(
+    r"\[(?:val|eval)@ep(\d+)\]\s+acc=([\d.]+)\s+"
+    r"mIoU\(\d+-way\)=([\d.]+)\s+mIoU\(present \d+\)=([\d.]+)")
 RUN_DIR_RE = re.compile(r"/outputs/runs/(\S+)")
 
 
 class LogParser(QObject):
     """Feeds on raw log text; emits structured epoch metrics and the run id."""
 
-    epoch = Signal(dict)     # {epoch, loss, acc, miou, sec_per_iter, sec_per_epoch}
+    epoch = Signal(dict)        # {epoch, loss, acc, miou, sec_per_iter, sec_per_epoch}
+    val_metrics = Signal(dict)  # {epoch, acc, miou (present-classes), miou_all (N-way)}
     run_id = Signal(str)
 
     def __init__(self, parent=None):
@@ -41,6 +49,14 @@ class LogParser(QObject):
                     "miou": float(m.group(4)),
                     "sec_per_iter": float(m.group(5)) if m.group(5) else None,
                     "sec_per_epoch": float(m.group(6)) if m.group(6) else None,
+                })
+            v = VAL_RE.search(line)
+            if v:
+                self.val_metrics.emit({
+                    "epoch": int(v.group(1)),
+                    "acc": float(v.group(2)),
+                    "miou_all": float(v.group(3)),
+                    "miou": float(v.group(4)),   # headline: present-classes mIoU
                 })
             if not self._run_id_seen:
                 r = RUN_DIR_RE.search(line)

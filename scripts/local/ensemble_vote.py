@@ -1,28 +1,34 @@
-"""Cross-model majority-vote ensemble over trainer_gui prediction files.
+"""Cross-model ensemble over trainer_gui prediction files.
 
-All three backbones (PTv3, KPConvX, RandLA-Net) predict on the SAME raw input
-points and their output reaches your folder as {scene}_pred.<fmt> (las/laz/ply/
-txt/csv after the GUI export, or the container's raw {scene}_pred.npz), so
-ensembling is a per-point vote, independent of architecture, dataset, or class
-count. Ensembling 2-3 models is the contest-era trick that survived into modern
-recipes (~+2 mIoU for 3 models on the 2024 Waymo winner).
+All backbones predict on the SAME raw input points and their output reaches
+your folder as {scene}_pred.<fmt> (las/laz/ply/txt/csv after the GUI export, or
+the container's raw {scene}_pred.npz), so ensembling is per-point, independent
+of architecture. Ensembling 2-3 models is the contest-era trick that survived
+into modern recipes (~+2 mIoU for 3 models on the 2024 Waymo winner).
+
+Voting: when every matched scene npz carries the saved class distribution
+("probs", written under TT_SAVE_PROBS=1), the distributions are AVERAGED and
+argmax wins (soft vote — confidence = max of the average). Otherwise it falls
+back to a confidence-weighted hard vote: each model's label weighted by its
+per-point confidence (1.0 when absent), confidence = the winning weight share.
+Every output also carries "agreement": the fraction of models whose own label
+matches the final one. Class compatibility is clamped via each folder's
+infer_run.json when present.
 
 Scenes are matched by filename (minus extension) across the input folders.
 Points are matched by row when the clouds are identical (the normal case); if a
-model's cloud differs (e.g. it filtered points), its labels are carried onto
-the first model's points by nearest neighbour. Vote ties go to the earliest-
+model's cloud differs (e.g. it filtered points), its rows are carried onto the
+first model's points by nearest neighbour. Hard-vote ties go to the earliest-
 listed model — put your strongest model first. Output is written in the first
 input's format.
 
 Usage:
   python ensemble_vote.py --inputs predsA predsB [predsC ...] --out out_dir
   python ensemble_vote.py --self-test
-
-# ponytail: hard-label majority vote; upgrade path is saving per-class probs
-# from inference and averaging those instead.
 """
 import argparse
 import glob
+import json
 import os
 import sys
 
@@ -31,30 +37,49 @@ import numpy as np
 REPO_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
 
 
-def vote(labels):
-    """labels: (M, N) int array, one row per model. Returns (N,) voted labels;
-    ties go to the earliest model whose label has the max vote count."""
+def soft_vote(probs):
+    """probs: (M, N, C) normalized distributions, one per model. Returns
+    ((N,) argmax labels, (N,) f32 confidence = max of the averaged distribution)."""
+    p = np.asarray(probs, np.float32).mean(0)
+    return p.argmax(1), p.max(1).astype(np.float32)
+
+
+def weighted_vote(labels, weights):
+    """labels: (M, N) int, weights: (M, N) per-point confidence (1.0 = a plain
+    vote). Returns ((N,) labels, (N,) f32 confidence = winning weight share).
+    Ties go to the earliest model whose label holds the max weight."""
     labels = np.asarray(labels)
+    weights = np.asarray(weights, np.float32)
     m, n = labels.shape
     c = int(labels.max()) + 1
-    counts = np.zeros((n, c), np.int32)
-    for row in labels:
-        counts[np.arange(n), row] += 1
+    counts = np.zeros((n, c), np.float32)
+    idx = np.arange(n)
+    for row, w in zip(labels, weights):
+        counts[idx, row] += w
     mx = counts.max(1)
     out = np.full(n, -1, labels.dtype)
     for row in labels:                       # priority order = input order
-        sel = (out < 0) & (counts[np.arange(n), row] == mx)
+        sel = (out < 0) & (counts[idx, row] == mx)
         out[sel] = row[sel]
-    return out
+    conf = mx / np.maximum(counts.sum(1), 1e-9)
+    return out, conf.astype(np.float32)
+
+
+def agreement(labels, final):
+    """(N,) f32 fraction of models whose own label equals the final label."""
+    return (np.asarray(labels) == final).mean(0).astype(np.float32)
 
 
 def load_pred(path):
-    """xyz, labels, intensity(|None) from any prediction file. npz is read
-    natively (container-safe); exported formats go through the GUI's readers."""
+    """(xyz, labels, intensity|None, confidence|None, probs|None) from any
+    prediction file. npz is read natively (container-safe); exported formats go
+    through the GUI's readers (probs never survive an export — npz only)."""
     if path.endswith(".npz"):
         z = np.load(path)
         return (z["xyz"].astype(np.float32), z["classification"].astype(np.int64),
-                z["intensity"] if "intensity" in z.files else None)
+                z["intensity"] if "intensity" in z.files else None,
+                z["confidence"].astype(np.float32) if "confidence" in z.files else None,
+                z["probs"].astype(np.float32) if "probs" in z.files else None)
     sys.path.insert(0, REPO_ROOT)
     from trainer_gui.readers import read_points
     c = read_points(path)
@@ -63,29 +88,37 @@ def load_pred(path):
         lab = next(iter(c.fields.values()))
     if lab is None:
         raise ValueError(f"{path}: no 'classification' field (has {list(c.fields)})")
-    return c.xyz.astype(np.float32), np.asarray(lab, np.int64), c.intensity
+    conf = c.fields.get("confidence")
+    return (c.xyz.astype(np.float32), np.asarray(lab, np.int64), c.intensity,
+            np.asarray(conf, np.float32) if conf is not None else None, None)
 
 
-def write_out(path, xyz, cls, intensity):
+def write_out(path, xyz, cls, intensity, confidence, agree):
     if path.endswith(".npz"):
-        d = {"xyz": xyz, "classification": cls.astype(np.int32)}
+        d = {"xyz": xyz, "classification": cls.astype(np.int32),
+             "confidence": np.asarray(confidence, np.float32),
+             "agreement": np.asarray(agree, np.float32)}
         if intensity is not None:
             d["intensity"] = intensity
         np.savez(path, **d)
         return
+    # ponytail: agreement is npz-only — dataset._write_pred has no agreement
+    # column; add one there if the deliverable ever needs it.
     sys.path.insert(0, REPO_ROOT)
     from trainer_gui.dataset import _write_pred
     from pathlib import Path
     _write_pred(Path(path), np.asarray(xyz, np.float64),
-                np.clip(cls, 0, 255).astype(np.uint8), path.rsplit(".", 1)[1])
+                np.clip(cls, 0, 255).astype(np.uint8), path.rsplit(".", 1)[1],
+                confidence=np.asarray(confidence, np.float32))
 
 
-def align(ref_xyz, xyz, lab):
-    """Map lab onto ref_xyz. Row-aligned when the clouds match; NN otherwise."""
+def align_idx(ref_xyz, xyz):
+    """Row map from xyz onto ref_xyz: None when the clouds already match row-for-
+    row (fast path); else NN indices so lab/conf/probs can all be re-rowed."""
     if len(xyz) == len(ref_xyz) and np.allclose(xyz, ref_xyz, atol=1e-4):
-        return lab
+        return None
     from scipy.spatial import cKDTree      # lazy: only the mismatch path needs it
-    return lab[cKDTree(xyz).query(ref_xyz)[1]]
+    return cKDTree(xyz).query(ref_xyz)[1]
 
 
 PRED_EXTS = (".npz", ".las", ".laz", ".ply", ".txt", ".csv")
@@ -101,7 +134,42 @@ def _scan(d):
     return out
 
 
-def ensemble(input_dirs, out_dir):
+def _class_info(d):
+    """(num_classes, class_names) from a folder's infer_run.json, or None when
+    the folder has none (bare exported files) or it names no classes."""
+    p = os.path.join(d, "infer_run.json")
+    if not os.path.isfile(p):
+        return None
+    try:
+        with open(p, encoding="utf-8") as f:
+            m = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    n, names = m.get("num_classes"), m.get("class_names") or []
+    if n is None and not names:
+        return None
+    return int(n if n is not None else len(names)), list(names)
+
+
+def check_class_clamp(input_dirs, log=print):
+    """Refuse to mix models with different class sets. Dirs without an
+    infer_run.json (bare exported files) skip the check with a printed note."""
+    infos = {}
+    for d in input_dirs:
+        info = _class_info(d)
+        if info is None:
+            log(f"  note: no infer_run.json in {d} — class check skipped for it")
+        else:
+            infos[d] = info
+    if len({(n, tuple(names)) for n, names in infos.values()}) > 1:
+        raise ValueError(
+            "class mismatch across ensemble inputs — every model must share one "
+            "class set:\n" + "\n".join(f"  {d}: {n} classes {names}"
+                                       for d, (n, names) in infos.items()))
+
+
+def ensemble(input_dirs, out_dir, log=print):
+    check_class_clamp(input_dirs, log)
     os.makedirs(out_dir, exist_ok=True)
     scans = [_scan(d) for d in input_dirs]
     if not scans[0]:
@@ -111,37 +179,109 @@ def ensemble(input_dirs, out_dir):
         others = [s.get(stem) for s in scans[1:]]
         if any(p is None for p in others):
             miss = [d for d, s in zip(input_dirs[1:], scans[1:]) if stem not in s]
-            print(f"  skip {stem}: missing in {miss}")
+            log(f"  skip {stem}: missing in {miss}")
             continue
-        ref_xyz, ref_lab, ref_itn = load_pred(ref_path)
-        rows = [ref_lab]
+        ref_xyz, ref_lab, ref_itn, ref_conf, ref_probs = load_pred(ref_path)
+        labs, confs, probs = [ref_lab], [ref_conf], [ref_probs]
         for p in others:
-            xyz, lab, _ = load_pred(p)
-            rows.append(align(ref_xyz, xyz, lab))
-        voted = vote(np.stack(rows))
+            xyz, lab, _, cf, pb = load_pred(p)
+            idx = align_idx(ref_xyz, xyz)
+            if idx is not None:
+                lab = lab[idx]
+                cf = cf[idx] if cf is not None else None
+                pb = pb[idx] if pb is not None else None
+            labs.append(lab)
+            confs.append(cf)
+            probs.append(pb)
+        stacked = np.stack(labs)
+        if all(p is not None for p in probs):
+            voted, conf = soft_vote(np.stack(probs))     # soft vote: average the dists
+        else:                                            # fallback: weighted hard vote
+            w = np.stack([c if c is not None else np.ones(len(ref_lab), np.float32)
+                          for c in confs])
+            voted, conf = weighted_vote(stacked, w)
+        agree = agreement(stacked, voted)
         out_path = f"{out_dir}/{os.path.basename(ref_path)}"
-        write_out(out_path, ref_xyz, voted, ref_itn)
-        agree = float(np.mean([np.mean(r == voted) for r in rows]))
-        print(f"  {os.path.basename(out_path)}: {len(voted)} pts, "
-              f"mean model-vote agreement {agree:.3f}")
+        write_out(out_path, ref_xyz, voted, ref_itn, conf, agree)
+        log(f"  {os.path.basename(out_path)}: {len(voted)} pts, "
+            f"mean confidence {float(conf.mean()):.3f}, "
+            f"mean agreement {float(agree.mean()):.3f}")
         done += 1
-    print(f"ensembled {done}/{len(scans[0])} scene(s) -> {out_dir}")
+    log(f"ensembled {done}/{len(scans[0])} scene(s) -> {out_dir}")
 
 
 def self_test():
-    # majority wins
-    assert vote(np.array([[1, 2, 3], [1, 2, 0], [0, 2, 3]])).tolist() == [1, 2, 3]
-    # all-way tie -> first model wins
-    assert vote(np.array([[1], [2], [3]])).tolist() == [1]
-    # two-way tie between models 2+3 vs model 1: first max-count holder wins
-    assert vote(np.array([[5], [7], [7]])).tolist() == [7]
-    # identical clouds align by row even with permuted-looking labels
+    import shutil
+    import tempfile
+
+    # soft vote overturns the 2-1 hard majority: two unsure models vs one sure one
+    sv = np.array([[[0.9, 0.1]], [[0.45, 0.55]], [[0.45, 0.55]]], np.float32)
+    lab, conf = soft_vote(sv)
+    hard, _ = weighted_vote(np.array([[0], [1], [1]]), np.ones((3, 1), np.float32))
+    assert hard.tolist() == [1] and lab.tolist() == [0] and abs(conf[0] - 0.6) < 1e-6
+    # weighted hard vote: confidence flips the majority; conf = winning share
+    lab, conf = weighted_vote(np.array([[0, 0], [1, 0], [1, 0]]),
+                              np.array([[0.9, 1.0], [0.2, 1.0], [0.2, 1.0]], np.float32))
+    assert lab.tolist() == [0, 0] and abs(conf[0] - 0.9 / 1.3) < 1e-6 and conf[1] == 1.0
+    # unweighted all-way tie keeps the old semantics: earliest model wins
+    assert weighted_vote(np.array([[1], [2], [3]]),
+                         np.ones((3, 1), np.float32))[0].tolist() == [1]
+    # agreement: exact per-point fraction of models matching the final label
+    ag = agreement(np.array([[0, 0], [1, 0], [1, 1]]), np.array([0, 0]))
+    assert np.allclose(ag, [1 / 3, 2 / 3]) and ag.dtype == np.float32
+    # identical clouds take the row-aligned fast path; mismatched fall back to NN
     xyz = np.random.rand(100, 3).astype(np.float32)
-    assert (align(xyz, xyz, np.arange(100)) == np.arange(100)).all()
-    # mismatched cloud falls back to NN mapping
-    sub = xyz[::2]
-    out = align(xyz, sub, np.arange(len(sub)))
-    assert len(out) == 100 and (out[::2] == np.arange(50)).all()
+    assert align_idx(xyz, xyz) is None
+    idx = align_idx(xyz, xyz[::2])
+    assert len(idx) == 100 and (idx[::2] == np.arange(50)).all()
+
+    # end-to-end over folders: soft vote, clamp refusal, probs-missing fallback
+    tmp = tempfile.mkdtemp(prefix="ensemble_vote_st_")
+    try:
+        x3 = np.random.rand(3, 3).astype(np.float32)
+        P = [np.array([[0.9, 0.1], [0.6, 0.4], [0.2, 0.8]], np.float32),
+             np.array([[0.45, 0.55], [0.7, 0.3], [0.3, 0.7]], np.float32),
+             np.array([[0.45, 0.55], [0.8, 0.2], [0.4, 0.6]], np.float32)]
+        dirs = []
+        for k, p in enumerate(P):
+            d = os.path.join(tmp, f"m{k}")
+            os.makedirs(d)
+            np.savez(os.path.join(d, "s_pred.npz"), xyz=x3,
+                     classification=p.argmax(1).astype(np.int32),
+                     confidence=p.max(1), probs=p.astype(np.float16))
+            with open(os.path.join(d, "infer_run.json"), "w", encoding="utf-8") as f:
+                json.dump({"num_classes": 2, "class_names": ["a", "b"],
+                           "backbone": f"m{k}"}, f)
+            dirs.append(d)
+        quiet = lambda s: None
+        ensemble(dirs, os.path.join(tmp, "out"), log=quiet)
+        z = np.load(os.path.join(tmp, "out", "s_pred.npz"))
+        # point 0 is the overturn: hard majority 2-1 for class 1, soft vote -> 0
+        assert z["classification"].tolist() == [0, 0, 1]
+        assert z["confidence"].dtype == np.float32 and z["agreement"].dtype == np.float32
+        assert np.allclose(z["confidence"], [0.6, 0.7, 0.7], atol=2e-3)   # f16 probs
+        assert np.allclose(z["agreement"], [1 / 3, 1.0, 1.0])
+        # clamp: mismatched class_names refuse loudly
+        with open(os.path.join(dirs[1], "infer_run.json"), "w", encoding="utf-8") as f:
+            json.dump({"num_classes": 2, "class_names": ["a", "c"]}, f)
+        try:
+            ensemble(dirs, os.path.join(tmp, "out2"), log=quiet)
+            raise AssertionError("clamp did not refuse mismatched class_names")
+        except ValueError:
+            pass
+        with open(os.path.join(dirs[1], "infer_run.json"), "w", encoding="utf-8") as f:
+            json.dump({"num_classes": 2, "class_names": ["a", "b"]}, f)
+        # one dir without probs -> confidence-weighted hard vote for every scene
+        zp = np.load(os.path.join(dirs[2], "s_pred.npz"))
+        slim = {k: zp[k] for k in zp.files if k != "probs"}
+        np.savez(os.path.join(dirs[2], "s_pred.npz"), **slim)
+        ensemble(dirs, os.path.join(tmp, "out3"), log=quiet)
+        z3 = np.load(os.path.join(tmp, "out3", "s_pred.npz"))
+        # point 0: w(0)=0.9 vs w(1)=0.55+0.55=1.1 -> label 1, share 1.1/2.0
+        assert z3["classification"].tolist() == [1, 0, 1]
+        assert np.allclose(z3["confidence"], [0.55, 1.0, 1.0], atol=1e-6)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
     print("self-test OK")
 
 

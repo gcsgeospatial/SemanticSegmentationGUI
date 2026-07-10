@@ -19,7 +19,9 @@ The 3 color channels prefer lidar intensity (normalized grayscale x3) over RGB
 when the dataset has both — intensity separates water/asphalt/shadow where RGB
 is ambiguous. RGB is the fallback, mid-gray the last resort. Old RGB-trained
 checkpoints keep getting RGB at inference (run.json "color_source", absent =
-pre-change = rgb).
+pre-change = rgb). FEAT_CHANNELS env overrides the input spec (ordered csv
+incl. dataset feat_* channels); run.json "features" records the resolved list
+and inference rebuilds from it.
 
 --hag appends a HeightAboveGround input channel (in_channels 6 -> 7;
 [xyz, color, HAG]), read per point from the tile/scene "hag" array, which the
@@ -51,6 +53,14 @@ GRID_SIZE     = 0.5            # voxel grid (m). PTv3's 0.05 m outdoor default i
 USE_FLASH_ATTN = False   # PTv3 runs on standard attention — flash serialized-attn
                          # patch-gather OOB'd mid-train (disabled after a real
                          # crash, commit 98cc344; not a missing-dep workaround)
+
+# Input-feature spec (FEAT_CHANNELS env, GUI picker): comma-separated ordered
+# names; "" = the legacy [x, y, z, <color>] layout where <color> is "rgb" or
+# "intensity" per color_src. PTv3's color slot is 3-wide: a single-channel
+# "intensity" entry is expanded to 3 via the tile's baked rgb array (the arch
+# rule) — run.json records the true single name plus "color_source" as always.
+# HAG (--hag) and log d_k (DG_LOGDK_FEAT) append after the spec.
+FEAT_CHANNELS = ""
 
 # ----------------------------------------------------------------------------
 # Regularization / optimizer — PTv3's published outdoor-LiDAR recipe
@@ -142,10 +152,12 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
     # closures capture these, defaulting to the module constants.
     (DG_DENSITY_AUG, DG_COARSEN_MAX, DG_P_NATIVE, DG_LOGDK_FEAT, DG_LOGDK_K,
      DG_INFER_TTA, USE_FOCAL, FOCAL_GAMMA, CLASS_WEIGHTING, WEIGHT_BETA,
-     RARE_OVERSAMPLE, RARE_CENTER_PROB) = tc.env_overrides(globals(), [
+     RARE_OVERSAMPLE, RARE_CENTER_PROB, VAL_EVERY,
+     FEAT_CHANNELS) = tc.env_overrides(globals(), [
         "DG_DENSITY_AUG", "DG_COARSEN_MAX", "DG_P_NATIVE", "DG_LOGDK_FEAT",
         "DG_LOGDK_K", "DG_INFER_TTA", "USE_FOCAL", "FOCAL_GAMMA",
-        "CLASS_WEIGHTING", "WEIGHT_BETA", "RARE_OVERSAMPLE", "RARE_CENTER_PROB"])
+        "CLASS_WEIGHTING", "WEIGHT_BETA", "RARE_OVERSAMPLE", "RARE_CENTER_PROB",
+        "VAL_EVERY", "FEAT_CHANNELS"])
 
     sys.path.insert(0, "/opt")          # so `import ptv3.model` resolves
 
@@ -158,6 +170,20 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
     STRIDE      = CHUNK_XY / 2.0
     HAG = bool(hag)   # --hag: local vars named `hag` below are per-point ARRAYS
     color_src = "intensity"   # what fills the 3 color channels; see module docstring
+    FEAT_LEGACY = ["x", "y", "z", "intensity"]   # re-derived once color_src is known
+    FEAT_SPEC = list(FEAT_LEGACY)                # --mode infer resolves from run.json
+
+    def _check_spec(spec):
+        bad = [n for n in spec
+               if n not in ("x", "y", "z", "rgb", "intensity")
+               and not n.startswith("feat_")]
+        if bad:
+            raise ValueError(f"PTv3 can't feed {bad}; supported: x, y, z, "
+                             f"rgb/intensity (one 3-wide color slot) plus "
+                             f"dataset feat_* channels")
+        if "rgb" in spec and "intensity" in spec:
+            raise ValueError("PTv3 has ONE 3-wide color slot — pick rgb OR "
+                             "intensity in FEAT_CHANNELS, not both")
 
     # NUM_CLASSES / CLASS_NAMES come ONLY from the dataset's dataset_meta.json.
     # --mode infer is dataset-free: the inference branch below reads the class
@@ -168,12 +194,34 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
             dataset, HAG, "train the plain PTv3.")
         if not ds_meta.get("has_intensity"):
             color_src = "rgb" if ds_meta.get("has_rgb") else "gray"
+        # Input-feature spec: FEAT_CHANNELS env; "" = the legacy layout for this
+        # dataset's color_src. An explicit "rgb" spec forces real RGB into the
+        # color slot even when the dataset also has intensity. Env is ignored
+        # at infer (the inference branch resolves the spec from run.json).
+        FEAT_LEGACY = ["x", "y", "z", "rgb" if color_src == "rgb" else "intensity"]
+        FEAT_SPEC = (list(FEAT_LEGACY) if mode == "infer"
+                     else tc.parse_feat_spec(FEAT_CHANNELS, FEAT_LEGACY))
+        _check_spec(FEAT_SPEC)
+        if "rgb" in FEAT_SPEC:
+            color_src = "rgb"
+        elif "intensity" in FEAT_SPEC and ds_meta.get("has_intensity"):
+            color_src = "intensity"
         # --hag gets its own cache family (tiles carry a "hag" array), keyed by the
         # HAG method too — tiles built one way must never be reused by another.
         # Keyed by color_src for the same reason: tiles bake the color channels in,
         # so RGB-era caches ("ptv3_cold") are abandoned, not silently reused.
+        # A custom feature spec gets its own family too (legacy spec = "" tag).
         _hag_tag = f"_hag_{HAG_SOURCE.replace('+', '_')}" if HAG else ""
-        PREP_DIR = f"{ds_root}/prep/ptv3_{color_src}{_hag_tag}_chunk{int(CHUNK_XY)}"
+        PREP_DIR = (f"{ds_root}/prep/ptv3_{color_src}{_hag_tag}"
+                    f"{tc.feat_spec_tag(FEAT_SPEC, FEAT_LEGACY)}_chunk{int(CHUNK_XY)}")
+
+    def _in_ch(spec):
+        # spec widths: the color slot (rgb OR intensity) is 3 wide — PTv3
+        # expands single-channel color to 3 (see build_feat) — the rest 1;
+        # + HAG (--hag) + log d_k (D3b) appended after the spec.
+        return (sum(3 if n in ("rgb", "intensity") else 1 for n in spec)
+                + (1 if HAG else 0) + (1 if DG_LOGDK_FEAT else 0))
+    IN_CH = _in_ch(FEAT_SPEC)
 
     # --- Preprocessing ------------------------------------------------------
     def load_canonical(npz_path):
@@ -209,11 +257,14 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                 print(f"  skip {src}: {e}", flush=True); continue
             # --hag: per-point HAG from the source scene npz rides into the cache
             # tiles; without --hag the tile layout is exactly the pre-merge one.
-            hag = None
-            if HAG and src.endswith(".npz"):
+            # Every feat_* channel the scene carries rides along too.
+            hag, extras = None, {}
+            if src.endswith(".npz"):
                 z = np.load(src)
-                if "hag" in z.files and len(z["hag"]) == len(xyz):
+                if HAG and "hag" in z.files and len(z["hag"]) == len(xyz):
                     hag = z["hag"].astype(np.float32)
+                extras = {k: z[k].astype(np.float32) for k in z.files
+                          if k.startswith("feat_")}
             print(f"    [{fi+1}/{len(src_paths)}] {scene}: {len(xyz):,} pts "
                   f"loaded in {time.time()-t0:.1f}s, tiling…", flush=True)
             mins, maxs = xyz[:, :2].min(0), xyz[:, :2].max(0)
@@ -227,6 +278,8 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                     tile = {"xyz": xyz[m].astype(np.float32),
                             "rgb": rgb[m].astype(np.uint8),
                             "lab": lab[m].astype(np.int32)}
+                    for n, v in extras.items():
+                        tile[n] = v[m].astype(np.float32)
                     if hag is not None:
                         tile["hag"] = hag[m].astype(np.float32)
                     np.savez_compressed(out_path, **tile)
@@ -286,9 +339,29 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                              "dataset with Height-Above-Ground enabled.")
         return np.zeros(len(xyz), np.float32)   # plain PTv3: never reaches the net
 
+    def build_feat(cxyz, rgbf, extras=None, hag=None):
+        """Spec-ordered PTv3 features: x/y/z from the (augmented, centered,
+        voxel-deduped) coords, rgb/intensity = the tile's 3 baked color
+        channels (single-channel intensity was expanded to 3 at prep — the
+        arch rule), feat_* from `extras`. HAG and log d_k append after the
+        spec, as always. The legacy spec reproduces [cxyz, rgbf] exactly."""
+        cols = []
+        for n in FEAT_SPEC:
+            if n in ("rgb", "intensity"):
+                cols.append(rgbf)
+            elif n in ("x", "y", "z"):
+                cols.append(cxyz[:, "xyz".index(n):"xyz".index(n) + 1])
+            else:
+                cols.append(extras[n][:, None])
+        if HAG:
+            cols.append(hag[:, None])
+        if DG_LOGDK_FEAT:
+            cols.append(dg.local_density_logdk(cxyz, DG_LOGDK_K)[:, None])
+        return np.concatenate(cols, axis=1).astype(np.float32)
+
     def build_model(num_classes):
         backbone = PointTransformerV3(
-            in_channels=6 + (1 if HAG else 0) + (1 if DG_LOGDK_FEAT else 0),   # xyz + rgb (+ HAG, --hag) (+ log d_k, D3b)
+            in_channels=IN_CH,   # spec channels (+ HAG, --hag) (+ log d_k, D3b)
             order=("z", "z-trans", "hilbert", "hilbert-trans"),
             stride=(2, 2, 2, 2),
             enc_depths=(2, 2, 2, 6, 2),
@@ -309,6 +382,8 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
     from scipy.spatial import cKDTree
 
     def make_predict_scene(backbone, head, num_classes):
+        SAVE_PROBS = os.environ.get("TT_SAVE_PROBS") == "1"
+
         def _predict_scene(scene_path):
             # Tile into CHUNK_XY windows, voxel-downsample tracking the inverse
             # map, scatter per-voxel predictions back, NN-fill stragglers.
@@ -324,13 +399,19 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                         f"which this HAG model requires. Tick 'Compute Height-Above-Ground' "
                         f"on the Inference page and run again.")
                 hag = _z["hag"].astype(np.float32)
+            # the feat_* channels the spec needs (a miss is a clear error)
+            ex0 = tc.feat_extras(np.load(scene_path), FEAT_SPEC,
+                                 os.path.basename(scene_path))
             pred = np.full(len(xyz), -1, np.int64)
+            conf = np.zeros(len(xyz), np.float32)
+            probs = np.zeros((len(xyz), num_classes), np.float16) if SAVE_PROBS else None
             with torch.no_grad():
                 # windows via one packed-code sort, not a full-cloud mask per window
                 for idx in tc.xy_chunk_groups(xyz, CHUNK_XY, min_pts=64):
                     w0 = (xyz[idx] - xyz[idx].mean(0)).astype(np.float32)
                     rgbf = rgb[idx].astype(np.float32) / 255.0
                     hagf = hag[idx].astype(np.float32) if HAG else None
+                    exw = {n: v[idx] for n, v in ex0.items()}
                     # D5 density-TTA: isotropic scale s is a density change (o->o/s^2);
                     # re-voxelize per view, average per-point softmax. views=[1.0] when
                     # off -> identical to the old single-view argmax.
@@ -342,11 +423,9 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                         keys = np.floor(w / GRID_SIZE).astype(np.int64)
                         first, inverse = tc.voxel_unique(keys, return_inverse=True)
                         vx = w[first]
-                        feat = np.concatenate(
-                            [vx, rgbf[first]]
-                            + ([hagf[first, None]] if HAG else [])
-                            + ([dg.local_density_logdk(vx, DG_LOGDK_K)[:, None]] if DG_LOGDK_FEAT else []),
-                            axis=1).astype(np.float32)
+                        feat = build_feat(vx, rgbf[first],
+                                          {n: v[first] for n, v in exw.items()},
+                                          hagf[first] if HAG else None)
                         coord = torch.from_numpy(vx).cuda()
                         featt = torch.from_numpy(feat).cuda()
                         offset = torch.tensor([len(vx)], dtype=torch.long).cuda()
@@ -357,13 +436,18 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                         fe = point["feat"] if isinstance(point, dict) else point.feat
                         vp = torch.softmax(head(fe).float(), -1).cpu().numpy()[inverse]
                         pprob = vp if pprob is None else pprob + vp
+                    # view sums exceed 1 — renormalize to a distribution
+                    pprob /= np.maximum(pprob.sum(-1, keepdims=True), 1e-12)
                     pred[idx] = pprob.argmax(-1)
+                    conf[idx] = pprob.max(-1)
+                    if SAVE_PROBS:
+                        probs[idx] = pprob.astype(np.float16)
             miss = pred < 0
             if miss.any() and (~miss).any():
                 _, nn = cKDTree(xyz[~miss]).query(xyz[miss])
-                pred[miss] = pred[~miss][nn]
+                pred[miss] = pred[~miss][nn]           # conf/probs stay 0: no votes
             # rgb carries the p95-normalized intensity grayscale the model saw.
-            return xyz, np.clip(pred, 0, num_classes - 1), rgb[:, 0] / 255.0
+            return xyz, np.clip(pred, 0, num_classes - 1), rgb[:, 0] / 255.0, conf, probs
         return _predict_scene
 
     # ==========================================================================
@@ -388,6 +472,19 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
             class_names = meta.get("class_names") or class_names
             if meta.get("grid") is not None:
                 GRID_SIZE = float(meta["grid"])
+        # rebuild the EXACT assembly recorded with the weights (env is ignored
+        # at infer). Old manifests wrote no "features", or wrote the color slot
+        # as 3 duplicate entries (+"HAG") — those fall back to the legacy
+        # layout, which is exactly what they trained on (color_src drives it).
+        FEAT_LEGACY = ["x", "y", "z", "rgb" if color_src == "rgb" else "intensity"]
+        mf = (meta or {}).get("features")
+        try:
+            FEAT_SPEC = (tc.parse_feat_spec(",".join(mf), FEAT_LEGACY)
+                         if mf and len(set(mf)) == len(mf) else list(FEAT_LEGACY))
+            _check_spec(FEAT_SPEC)
+        except ValueError:
+            FEAT_SPEC = list(FEAT_LEGACY)
+        IN_CH = _in_ch(FEAT_SPEC)
 
         backbone, head = build_model(num_classes)
         backbone.load_state_dict(bsd)
@@ -410,7 +507,7 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
         infer_cfg = {"backbone": "PTv3", "mode": "infer", "weights": weights,
                      "infer_input": infer_input, "num_classes": num_classes,
                      "class_names": class_names, "grid_size": GRID_SIZE,
-                     "color_source": color_src,
+                     "color_source": color_src, "features": FEAT_SPEC,
                      "chunk_xy": CHUNK_XY, "hag": HAG, "gpu": tc.gpu_name(),
                      "started_utc": datetime.utcnow().isoformat() + "Z"}
 
@@ -481,13 +578,13 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                 "num_classes": NUM_CLASSES, "grid_size": GRID_SIZE,
                 "class_names": CLASS_NAMES,
                 "color_source": color_src,
-                # --hag adds exactly the twin's extra keys; base mode writes none.
-                **({"in_channels": 7,
-                    "features": ["x", "y", "z"]
-                        + {"intensity": ["intensity"] * 3, "gray": ["gray"] * 3,
-                           "rgb": ["rgb_r", "rgb_g", "rgb_b"]}[color_src]
-                        + ["HAG"],
-                    "hag_source": HAG_SOURCE} if HAG else {}),
+                # resolved input spec: one rgb/intensity name = the 3-wide
+                # color slot (PTv3 expands single-channel color to 3 — see
+                # build_feat); HAG/log-dk ride outside it, driven by --hag /
+                # DG_LOGDK_FEAT. Inference rebuilds this exact assembly.
+                "features": FEAT_SPEC,
+                "in_channels": IN_CH,
+                **({"hag_source": HAG_SOURCE} if HAG else {}),
                 "chunk_xy": CHUNK_XY, "stride": STRIDE,
                 "steps_per_epoch": STEPS,
                 "flash_attn": USE_FLASH_ATTN,
@@ -617,6 +714,7 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
             z = np.load(tile)
             xyz, rgb, lab = z["xyz"], z["rgb"], z["lab"]
             hag = _hag_of(z, xyz)                      # real HAG (zeros when plain)
+            ex = tc.feat_extras(z, FEAT_SPEC, os.path.basename(tile))
             # random crop ~30m for memory (train only — eval keeps full tiles).
             # With prob RARE_CENTER_PROB the crop centers on a rare-class point,
             # so the rare points a rare tile was drawn for actually land in-crop.
@@ -634,6 +732,7 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                 if len(idx) > 80000:
                     idx = np.random.choice(idx, 80000, replace=False)
                 xyz, rgb, lab, hag = xyz[idx], rgb[idx], lab[idx], hag[idx]
+                ex = {n: v[idx] for n, v in ex.items()}
             xyz = xyz.astype(np.float32)
             if training and AUG_ENABLE:
                 xyz = augment_xyz(xyz)
@@ -647,6 +746,7 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
             if int(ok.sum()) < 64:
                 continue
             xyz = xyz[ok]; rgb = rgb[ok]; lab = lab[ok]; hag = hag[ok]
+            ex = {n: v[ok] for n, v in ex.items()}
             # voxel-grid downsample to GRID_SIZE. Take grid_coord from the SAME
             # integer keys used to dedup, so it is unique per cloud and phase-
             # consistent with the kept points. Recomputing it as
@@ -661,13 +761,12 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
             keys = np.floor(xyz / g_eff).astype(np.int64)
             uniq = tc.voxel_unique(keys)
             xyz = xyz[uniq]; rgb = rgb[uniq]; lab = lab[uniq]; hag = hag[uniq]
-            # feat = augmented/centered coords + color/intensity (intensity is
-            # carried in the rgb channels for LiDAR canonical datasets).
-            feat = np.concatenate(
-                [xyz.astype(np.float32), rgb.astype(np.float32) / 255.0]
-                + ([hag[:, None].astype(np.float32)] if HAG else [])
-                + ([dg.local_density_logdk(xyz, DG_LOGDK_K)[:, None]] if DG_LOGDK_FEAT else []),
-                axis=1)
+            ex = {n: v[uniq] for n, v in ex.items()}
+            # feat = spec-ordered stack (augmented/centered coords, the baked
+            # color channels, dataset feat_*) — see build_feat.
+            xyz = xyz.astype(np.float32)
+            feat = build_feat(xyz, rgb.astype(np.float32) / 255.0, ex,
+                              hag if HAG else None)
             coords.append(xyz); feats.append(feat); labels.append(lab)
             grid_coords.append(keys[uniq])
             running += len(xyz)
@@ -736,6 +835,7 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                     if len(xyz) < 64:
                         continue
                     hag = _hag_of(z, xyz)
+                    ex = tc.feat_extras(z, FEAT_SPEC, os.path.basename(tile))
                     cxyz = xyz - xyz.mean(0, keepdims=True)
                     ok = (np.isfinite(cxyz).all(1)
                           & (np.abs(cxyz[:, :2]).max(1) <= CHUNK_XY)
@@ -743,14 +843,13 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                     if int(ok.sum()) < 64:
                         continue
                     xyz, rgb, cxyz, hag = xyz[ok], rgb[ok], cxyz[ok], hag[ok]
+                    ex = {n: v[ok] for n, v in ex.items()}
                     vk = np.floor(cxyz / GRID_SIZE).astype(np.int64)
                     first, inverse = tc.voxel_unique(vk, return_inverse=True)
                     vx = cxyz[first].astype(np.float32)
-                    feat = np.concatenate(
-                        [vx, rgb[first].astype(np.float32) / 255.0]
-                        + ([hag[first, None].astype(np.float32)] if HAG else [])
-                        + ([dg.local_density_logdk(vx, DG_LOGDK_K)[:, None]] if DG_LOGDK_FEAT else []),
-                        axis=1).astype(np.float32)
+                    feat = build_feat(vx, rgb[first].astype(np.float32) / 255.0,
+                                      {n: v[first] for n, v in ex.items()},
+                                      hag[first] if HAG else None)
                     coord = torch.from_numpy(vx).cuda()
                     featt = torch.from_numpy(feat).cuda()
                     offset = torch.tensor([len(vx)], dtype=torch.long).cuda()

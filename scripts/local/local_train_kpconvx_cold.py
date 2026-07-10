@@ -5,6 +5,8 @@ Local training script for KPConvX-L on a canonical trainer_gui --dataset
   Features  : 4 = [1, intensity, return_number, height], where height is
               tile-relative (z - tile_min_z). No geometric-feature
               computation — uses the attributes the cloud carries.
+              FEAT_CHANNELS env overrides the spec (ordered csv incl. dataset
+              feat_* channels); run.json "features" records the resolved list.
   --hag     : swaps the 4th channel to real PDAL HeightAboveGround, which the
               dataset (or the Inference page's HAG box) must supply.
               Same 4 channels / param count -> a clean A/B of tile-relative
@@ -85,7 +87,11 @@ RARE_FREQ_FRAC  = 0.5        # auto-rare threshold: freq < frac x median present
 # 0.5 + cap 10 overcooked (Building 0.74->0.61, rare tiles memorised): dialed back.
 RARE_TILE_PROB  = 0.25       # P(draw the next train tile from a rare-class tile)
 
-INPUT_CHANNELS = 4           # [1, intensity, return_number, height]
+# Input-feature spec (FEAT_CHANNELS env, GUI picker): comma-separated ordered
+# names; "" = the legacy [intensity, return_number, height] recipe. The
+# constant-1 bias channel is always first and not part of the spec; --hag
+# still swaps what feeds "height", exactly as before.
+FEAT_CHANNELS = ""
 
 # Geometry — matches train_LAS.py LASConfig.
 GRID          = 2.0          # first_subsampling_dl: layer-0 voxel grid (m)
@@ -154,12 +160,13 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
     # closures capture these, defaulting to the module constants.
     (DG_DENSITY_AUG, DG_COARSEN_MAX, DG_P_NATIVE, DG_LOGDK_FEAT, DG_LOGDK_K,
      DG_INFER_ADABN, DG_INFER_TTA, USE_FOCAL, FOCAL_GAMMA, CLASS_WEIGHTING,
-     WEIGHT_BETA, RARE_OVERSAMPLE, KP_AGGREGATION, KP_NORM) = tc.env_overrides(
+     WEIGHT_BETA, RARE_OVERSAMPLE, KP_AGGREGATION, KP_NORM,
+     VAL_EVERY, FEAT_CHANNELS) = tc.env_overrides(
         globals(), [
         "DG_DENSITY_AUG", "DG_COARSEN_MAX", "DG_P_NATIVE", "DG_LOGDK_FEAT",
         "DG_LOGDK_K", "DG_INFER_ADABN", "DG_INFER_TTA", "USE_FOCAL",
         "FOCAL_GAMMA", "CLASS_WEIGHTING", "WEIGHT_BETA", "RARE_OVERSAMPLE",
-        "KP_AGGREGATION", "KP_NORM"])
+        "KP_AGGREGATION", "KP_NORM", "VAL_EVERY", "FEAT_CHANNELS"])
 
     sys.path.insert(0, "/opt/kpconvx")
     EVAL_ONLY = (mode == "eval")
@@ -188,6 +195,12 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
     # --hag swaps the 4th feature channel (still 4 ch): shadow FEATURE_MODE so the
     # banner / run.json / resume filter all track the variant.
     FEATURE_MODE = "native_hag" if HAG else globals()["FEATURE_MODE"]
+    # Input-feature spec: FEAT_CHANNELS env at train (the infer branch below
+    # overrides it from run.json — env is ignored at infer). "height" is fed by
+    # real HAG under --hag, the tile-relative height otherwise, as always.
+    FEAT_LEGACY = ["intensity", "return_number", "height"]
+    FEAT_SPEC = (list(FEAT_LEGACY) if INFER    # env ignored at infer
+                 else tc.parse_feat_spec(FEAT_CHANNELS, FEAT_LEGACY))
 
     # --dataset NAME selects a canonical trainer_gui dataset under /datasets
     # (bind-mounted); NUM_CLASSES / CLASS_NAMES / PREP_DIR are locals so the
@@ -199,8 +212,11 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
             dataset, HAG,
             "train the plain KPConvX-L (its 4th channel is the tile-relative "
             "height, which needs no HAG).")
-        # --hag gets its own cache family (tiles carry a "hag" array).
-        PREP_DIR = f"{ds_root}/prep/kpconvx_cold{'_hag' if HAG else ''}_grid{GRID:g}_c{int(CHUNK_XY)}"
+        # --hag gets its own cache family (tiles carry a "hag" array); a custom
+        # feature spec gets its own too (legacy spec = "" tag, old caches valid).
+        PREP_DIR = (f"{ds_root}/prep/kpconvx_cold{'_hag' if HAG else ''}"
+                    f"_grid{GRID:g}_c{int(CHUNK_XY)}"
+                    f"{tc.feat_spec_tag(FEAT_SPEC, FEAT_LEGACY)}")
     else:
         # Folder inference (--mode infer): no --dataset. Reproduce the TRAINED
         # geometry + class layout from the run's run.json (the self-contained
@@ -233,6 +249,21 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
                 if meta.get("grid") is not None: GRID = float(meta["grid"])
                 if meta.get("chunk_xy") is not None: CHUNK_XY = float(meta["chunk_xy"])
                 STRIDE = CHUNK_XY / 2.0
+                # rebuild the EXACT assembly recorded with the weights (env is
+                # ignored at infer); manifests without "features" = legacy runs.
+                mf = meta.get("features")
+                try:
+                    FEAT_SPEC = (tc.parse_feat_spec(",".join(mf), FEAT_LEGACY)
+                                 if mf else list(FEAT_LEGACY))
+                except ValueError:
+                    FEAT_SPEC = list(FEAT_LEGACY)
+
+    if "rgb" in FEAT_SPEC:
+        raise ValueError("the KPConvX tile pipeline has no rgb channel — use "
+                         "intensity (rgb is folded into it when a scene has "
+                         "no intensity)")
+    # bias + spec channels (+ log d_k); every kp spec name is width 1.
+    IN_CH = 1 + len(FEAT_SPEC)
 
     def _cache_signature():
         # Everything that changes what a cached tile contains. A mismatch means
@@ -241,7 +272,8 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
         # records the dataset's split identity.
         sp = ds_meta.get("split", {})
         # --hag is a separate cache family (pipeline / recipe / hag_source below
-        # match the old _hag script), so every existing cache stays valid.
+        # match the old _hag script), so every existing cache stays valid: the
+        # spec-derived recipe string reproduces the legacy spellings byte-for-byte.
         sig = {
             "format_version": 1,
             "pipeline": "kpconvx_cold_hag" if HAG else "kpconvx_cold",
@@ -253,8 +285,10 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
             "min_pts_mask": 64,
             "min_pts_sub": 32,
             "intensity_norm": "p95_clip2",
-            "feature_recipe": ("bias,intensity,ret_num,hag" if HAG
-                               else "bias,intensity,ret_num,height"),
+            "feature_recipe": "bias," + ",".join(
+                "hag" if (n == "height" and HAG)
+                else "ret_num" if n == "return_number" else n
+                for n in FEAT_SPEC),
         }
         if HAG:
             sig["hag_source"] = HAG_SOURCE
@@ -316,7 +350,10 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
             "backbone": "KPConvX-L",
             "warm_start": False,
             "feature_mode": FEATURE_MODE,
-            "input_channels": INPUT_CHANNELS,
+            "input_channels": IN_CH,
+            # resolved input spec (bias/HAG/log-dk ride outside it) — inference
+            # rebuilds this exact assembly from here.
+            "features": FEAT_SPEC,
             "dataset": dataset,
             **({"hag_source": HAG_SOURCE} if HAG else {}),   # --hag: tags the variant
             "n_epochs": N_EPOCHS, "epoch_steps": EPOCH_STEPS,
@@ -382,7 +419,7 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
     cfg.model.decoder_layer = True
     cfg.model.upsample_n    = 3
     cfg.model.drop_path_rate = 0.3
-    cfg.model.input_channels = INPUT_CHANNELS + (1 if DG_LOGDK_FEAT else 0)  # +log d_k (D3b)
+    cfg.model.input_channels = IN_CH + (1 if DG_LOGDK_FEAT else 0)  # +log d_k (D3b)
     cfg.model.neighbor_limits = [12, 16, 20, 20, 20]
     cfg.model.use_strided_conv = True
     cfg.model.kpx_upcut     = False
@@ -484,9 +521,9 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
                                 FOCAL_GAMMA, LOVASZ_WEIGHT)
     pick_train_tile = tc.make_tile_picker(train_tiles, rare_tiles, RARE_TILE_PROB)
 
-    # Feature recipe + tile sampler (shared KP-family pipeline; a new feature
-    # channel goes into kp_tile_and_save + kp_make_build_feat, nothing here).
-    build_feat = tc.kp_make_build_feat(DG_LOGDK_FEAT, DG_LOGDK_K)
+    # Feature recipe + tile sampler (shared KP-family pipeline; dataset feat_*
+    # channels are cached by kp_tile_and_save and fed by the spec, nothing here).
+    build_feat = tc.kp_make_build_feat(DG_LOGDK_FEAT, DG_LOGDK_K, FEAT_SPEC)
     sample_tile = tc.kp_make_sample_tile(
         build_feat, HAG, GRID, max_pts=60000, aug_color=AUG_COLOR,
         density_aug=DG_DENSITY_AUG, coarsen_max=DG_COARSEN_MAX,
@@ -531,10 +568,12 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
 
     # Sliding-window inference over already-normalized features (--mode infer),
     # with the D5 density-TTA view averaging (shared KP-family pipeline).
+    SAVE_PROBS = os.environ.get("TT_SAVE_PROBS") == "1"
     _predict_points = tc.kp_make_predict_points(
         lambda cxyz, feat: torch.softmax(net(_kp_batch(cxyz, feat)).float(),
                                          -1).cpu().numpy(),
-        build_feat, GRID, CHUNK_XY, NUM_CLASSES, DG_INFER_TTA)
+        build_feat, GRID, CHUNK_XY, NUM_CLASSES, DG_INFER_TTA,
+        save_probs=SAVE_PROBS)
 
     # ------------------------------------------------------------------------
     # Arbitrary-folder inference (trainer_gui): label the npz scenes staged to
@@ -579,7 +618,10 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
             # convert_infer_job already p95-normalized intensity to [0,2].
             intensity_n, ret_num = tc.scene_arrays(z, len(xyz))
             hag = tc.scene_hag(z, pc_path, len(xyz), HAG)   # --hag: real HAG; plain: None
-            return xyz, _predict_points(xyz, intensity_n, ret_num, hag=hag), intensity_n
+            extras = tc.feat_extras(z, FEAT_SPEC, os.path.basename(pc_path))
+            pred, conf, probs = _predict_points(xyz, intensity_n, ret_num,
+                                                hag=hag, extras=extras)
+            return xyz, pred, intensity_n, conf, probs
 
         tc.run_infer_scenes(scenes, _predict, pred_dir, run_dir, infer_cfg, cls_txt=True)
         return

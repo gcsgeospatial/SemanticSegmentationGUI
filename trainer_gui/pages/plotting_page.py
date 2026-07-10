@@ -83,8 +83,9 @@ class PlottingPage(QWidget):
     # ------------------------------------------------------------- run discovery
     def _default_roots(self) -> list[Path]:
         """Run roots: each dataset's own runs/ folder (runs now nest under their
-        dataset), the repo's runs/, and — for runs made before the workspace layout —
-        the Train page's last output folder if one was recorded."""
+        dataset) and the repo's runs/. local_train_out is a legacy state key —
+        the Train page no longer writes it — kept read-only so runs made before
+        the workspace-only layout still show up."""
         roots = [*appstate.dataset_run_roots(), Path(self.repo_root) / "runs"]
         out = appstate.get("local_train_out", "")
         if out:

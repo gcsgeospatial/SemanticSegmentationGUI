@@ -253,7 +253,7 @@ def delete_dataset(name: str) -> tuple[str, str]:
     # Forget the entry + overrides FIRST so the list always reflects the delete,
     # even if the on-disk cleanup below fails (locked files are common on Windows).
     forget_dataset(name)
-    for key in ("dg_config", "palette_overrides", "palette_name_overrides"):
+    for key in ("dg_config",):
         allc = get(key, {})
         if name in allc:
             allc.pop(name, None)

@@ -297,3 +297,64 @@ def loss_config_to_env(cfg: dict) -> dict:
     if cfg.get("rare_oversample", True) != LOSS_DEFAULTS["rare_oversample"]:
         env["RARE_OVERSAMPLE"] = b(cfg.get("rare_oversample"))
     return env
+
+
+# ---- prediction vs ground truth (Inference page "Compare to ground truth") ----
+# Stats only — both files must carry an EXPLICIT per-point classification (a
+# prediction npz's 'classification'/'pred', a dataset npz's 'label', a LAS/LAZ
+# classification, or any label column readers.read_points exposes). Decoding
+# classes back out of palette RGB is gone with the viewer.
+
+_CLASS_KEYS = ("classification", "pred", "label")
+
+
+def _npz_class(z) -> np.ndarray | None:
+    """An npz's per-point class array: exported prediction ('classification'),
+    raw prediction ('pred'), or dataset/GT ('label'). -1 stays -1 (ignore)."""
+    for k in _CLASS_KEYS:
+        if k in z:
+            return np.asarray(z[k], np.int64).reshape(-1)
+    return None
+
+
+def _read_classes(path: Path) -> np.ndarray:
+    """Per-point class indices from a file with an explicit classification."""
+    if path.suffix.lower() == ".npz":
+        cls = _npz_class(np.load(str(path), allow_pickle=False))
+        if cls is None:
+            raise ValueError(f"{path.name}: npz has no "
+                             f"{'/'.join(_CLASS_KEYS)} array to compare")
+        return cls
+    fields = read_points(path).fields
+    for k in fields:
+        if k.lower() in _CLASS_KEYS or k.lower() in ("class", "scalar_label"):
+            return np.asarray(fields[k], np.int64).reshape(-1)
+    raise ValueError(f"{path.name}: no classification/label field to compare - "
+                     f"use files that carry explicit per-point classes")
+
+
+def prediction_metrics(pred_path, gt_path) -> dict:
+    """Overall accuracy + mIoU + per-class IoU of a prediction cloud against
+    ground truth, scored on points that carry a GT label. mIoU averages only the
+    classes present in GT or prediction (absent classes don't drag it to zero)."""
+    pred_path, gt_path = Path(pred_path), Path(gt_path)
+    pred = _read_classes(pred_path)
+    gt = _read_classes(gt_path)
+    scene = pred_path.stem
+    for suffix in ("_pred", "_gt"):
+        scene = scene.replace(suffix, "")
+    n = min(len(pred), len(gt))
+    pred, gt = pred[:n], gt[:n]
+    has = gt >= 0
+    labeled = int(has.sum())
+    acc = float((pred[has] == gt[has]).sum()) / max(labeled, 1)
+    present = sorted({int(c) for c in np.unique(pred[has])} | {int(c) for c in np.unique(gt[has])})
+    present = [c for c in present if c >= 0]   # drop the unlabeled (-1) class from mIoU
+    ious = {}
+    for c in present:
+        inter = int(((pred == c) & (gt == c) & has).sum())
+        union = int((((pred == c) | (gt == c)) & has).sum())
+        ious[c] = inter / union if union else 0.0
+    miou = float(np.mean(list(ious.values()))) if ious else 0.0
+    return {"scene": scene, "accuracy": acc, "miou": miou,
+            "labeled": labeled, "per_class_iou": ious}
