@@ -10,6 +10,7 @@ import json
 import os
 import shutil
 import subprocess
+import tempfile
 
 DATASETS_VOLUME = "terminal-datasets"
 
@@ -30,7 +31,9 @@ def volume_put(volume: str, local_path: str, remote_path: str) -> tuple[str, lis
 
 
 def volume_get(volume: str, remote_path: str, local_path: str) -> tuple[str, list[str]]:
-    return modal_exe(), ["volume", "get", "-f", volume, remote_path, local_path]
+    # --force (spelled out): newer Modal CLIs dropped the -f short form on `get`
+    # (`put` still has it), so -f dies with "No such option".
+    return modal_exe(), ["volume", "get", "--force", volume, remote_path, local_path]
 
 
 def volume_ls(volume: str, remote_path: str = "/") -> tuple[str, list[str]]:
@@ -62,6 +65,30 @@ def app_logs(app_name: str) -> tuple[str, list[str]]:
 
 
 # ---- thin synchronous helpers (background threads only — they block) ----
+
+def fetch_run_manifest(volume: str, run_id: str, timeout: int = 60) -> dict | None:
+    """Blocking: read runs/<run_id>/run.json (legacy run_config.json) off an
+    outputs volume via `modal volume get` into a temp dir. None if absent or
+    unreadable — including when the volume itself doesn't exist."""
+    env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
+    for fn in ("run.json", "run_config.json"):
+        with tempfile.TemporaryDirectory() as td:
+            prog, args = volume_get(volume, f"runs/{run_id}/{fn}", td)
+            try:
+                out = subprocess.run([prog] + args, capture_output=True, text=True,
+                                     timeout=timeout, encoding="utf-8",
+                                     errors="replace", env=env)
+            except (OSError, subprocess.TimeoutExpired):
+                return None
+            dest = os.path.join(td, fn)
+            if out.returncode == 0 and os.path.isfile(dest):
+                try:
+                    with open(dest, encoding="utf-8") as f:
+                        return json.load(f)
+                except (OSError, json.JSONDecodeError):
+                    return None
+    return None
+
 
 def list_volume_entries(volume: str, remote_path: str = "/", timeout: int = 60) -> list[dict]:
     """Blocking `modal volume ls --json`; returns [] if the path doesn't exist."""

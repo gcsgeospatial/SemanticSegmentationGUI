@@ -118,9 +118,11 @@ class MainWindow(QWidget):
         self.infer_page = InferPage(REPO_ROOT)
         # Local backbone selection (Train page checkboxes) also filters Inference.
         self.train_page.models_changed.connect(self.infer_page.reload_backbones)
-        # Each page scrolls vertically instead of being crammed into the window.
+        # Each page scrolls vertically instead of being crammed into the window,
+        # and gets HIG form spacing (Fusion's 6px default clumps the text).
         for page in (self.datasets_page, self.train_page,
                      self.infer_page, self.plotting_page):
+            ui.polish_forms(page)
             self.stack.addWidget(ui.scroll_v(page))
 
         self.nav.setCurrentRow(0)

@@ -1037,6 +1037,30 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     write_run_manifest(run_dir, "randlanet_hag" if HAG else "randlanet", dataset)
 
     def run_eval(ep, write_json=False):
+        # VAL always scores the current (most-recent) weights. The final
+        # (write_json) call scores TEST on the BEST-TRACKED checkpoint instead,
+        # so test_metrics.json reports the model actually kept as
+        # final_model.pth, not whatever epoch training happened to end on.
+        #
+        # PreciseBN (Yan et al., "Rethinking 'Batch' in BatchNorm"): eval-mode BN
+        # runs on EMA stats that lag the fast-moving weights ("moment staleness"),
+        # which whipsaws the val curve while train stays smooth. Re-estimate the
+        # stats with the CURRENT frozen weights over train_loader batches (the
+        # exact distribution BN tracked, cumulative average) before scoring, so
+        # best.update selects on and saves the precise stats.
+        def _bn_batches(n=32):
+            it = iter(train_loader)
+            for _ in range(n):
+                try:
+                    batch = next(it)
+                except StopIteration:
+                    return
+                for k in ("features", "labels", "input_inds", "cloud_inds"):
+                    batch[k] = batch[k].to(device, non_blocking=True)
+                for k in ("xyz", "neigh_idx", "sub_idx", "interp_idx"):
+                    batch[k] = [t.to(device, non_blocking=True) for t in batch[k]]
+                yield batch
+        dg.adabn_recalibrate(net, _bn_batches(), forward=lambda mdl, b: mdl(b))
         net.eval()
         m = evaluate(val_ds, val_src, f"eval@ep{ep}")
         ious = [m["per_class_iou"][CLASS_NAMES[c]] for c in range(NUM_CLASSES)]
@@ -1046,7 +1070,15 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         if best.update(m["present_classes_mIoU"]):
             torch.save({"model": net.state_dict(), "epoch": ep}, best.final)
         if write_json:
+            swapped = os.path.exists(best.final)
+            if swapped:
+                live_state = {k: v.clone() for k, v in net.state_dict().items()}
+                net.load_state_dict(torch.load(best.final, map_location=device,
+                                               weights_only=True)["model"])
+                net.eval()
             m_test = evaluate(test_ds, {n: (p, c) for n, p, c in test_list}, "test")
+            if swapped:
+                net.load_state_dict(live_state)
             with open(f"{run_dir}/test_metrics.json", "w") as fj:
                 json.dump({"val": m, "test": m_test,
                            "val_scenes": [n for n, _, _ in val_list],

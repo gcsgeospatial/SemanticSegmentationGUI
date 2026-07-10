@@ -110,6 +110,15 @@ QWidget {{ font-size: 14px; }}
 #log {{ font-family: Consolas, "Courier New", monospace; font-size: 12px;
         background: {c['log_bg']}; color: {c['log_text']}; border: 1px solid {c['border']}; }}
 
+/* Plain line edits get breathing room (Fusion renders them crunched). Combos and
+   spin boxes stay native: QSS padding flips them to styled mode, whose arrow
+   subcontrols overlap and clip the text. */
+QLineEdit {{ padding: 5px 8px; border: 1px solid {c['border']}; border-radius: 4px;
+             background: {c['panel']}; color: {c['text']}; }}
+/* the QLineEdit inside a native-rendered combo/spinbox: no inner box */
+QComboBox QLineEdit, QAbstractSpinBox QLineEdit {{
+    padding: 0 2px; border: none; background: transparent; }}
+
 QPushButton {{ padding: 7px 14px; border-radius: 5px; border: 1px solid {c['border']};
                background: {c['button']}; color: {c['button_text']}; }}
 QPushButton:hover {{ background: {c['button_hover']}; }}
@@ -120,8 +129,8 @@ QPushButton#primary:hover {{ background: {c['accent_hover']}; }}
 QPushButton#primary:disabled {{ background: {c['button']}; color: {c['disabled_text']};
                                 border: 1px solid {c['border']}; }}
 
-QGroupBox {{ font-weight: 600; margin-top: 10px; border: 1px solid {c['border']};
-             border-radius: 6px; padding: 10px; color: {c['text']}; }}
+QGroupBox {{ font-weight: 600; margin-top: 12px; border: 1px solid {c['border']};
+             border-radius: 6px; padding: 18px 14px 14px 14px; color: {c['text']}; }}
 QGroupBox::title {{ subcontrol-origin: margin; left: 10px; padding: 0 4px; color: {c['text']}; }}
 
 /* keyboard-focus visibility (accessibility) */

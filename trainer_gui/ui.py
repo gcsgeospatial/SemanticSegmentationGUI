@@ -11,8 +11,22 @@ window scrolls instead of being squeezed.
 from __future__ import annotations
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import (QDoubleSpinBox, QHBoxLayout, QScrollArea, QSpinBox, QVBoxLayout,
-                               QWidget)
+from PySide6.QtGui import QTextCursor
+from PySide6.QtWidgets import (QDoubleSpinBox, QHBoxLayout, QPlainTextEdit, QScrollArea, QSpinBox,
+                               QVBoxLayout, QWidget)
+
+
+def append_log(log: QPlainTextEdit, text: str, newline: bool = True):
+    """Append to a log console without yanking a scrolled-up user back to the
+    bottom. Autoscrolls only if the view was already at (or within a line of)
+    the bottom before this append — the standard `tail -f` behavior — so
+    reading earlier output stays put while new lines keep arriving below."""
+    bar = log.verticalScrollBar()
+    at_bottom = bar.value() >= bar.maximum() - log.fontMetrics().height()
+    log.moveCursor(QTextCursor.End)
+    log.insertPlainText(text + ("\n" if newline else ""))
+    if at_bottom:
+        bar.setValue(bar.maximum())
 
 
 class NoWheelSpinBox(QSpinBox):
@@ -46,7 +60,12 @@ def _stack(layout_cls, widgets, sizes, vertical: bool) -> QWidget:
     sizes = sizes or [1] * len(widgets)
     for child, size in zip(widgets, sizes):
         if vertical:
-            child.setMinimumHeight(int(size))   # floor: never crop a section
+            # Floor: never crop a section. An explicit setMinimumHeight REPLACES
+            # the content-derived minimum, so clamp to whichever is larger — a
+            # bare `size` let dense forms be squashed until their rows overlapped.
+            # Spacing must be final before measuring, hence polish_forms here.
+            polish_forms(child)
+            child.setMinimumHeight(max(int(size), child.minimumSizeHint().height()))
         else:
             child.setMinimumWidth(160)          # keep side panes usable
         lay.addWidget(child, int(size))         # weight: grow proportionally
@@ -65,6 +84,17 @@ def scrollable(widget: QWidget) -> QWidget:
     """No-op: the whole page now scrolls (see scroll_v), so inner scroll areas
     would just nest. Kept so existing call sites need no change."""
     return widget
+
+
+def polish_forms(root: QWidget) -> None:
+    """Open up every form under `root`. Fusion's 6px default layout spacing reads
+    as clumped text at our 14px font; 12px between rows and 14px between a label
+    and its field are the usual desktop-HIG numbers. Called once per page from
+    main.py so every page (and any future one) gets the same rhythm."""
+    from PySide6.QtWidgets import QFormLayout
+    for f in root.findChildren(QFormLayout):
+        f.setVerticalSpacing(12)
+        f.setHorizontalSpacing(14)
 
 
 def scroll_v(widget: QWidget) -> QScrollArea:

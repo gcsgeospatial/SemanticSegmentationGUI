@@ -38,6 +38,8 @@ SCRIPTS = {
     "randlanet_hag": "modal_train_randlanet_hag.py",
     "kpconvx_cold": "modal_train_kpconvx_cold.py",
     "kpconvx_cold_hag": "modal_train_kpconvx_cold_hag.py",
+    "kpconv": "modal_train_kpconv.py",
+    "kpconv_hag": "modal_train_kpconv_hag.py",
 }
 
 # pip wheel channel -> CUDA toolkit tag for the `nvidia/cuda:<ver>-devel` base.

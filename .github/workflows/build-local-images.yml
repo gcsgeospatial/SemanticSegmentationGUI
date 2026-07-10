@@ -56,6 +56,16 @@ jobs:
             url: 'https://github.com/apple/ml-kpconvx'
             sha: '54e644a9f3bddd4c344a58193897a44582b0fea4'
             subdir: '/Standalone/KPConvX'
+          - key: kpconv
+            ctx: kpconvsrc
+            url: 'https://github.com/HuguesTHOMAS/KPConv-PyTorch'
+            sha: 'd19c575d3fa9fcfd5a74845b5b27aac7e50472c7'
+            subdir: ''
+          - key: kpconv_hag
+            ctx: kpconvsrc
+            url: 'https://github.com/HuguesTHOMAS/KPConv-PyTorch'
+            sha: 'd19c575d3fa9fcfd5a74845b5b27aac7e50472c7'
+            subdir: ''
     steps:
       - name: Checkout this repo (Dockerfiles)
         uses: actions/checkout@v4

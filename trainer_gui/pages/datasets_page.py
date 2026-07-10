@@ -16,13 +16,12 @@ import os
 from pathlib import Path
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
                                QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel,
                                QLineEdit, QListWidget, QMessageBox, QPlainTextEdit, QPushButton,
                                QSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
-from .. import analysis, appstate, dataset, modal_cli, pretrain, theme
+from .. import analysis, appstate, dataset, modal_cli, pretrain, theme, ui
 from ..dataset import LabelSpec, SplitConfig
 from ..jobs import FuncWorker, JobRunner
 from ..readers import list_label_fields
@@ -740,9 +739,7 @@ class DatasetsPage(QWidget):
     def _append(self, text: str, newline: bool = True):
         # Stream into the console. newline=False for chunked subprocess output
         # (uploader); True for one-shot status messages.
-        self.log.moveCursor(QTextCursor.End)
-        self.log.insertPlainText(text + ("\n" if newline else ""))
-        self.log.moveCursor(QTextCursor.End)
+        ui.append_log(self.log, text, newline)
 
 
 def _parse_values(text: str) -> list[int]:

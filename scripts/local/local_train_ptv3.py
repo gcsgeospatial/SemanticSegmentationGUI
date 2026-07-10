@@ -16,8 +16,14 @@ Softmax, inverse-sqrt-frequency class weights + rare-class tile oversampling,
 AdamW (lr 2e-3, wd 5e-3) + warmup/cosine, overlap-voting eval scored on raw
 points, periodic held-out validation + resumable checkpoints.
 
+The 3 color channels prefer lidar intensity (normalized grayscale x3) over RGB
+when the dataset has both — intensity separates water/asphalt/shadow where RGB
+is ambiguous. RGB is the fallback, mid-gray the last resort. Old RGB-trained
+checkpoints keep getting RGB at inference (run.json "color_source", absent =
+pre-change = rgb).
+
 --hag appends a HeightAboveGround input channel (in_channels 6 -> 7;
-[xyz, rgb, HAG]), read per point from the tile/scene "hag" array, which the
+[xyz, color, HAG]), read per point from the tile/scene "hag" array, which the
 dataset (or the Inference page's HAG box) must supply — this replaces the old
 copy-paste local_train_ptv3_hag.py twin (now a thin wrapper forcing --hag).
 
@@ -184,6 +190,7 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
     CHUNK_XY    = chunk_xy if chunk_xy is not None else 50.0
     STRIDE      = CHUNK_XY / 2.0
     HAG = bool(hag)   # --hag: local vars named `hag` below are per-point ARRAYS
+    color_src = "intensity"   # what fills the 3 color channels; see module docstring
 
     # NUM_CLASSES / CLASS_NAMES come ONLY from the dataset's dataset_meta.json.
     # --mode infer is dataset-free: the inference branch below reads the class
@@ -207,10 +214,14 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
         # PDAL nearest-neighbour filter was the only one back then.)
         HAG_SOURCE = (((ds_meta.get("source") or {}).get("hag_source") or "pdal_hag_nn")
                       if HAG else None)
+        if not ds_meta.get("has_intensity"):
+            color_src = "rgb" if ds_meta.get("has_rgb") else "gray"
         # --hag gets its own cache family (tiles carry a "hag" array), keyed by the
         # HAG method too — tiles built one way must never be reused by another.
+        # Keyed by color_src for the same reason: tiles bake the color channels in,
+        # so RGB-era caches ("ptv3_cold") are abandoned, not silently reused.
         _hag_tag = f"_hag_{HAG_SOURCE.replace('+', '_')}" if HAG else ""
-        PREP_DIR = f"{ds_root}/prep/ptv3_cold{_hag_tag}_chunk{int(CHUNK_XY)}"
+        PREP_DIR = f"{ds_root}/prep/ptv3_{color_src}{_hag_tag}_chunk{int(CHUNK_XY)}"
 
     # --- Preprocessing ------------------------------------------------------
     def load_ply(path):
@@ -231,13 +242,20 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
 
     def load_canonical(npz_path):
         """Canonical trainer_gui scene -> the (xyz, rgb, lab) tuple load_ply produces.
-        Missing rgb falls back to mid-gray (same as load_ply)."""
+        color_src picks what fills the 3 color channels: intensity-first for new
+        runs, rgb for old RGB-trained checkpoints at inference. Missing signals
+        fall through (intensity -> rgb -> mid-gray). Intensity is npz-normalized
+        (0..1 max / 0..2 p95); x255 puts it on the rgb scale the /255 sites expect."""
         z = np.load(npz_path)
         xyz = z["xyz"].astype(np.float32)
-        if "rgb" in z:
+        def _itn():
+            return np.repeat((z["intensity"].astype(np.float32) * 255.0)[:, None], 3, axis=1)
+        if color_src != "rgb" and "intensity" in z:
+            rgb = _itn()
+        elif "rgb" in z:
             rgb = z["rgb"].astype(np.float32)
         elif "intensity" in z:
-            rgb = np.repeat((z["intensity"].astype(np.float32) * 255.0)[:, None], 3, axis=1)
+            rgb = _itn()
         else:
             rgb = np.full((len(xyz), 3), 128.0, dtype=np.float32)
         lab = z["label"].astype(np.int64) if "label" in z \
@@ -472,6 +490,9 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
         _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "helper"))
         from train_common import infer_meta
         meta = infer_meta(wpath)
+        # Feed the checkpoint the color signal it was trained on. Manifests from
+        # before intensity-first carry no color_source -> those runs saw RGB.
+        color_src = (meta or {}).get("color_source") or "rgb"
         if meta:
             class_names = meta.get("class_names") or class_names
             if meta.get("grid") is not None:
@@ -498,6 +519,7 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
         infer_cfg = {"backbone": "PTv3", "mode": "infer", "weights": weights,
                      "infer_input": infer_input, "num_classes": num_classes,
                      "class_names": class_names, "grid_size": GRID_SIZE,
+                     "color_source": color_src,
                      "chunk_xy": CHUNK_XY, "hag": HAG, "gpu": gpu_name(),
                      "started_utc": datetime.utcnow().isoformat() + "Z"}
 
@@ -583,9 +605,13 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                 "mode": mode, "gpu": gpu_name(),
                 "num_classes": NUM_CLASSES, "grid_size": GRID_SIZE,
                 "class_names": CLASS_NAMES,
+                "color_source": color_src,
                 # --hag adds exactly the twin's extra keys; base mode writes none.
                 **({"in_channels": 7,
-                    "features": ["x", "y", "z", "rgb_r", "rgb_g", "rgb_b", "HAG"],
+                    "features": ["x", "y", "z"]
+                        + {"intensity": ["intensity"] * 3, "gray": ["gray"] * 3,
+                           "rgb": ["rgb_r", "rgb_g", "rgb_b"]}[color_src]
+                        + ["HAG"],
                     "hag_source": HAG_SOURCE} if HAG else {}),
                 "chunk_xy": CHUNK_XY, "stride": STRIDE,
                 "steps_per_epoch": STEPS,
@@ -1046,7 +1072,10 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
     def run_eval(ep, write_json=False):
         # Periodic pass scores the held-out VAL scenes only (no test peeking) and
         # selects the best checkpoint on val present-class mIoU. The final pass
-        # (write_json) also scores the TEST set and writes both, separately.
+        # (write_json) scores TEST on the BEST-TRACKED checkpoint, not whatever
+        # epoch training happened to end on, so test_metrics.json reports the
+        # model actually kept as final_model.pth. VAL stays on the current
+        # (most-recent) weights, matching the periodic curve.
         backbone.eval(); head.eval()
         m = evaluate(val_items, f"val@ep{ep}")
         ious = [m["per_class_iou"][_name(c)] for c in range(NUM_CLASSES)]
@@ -1057,7 +1086,16 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
             torch.save({"backbone": backbone.state_dict(),
                         "head": head.state_dict(), "epoch": ep}, best.final)
         if write_json:
+            swapped = os.path.exists(best.final)
+            if swapped:
+                live_backbone = {k: v.clone() for k, v in backbone.state_dict().items()}
+                live_head = {k: v.clone() for k, v in head.state_dict().items()}
+                bckpt = torch.load(best.final, map_location="cuda", weights_only=True)
+                backbone.load_state_dict(bckpt["backbone"]); head.load_state_dict(bckpt["head"])
+                backbone.eval(); head.eval()
             mt = evaluate(test_items, f"test@ep{ep}")
+            if swapped:
+                backbone.load_state_dict(live_backbone); head.load_state_dict(live_head)
             with open(f"{run_dir}/test_metrics.json", "w") as fj:
                 json.dump({"val": m, "test": mt,
                            "val_scenes": [n for n, _, _ in val_items],

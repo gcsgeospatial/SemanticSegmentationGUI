@@ -320,9 +320,10 @@ def main():
               ip95.max() >= imax.max() and ip95.max() <= 2.0)
 
         # ---------------- backbones: infer-readiness contracts
-        check("backbones: folder-infer set = the 6 cold/hag scripts",
+        check("backbones: folder-infer set = the 8 cold/hag scripts",
               set(infer_backbones()) == {"ptv3", "randlanet", "ptv3_hag", "randlanet_hag",
-                                         "kpconvx_cold", "kpconvx_cold_hag"})
+                                         "kpconvx_cold", "kpconvx_cold_hag",
+                                         "kpconv", "kpconv_hag"})
         check("backbones: randlanet uses --sub-grid and has no --chunk-xy",
               BACKBONES["randlanet"].grid_flag == "sub-grid"
               and not BACKBONES["randlanet"].has_chunk)
@@ -390,7 +391,28 @@ def main():
 
         # Train page's Modal-presence check parses `modal volume ls --json` entries
         # whose basename key varies by CLI version — lock the parser.
-        from trainer_gui.pages.infer_page import _entry_name, _localize_paths
+        from trainer_gui.pages.infer_page import _entry_name, _localize_paths, _parse_run_ref
+        # The Inference run box accepts the train log's copy string verbatim
+        # (<volume>/runs/<id>), plus every older shape that already worked.
+        check("infer: _parse_run_ref handles pasted volume paths and bare ids",
+              _parse_run_ref("ptv3-hag-outputs/runs/20260709_195750_ieee-test_ptv3_hag")
+              == ("ptv3-hag-outputs", "20260709_195750_ieee-test_ptv3_hag")
+              and _parse_run_ref("runs/20260709_1957") == ("", "20260709_1957")
+              and _parse_run_ref("20260709_1957  (ptv3_hag)") == ("", "20260709_1957")
+              and _parse_run_ref("/vol/runs/id/") == ("vol", "id")
+              and _parse_run_ref("") == ("", ""))
+        # Modal CLI removed `volume get -f` (only --force remains); `put` keeps -f.
+        from trainer_gui import modal_cli
+        check("modal_cli: volume get spells out --force (short -f was removed)",
+              "--force" in modal_cli.volume_get("v", "runs/x", "d")[1]
+              and "-f" not in modal_cli.volume_get("v", "runs/x", "d")[1])
+        from trainer_gui.pages.infer_page import _manifest_in
+        mdir = tmp / "dl_run"
+        mdir.mkdir()
+        (mdir / "run.json").write_text('{"backbone": "ptv3"}', encoding="utf-8")
+        check("infer: _manifest_in reads run.json from a downloaded run folder",
+              _manifest_in(mdir)["backbone"] == "ptv3"
+              and _manifest_in(tmp / "no_such_run") is None)
         check("infer: _entry_name reads path/Filename/name across CLI shapes",
               _entry_name({"path": "/ds/dataset_meta.json"}) == "dataset_meta.json"
               and _entry_name({"Filename": "train/"}) == "train"

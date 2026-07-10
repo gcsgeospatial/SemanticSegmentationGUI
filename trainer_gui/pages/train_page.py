@@ -15,7 +15,6 @@ import os
 from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog, QFileDialog,
                                QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
                                QPlainTextEdit, QPushButton, QTableWidget, QTableWidgetItem,
@@ -782,9 +781,7 @@ class TrainPage(QWidget):
         appstate.put("run_history", history[-200:])
 
     def _append(self, text: str, newline: bool = True):
-        self.log.moveCursor(QTextCursor.End)
-        self.log.insertPlainText(text + ("\n" if newline else ""))
-        self.log.moveCursor(QTextCursor.End)
+        ui.append_log(self.log, text, newline)
 
 
 def _wrap(layout) -> QWidget:

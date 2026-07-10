@@ -14,7 +14,7 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QProcess, Qt
-from PySide6.QtGui import QColor, QTextCursor
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (QCheckBox, QColorDialog, QComboBox, QDialog, QDialogButtonBox,
                                QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout,
                                QHeaderView, QLabel, QLineEdit, QPlainTextEdit, QPushButton,
@@ -53,6 +53,8 @@ class InferPage(QWidget):
         self._dg: dict = {}                         # DG settings baked into the weights (run.json["dg"])
         self._run_class_names: list | None = None   # the loaded run's own classes (run.json)
         self._hag_ground_value: int | None = None   # parsed in _check_hag, used by the converter
+        self._modal_cfg_run = ""                    # run id whose fetched config is applied
+        self._pending_cfg_run = ""                  # run id the cfg_fetcher is out for
 
         root = QVBoxLayout(self)
         title = QLabel("Inference")
@@ -102,13 +104,17 @@ class InferPage(QWidget):
         # MODAL: pick/paste a run id (weights live on the cloud outputs volume).
         self.run_combo = QComboBox()
         self.run_combo.setEditable(True)   # run ids can also be typed/pasted
+        self.run_combo.lineEdit().setPlaceholderText(
+            "run id — or paste <volume>/runs/<id> straight from the train log")
         self.run_combo.currentIndexChanged.connect(self._on_run_pick)
+        # A typed/pasted id pulls the run's config off the outputs volume.
+        self.run_combo.lineEdit().editingFinished.connect(self._on_run_id_typed)
         run_row = QHBoxLayout()
         run_row.addWidget(self.run_combo, 1)
         self.dl_run_btn = QPushButton("Download run…")
         self.dl_run_btn.setToolTip("Fetch runs/<id> (weights + run.json + metrics) from the "
-                                   "model's outputs volume to this machine — for backup, local "
-                                   "inference later, or the class legend.")
+                                   "model's outputs volume to <workspace>/inference/<id> — "
+                                   "for backup, local inference later, or the class legend.")
         self.dl_run_btn.clicked.connect(self._download_run)
         run_row.addWidget(self.dl_run_btn)
         self.run_row_w = _wrap(run_row)
@@ -286,6 +292,11 @@ class InferPage(QWidget):
         self.exporter.output.connect(self._append)
         self.exporter.done.connect(self._on_exported)
         self.exporter.error.connect(self._on_export_error)
+        self.cfg_fetcher = FuncWorker(self)   # modal run.json fetch for a typed run id
+        self.cfg_fetcher.output.connect(self._append)
+        self.cfg_fetcher.done.connect(self._on_cfg_fetched)
+        self.cfg_fetcher.error.connect(
+            lambda tb: self._append(f"✗ Run-config fetch failed:\n{tb}"))
         self.runner.output.connect(self._on_output)
         self.runner.finished.connect(self._on_stage_done)
         self.runner.failed.connect(self._on_runner_failed)
@@ -303,6 +314,8 @@ class InferPage(QWidget):
 
     def apply_exec_mode(self, local: bool):
         """Reword copy for the backend, apply the local backbone filter."""
+        if local and self._manifest and self._manifest_path is None:
+            self._invalidate_manifest()   # a modal-fetched config doesn't apply locally
         self.sub.setText(
             "Label point clouds with a trained model. "
             + ("Pick a run.json (or a local .pth), a folder of clouds, and run in Docker."
@@ -310,10 +323,19 @@ class InferPage(QWidget):
                "Pick a run (or a local .pth), a folder of clouds, and run on Modal."))
         # Output folder shown in both modes (Modal: download target).
         self.iform.setRowVisible(self.out_row_w, True)
-        self.wf.setRowVisible(self.runjson_row_w, local)  # run.json picker = local only
-        self.wf.setRowVisible(self.weights_row_w, local)  # weights override = local only
-        self.wf.setRowVisible(self.run_row_w, not local)  # run-id combo = modal only
+        self._sync_source_rows()
         self.reload_backbones()
+
+    def _sync_source_rows(self):
+        """Show only the weights inputs that match the source radio + backend:
+        Training run -> the run box (Modal) or run.json + weights rows (local);
+        Local .pth file -> just the File box."""
+        local = appstate.get_exec_mode() == "local"
+        from_run = self.from_run_radio.isChecked()
+        self.wf.setRowVisible(self.runjson_row_w, from_run and local)
+        self.wf.setRowVisible(self.weights_row_w, from_run and local)
+        self.wf.setRowVisible(self.run_row_w, from_run and not local)
+        self.wf.setRowVisible(self.pth_row_w, not from_run)
 
     def reload_backbones(self):
         """Populate the model dropdown, honoring the local-mode backbone filter."""
@@ -444,6 +466,7 @@ class InferPage(QWidget):
     # ------------------------------------------------------------- inputs
     def reload_runs(self):
         self.reload_palettes()
+        prev = self.run_combo.currentText()   # keep a typed/pasted ref across reloads
         self.run_combo.blockSignals(True)
         self.run_combo.clear()
         seen = set()
@@ -451,62 +474,79 @@ class InferPage(QWidget):
             if h["run_id"] not in seen:
                 seen.add(h["run_id"])
                 self.run_combo.addItem(f"{h['run_id']}  ({h['backbone']})", h)
-        # also offer runs already downloaded via the Runs page
+        # also offer downloaded runs: <workspace>/inference/<id> ('Download run…')
+        # and the legacy runs_dir()/<backbone>/<id> layout (Runs page).
+        inf = appstate.workspace_dir() / "inference"
+        for rdir in (inf.iterdir() if inf.is_dir() else []):
+            m = _manifest_in(rdir) if (rdir.is_dir() and rdir.name not in seen) else None
+            if m is not None:
+                seen.add(rdir.name)
+                self.run_combo.addItem(f"{rdir.name}  ({m.get('backbone', '?')})",
+                                       {"run_id": rdir.name, "backbone": m.get("backbone")})
         for bdir in appstate.runs_dir().iterdir() if appstate.runs_dir().exists() else []:
             if bdir.is_dir():
                 for rdir in bdir.iterdir():
-                    if rdir.name not in seen and any(
-                            (rdir / fn).exists() for fn in ("run.json", "run_config.json")):
+                    if rdir.name not in seen and _manifest_in(rdir) is not None:
                         seen.add(rdir.name)
                         self.run_combo.addItem(f"{rdir.name}  ({bdir.name})",
                                                {"run_id": rdir.name, "backbone": bdir.name})
+        # No implicit default: an old history entry preselected here reads as "the"
+        # run and may not even exist on Modal anymore. Restore what was typed, else blank.
+        self.run_combo.setCurrentIndex(-1)
+        self.run_combo.setEditText(prev)
         self.run_combo.blockSignals(False)
         self._on_run_pick()
 
     def _on_run_pick(self):
         """Sync architecture from the picked run; adopt its classes if downloaded."""
         h = self.run_combo.currentData()
+        if self._modal_cfg_run and self._combo_run_ref()[1] != self._modal_cfg_run:
+            self._invalidate_manifest()   # a different run than the fetched config
         if isinstance(h, dict) and h.get("backbone") in BACKBONES:
             i = self.backbone_combo.findData(h["backbone"])
             if i >= 0:
                 self.backbone_combo.setCurrentIndex(i)
-        if appstate.get_exec_mode() != "local":
+        # Typed/pasted text has no item data — leave any fetched classes in place.
+        if appstate.get_exec_mode() != "local" and isinstance(h, dict):
             self._set_run_classes(self._run_pick_class_names(h))
 
     def _run_pick_class_names(self, h) -> list | None:
         """Class names for a Modal run if downloaded locally, else None."""
         if not isinstance(h, dict):
             return None
-        rdir = appstate.runs_dir() / str(h.get("backbone", "")) / str(h.get("run_id", ""))
-        for fn in ("run.json", "run_config.json"):
-            p = rdir / fn
-            if p.exists():
-                try:
-                    with open(p, encoding="utf-8") as f:
-                        return self._names_from_manifest(json.load(f))
-                except (OSError, json.JSONDecodeError):
-                    pass
+        rid = str(h.get("run_id", ""))
+        for rdir in (appstate.workspace_dir() / "inference" / rid,
+                     appstate.runs_dir() / str(h.get("backbone", "")) / rid):
+            m = _manifest_in(rdir)
+            if m is not None:
+                return self._names_from_manifest(m)
         return None
+
+    def _combo_run_ref(self) -> tuple:
+        """(volume, run_id) from the run combo — typed text wins over currentData().
+        Accepts a pasted '<volume>/runs/<id>' (the train log's copy string), a bare
+        id, or the combo's own 'id  (backbone)' items. Volume is '' unless pasted."""
+        return _parse_run_ref(self.run_combo.currentText())
 
     def _download_run(self):
         """Modal: fetch runs/<id> (weights + run.json + metrics) from the model's
-        outputs volume to runs_dir()/<backbone>/<id> — the folder reload_runs and
-        the class-legend lookup already read."""
+        outputs volume to <workspace>/inference/<id> — the folder reload_runs and
+        the class-legend lookup also read, and where local inference can pick the
+        run.json straight back up."""
         b = self._backbone()
-        h = self.run_combo.currentData()
-        run_id = ((h.get("run_id") if isinstance(h, dict) else None)
-                  or self.run_combo.currentText().strip())
+        vol, run_id = self._combo_run_ref()
         if not (b and run_id):
             self._append("Pick (or type) a run id to download.")
             return
         if self.dl_runner.running:
             self._append("A run download is already in progress.")
             return
-        dest_base = appstate.runs_dir() / b.key
+        volume = vol or b.outputs_volume   # a pasted <volume>/runs/<id> names it exactly
+        dest_base = appstate.workspace_dir() / "inference"
         dest_base.mkdir(parents=True, exist_ok=True)
         self._dl_run_dest = dest_base / run_id
-        self._append(f"\nDownloading {b.outputs_volume}:/runs/{run_id} -> {self._dl_run_dest} …")
-        prog, args = modal_cli.volume_get(b.outputs_volume, f"runs/{run_id}", str(dest_base))
+        self._append(f"\nDownloading {volume}:/runs/{run_id} -> {self._dl_run_dest} …")
+        prog, args = modal_cli.volume_get(volume, f"runs/{run_id}", str(dest_base))
         self.dl_run_btn.setEnabled(False)
         self.dl_runner.start(prog, args, cwd=self.repo_root)
 
@@ -533,6 +573,7 @@ class InferPage(QWidget):
         """Drop the loaded manifest so a run can't proceed stale."""
         self._manifest = self._manifest_path = self._local_weights = None
         self._dg = {}
+        self._modal_cfg_run = ""
         self._apply_manifest_lock(False)   # run-derived inputs editable again
 
     def _infer_dg_env(self) -> dict:
@@ -569,12 +610,27 @@ class InferPage(QWidget):
         except (OSError, json.JSONDecodeError) as e:
             self._append(f"✗ couldn't read {p.name}: {e}")
             return
+        if not self._apply_manifest_fields(m):
+            return
+        self._manifest, self._manifest_path = m, p
+        self._local_weights = p.parent / m.get("weights", "final_model.pth")
+        self.weights_edit.setText(str(self._local_weights))   # default
+        self._apply_manifest_lock(True)   # arch/grid/tile come from the run — grey them out
+        ok = "✓" if self._local_weights.is_file() else "✗ weights missing -"
+        self._append(f"Loaded {p.name}: {m.get('backbone')}, grid={m.get('grid')}, "
+                     f"chunk={m.get('chunk_xy')}, intensity={m.get('intensity_norm')}. "
+                     f"{ok} {self._local_weights}")
+
+    def _apply_manifest_fields(self, m: dict) -> bool:
+        """Arch/grid/tile/HAG/DG/classes from a run manifest — shared by the local
+        run.json loader and the Modal fetch-by-run-id path. False (with a log
+        line) when the run's model can't be used here."""
         bkey = m.get("backbone")
         i = self.backbone_combo.findData(bkey)
         if i < 0:   # the run's model is hidden/unknown — don't keep the wrong one
             self._append(f"✗ Model '{bkey}' isn't available here. Enable it on the "
-                         f"Train page, then reload this run.json.")
-            return
+                         f"Train page, then reload this run.")
+            return False
         # hag_source is a truthy string iff the run trained with --hag. The old z-min
         # height proxy is gone, so weights that learned it can never be fed their
         # training feature again — refuse rather than silently hand them real HAG.
@@ -584,16 +640,13 @@ class InferPage(QWidget):
                          f"(hag_source={m.get('hag_source')}). That feature no longer "
                          f"exists. Rebuild the dataset with Height-Above-Ground enabled "
                          f"and retrain.")
-            return
-        self._manifest, self._manifest_path = m, p
+            return False
         self.backbone_combo.setCurrentIndex(i)       # fires _sync_controls (sets defaults)
         if m.get("grid") is not None:                # then the manifest overrides them
             self.grid_spin.setValue(float(m["grid"]))
         if m.get("chunk_xy") is not None and self.chunk_spin.isEnabled():
             self.chunk_spin.setValue(float(m["chunk_xy"]))
-        self._local_weights = p.parent / m.get("weights", "final_model.pth")
-        self.weights_edit.setText(str(self._local_weights))   # default
-        # logdk changes input width, so it MUST be re-fed at inference (DG_* env below).
+        # logdk changes input width, so it MUST be re-fed at inference (DG_* env).
         self._dg = m.get("dg") or {}
         # Prefill HAG from the run: tick + preselect the method it trained with. The
         # user can still untick. Ground class isn't prefilled — run.json doesn't carry
@@ -605,28 +658,95 @@ class InferPage(QWidget):
             j = self.hag_filter.findText(method)
             if j >= 0:
                 self.hag_filter.setCurrentIndex(j)
-        # Label legend + viewer with the model's own classes.
-        self._set_run_classes(self._names_from_manifest(m))
-        self._apply_manifest_lock(True)   # arch/grid/tile come from the run — grey them out
-        ok = "✓" if self._local_weights.is_file() else "✗ weights missing -"
-        self._append(f"Loaded {p.name}: {bkey}, grid={m.get('grid')}, "
-                     f"chunk={m.get('chunk_xy')}, intensity={m.get('intensity_norm')}. "
-                     f"{ok} {self._local_weights}")
-        if hs:
             self._append(f"[hag] run trained on real HAG ({m.get('hag_source')}); "
                          f"HAG enabled, method={self.hag_filter.currentText()}.")
         if self._dg.get("logdk"):
             self._append(f"[dg] trained with the log-d_k density channel "
                          f"(k={self._dg.get('logdk_k', 8)}); recomputed at inference.")
+        # Label legend + viewer with the model's own classes.
+        self._set_run_classes(self._names_from_manifest(m))
+        return True
+
+    # ------------------------------------------- modal config-by-run-id fetch
+    def _on_run_id_typed(self):
+        """Modal: a typed/pasted run id — pull its run.json (locally downloaded
+        copy first, else off the outputs volumes) so arch/grid/tile/HAG/classes
+        match the run, same as picking a run.json does for local inference."""
+        if appstate.get_exec_mode() == "local" or not self.from_run_radio.isChecked():
+            return
+        vol, rid = self._combo_run_ref()
+        if not rid or rid == self._modal_cfg_run or self.cfg_fetcher.running:
+            return
+        if self._manifest and self._manifest_path is None:
+            self._invalidate_manifest()   # a different run's fetched config — drop it
+        # Already downloaded ('Download run…' / Runs page)? No network needed.
+        rdirs = appstate.runs_dir()
+        cands = [appstate.workspace_dir() / "inference" / rid]
+        cands += [bdir / rid for bdir in (rdirs.iterdir() if rdirs.exists() else [])]
+        for d in cands:
+            m = _manifest_in(d)
+            if m is not None:
+                self._apply_modal_manifest(m, rid)
+                return
+        if vol:
+            vols = [vol]   # pasted <volume>/runs/<id> — go straight there, no search
+        else:
+            # Bare id: search the current model's outputs volume first, then the others.
+            cur = BACKBONES.get(self.backbone_combo.currentData())
+            vols = [cur.outputs_volume] if cur else []
+            for i in range(self.backbone_combo.count()):
+                b = BACKBONES.get(self.backbone_combo.itemData(i))
+                if b and b.outputs_volume not in vols:
+                    vols.append(b.outputs_volume)
+            if not vols:
+                self._append("✗ No models enabled — enable one on the Train page first.")
+                return
+        self._pending_cfg_run = rid
+        self._append(f"Fetching run config for '{rid}' from Modal…")
+        self.cfg_fetcher.start(_fetch_run_config, vols, rid)
+
+    def _on_cfg_fetched(self, m):
+        rid = self._pending_cfg_run
+        if not m:
+            self._append(f"✗ No run.json for '{rid}' on any outputs volume — set "
+                         f"Architecture / grid / tile to match the run manually.")
+            self._forget_run(rid)   # a stale history entry stops being offered
+            return
+        if self._combo_run_ref()[1] != rid:
+            return   # the user moved on to another run while we fetched
+        self._apply_modal_manifest(m, rid)
+
+    def _forget_run(self, rid: str):
+        """A history run that's gone from Modal: purge it so it stops being offered.
+        A pasted id that was never in history is left alone (the run may simply
+        predate run.json manifests)."""
+        hist = appstate.get("run_history", [])
+        kept = [h for h in hist if h.get("run_id") != rid]
+        if len(kept) == len(hist):
+            return
+        appstate.put("run_history", kept)
+        if self._combo_run_ref()[1] == rid:
+            self.run_combo.clearEditText()
+        self.reload_runs()
+        self._append(f"  (dropped '{rid}' from the run list — stale history entry.)")
+
+    def _apply_modal_manifest(self, m: dict, rid: str):
+        """A run manifest resolved from a Modal run id: apply + lock the run-derived
+        inputs and keep it as self._manifest (no path — there's no local run.json)
+        so intensity_norm and dataset-nested output work as in local mode."""
+        if not self._apply_manifest_fields(m):
+            return
+        self._manifest, self._manifest_path = m, None
+        self._modal_cfg_run = rid
+        self._apply_manifest_lock(True)
+        self._append(f"✓ Run '{rid}': {m.get('backbone')}, grid={m.get('grid')}, "
+                     f"chunk={m.get('chunk_xy')}, intensity={m.get('intensity_norm')}.")
 
     def _on_source_toggle(self):
-        from_run = self.from_run_radio.isChecked()
-        self.run_combo.setEnabled(from_run)
-        self.runjson_row_w.setEnabled(from_run)
-        self.weights_row_w.setEnabled(from_run)
-        self.pth_row_w.setEnabled(not from_run)
+        self._sync_source_rows()   # hide the rows the other source owns
         # A loaded run.json dictates arch/grid/tile; the manual .pth source frees them.
-        self._apply_manifest_lock(from_run and self._manifest is not None)
+        self._apply_manifest_lock(self.from_run_radio.isChecked()
+                                  and self._manifest is not None)
 
     def _apply_manifest_lock(self, locked: bool):
         """Grey out the inputs a run.json dictates (architecture, grid, tile size) so
@@ -741,6 +861,7 @@ class InferPage(QWidget):
             return
         modal = appstate.get_exec_mode() != "local"
         weights_run_id = ""
+        weights_vol = ""   # a pasted <volume>/runs/<id> names it; else the backbone's
         if self.from_file_radio.isChecked():
             if not os.path.isfile(self.pth_edit.text().strip()):
                 self._append("Choose a .pth file.")
@@ -761,23 +882,23 @@ class InferPage(QWidget):
                 self._append(f"✗ {BACKBONES[bkey].label} doesn't support folder inference.")
                 return
         else:
-            # MODAL: weights live on the cloud volume, keyed by run id.
-            h = self.run_combo.currentData()
-            if isinstance(h, dict):
-                run_id = h["run_id"]
-            else:
-                parts = self.run_combo.currentText().split()   # empty combo -> no crash
-                run_id = parts[0] if parts else ""
+            # MODAL: weights live on the cloud volume, keyed by run id. The typed
+            # text wins — currentData() keeps returning the last picked item even
+            # after the user types/pastes a different id over it.
+            pasted_vol, run_id = self._combo_run_ref()
             if not run_id:
                 self._append("Pick or type a run id.")
                 return
-            bkey = (h.get("backbone") if isinstance(h, dict) else None) \
+            h = self.run_combo.currentData()
+            bkey = (h.get("backbone") if isinstance(h, dict)
+                    and h.get("run_id") == run_id else None) \
                 or self.backbone_combo.currentData()
             if bkey in BACKBONES and not BACKBONES[bkey].folder_infer:
                 self._append(f"✗ {BACKBONES[bkey].label} doesn't support folder inference.")
                 return
             self._weights_remote = f"runs/{run_id}/final_model.pth"
             weights_run_id = run_id
+            weights_vol = pasted_vol
 
         if not self._check_hag(bkey):
             return
@@ -791,10 +912,9 @@ class InferPage(QWidget):
         if modal and weights_run_id:
             self._pending_input = input_dir
             self._pending_run_id = weights_run_id
-            self._append(f"[0/4] Checking weights on Modal "
-                         f"({self._backbone().outputs_volume})…")
-            self.preflight.start(_check_weights_present,
-                                 self._backbone().outputs_volume, weights_run_id)
+            wvol = weights_vol or self._backbone().outputs_volume
+            self._append(f"[0/4] Checking weights on Modal ({wvol})…")
+            self.preflight.start(_check_weights_present, wvol, weights_run_id)
             return
         self._start_conversion(input_dir)
 
@@ -1120,9 +1240,7 @@ class InferPage(QWidget):
 
     # ------------------------------------------------------------- helpers
     def _append(self, text: str, newline: bool = True):
-        self.log.moveCursor(QTextCursor.End)
-        self.log.insertPlainText(text + ("\n" if newline else ""))
-        self.log.moveCursor(QTextCursor.End)
+        ui.append_log(self.log, text, newline)
 
 
 class ClassPaletteDialog(QDialog):
@@ -1227,6 +1345,33 @@ def _localize_paths(text: str, job_id: str, pred_dir, staged) -> str:
     return text
 
 
+def _manifest_in(rdir: Path) -> dict | None:
+    """run.json (legacy run_config.json) in a run folder, or None."""
+    for fn in ("run.json", "run_config.json"):
+        p = Path(rdir) / fn
+        if p.is_file():
+            try:
+                with open(p, encoding="utf-8") as f:
+                    return json.load(f)
+            except (OSError, json.JSONDecodeError):
+                pass
+    return None
+
+
+def _parse_run_ref(text: str) -> tuple:
+    """('volume', 'run_id') out of whatever landed in the run box: a pasted
+    '<volume>/runs/<id>' (the train log's copy string), 'runs/<id>', a bare id,
+    or the combo's own 'id  (backbone)' items. Volume is '' when not named."""
+    parts = text.split()
+    tok = (parts[0] if parts else "").strip("/")
+    if "/runs/" in tok:
+        vol, rid = tok.split("/runs/", 1)
+        return vol, rid.strip("/")
+    if tok.startswith("runs/"):
+        return "", tok[len("runs/"):].strip("/")
+    return "", tok
+
+
 def _entry_name(entry: dict) -> str:
     """Basename of a `modal volume ls --json` entry (key name varies by CLI ver)."""
     for k in ("path", "Filename", "filename", "name", "Name"):
@@ -1234,6 +1379,18 @@ def _entry_name(entry: dict) -> str:
         if v:
             return str(v).rstrip("/").rsplit("/", 1)[-1]
     return ""
+
+
+def _fetch_run_config(volumes: list, run_id: str, progress=None):
+    """runs/<run_id>/run.json from the first outputs volume that has it, or None.
+    Runs in a FuncWorker thread (each try blocks on a `modal volume get`)."""
+    for vol in volumes:
+        if progress:
+            progress(f"  checking {vol}…")
+        m = modal_cli.fetch_run_manifest(vol, run_id)
+        if m:
+            return m
+    return None
 
 
 def _check_weights_present(volume: str, run_id: str, progress=None):

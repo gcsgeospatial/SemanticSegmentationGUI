@@ -146,6 +146,29 @@ BACKBONES: dict[str, Backbone] = {b.key: b for b in [
                           step=0.1, decimals=2, recommend_key="grid")]
                + _common(150, 4, steps_default=300, chunk_default=100.0),
     ),
+    # --- original KPConv (KPConv-PyTorch, deformable KPFCNN) -----------------
+    # Same conv-radius ladder / grid family as KPConvX; heavier though — the
+    # deformable blocks materialize [n_points, n_neighbors, K, 3] difference
+    # tensors — hence min_vram 40 and default batch 3 (vs KPConvX's 24 / 4).
+    Backbone(
+        key="kpconv", label="KPConv", script="scripts/modal/modal_train_kpconv.py",
+        app_name="kpconv", ready=True, folder_infer=True,
+        rec_gpu="A100-80GB", min_vram_gb=40,
+        grid_clamp=(0.4, 2.0), grid_mult=1.5,
+        params=[ParamSpec("grid", "Grid size (m)", "float", 2.0, 0.1, 5.0,
+                          step=0.1, decimals=2, recommend_key="grid")]
+               + _common(150, 3, steps_default=300, chunk_default=100.0),
+    ),
+    Backbone(
+        key="kpconv_hag", label="KPConv_hag",
+        script="scripts/modal/modal_train_kpconv_hag.py",
+        app_name="kpconv-hag", ready=True, folder_infer=True,
+        rec_gpu="A100-80GB", min_vram_gb=40,
+        grid_clamp=(0.4, 2.0), grid_mult=1.5,
+        params=[ParamSpec("grid", "Grid size (m)", "float", 2.0, 0.1, 5.0,
+                          step=0.1, decimals=2, recommend_key="grid")]
+               + _common(150, 3, steps_default=300, chunk_default=100.0),
+    ),
 ]}
 
 GPU_CHOICES = ["A10G", "L4", "L40S", "A100", "A100-80GB", "H100"]

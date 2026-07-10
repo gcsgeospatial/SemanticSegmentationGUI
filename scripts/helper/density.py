@@ -136,7 +136,12 @@ def adabn_recalibrate(model, batches, forward, momentum=None, reset=True):
     model    : nn.Module (BatchNorm layers anywhere inside).
     batches  : iterable of inputs to feed `forward`.
     forward  : callable(model, batch) -> runs a forward pass (output ignored).
-    momentum : BN momentum to use while accumulating (None keeps each layer's own).
+    momentum : BN momentum while accumulating. None (default) -> torch's
+               momentum=None mode, a CUMULATIVE average over all batches — the
+               PreciseBN estimator (Yan et al., "Rethinking 'Batch' in
+               BatchNorm"), unbiased in ~30-50 batches. A float -> exponential
+               average with that momentum (with reset=True, (1-m)^N of the
+               zeroed init survives N batches — feed enough of them).
     reset    : if True, zero the running stats first so the estimate is purely
                target-driven (pure AdaBN); if False, the existing stats act as a
                source prior that the target updates ease into (source-prior mixing).
@@ -157,8 +162,7 @@ def adabn_recalibrate(model, batches, forward, momentum=None, reset=True):
             if bn.running_var is not None:
                 bn.running_var.fill_(1.0)
             bn.num_batches_tracked.zero_()
-        if momentum is not None:
-            bn.momentum = momentum      # fixed momentum -> exponential avg; None -> cumulative
+        bn.momentum = momentum          # float -> exponential avg; None -> cumulative
         bn.train()                      # train mode == update running stats on forward
     with torch.no_grad():
         for batch in batches:

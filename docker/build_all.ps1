@@ -8,5 +8,7 @@ docker buildx build -f docker/randlanet.Dockerfile -t trainer-local-randlanet  -
 docker buildx build -f docker/randlanet_hag.Dockerfile -t trainer-local-randlanet_hag  --load .
 docker buildx build -f docker/kpconvx_cold.Dockerfile -t trainer-local-kpconvx_cold  --load .
 docker buildx build -f docker/kpconvx_cold_hag.Dockerfile -t trainer-local-kpconvx_cold_hag  --load .
+docker buildx build -f docker/kpconv.Dockerfile -t trainer-local-kpconv  --load .
+docker buildx build -f docker/kpconv_hag.Dockerfile -t trainer-local-kpconv_hag  --load .
 
 Pop-Location
