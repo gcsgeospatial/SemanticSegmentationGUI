@@ -557,8 +557,12 @@ class TrainPage(QWidget):
             defaults = ["x", "y", "z", "rgb"]   # the trainer's rgb-dataset legacy
         extra = ((meta.get("source") or {}).get("feature_channels")
                  if isinstance(meta.get("source"), dict) else None) or []
-        names = std + [n if str(n).startswith("feat_") else f"feat_{n}"
-                       for n in extra]
+        # feature_channels entries are dicts ({"name", "source_field", "norm"});
+        # the channel key is the "name" field, never the dict repr.
+        extra_names = [c.get("name") if isinstance(c, dict) else str(c)
+                       for c in extra]
+        names = std + [n if n.startswith("feat_") else f"feat_{n}"
+                       for n in extra_names if n]
         for n in names:
             it = QListWidgetItem(str(n))
             it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
