@@ -757,12 +757,17 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
 
         def _predict(pc_path):
             z = np.load(pc_path)
-            xyz = z["xyz"].astype(np.float32)
+            # predict in the scene-local frame (kp_load_canonical's origin
+            # shift — the frame the model trained in; global-UTM float32 both
+            # quantizes coords and mis-centers windows), return the ORIGINAL
+            # georeferenced coords as the deliverable.
+            raw = z["xyz"]
+            xyz = (raw - np.floor(raw.min(0))).astype(np.float32)
             intensity_n, ret_num = tc.scene_arrays(z, len(xyz))
             extras = tc.feat_extras(z, FEAT_SPEC, os.path.basename(pc_path))
             pred, conf, probs = _predict_points(xyz, intensity_n, ret_num,
                                                 extras=extras)
-            return xyz, pred, intensity_n, conf, probs
+            return raw, pred, intensity_n, conf, probs
 
         tc.run_infer_scenes(scenes, _predict, pred_dir, run_dir, infer_cfg, cls_txt=True)
         return

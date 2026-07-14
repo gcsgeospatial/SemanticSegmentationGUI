@@ -234,7 +234,10 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         (Phase 2a writes them, feat_hag included). Which channels the net
         actually eats is FEAT_SPEC's call; DG_LOGDK_FEAT appends more."""
         z = np.load(npz_path)
-        xyz = z["xyz"].astype(np.float32)
+        # origin-offset (per-scene floor-min, kp_load_canonical's pattern)
+        # before the float32 cast so projected (UTM) coords keep sub-meter
+        # precision in the prep cache (float32 spacing at y~5e6 is 0.5m).
+        xyz = (z["xyz"] - np.floor(z["xyz"].min(0))).astype(np.float32)
         intensity = z["intensity"].astype(np.float32) if "intensity" in z \
             else np.full(len(xyz), 0.5, np.float32)
         ret_num = z["return_number"].astype(np.float32) if "return_number" in z \
@@ -256,6 +259,9 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         # means the cache is stale/leaky and must not be silently reused.
         sig = {
             "format_version": 1,
+            # v2: cached xyz is scene-local (load_canonical's origin shift) —
+            # a global-frame cache must not be reused (0.5m y quantization).
+            "coord_frame": "scene-local",
             "pipeline": "randlanet",
             "dataset": dataset,
             "sub_grid_size": SUB_GRID_SIZE,
@@ -452,7 +458,11 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
             # spatially sort it for locality, predict it in NUM_POINTS blocks
             # (reusing the collate), then NN-propagate to all original points.
             z = np.load(pc_path)
-            xyz0 = z["xyz"].astype(np.float32)
+            # predict in the scene-local frame (kp_load_canonical's origin
+            # shift pattern; global-UTM float32 quantizes y to 0.5m), return
+            # the ORIGINAL georeferenced coords as the deliverable.
+            raw0 = z["xyz"]
+            xyz0 = (raw0 - np.floor(raw0.min(0))).astype(np.float32)
             itn0, ret0 = tc.scene_arrays(z, len(xyz0))
             ex0 = tc.feat_extras(z, FEAT_SPEC, os.path.basename(pc_path))
             keys = np.floor(xyz0 / SUB_GRID_SIZE).astype(np.int64)
@@ -492,7 +502,10 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                     # order (training spheres shuffle); shuffle, unshuffle on scatter.
                     perm = np.random.permutation(N)
                     block, f2, orig = block[perm], f2[perm], orig[perm]
-                    pc0 = (block - block.mean(0, keepdims=True)).astype(np.float32)
+                    # float64 mean: raw inference scenes carry global-UTM
+                    # coords, where a float32 mean mis-centers by ~500m
+                    pc0 = (block - block.mean(0, keepdims=True, dtype=np.float64)
+                           ).astype(np.float32)
                     # D5 density-TTA: isotropic scale s rescales the LocSE relative-coord
                     # magnitudes (a density view); average softmax over views. views=[1.0]
                     # when off -> identical to the old single-view behavior.
@@ -519,7 +532,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                 # degrade like the KP/PTv3 paths instead of crashing the job.
                 # Lowest NON-excluded class, confidence 0.
                 fb = min(set(range(num_classes)) - set(exclude_idx or ()))
-                return (xyz0, np.full(len(xyz0), fb, np.int64), itn0,
+                return (raw0, np.full(len(xyz0), fb, np.int64), itn0,
                         np.zeros(len(xyz0), np.float32),
                         np.zeros((len(xyz0), num_classes), np.float16)
                         if SAVE_PROBS else None)
@@ -531,7 +544,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
             conf = vv.max(1)[nn]
             probs = vv[nn].astype(np.float16) if SAVE_PROBS else None
             # itn0 is the p95-normalized intensity (the feature the net saw).
-            return xyz0, np.clip(pred, 0, num_classes - 1), itn0, conf, probs
+            return raw0, np.clip(pred, 0, num_classes - 1), itn0, conf, probs
         return _predict_scene
 
     # ==========================================================================
@@ -637,7 +650,8 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                             f2 = np.concatenate([f2, f2[pad]], 0)
                         perm = np.random.permutation(N)
                         block, f2 = block[perm], f2[perm]
-                        pc_c = (block - block.mean(0, keepdims=True)).astype(np.float32)
+                        pc_c = (block - block.mean(0, keepdims=True,
+                                                   dtype=np.float64)).astype(np.float32)
                         item = (pc_c, f2.astype(np.float32), np.zeros(N, np.int64),
                                 np.arange(N, dtype=np.int32), np.array([0], np.int32))
                         batch = collate_fn([item])
@@ -832,7 +846,8 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                         # wrecks predictions. Shuffle, then track originals.
                         perm = np.random.permutation(N)
                         pts_blk, f2, orig = pts_blk[perm], f2[perm], orig[perm]
-                        pc_c = (pts_blk - pts_blk.mean(0, keepdims=True)).astype(np.float32)
+                        pc_c = (pts_blk - pts_blk.mean(0, keepdims=True,
+                                                       dtype=np.float64)).astype(np.float32)
                         pend_items.append((pc_c, f2, np.zeros(N, np.int64),
                                            np.arange(N, dtype=np.int32),
                                            np.array([0], np.int32)))

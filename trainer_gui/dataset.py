@@ -384,7 +384,11 @@ def _convert_one(cloud: Cloud, raw: np.ndarray | None, value_to_index: dict[int,
     pass — no reload/re-write round trip. Skipped when PDAL can't produce an
     aligned result; the scene then has no "feat_hag" key and runs requiring
     it are blocked by the channel report."""
-    out: dict[str, np.ndarray] = {"xyz": cloud.xyz.astype(np.float32)}
+    # xyz stays float64: canonical scenes carry georeferenced (UTM ~1e6)
+    # coords, where float32 spacing is 0.5m — a cast here quantizes northing
+    # to half-meter steps before any trainer ever sees the points. Trainers
+    # origin-shift to a scene-local frame before their own float32 casts.
+    out: dict[str, np.ndarray] = {"xyz": cloud.xyz.astype(np.float64)}
 
     class_counts: dict[int, int] = {}
     # No class mapping = inference: `raw` was read only to locate ground (see

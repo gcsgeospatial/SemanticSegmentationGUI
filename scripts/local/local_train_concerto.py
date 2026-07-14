@@ -228,8 +228,12 @@ def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
         # builder in this one file). Deliberately NOT the ptv3_ family: that
         # trainer has its own copy of the tile code, and silent cross-reuse
         # would break the day either copy drifts.
+        # "_loc" = tiles in the scene-local frame (ptv3_load_canonical's
+        # origin shift). Pre-shift caches stored global-UTM float32 tiles
+        # (0.5m y quantization + the float32-mean centering bug) — a new dir
+        # name abandons them instead of silently mixing frames.
         PREP_DIR = (f"{ds_root}/prep/pcssl_{color_src}"
-                    f"{tc.feat_spec_tag(FEAT_SPEC, FEAT_LEGACY)}_chunk{int(CHUNK_XY)}")
+                    f"{tc.feat_spec_tag(FEAT_SPEC, FEAT_LEGACY)}_chunk{int(CHUNK_XY)}_loc")
 
     def _in_ch(spec):
         # spec widths: the color slot (rgb OR intensity) is 3 wide — the color
@@ -369,11 +373,11 @@ def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
         def _predict_scene(scene_path):
             # Tile into CHUNK_XY windows, voxel-downsample tracking the inverse
             # map, scatter per-voxel predictions back, NN-fill stragglers.
-            xyz, rgb, _ = load_canonical(scene_path)
+            xyz, rgb, _ = load_canonical(scene_path)   # scene-local frame
+            z0 = np.load(scene_path)
             # the feat_* channels the spec needs (a miss is a clear error;
             # feat_hag is written by convert_infer_job like any other channel)
-            ex0 = tc.feat_extras(np.load(scene_path), FEAT_SPEC,
-                                 os.path.basename(scene_path))
+            ex0 = tc.feat_extras(z0, FEAT_SPEC, os.path.basename(scene_path))
             pred = np.full(len(xyz), -1, np.int64)
             conf = np.zeros(len(xyz), np.float32)
             probs = np.zeros((len(xyz), num_classes), np.float16) if SAVE_PROBS else None
@@ -419,7 +423,11 @@ def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
                 _, nn = cKDTree(xyz[~miss]).query(xyz[miss])
                 pred[miss] = pred[~miss][nn]           # conf/probs stay 0: no votes
             # rgb carries the p95-normalized intensity grayscale the model saw.
-            return xyz, np.clip(pred, 0, num_classes - 1), rgb[:, 0] / 255.0, conf, probs
+            # Return the scene's ORIGINAL coords, not the origin-shifted ones
+            # load_canonical computed on — the _pred.npz is the georeferenced
+            # deliverable.
+            return (z0["xyz"], np.clip(pred, 0, num_classes - 1),
+                    rgb[:, 0] / 255.0, conf, probs)
         return _predict_scene
 
     # ==========================================================================
@@ -685,7 +693,11 @@ def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
             xyz = xyz.astype(np.float32)
             if training and AUG_ENABLE:
                 xyz = augment_xyz(xyz)
-            xyz = xyz - xyz.mean(0, keepdims=True)
+            # float64 mean: at global-UTM magnitudes a float32 mean is off by
+            # hundreds of meters, which fails the |xy|<=CHUNK_XY cut below for
+            # EVERY point and empties the whole batch (np.concatenate crash).
+            xyz = (xyz - xyz.mean(0, keepdims=True, dtype=np.float64)
+                   ).astype(np.float32)
             # Drop non-finite + far-outlier points: a single bad coordinate (NaN/
             # Inf or a stray faraway return) blows up the voxel grid and spconv's
             # indices, triggering a CUDA index device-assert that kills the run.

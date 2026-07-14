@@ -119,7 +119,7 @@ def main():
                                          test_inputs=[str(laz_root / "test")], progress=print)
         z = np.load(staged / "train" / "scene0.npz")
         check("laz npz: keys", {"xyz", "label", "rgb", "intensity"}.issubset(z.files))
-        check("laz npz: xyz f32 (N,3)", z["xyz"].dtype == np.float32 and z["xyz"].shape[1] == 3)
+        check("laz npz: xyz f64 (N,3)", z["xyz"].dtype == np.float64 and z["xyz"].shape[1] == 3)
         check("laz npz: label i32 in {-1,0,1,2}",
               z["label"].dtype == np.int32 and set(np.unique(z["label"])) <= {-1, 0, 1, 2})
         check("laz npz: ignored value 0 -> -1", (z["label"] == -1).sum() > 0)

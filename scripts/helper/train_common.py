@@ -22,7 +22,9 @@ def write_pred(path, xyz, pred, intensity=None, confidence=None, probs=None):
     and then reparse. Class is stored losslessly (the raw prediction), not
     encoded as palette colour."""
     import numpy as np
-    d = {"xyz": np.asarray(xyz, np.float32),
+    # xyz stays float64: predictions carry georeferenced (UTM ~1e6) coords,
+    # where a float32 cast quantizes northing to 0.5m steps in the deliverable.
+    d = {"xyz": np.asarray(xyz, np.float64),
          "classification": np.asarray(pred, np.int32)}
     if intensity is not None:
         d["intensity"] = np.asarray(intensity, np.float32)
@@ -1237,7 +1239,8 @@ def kp_make_target_batches(scenes, make_batch, build_feat, grid,
             if seen >= cap:
                 return
             z = np.load(pc_path)
-            txyz = z["xyz"].astype(np.float32)
+            # scene-local frame, matching what predict_points is fed
+            txyz = (z["xyz"] - np.floor(z["xyz"].min(0))).astype(np.float32)
             tin, trn = scene_arrays(z, len(txyz))
             tex = feat_extras(z, feat_names, os.path.basename(pc_path))
             for idx in xy_chunk_groups(txyz, chunk_xy, min_pts=64):
@@ -1275,10 +1278,15 @@ def ptv3_load_canonical(npz_path, color_src):
     color_src picks what fills the 3 color channels: intensity-first for new
     runs, rgb for old RGB-trained checkpoints at inference. Missing signals
     fall through (intensity -> rgb -> mid-gray). Intensity is npz-normalized
-    (0..1 max / 0..2 p95); x255 puts it on the rgb scale the /255 sites expect."""
+    (0..1 max / 0..2 p95); x255 puts it on the rgb scale the /255 sites expect.
+    xyz is origin-offset (per-scene floor-min, kp_load_canonical's pattern)
+    before the float32 cast: projected (UTM) coords are ~1e6 in magnitude,
+    where float32 spacing is 0.5m AND a float32 mean is off by hundreds of
+    meters — enough to blow the |xy|<=CHUNK_XY batch filter and empty every
+    training batch."""
     import numpy as np
     z = np.load(npz_path)
-    xyz = z["xyz"].astype(np.float32)
+    xyz = (z["xyz"] - np.floor(z["xyz"].min(0))).astype(np.float32)
     def _itn():
         return np.repeat((z["intensity"].astype(np.float32) * 255.0)[:, None], 3, axis=1)
     if color_src != "rgb" and "intensity" in z:
@@ -1485,7 +1493,10 @@ def ptv3_make_evaluate(forward, build_feat, feat_spec, grid, chunk_xy,
                     if len(xyz) < 64:
                         continue
                     ex = feat_extras(z, feat_spec, os.path.basename(tile))
-                    cxyz = xyz - xyz.mean(0, keepdims=True)
+                    # float64 mean: exact centering even for legacy global-UTM
+                    # tiles, where a float32 mean is hundreds of meters off
+                    cxyz = (xyz - xyz.mean(0, keepdims=True, dtype=np.float64)
+                            ).astype(np.float32)
                     ok = (np.isfinite(cxyz).all(1)
                           & (np.abs(cxyz[:, :2]).max(1) <= chunk_xy)
                           & (np.abs(cxyz[:, 2]) <= 200.0))
@@ -1803,6 +1814,19 @@ def _demo():  # ponytail: one runnable check -- `python train_common.py`
     assert not os.path.exists(f"{cd}/bad_x0_y50.npz")   # tile dropped
     assert not os.path.exists(f"{cd}/bad.done")          # scene unmarked
     assert os.path.exists(f"{cd}/good_x0_y0.npz")        # good tile untouched
+
+    # ptv3_load_canonical: global-UTM float64 scenes come back scene-local —
+    # centering a 30m tile then must land within |xy|<=40 (the batch filter
+    # that emptied every utonia batch when a float32 mean of ~5e6-magnitude
+    # coords was off by hundreds of meters).
+    utm = np.array([620900.0, 4849000.0, 170.0]) + \
+        np.random.RandomState(2).rand(20_000, 3) * [30, 30, 5]
+    np.savez(f"{cd}/utm.npz", xyz=utm, label=np.zeros(len(utm), np.int32))
+    lx, _, _ = ptv3_load_canonical(f"{cd}/utm.npz", "intensity")
+    assert lx.dtype == np.float32 and 0 <= lx.min() and lx.max() < 40.0
+    c = (lx - lx.mean(0, keepdims=True, dtype=np.float64)).astype(np.float32)
+    assert (np.abs(c[:, :2]).max(1) <= 40.0).all()      # every point survives
+    assert np.allclose(lx + np.floor(utm.min(0)), utm, atol=1e-2)  # invertible
 
     # make_prefetcher: batches arrive in order, shutdown is clean
     _pn = iter(range(100))

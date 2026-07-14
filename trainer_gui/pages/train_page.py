@@ -157,12 +157,7 @@ class TrainPage(QWidget):
         self.launch_btn.setObjectName("primary")
         self.launch_btn.clicked.connect(self._launch)
         run_row.addWidget(self.launch_btn)
-        self.dup_btn = QPushButton("↻ Duplicate previous run")
-        self.dup_btn.setToolTip("Restore dataset + model from the most recent run.")
-        self.dup_btn.clicked.connect(self._duplicate_prev)
-        self.dup_btn.setEnabled(bool(appstate.get("run_history", [])))
-        run_row.addWidget(self.dup_btn)
-        self.stop_ckpt_btn = QPushButton("Stop after epoch")
+        self.stop_ckpt_btn = QPushButton("⏹ Stop at nearest checkpoint")
         self.stop_ckpt_btn.setToolTip(
             "Cooperative stop (local runs): the trainer finishes the current epoch, "
             "then runs its normal final evaluation and best-checkpoint finalize "
@@ -1062,24 +1057,6 @@ class TrainPage(QWidget):
         history.append({"run_id": run_id, "backbone": b.key if b else "",
                         "dataset": self.dataset_combo.currentText()})
         appstate.put("run_history", history[-200:])
-        self.dup_btn.setEnabled(True)
-
-    # -------------------------------------------------- restore / duplicate
-    def _duplicate_prev(self):
-        """Repopulate dataset + model from the newest run_history entry."""
-        hist = appstate.get("run_history", [])
-        if not hist:
-            self.dup_btn.setEnabled(False)
-            return
-        e = hist[-1]
-        i = self.dataset_combo.findText(e.get("dataset", ""))
-        if i >= 0:
-            self.dataset_combo.setCurrentIndex(i)
-        i = self.backbone_combo.findData(e.get("backbone", ""))
-        if i >= 0:
-            self.backbone_combo.setCurrentIndex(i)
-        self._append(f"[dup] restored {e.get('backbone', '?')} · "
-                     f"{e.get('dataset', '?')} (run {e.get('run_id', '?')}).")
 
     def _restore_last_config(self):
         """Repopulate the page from the last launched config; stale dataset/
