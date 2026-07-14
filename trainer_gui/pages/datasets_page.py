@@ -309,7 +309,7 @@ class DatasetsPage(QWidget):
             self.feat_group.toggled.connect(w.setVisible)  # collapse w/ the checkbox
             w.setVisible(False)
         self.feat_group.setVisible(False)
-        form.addRow("", self.feat_group)
+        form.addRow(self.feat_group)   # spanning row (like the HAG box), no label gap
         # TODO(not ready): parallel-worker UI hidden until reviewed; conversion runs
         # single-process (max_workers=1 forced in _conversion_plan).
         self.tile_btn = QPushButton("Build dataset")

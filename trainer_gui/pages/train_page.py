@@ -57,7 +57,8 @@ _FEAT_DEFAULTS = {
 _PTV3_LIKE = ("ptv3", "concerto", "sonata", "utonia")
 
 # param flags that live in the collapsed Tuning fold, not the Job box
-_TUNING_FLAGS = ("batch", "steps-per-epoch", "chunk-xy")
+# ("grid"/"sub-grid" covers every backbone's grid_flag)
+_TUNING_FLAGS = ("batch", "chunk-xy", "grid", "sub-grid")
 
 
 class TrainPage(QWidget):
@@ -110,10 +111,21 @@ class TrainPage(QWidget):
         self.cfg_btn.clicked.connect(self._open_model_config)
         model_row.addWidget(self.cfg_btn)
         form.addRow("Model", ui.wrap(model_row))
-        # key params (epochs, grid, …) are inserted here by _rebuild_params
+        # key params (epochs, steps/epoch, …) are inserted here by _rebuild_params
         self.star_hint = QLabel("★ = dataset recommendation")
         theme.set_accent(self.star_hint, "muted")
         form.addRow("", self.star_hint)
+        # Validation cadence (VAL_EVERY env; trainer default 10 emits nothing).
+        self.val_every = QSpinBox()
+        self.val_every.setRange(1, 100)
+        self.val_every.setValue(10)
+        self.val_every.setToolTip(
+            "Run the held-out validation pass every N epochs. Lower N = slower "
+            "training but finer best-checkpoint selection (the best model is "
+            "picked among validated epochs only); higher N = faster, coarser.")
+        self.val_every.valueChanged.connect(self._refresh_summaries)
+        form.addRow("Validate every N epochs", self.val_every)
+        form.addRow("Input features", self._features_row())
         self.smoke_chk = QCheckBox("Smoke run (2 epochs × 50 steps)")
         self.smoke_chk.toggled.connect(self._apply_smoke)
         self.smoke_chk.toggled.connect(self._refresh_summaries)
@@ -177,7 +189,6 @@ class TrainPage(QWidget):
         # TODO(not ready): train-time DG UI disabled pending review; no DG env is
         # sent. analysis.dg_recommend/dg_config_to_env remain the backend hooks.
         config_col.addWidget(self._loss_box())
-        config_col.addWidget(self._features_box())
         config_col.addWidget(self.warn_label)
         config_col.addWidget(self.summary_lbl)
         config_col.addLayout(run_row)
@@ -558,22 +569,8 @@ class TrainPage(QWidget):
         box.toggled.connect(lambda *_: self._apply_smoke())
         inner.setVisible(False)
         self.tuning_box = box    # title echoes current values (_refresh_summaries)
-        self.tuning_form = QFormLayout()   # batch/steps/tile rows, per backbone
+        self.tuning_form = QFormLayout()   # batch/grid/tile rows, per backbone
         lay.addLayout(self.tuning_form)
-        # Validation cadence (VAL_EVERY env; trainer default 10 emits nothing).
-        self.val_every = QSpinBox()
-        self.val_every.setRange(1, 100)
-        self.val_every.setValue(10)
-        self.val_every.setToolTip(
-            "Run the held-out validation pass every N epochs. Lower N = slower "
-            "training but finer best-checkpoint selection (the best model is "
-            "picked among validated epochs only); higher N = faster, coarser.")
-        self.val_every.valueChanged.connect(self._refresh_summaries)
-        val_row = QHBoxLayout()
-        val_row.addWidget(QLabel("Validate every N epochs"))
-        val_row.addWidget(self.val_every)
-        val_row.addStretch(1)
-        lay.addLayout(val_row)
         return box
 
     def _refresh_summaries(self):
@@ -584,13 +581,13 @@ class TrainPage(QWidget):
         w = self._param_widgets.get("batch")
         if w is not None:
             parts.append(f"batch {w.value()}")
-        w = self._param_widgets.get("steps-per-epoch")
+        w = (self._param_widgets.get("grid")
+             or self._param_widgets.get("sub-grid"))
         if w is not None:
-            parts.append(f"steps {w.value()}")
+            parts.append(f"grid {w.value():g} m")
         w = self._param_widgets.get("chunk-xy")
         if w is not None:
             parts.append(f"tile {w.value():g} m")
-        parts.append(f"val every {self.val_every.value()}")
         self.tuning_box.setTitle("Tuning — " + " · ".join(parts))
         b = self._backbone()
         name = self.dataset_combo.currentText()
@@ -600,12 +597,12 @@ class TrainPage(QWidget):
         smoke = self.smoke_chk.isChecked()
         ep_w = self._param_widgets.get("epochs")
         ep = 2 if smoke else (ep_w.value() if ep_w is not None else 0)
-        gw = self._param_widgets.get(b.grid_flag)
-        grid = f" · grid {gw.value():g} m" if gw is not None else ""
+        sw = self._param_widgets.get("steps-per-epoch")
+        steps = 50 if smoke else (sw.value() if sw is not None else 0)
         mode = ("Docker (local)" if appstate.get_exec_mode() == "local"
                 else f"Modal ({self.gpu_combo.currentText()})")
         self.summary_lbl.setText(
-            f"▶ {b.label} · {name} · {ep} ep{grid}"
+            f"▶ {b.label} · {name} · {ep} ep × {steps} steps"
             + (" · smoke" if smoke else "") + f" · {mode}")
 
     # ------------------------------------------- loss / class balance (per run)
@@ -689,32 +686,30 @@ class TrainPage(QWidget):
                 "rare_oversample": self.loss_rare.isChecked()}
 
     # -------------------------------------------- input features (per run)
-    def _features_box(self) -> QGroupBox:
-        box = QGroupBox("Input features (advanced)")
-        box.setCheckable(True)
-        box.setChecked(False)
-        outer = QVBoxLayout(box)
-        inner = QWidget()
-        lay = QVBoxLayout(inner)
-        lay.setContentsMargins(0, 0, 0, 0)
-        outer.addWidget(inner)
-        box.toggled.connect(inner.setVisible)
-        inner.setVisible(False)
-        self.feat_box = box      # unchecked = off, use the trainer's legacy defaults
-
-        hint = QLabel("Check the channels the model eats, drag to reorder "
-                      "(top-to-bottom = channel order). Unchecked box = the "
-                      "model's built-in defaults. Sent as FEAT_CHANNELS; "
-                      "recorded in run.json.")
-        hint.setWordWrap(True)
-        theme.set_accent(hint, "muted")
-        lay.addWidget(hint)
-
+    def _features_row(self) -> QWidget:
+        """Compact picker for the Job form: a 'Custom' toggle + a wrapping
+        horizontal chip list. Off = the trainer's legacy defaults; on = checked
+        chips in left-to-right order (drag to reorder) sent as FEAT_CHANNELS."""
+        self.feat_box = QCheckBox("Custom")   # same isChecked/setChecked API
+        self.feat_box.setToolTip(
+            "Off = the model's built-in default channels. On: checked chips "
+            "are the channel spec, left-to-right (drag to reorder). Sent as "
+            "FEAT_CHANNELS; recorded in run.json.")
         self.feat_list = QListWidget()
+        self.feat_list.setFlow(QListWidget.LeftToRight)
+        self.feat_list.setWrapping(True)
+        self.feat_list.setResizeMode(QListWidget.Adjust)
         self.feat_list.setDragDropMode(QAbstractItemView.InternalMove)
         self.feat_list.setDefaultDropAction(Qt.MoveAction)
-        lay.addWidget(self.feat_list)
-        return box
+        self.feat_list.setMaximumHeight(58)   # ~2 chip rows, then scrolls
+        self.feat_list.setEnabled(False)
+        self.feat_box.toggled.connect(self.feat_list.setEnabled)
+        self.feat_box.toggled.connect(self._refresh_summaries)
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(self.feat_box)
+        row.addWidget(self.feat_list, 1)
+        return ui.wrap(row)
 
     def _rebuild_feat_list(self):
         """Repopulate the checklist for the selected backbone + dataset: the

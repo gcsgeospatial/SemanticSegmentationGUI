@@ -921,7 +921,11 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         return m
 
     t_run = time.time()
-    print(f"  starting {N_EPOCHS} epochs, {cfg.train_steps} steps/epoch", flush=True)
+    # Opt-in bf16 autocast (TT_AMP=1), matching the other trainers. Batch
+    # prefetch is already covered here by the DataLoader's num_workers.
+    AMP = os.environ.get("TT_AMP") == "1"
+    print(f"  starting {N_EPOCHS} epochs, {cfg.train_steps} steps/epoch"
+          f"{' [bf16 autocast]' if AMP else ''}", flush=True)
     LOG_EVERY = 20
     ep = N_EPOCHS - 1     # final-eval label when the loop never runs
     for ep in range(N_EPOCHS):
@@ -936,8 +940,9 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                 batch[k] = batch[k].to(device, non_blocking=True)
             for k in ("xyz", "neigh_idx", "sub_idx", "interp_idx"):
                 batch[k] = [t.to(device, non_blocking=True) for t in batch[k]]
-            end_points = net(batch)
-            loss, end_points = compute_loss(end_points, NUM_CLASSES)
+            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=AMP):
+                end_points = net(batch)
+                loss, end_points = compute_loss(end_points, NUM_CLASSES)
             # Skip non-finite batches so one bad gradient can't poison the
             # weights with NaN (which is unrecoverable), and clip gradients to
             # prevent the spike in the first place (RandLA at lr=1e-2 is prone

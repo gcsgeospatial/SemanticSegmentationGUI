@@ -848,8 +848,23 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
     # Train loop — EPOCH_STEPS optimizer steps of PACK_N tiles/forward x ACCUM.
     # ------------------------------------------------------------------------
     LOG_EVERY = 50
+    # Same loop speedups as the kpconvx_cold twin: opt-in bf16 autocast,
+    # background pack building (tile load + CPU pyramid overlap the GPU), and
+    # a GPU-accumulated confusion matrix (one bincount/forward, one sync/epoch
+    # instead of ~4*NUM_CLASSES syncs per forward).
+    AMP = os.environ.get("TT_AMP") == "1"
+    def _draw():
+        while True:
+            s = sample_tile(pick_train_tile(), training=True)
+            if s is not None:
+                return s
+    prefetch = (tc.make_prefetcher(
+        lambda: make_kp_batch([_draw() for _ in range(PACK_N)]),
+        depth=int(os.environ.get("TT_PREFETCH", "2")))
+        if start_epoch < N_EPOCHS else None)
     print(f"  starting at epoch {start_epoch}, up to {N_EPOCHS}, "
-          f"{EPOCH_STEPS} steps/epoch, pack {PACK_N} x accum {ACCUM}", flush=True)
+          f"{EPOCH_STEPS} steps/epoch, pack {PACK_N} x accum {ACCUM}"
+          f"{' [bf16 autocast]' if AMP else ''}", flush=True)
     t_run = time.time()
     ep = N_EPOCHS - 1     # final-eval label when the loop never runs (EVAL_ONLY)
     for ep in range(start_epoch, N_EPOCHS):
@@ -857,9 +872,9 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
         for g in optim.param_groups:
             g["lr"] = cur_lr * g["lr_mult"]     # deform offsets stay at 0.1x
         net.train()
-        ep_loss, ep_reg, ep_correct, ep_total = 0.0, 0.0, 0, 0
-        ep_inter = np.zeros(NUM_CLASSES, dtype=np.int64)
-        ep_union = np.zeros(NUM_CLASSES, dtype=np.int64)
+        ep_loss, ep_reg = 0.0, 0.0
+        ep_conf = torch.zeros(NUM_CLASSES, NUM_CLASSES, dtype=torch.long,
+                              device="cuda")
         t_ep = time.time()
         n_steps = n_fwd = n_failed = 0
         print(f"  ep {ep:3d} starting (lr={cur_lr:.2e})…", flush=True)
@@ -867,20 +882,16 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
             optim.zero_grad()
             n_ok = 0
             for _ in range(ACCUM):
-                samples = []
-                while len(samples) < PACK_N:
-                    s = sample_tile(pick_train_tile(), training=True)
-                    if s is not None:
-                        samples.append(s)
                 try:
-                    batch, lab_t = make_kp_batch(samples)
-                    logits = net(batch, cfg)
-                    loss_seg = seg_loss(logits, lab_t)
-                    # Deformable fitting/repulsion regularizer — reads state the
-                    # forward populates (min_d2/deformed_KP), so it MUST come
-                    # after net(...); plain 0 when there are no deformable blocks.
-                    reg = p2p_fitting_regularizer(net)
-                    loss = (loss_seg + reg) / ACCUM
+                    batch, lab_t = prefetch()
+                    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=AMP):
+                        logits = net(batch, cfg)
+                        loss_seg = seg_loss(logits, lab_t)
+                        # Deformable fitting/repulsion regularizer — reads state the
+                        # forward populates (min_d2/deformed_KP), so it MUST come
+                        # after net(...); plain 0 when there are no deformable blocks.
+                        reg = p2p_fitting_regularizer(net)
+                        loss = (loss_seg + reg) / ACCUM
                     if not torch.isfinite(loss):
                         n_failed += 1
                         continue
@@ -890,11 +901,10 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
                     ep_reg  += float(reg.detach()) if torch.is_tensor(reg) else 0.0
                     pred = logits.argmax(-1)
                     m = lab_t >= 0
-                    ep_correct += (pred[m] == lab_t[m]).sum().item()
-                    ep_total   += int(m.sum())
-                    for c in range(NUM_CLASSES):
-                        ep_inter[c] += ((pred == c) & (lab_t == c)).sum().item()
-                        ep_union[c] += (((pred == c) | (lab_t == c)) & m).sum().item()
+                    ep_conf += torch.bincount(
+                        lab_t[m] * NUM_CLASSES + pred[m],
+                        minlength=NUM_CLASSES * NUM_CLASSES,
+                    ).reshape(NUM_CLASSES, NUM_CLASSES)
                 except Exception as e:
                     n_failed += 1
                     if n_failed == 1:
@@ -914,7 +924,10 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
         if n_failed:
             print(f"  ep {ep:3d} note: {n_failed} failed forwards", flush=True)
         sec_per_epoch = time.time() - t_ep
-        train_acc = ep_correct / max(ep_total, 1)
+        conf = ep_conf.cpu().numpy()
+        ep_inter = np.diag(conf)
+        ep_union = conf.sum(0) + conf.sum(1) - ep_inter
+        train_acc = int(np.trace(conf)) / max(int(conf.sum()), 1)
         with np.errstate(invalid="ignore"):
             train_iou = float(np.mean(ep_inter / np.maximum(ep_union, 1)))
         gpu_mem = torch.cuda.max_memory_allocated() / 1e6
@@ -935,6 +948,9 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
             run_eval(ep)               # last epoch handled by the final eval below
         if stop:
             break                      # falls through to the final eval + finalize
+
+    if prefetch:
+        prefetch.shutdown()      # stop background pack builds during the eval
 
     print("  final evaluation over the combined eval set…", flush=True)
     run_eval(ep, write_json=True)

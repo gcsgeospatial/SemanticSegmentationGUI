@@ -6,6 +6,7 @@ arXiv:2603.22420 selects "the checkpoint with highest validation mIoU"). This
 makes final_model.pth = best-by-val-mIoU while keeping the inference contract
 (final_model.pth) unchanged.
 """
+import contextlib
 import csv
 import json
 import os
@@ -664,29 +665,53 @@ def kp_load_canonical(npz_path):
     return xyz, intensity, ret_num, lab, extras
 
 
+def _grid_pool_t(p, a, l, voxel, num_classes):
+    """Torch core of kp_grid_subsample: (points, attrs-or-None,
+    labels-or-None) tensors on any device -> pooled tensors on that device.
+    Voxel keys are raveled to one int64 so unique is a sort, not a row
+    compare; sorted-flat order == np.unique(axis=0) lexicographic order, and
+    float64 accumulators keep the old numpy numerics."""
+    import torch
+    k = torch.floor(p / voxel).long()
+    k -= k.min(0).values
+    m = k.max(0).values + 1
+    flat = (k[:, 0] * m[1] + k[:, 1]) * m[2] + k[:, 2]
+    inv = torch.unique(flat, return_inverse=True)[1]
+    nv = int(inv.max()) + 1
+    cnt = torch.bincount(inv, minlength=nv).double()
+    sx = torch.zeros(nv, 3, dtype=torch.float64, device=p.device)
+    sx.index_add_(0, inv, p.double()); sx /= cnt[:, None]
+    sa = None
+    if a is not None:
+        sa = torch.zeros(nv, a.shape[1], dtype=torch.float64, device=p.device)
+        sa.index_add_(0, inv, a.double()); sa /= cnt[:, None]
+    sl = torch.full((nv,), -1, dtype=torch.int64, device=p.device)
+    if l is not None:
+        l = l.long()
+        v = l >= 0
+        oh = torch.bincount(inv[v] * num_classes + l[v],
+                            minlength=nv * num_classes).reshape(nv, num_classes)
+        has = oh.sum(1) > 0
+        sl[has] = oh[has].argmax(1)
+    return sx.float(), (sa.float() if sa is not None else None), sl
+
+
 def kp_grid_subsample(xyz, attrs, lab, voxel, num_classes):
     """Voxel-grid subsample to `voxel` m: barycenter points, mean attrs,
     majority labels. Mirrors KPConv's grid_subsampling (the C++ op that
-    produces the layer-0 cloud) in numpy so the prep cache never needs the
-    compiled extensions."""
+    produces the layer-0 cloud). Numpy wrapper over _grid_pool_t — pooled on
+    CUDA when available, CPU torch otherwise (every trainer image ships
+    torch)."""
     import numpy as np
-    keys = np.floor(xyz / voxel).astype(np.int64)
-    inv = voxel_unique(keys, return_inverse=True)[1]
-    nv = int(inv.max()) + 1
-    cnt = np.bincount(inv, minlength=nv).astype(np.float64)
-    sx = np.zeros((nv, 3)); np.add.at(sx, inv, xyz); sx /= cnt[:, None]
-    sa = None
-    if attrs is not None:
-        sa = np.zeros((nv, attrs.shape[1])); np.add.at(sa, inv, attrs); sa /= cnt[:, None]
-    sl = np.full(nv, -1, np.int64)
-    if lab is not None:
-        oh = np.zeros((nv, num_classes)); v = lab >= 0
-        np.add.at(oh, (inv[v], lab[v]), 1)
-        has = oh.sum(1) > 0
-        sl[has] = oh[has].argmax(1)
-    return (sx.astype(np.float32),
-            (sa.astype(np.float32) if sa is not None else None),
-            sl)
+    import torch
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    t = lambda x: torch.from_numpy(np.ascontiguousarray(x)).to(dev)
+    sx, sa, sl = _grid_pool_t(t(xyz), t(attrs) if attrs is not None else None,
+                              t(lab) if lab is not None else None,
+                              voxel, num_classes)
+    return (sx.cpu().numpy(),
+            (sa.cpu().numpy() if sa is not None else None),
+            sl.cpu().numpy())
 
 
 def kp_augment(xyz, scale_min=0.9, scale_max=1.1, sym_x=True, noise=0.05):
@@ -702,6 +727,87 @@ def kp_augment(xyz, scale_min=0.9, scale_max=1.1, sym_x=True, noise=0.05):
     out = (xyz @ R.T) * scale
     out += np.random.normal(0, noise, out.shape).astype(np.float32)
     return out.astype(np.float32)
+
+
+def make_prefetcher(make_batch, depth=2):
+    """next() -> a ready training batch; `depth` background threads keep
+    building the following ones, so tile loading + CPU pyramid assembly
+    overlaps GPU compute (the same overlap upstream KPConvX gets from its
+    DataLoader workers). Build errors re-raise at next(); call .shutdown()
+    when the loop ends."""
+    from collections import deque
+    from concurrent.futures import ThreadPoolExecutor
+    ex = ThreadPoolExecutor(depth)
+    q = deque(ex.submit(make_batch) for _ in range(depth + 1))
+
+    def nxt():
+        q.append(ex.submit(make_batch))
+        return q.popleft().result()
+
+    nxt.shutdown = lambda: ex.shutdown(wait=False, cancel_futures=True)
+    return nxt
+
+
+@contextlib.contextmanager
+def npz_save_pool():
+    """`with npz_save_pool() as save:` -> save(path, **arrays) queues an
+    np.savez_compressed on a thread pool — zlib releases the GIL, so tile
+    writes scale with cores instead of serializing behind the tiling loop.
+    Queue is bounded at 2x workers (backpressure: raw ptv3 tiles are ~10MB
+    each and would otherwise pile up in RAM); worker exceptions surface on a
+    later save() or at exit."""
+    import numpy as np
+    from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+    workers = os.cpu_count() or 4
+    ex = ThreadPoolExecutor(workers)
+    pending = set()
+
+    def save(path, **arrays):
+        nonlocal pending
+        if len(pending) >= workers * 2:
+            done, pending = wait(pending, return_when=FIRST_COMPLETED)
+            for f in done:
+                f.result()
+        pending.add(ex.submit(np.savez_compressed, path, **arrays))
+
+    try:
+        yield save
+        for f in pending:
+            f.result()
+    finally:
+        ex.shutdown(wait=True)
+
+
+def tile_xy_indices(xyz_t, chunk_xy, stride):
+    """Yield (x0, y0, idx) for every non-empty overlapping chunk_xy tile of a
+    torch (N,3+) tensor; idx stays on xyz_t's device so callers gather with no
+    round-trips (put the scene on CUDA once and the whole loop runs there).
+    Points are sorted by x once so each column strip is a searchsorted slice,
+    then each strip is sorted by y so tiles are slices too — replaces the old
+    per-tile full-cloud boolean mask (O(tiles*N) -> O(N log N)). Tile origins
+    come from np.arange exactly as before, so cached-tile filenames match."""
+    import numpy as np
+    import torch
+    x, y = xyz_t[:, 0], xyz_t[:, 1]
+    mins = (float(x.min()), float(y.min()))
+    maxs = (float(x.max()), float(y.max()))
+    ox = torch.argsort(x)
+    xs = x[ox]
+    for x0 in np.arange(mins[0], maxs[0], stride):
+        lo, hi = torch.searchsorted(
+            xs, torch.tensor([x0, x0 + chunk_xy], dtype=xs.dtype,
+                             device=xs.device)).tolist()
+        strip = ox[lo:hi]
+        if len(strip) == 0:
+            continue
+        strip = strip[torch.argsort(y[strip])]
+        ys = y[strip].contiguous()
+        for y0 in np.arange(mins[1], maxs[1], stride):
+            a, b = torch.searchsorted(
+                ys, torch.tensor([y0, y0 + chunk_xy], dtype=ys.dtype,
+                                 device=ys.device)).tolist()
+            if b > a:
+                yield x0, y0, strip[a:b]
 
 
 def kp_tile_and_save(name, pc_path, out_dir, chunk_xy, stride, grid, num_classes):
@@ -720,35 +826,37 @@ def kp_tile_and_save(name, pc_path, out_dir, chunk_xy, stride, grid, num_classes
     intensity_n = np.clip(intensity, 0.0, 2.0).astype(np.float32)
     print(f"    {name}: {len(xyz):,} pts loaded in {time.time()-t0:.1f}s, tiling…",
           flush=True)
-    mins = xyz[:, :2].min(0); maxs = xyz[:, :2].max(0)
+    # GPU-resident tiling: the scene's arrays move to the device ONCE; strip
+    # slicing, per-tile gathers and voxel pooling all run there, and only the
+    # small pooled tiles come back for the (thread-pooled) compressed writes.
+    import torch
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    fnames = sorted(extras)              # deterministic cache column order
+    P = torch.from_numpy(xyz).to(dev)
+    A = torch.from_numpy(np.stack([intensity_n, ret_num]
+                                  + [extras[n] for n in fnames],
+                                  axis=1)).to(dev)
+    L = torch.from_numpy(np.ascontiguousarray(lab)).to(dev)
     n_tiles = 0
-    for x0 in np.arange(mins[0], maxs[0], stride):
-        for y0 in np.arange(mins[1], maxs[1], stride):
-            mask = (
-                (xyz[:, 0] >= x0) & (xyz[:, 0] < x0 + chunk_xy) &
-                (xyz[:, 1] >= y0) & (xyz[:, 1] < y0 + chunk_xy)
-            )
+    with npz_save_pool() as save:
+        for x0, y0, idx in tile_xy_indices(P, chunk_xy, stride):
             # Low thresholds on purpose: water absorbs LiDAR, so pure-water
             # tiles are sparse — a higher cut would delete them from training.
-            if mask.sum() < 64:
+            if len(idx) < 64:
                 continue
-            fnames = sorted(extras)          # deterministic cache column order
-            attrs = np.stack([intensity_n[mask], ret_num[mask]]
-                             + [extras[n][mask] for n in fnames],
-                             axis=1).astype(np.float32)
-            sx, sa, sl = kp_grid_subsample(xyz[mask], attrs, lab[mask], grid, num_classes)
+            sx, sa, sl = _grid_pool_t(P[idx], A[idx], L[idx], grid, num_classes)
             if len(sx) < 32:
                 continue
+            sa = sa.cpu().numpy()
             tile = dict(
-                xyz=sx.astype(np.float32),
-                intensity=sa[:, 0].astype(np.float32),
-                ret_num=sa[:, 1].astype(np.float32),
+                xyz=sx.cpu().numpy(),
+                intensity=sa[:, 0],
+                ret_num=sa[:, 1],
             )
             for i, n in enumerate(fnames):
-                tile[n] = sa[:, 2 + i].astype(np.float32)
-            tile["lab"] = sl.astype(np.int32)
-            np.savez_compressed(
-                os.path.join(out_dir, f"{name}_x{int(x0)}_y{int(y0)}.npz"), **tile)
+                tile[n] = sa[:, 2 + i]
+            tile["lab"] = sl.cpu().numpy().astype(np.int32)
+            save(os.path.join(out_dir, f"{name}_x{int(x0)}_y{int(y0)}.npz"), **tile)
             n_tiles += 1
     print(f"      -> {n_tiles} tiles", flush=True)
     return n_tiles
@@ -1171,20 +1279,22 @@ def ptv3_tile_and_save(src_paths, out_dir, chunk_xy, stride, load_canonical):
                       if k.startswith("feat_")}
         print(f"    [{fi+1}/{len(src_paths)}] {scene}: {len(xyz):,} pts "
               f"loaded in {time.time()-t0:.1f}s, tiling…", flush=True)
-        mins, maxs = xyz[:, :2].min(0), xyz[:, :2].max(0)
+        # ptv3 tiles are RAW slices (no pooling), so only the tile-index math
+        # runs on the device; gathers stay on the host arrays.
+        import torch
+        dev = "cuda" if torch.cuda.is_available() else "cpu"
+        P = torch.from_numpy(np.ascontiguousarray(xyz)).to(dev)
         n_tiles = 0
-        for x0 in np.arange(mins[0], maxs[0], stride):
-            for y0 in np.arange(mins[1], maxs[1], stride):
-                m = ((xyz[:, 0] >= x0) & (xyz[:, 0] < x0 + chunk_xy) &
-                     (xyz[:, 1] >= y0) & (xyz[:, 1] < y0 + chunk_xy))
-                if m.sum() < 2048: continue
-                out_path = f"{out_dir}/{scene}_x{int(x0)}_y{int(y0)}.npz"
+        with npz_save_pool() as save:
+            for x0, y0, idx in tile_xy_indices(P, chunk_xy, stride):
+                if len(idx) < 2048: continue
+                m = idx.cpu().numpy()
                 tile = {"xyz": xyz[m].astype(np.float32),
                         "rgb": rgb[m].astype(np.uint8),   # load_canonical clips to [0,255]
                         "lab": lab[m].astype(np.int32)}
                 for n, v in extras.items():
                     tile[n] = v[m].astype(np.float32)
-                np.savez_compressed(out_path, **tile)
+                save(f"{out_dir}/{scene}_x{int(x0)}_y{int(y0)}.npz", **tile)
                 n_tiles += 1
         print(f"      -> {n_tiles} tiles", flush=True)
 
@@ -1620,8 +1730,44 @@ def _demo():  # ponytail: one runnable check -- `python train_common.py`
     assert im["hag_source"] is None and im["class_names"] == list("abcdefg")
     assert infer_meta(os.path.join(tempfile.mkdtemp(), "bare.pth")) is None
 
-    # voxel_unique == np.unique(axis=0) exactly (order included), negatives too
+    # tile_xy_indices == the old brute-force per-tile mask, tile for tile
     import numpy as np
+    import torch as _torch
+    rng = np.random.RandomState(1)
+    pts = rng.rand(5_000, 3).astype(np.float32) * [300, 300, 10]
+    got = {(x0, y0): set(idx.tolist())
+           for x0, y0, idx in tile_xy_indices(_torch.from_numpy(pts), 100.0, 50.0)}
+    mins, maxs = pts[:, :2].min(0), pts[:, :2].max(0)
+    for x0 in np.arange(mins[0], maxs[0], 50.0):
+        for y0 in np.arange(mins[1], maxs[1], 50.0):
+            m = ((pts[:, 0] >= x0) & (pts[:, 0] < x0 + 100.0) &
+                 (pts[:, 1] >= y0) & (pts[:, 1] < y0 + 100.0))
+            ref = set(np.nonzero(m)[0].tolist())
+            assert got.get((x0, y0), set()) == ref
+
+    # make_prefetcher: batches arrive in order, shutdown is clean
+    _pn = iter(range(100))
+    pf = make_prefetcher(lambda: next(_pn), depth=2)
+    assert pf() == 0 and pf() == 1 and pf() == 2
+    pf.shutdown()
+
+    # kp_grid_subsample (torch-pooled) == brute-force per-voxel reference,
+    # voxel order included (sorted-flat == np.unique(axis=0) lexicographic)
+    pts2 = rng.rand(2_000, 3).astype(np.float32) * 10 - 5   # negatives too
+    at2 = rng.rand(2_000, 2).astype(np.float32)
+    lb2 = rng.randint(-1, 4, 2_000).astype(np.int32)
+    sx2, sa2, sl2 = kp_grid_subsample(pts2, at2, lb2, 1.0, 4)
+    vk = np.floor(pts2 / 1.0).astype(np.int64)
+    uk = np.unique(vk, axis=0)
+    assert len(sx2) == len(uk)
+    for i, kk in enumerate(uk):
+        m = (vk == kk).all(1)
+        assert np.allclose(sx2[i], pts2[m].mean(0), atol=1e-5)
+        assert np.allclose(sa2[i], at2[m].mean(0), atol=1e-5)
+        vl = lb2[m][lb2[m] >= 0]
+        assert sl2[i] == (np.bincount(vl, minlength=4).argmax() if len(vl) else -1)
+
+    # voxel_unique == np.unique(axis=0) exactly (order included), negatives too
     rng = np.random.RandomState(0)
     for dims in (2, 3):
         keys = rng.randint(-50, 50, size=(20_000, dims))

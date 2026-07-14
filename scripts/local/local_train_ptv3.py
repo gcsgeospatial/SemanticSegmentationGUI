@@ -682,8 +682,18 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
         return m
 
     LOG_EVERY = 20  # intra-epoch heartbeat
+    # Same loop speedups as the KP trainers: opt-in bf16 autocast, background
+    # batch building (tile load + batch assembly overlap the GPU), and a
+    # GPU-accumulated confusion matrix (one bincount/step, one sync/epoch).
+    AMP = os.environ.get("TT_AMP") == "1"
+    prefetch = (tc.make_prefetcher(
+        lambda: to_ptv3_batch([pick_train_tile() for _ in range(BATCH_SIZE)],
+                              training=True),
+        depth=int(os.environ.get("TT_PREFETCH", "2")))
+        if start_epoch < N_EPOCHS else None)
     print(f"  starting at epoch {start_epoch}, up to {N_EPOCHS}, "
-          f"{STEPS} steps/epoch (batch {BATCH_SIZE})", flush=True)
+          f"{STEPS} steps/epoch (batch {BATCH_SIZE})"
+          f"{' [bf16 autocast]' if AMP else ''}", flush=True)
     t_run = time.time()
     ep = N_EPOCHS - 1     # final-eval label when the loop never runs
     for ep in range(start_epoch, N_EPOCHS):
@@ -691,19 +701,19 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
         for g in optim.param_groups:
             g["lr"] = cur_lr
         backbone.train(); head.train()
-        ep_loss = ep_correct = ep_total = 0
-        ep_inter = np.zeros(NUM_CLASSES, dtype=np.int64)
-        ep_union = np.zeros(NUM_CLASSES, dtype=np.int64)
+        ep_loss = 0.0
+        ep_conf = torch.zeros(NUM_CLASSES, NUM_CLASSES, dtype=torch.long,
+                              device="cuda")
         t_ep = time.time(); t_chunk = t_ep; n_steps = 0; last_log_step = 0
         print(f"  ep {ep:3d} starting (lr={cur_lr:.2e})…", flush=True)
         for step in range(STEPS):
-            picks = [pick_train_tile() for _ in range(BATCH_SIZE)]
             try:
-                batch, label = to_ptv3_batch(picks, training=True)
-                point = backbone(batch)
-                feat = point["feat"] if isinstance(point, dict) else point.feat
-                logits = head(feat)
-                loss = seg_loss(logits, label)
+                batch, label = prefetch()
+                with torch.autocast("cuda", dtype=torch.bfloat16, enabled=AMP):
+                    point = backbone(batch)
+                    feat = point["feat"] if isinstance(point, dict) else point.feat
+                    logits = head(feat)
+                    loss = seg_loss(logits, label)
                 optim.zero_grad(); loss.backward()
                 torch.nn.utils.clip_grad_norm_(
                     list(backbone.parameters()) + list(head.parameters()), GRAD_CLIP)
@@ -717,18 +727,20 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                     t_chunk = time.time(); last_log_step = n_steps
                 pred = logits.argmax(-1)
                 m = label >= 0
-                ep_correct += (pred[m] == label[m]).sum().item()
-                ep_total   += int(m.sum())
-                for c in range(NUM_CLASSES):
-                    ep_inter[c] += ((pred == c) & (label == c)).sum().item()
-                    ep_union[c] += (((pred == c) | (label == c)) & m).sum().item()
+                ep_conf += torch.bincount(
+                    label[m] * NUM_CLASSES + pred[m],
+                    minlength=NUM_CLASSES * NUM_CLASSES,
+                ).reshape(NUM_CLASSES, NUM_CLASSES)
             except RuntimeError as e:
                 if "out of memory" in str(e).lower():
                     torch.cuda.empty_cache(); continue
                 raise
         sec_per_iter = (time.time() - t_ep) / max(n_steps, 1)
         sec_per_epoch = time.time() - t_ep
-        train_acc = ep_correct / max(ep_total, 1)
+        conf = ep_conf.cpu().numpy()
+        ep_inter = np.diag(conf)
+        ep_union = conf.sum(0) + conf.sum(1) - ep_inter
+        train_acc = int(np.trace(conf)) / max(int(conf.sum()), 1)
         with np.errstate(invalid="ignore"):
             train_iou = float(np.mean(ep_inter / np.maximum(ep_union, 1)))
         gpu_mem = torch.cuda.max_memory_allocated() / 1e6
@@ -756,6 +768,9 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
             run_eval(ep)               # last epoch handled by the final eval below
         if stop:
             break   # falls through to the final eval + finalize (+ DONE marker)
+
+    if prefetch:
+        prefetch.shutdown()      # stop background batch builds during the eval
 
     # --- Final evaluation: the real voted eval over the combined eval set,
     # written to test_metrics.json (the same number run_eval logs periodically). -

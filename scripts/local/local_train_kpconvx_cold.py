@@ -707,8 +707,26 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
     # PACK_N tiles/forward x ACCUM accumulated forwards.
     # ------------------------------------------------------------------------
     LOG_EVERY = 50
+    # bf16 autocast (A100+): opt-in — it changes training numerics, so it's a
+    # knob, not a default. No GradScaler needed for bf16.
+    AMP = os.environ.get("TT_AMP") == "1"
+    # Background pack building: tile np.load + feature assembly + the CPU
+    # pyramid build (fill_pyramid dispatches its neighbor search by DEVICE, so
+    # a CPU-built pyramid means CPU KNN) overlap the GPU fwd/bwd instead of
+    # serializing in front of it — the same overlap upstream KPConvX gets from
+    # its DataLoader workers.
+    def _draw():
+        while True:
+            s = sample_tile(pick_train_tile(), training=True)
+            if s is not None:
+                return s
+    prefetch = (tc.make_prefetcher(
+        lambda: make_kp_pack([_draw() for _ in range(PACK_N)]),
+        depth=int(os.environ.get("TT_PREFETCH", "2")))
+        if start_epoch < N_EPOCHS else None)
     print(f"  starting at epoch {start_epoch}, up to {N_EPOCHS}, "
-          f"{EPOCH_STEPS} steps/epoch, pack {PACK_N} x accum {ACCUM}", flush=True)
+          f"{EPOCH_STEPS} steps/epoch, pack {PACK_N} x accum {ACCUM}"
+          f"{' [bf16 autocast]' if AMP else ''}", flush=True)
     t_run = time.time()
     ep = N_EPOCHS - 1     # final-eval label when the loop never runs (EVAL_ONLY)
     for ep in range(start_epoch, N_EPOCHS):
@@ -716,9 +734,12 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
         for g in optim.param_groups:
             g["lr"] = cur_lr
         net.train()
-        ep_loss, ep_correct, ep_total = 0.0, 0, 0
-        ep_inter = np.zeros(NUM_CLASSES, dtype=np.int64)
-        ep_union = np.zeros(NUM_CLASSES, dtype=np.int64)
+        ep_loss = 0.0
+        # Confusion matrix accumulated ON the GPU: the old per-class python
+        # loop forced ~4*NUM_CLASSES device syncs per forward; this is one
+        # bincount per forward and a single .cpu() per epoch.
+        ep_conf = torch.zeros(NUM_CLASSES, NUM_CLASSES, dtype=torch.long,
+                              device="cuda")
         t_ep = time.time()
         n_steps = n_fwd = n_failed = 0
         print(f"  ep {ep:3d} starting (lr={cur_lr:.2e})…", flush=True)
@@ -726,15 +747,11 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
             optim.zero_grad()
             n_ok = 0
             for _ in range(ACCUM):
-                samples = []
-                while len(samples) < PACK_N:
-                    s = sample_tile(pick_train_tile(), training=True)
-                    if s is not None:
-                        samples.append(s)
                 try:
-                    batch, lab_t = make_kp_pack(samples)
-                    logits = net(batch)
-                    loss = seg_loss(logits, lab_t) / ACCUM
+                    batch, lab_t = prefetch()
+                    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=AMP):
+                        logits = net(batch)
+                        loss = seg_loss(logits, lab_t) / ACCUM
                     # Defense in depth: skip any non-finite loss (NaN/Inf from an
                     # all-ignored pack or a numerical blow-up) before backward, so
                     # one bad gradient can't poison the weights — as RandLA does.
@@ -746,11 +763,10 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
                     ep_loss += loss.item() * ACCUM
                     pred = logits.argmax(-1)
                     m = lab_t >= 0
-                    ep_correct += (pred[m] == lab_t[m]).sum().item()
-                    ep_total   += int(m.sum())
-                    for c in range(NUM_CLASSES):
-                        ep_inter[c] += ((pred == c) & (lab_t == c)).sum().item()
-                        ep_union[c] += (((pred == c) | (lab_t == c)) & m).sum().item()
+                    ep_conf += torch.bincount(
+                        lab_t[m] * NUM_CLASSES + pred[m],
+                        minlength=NUM_CLASSES * NUM_CLASSES,
+                    ).reshape(NUM_CLASSES, NUM_CLASSES)
                 except Exception as e:
                     n_failed += 1
                     if n_failed == 1:
@@ -769,7 +785,10 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
         if n_failed:
             print(f"  ep {ep:3d} note: {n_failed} failed forwards", flush=True)
         sec_per_epoch = time.time() - t_ep
-        train_acc = ep_correct / max(ep_total, 1)
+        conf = ep_conf.cpu().numpy()
+        ep_inter = np.diag(conf)
+        ep_union = conf.sum(0) + conf.sum(1) - ep_inter
+        train_acc = int(np.trace(conf)) / max(int(conf.sum()), 1)
         with np.errstate(invalid="ignore"):
             train_iou = float(np.mean(ep_inter / np.maximum(ep_union, 1)))
         gpu_mem = torch.cuda.max_memory_allocated() / 1e6
@@ -789,6 +808,9 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
             run_eval(ep)               # last epoch handled by the final eval below
         if stop:
             break                      # falls through to the final eval + finalize
+
+    if prefetch:
+        prefetch.shutdown()      # stop background pack builds during the eval
 
     # --- Final evaluation: the real voted eval over the combined eval set,
     # written to test_metrics.json (the same number run_eval logs periodically). -
