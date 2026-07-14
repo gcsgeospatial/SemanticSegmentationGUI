@@ -394,6 +394,27 @@ def make_seg_loss(class_weights, label_smooth, use_focal, focal_gamma, lovasz_we
 
 # ------------------------------------------------- class balance / sampling
 
+def drop_corrupt_tile(path):
+    """Remove a truncated cached tile AND its scene's .done marker so the next
+    prep re-tiles that scene. Interrupted runs can leave these behind: the
+    modal shells commit volumes every 120s WHILE tiles are being written, so a
+    preemption mid-commit can persist a half-uploaded npz behind a .done that
+    made the same commit — and validate_cache checks the signature, not file
+    integrity, so the poisoned cache is trusted forever without this."""
+    import re
+    print(f"  corrupt cached tile dropped: {path}", flush=True)
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    m = re.match(r"(.+)_x-?\d+_y-?\d+\.npz$", os.path.basename(path))
+    if m:
+        try:
+            os.remove(os.path.join(os.path.dirname(path), f"{m.group(1)}.done"))
+        except OSError:
+            pass
+
+
 def scan_class_balance(tile_paths, num_classes, cache_path=None):
     """One pass over cached tiles' 'lab' arrays -> (class_counts, present_mask
     (n_tiles, C)). The per-tile np.load is the bottleneck (~45k tiles ->
@@ -413,7 +434,10 @@ def scan_class_balance(tile_paths, num_classes, cache_path=None):
             print(f"  class balance: ignoring unreadable cache ({e})", flush=True)
 
     def _scan(tp):
-        lab = np.load(tp)["lab"]
+        try:
+            lab = np.load(tp)["lab"]
+        except Exception:
+            return None            # truncated/corrupt tile — healed below
         v = lab[(lab >= 0) & (lab < num_classes)]
         return (np.bincount(v, minlength=num_classes).astype(np.int64)
                 if v.size else np.zeros(num_classes, np.int64))
@@ -422,9 +446,19 @@ def scan_class_balance(tile_paths, num_classes, cache_path=None):
     print(f"  scanning {len(tile_paths)} train tiles for class balance (parallel)…",
           flush=True)
     per_tile = np.zeros((len(tile_paths), num_classes), np.int64)
+    bad = []
     with ThreadPoolExecutor(max_workers=32) as ex:
         for i, counts in enumerate(ex.map(_scan, tile_paths)):
-            per_tile[i] = counts
+            if counts is None:
+                bad.append(tile_paths[i])
+            else:
+                per_tile[i] = counts
+    if bad:
+        for p in bad:
+            drop_corrupt_tile(p)
+        raise RuntimeError(
+            f"class-balance scan: {len(bad)} corrupt cached tile(s) removed and "
+            "their scene(s) unmarked — rerun (Modal auto-retries) to re-tile them.")
     class_counts, present_mask = per_tile.sum(0), per_tile > 0
     if cache_path:
         try:
@@ -1062,8 +1096,13 @@ def kp_make_evaluate(forward, build_feat, grid, chunk_xy, num_classes,
                     continue
                 keys_l, log_l, xyz_l = [], [], []
                 for tile in tiles:
-                    z = np.load(tile)
-                    xyz = z["xyz"]
+                    try:
+                        z = np.load(tile)
+                        xyz = z["xyz"]
+                    except Exception:
+                        drop_corrupt_tile(tile)   # healed on the next prep
+                        n_skipped_tiles += 1
+                        continue
                     if len(xyz) < 32:
                         continue
                     feat = build_feat(xyz, z["intensity"], z["ret_num"],
@@ -1436,8 +1475,13 @@ def ptv3_make_evaluate(forward, build_feat, feat_spec, grid, chunk_xy,
                     n_skipped_scenes += 1; continue
                 keys_l, vote_l, xyz_l = [], [], []
                 for tile in tiles:
-                    z = np.load(tile)
-                    xyz, rgb = z["xyz"].astype(np.float32), z["rgb"]
+                    try:
+                        z = np.load(tile)
+                        xyz, rgb = z["xyz"].astype(np.float32), z["rgb"]
+                    except Exception:
+                        drop_corrupt_tile(tile)   # healed on the next prep
+                        n_skipped_tiles += 1
+                        continue
                     if len(xyz) < 64:
                         continue
                     ex = feat_extras(z, feat_spec, os.path.basename(tile))
@@ -1744,6 +1788,21 @@ def _demo():  # ponytail: one runnable check -- `python train_common.py`
                  (pts[:, 1] >= y0) & (pts[:, 1] < y0 + 100.0))
             ref = set(np.nonzero(m)[0].tolist())
             assert got.get((x0, y0), set()) == ref
+
+    # corrupt cached tile -> scan drops it + the scene's .done and raises so
+    # the (auto-retried) next run re-tiles the scene instead of dying forever
+    cd = tempfile.mkdtemp()
+    np.savez(f"{cd}/good_x0_y0.npz", lab=np.array([0, 1], np.int32))
+    open(f"{cd}/bad_x0_y50.npz", "w").write("not a zip")
+    open(f"{cd}/bad.done", "w").close()
+    try:
+        scan_class_balance([f"{cd}/good_x0_y0.npz", f"{cd}/bad_x0_y50.npz"], 2)
+        raise AssertionError("corrupt tile must raise after healing")
+    except RuntimeError as e:
+        assert "corrupt" in str(e)
+    assert not os.path.exists(f"{cd}/bad_x0_y50.npz")   # tile dropped
+    assert not os.path.exists(f"{cd}/bad.done")          # scene unmarked
+    assert os.path.exists(f"{cd}/good_x0_y0.npz")        # good tile untouched
 
     # make_prefetcher: batches arrive in order, shutdown is clean
     _pn = iter(range(100))
