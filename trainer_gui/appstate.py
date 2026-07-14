@@ -72,6 +72,22 @@ def dataset_run_roots() -> list[Path]:
     return roots
 
 
+def run_roots(repo_root: str | None = None) -> list[Path]:
+    """Every place local training runs live — the ONE discovery source shared by
+    the Plotting list and the Inference run picker (plots.discover_runs walks
+    each root one level deep, so runs/<id> and runs/<backbone>/<id> both fit):
+    dataset-nested runs/, downloaded runs (<workspace>/inference), the Runs-page
+    layout, the repo's runs/, plus the legacy local_train_out key (read-only —
+    the Train page no longer writes it)."""
+    roots = [*dataset_run_roots(), workspace_dir() / "inference", runs_dir()]
+    if repo_root:
+        roots.append(Path(repo_root) / "runs")
+    out = get("local_train_out", "")
+    if out:
+        roots.append(Path(out) / "runs")
+    return roots
+
+
 def scratch_infer_dir() -> Path:
     """Where inference from a loose .pth (no linked dataset) lands — a findable
     spot in the workspace instead of forcing a dataset pick."""

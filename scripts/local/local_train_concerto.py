@@ -1,32 +1,44 @@
 """
-Local training script for PointTransformerV3 on a canonical trainer_gui dataset.
+Local FINE-TUNING script for the Pointcept self-supervised pretrained encoders
+(Concerto / Sonata / Utonia) on a canonical trainer_gui dataset.
 
-Trains on the 3-folder --dataset path: a dataset materialized by the trainer_gui
-app under /datasets as train/val/test scene folders (.npz) plus
-a dataset_meta.json (num_classes / class_names). NUM_CLASSES / CLASS_NAMES come
-from that metadata; val = in-distribution selection holdout, test = final report.
+This is the shared core for the three pretrained-PTv3-family backbones: it
+fine-tunes an encoder-only PointTransformerV3 loaded from a HuggingFace
+checkpoint (concerto_base by default), recovers per-point features with the
+upstream "upcast" walk (concatenate each pooling level's features back onto
+the input points -> sum(enc_channels) dims) and trains a linear seg head on
+top — exactly the upstream demo/2_sem_seg.py protocol. local_train_sonata.py
+and local_train_utonia.py are thin wrappers that only swap the PKG constants.
 
-Uses the standalone PTv3 model.py from testSem/PointTransformerV3 directly (no
-full Pointcept install), on standard attention (enable_flash=False).
+Everything else (dataset contract, tiling cache, augmentation, loss recipe,
+overlap-voted eval on raw points, STOP sentinel, --mode infer) is the
+local_train_ptv3.py pipeline, unchanged.
 
-Recipe (PTv3's published outdoor-LiDAR suite — Wu et al., CVPR 2024): full data
-augmentation, loss = weighted CE (+ optional focal / label smoothing) + Lovász-
-Softmax, inverse-sqrt-frequency class weights + rare-class tile oversampling,
-AdamW (lr 2e-3, wd 5e-3) + warmup/cosine, overlap-voting eval scored on raw
-points, periodic held-out validation + resumable checkpoints.
+Pretrained-stem rule: the checkpoints were pretrained on a 9-channel input
+stem = [coord(3), color(3), normal(3)]. The legacy spec [x, y, z, <color>]
+plus the always-appended zero-filled normal block reproduces that layout
+exactly, so the pretrained stem weights load as-is. ANY custom FEAT_CHANNELS
+spec (or DG_LOGDK_FEAT) changes the layout -> the input embedding is
+re-initialized at the right width and trains from scratch while the rest of
+the encoder keeps its pretrained weights (run.json records "stem").
 
-The 3 color channels prefer lidar intensity (normalized grayscale x3) over RGB
-when the dataset has both — intensity separates water/asphalt/shadow where RGB
-is ambiguous. RGB is the fallback, mid-gray the last resort. Old RGB-trained
-checkpoints keep getting RGB at inference (run.json "color_source", absent =
-pre-change = rgb). FEAT_CHANNELS env overrides the input spec (ordered csv
-incl. dataset feat_* channels); run.json "features" records the resolved list
-and inference rebuilds from it.
+--freeze-encoder 1 freezes the pretrained encoder (and the embedding, when it
+is the pretrained one) and trains only the seg head — the upstream linear-
+probe protocol; cheap smoke runs and small datasets. Default 0 = full
+fine-tune.
+
+Checkpoints saved here embed the model config, so --mode infer rebuilds the
+architecture offline — no HuggingFace access at inference. The pretrained
+download itself is cached under /outputs/hf_cache/<pkg> (persists on the
+outputs volume / host mount).
+
+NOTE: the pretrained WEIGHTS are CC-BY-NC 4.0 (non-commercial); the upstream
+code is Apache 2.0.
 
 Usage:
-    python local_train_ptv3.py --dataset NAME [--grid G] [--chunk-xy C]
-        [--epochs N] [--batch B] [--steps-per-epoch S]
-    python local_train_ptv3.py --dataset NAME --mode infer
+    python local_train_concerto.py --dataset NAME [--grid G] [--chunk-xy C]
+        [--epochs N] [--batch B] [--steps-per-epoch S] [--freeze-encoder 0|1]
+    python local_train_concerto.py --mode infer
         --weights runs/<id>/final_model.pth --infer-input <job_id>
 """
 
@@ -36,7 +48,15 @@ from typing import Optional
 # ============================================================================
 # Configuration
 # ============================================================================
-N_EPOCHS      = 100             # default when --epochs is omitted; PTv3 outdoor recipe trains ~50 epochs
+# Which pretrained encoder this entry point fine-tunes. The sonata/utonia
+# wrappers overwrite these four module globals and delegate everything else —
+# train_pcssl() reads them via globals() at call time.
+PKG      = "concerto"            # package dir inside the /opt/<PKG> clone
+HF_NAME  = "concerto_base"       # checkpoint name in the package's MODELS list
+HF_REPO  = "Pointcept/Concerto"  # HuggingFace repo id
+BB_KEY   = "concerto"            # trainer_gui registry key == run.json backbone
+
+N_EPOCHS      = 100             # fine-tuning converges far faster than scratch
 BATCH_SIZE    = 4
 
 GRID_SIZE     = 0.5            # voxel grid (m). PTv3's 0.05 m outdoor default is
@@ -46,9 +66,10 @@ GRID_SIZE     = 0.5            # voxel grid (m). PTv3's 0.05 m outdoor default i
                                # positional-encoding conv with empty kernels (no
                                # point falls within a few voxels of another).
                                # 0.5 m ≈ the actual point spacing. Override --grid.
-USE_FLASH_ATTN = False   # PTv3 runs on standard attention — flash serialized-attn
-                         # patch-gather OOB'd mid-train (disabled after a real
-                         # crash, commit 98cc344; not a missing-dep workaround)
+USE_FLASH_ATTN = False   # standard attention, like the ptv3 trainer (the images
+                         # ship no flash-attn; the upstream demos run this exact
+                         # enable_flash=False + patch 1024 fallback)
+FREEZE_ENCODER = False   # --freeze-encoder 1: linear probe (head only)
 
 # Input-feature spec (FEAT_CHANNELS env, GUI picker): comma-separated ordered
 # names; "" = the legacy [x, y, z, <color>] layout where <color> is "rgb" or
@@ -62,8 +83,11 @@ FEAT_CHANNELS = ""
 # Regularization / optimizer — PTv3's published outdoor-LiDAR recipe
 # (Wu et al., CVPR 2024, supplementary Tab. 13).
 # ----------------------------------------------------------------------------
-DROP_PATH     = 0.3      # stochastic depth (PTv3 outdoor default)
-BASE_LR       = 2e-3     # PTv3 outdoor base lr (also OneCycle peak here)
+DROP_PATH     = 0.3      # stochastic depth (overrides the ckpt config's value;
+                         # DropPath has no weights, so the state_dict still loads)
+BASE_LR       = 6e-4     # fine-tune lr: ~1/3 of the scratch 2e-3 — the encoder
+                         # starts pretrained, a full-size lr walks it away from
+                         # the representations we paid for
 WEIGHT_DECAY  = 5e-3     # PTv3 outdoor AdamW wd (NOT 0.05)
 WARMUP_PCT    = 0.04     # 4% of the run (PTv3's 2-epoch warmup at its 50-epoch recipe)
 GRAD_CLIP     = 1.0
@@ -128,11 +152,12 @@ AUTO_RESUME      = os.environ.get("AUTO_RESUME", "0") == "1"
 
 DATASETS_ROOT = "/datasets"   # bind-mounted datasets root (trainer_gui canonical datasets)
 
-def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
-               epochs: Optional[int] = None, batch: Optional[int] = None,
-               steps_per_epoch: Optional[int] = None, chunk_xy: Optional[float] = None,
-               mode: str = "train", weights: Optional[str] = None,
-               infer_input: Optional[str] = None):
+def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
+                epochs: Optional[int] = None, batch: Optional[int] = None,
+                steps_per_epoch: Optional[int] = None, chunk_xy: Optional[float] = None,
+                mode: str = "train", weights: Optional[str] = None,
+                infer_input: Optional[str] = None,
+                freeze_encoder: Optional[int] = None):
     if dataset is None and mode != "infer":
         raise ValueError("--dataset is required: pass a canonical trainer_gui dataset "
                          "name materialized under /datasets. The only "
@@ -156,7 +181,12 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
         "CLASS_WEIGHTING", "WEIGHT_BETA", "RARE_OVERSAMPLE", "RARE_CENTER_PROB",
         "VAL_EVERY", "FEAT_CHANNELS"])
 
-    sys.path.insert(0, "/opt")          # so `import ptv3.model` resolves
+    # The sonata/utonia wrappers overwrite these module globals before calling.
+    PKG, HF_NAME, HF_REPO, BB_KEY = (globals()["PKG"], globals()["HF_NAME"],
+                                     globals()["HF_REPO"], globals()["BB_KEY"])
+    # upstream repo cloned at /opt/<PKG> (repo root holds the <PKG>/ package dir),
+    # so `import <PKG>.model` resolves from there
+    sys.path.insert(0, f"/opt/{PKG}")
 
     # --- resolve config: CLI args override the module defaults ---------------
     GRID_SIZE   = grid if grid is not None else globals()["GRID_SIZE"]
@@ -165,6 +195,8 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
     STEPS       = steps_per_epoch if steps_per_epoch is not None else 500
     CHUNK_XY    = chunk_xy if chunk_xy is not None else 50.0
     STRIDE      = CHUNK_XY / 2.0
+    FREEZE = bool(freeze_encoder if freeze_encoder is not None
+                  else globals()["FREEZE_ENCODER"])
     color_src = "intensity"   # what fills the 3 color channels; see module docstring
     FEAT_LEGACY = ["x", "y", "z", "intensity"]   # re-derived once color_src is known
     FEAT_SPEC = list(FEAT_LEGACY)                # --mode infer resolves from run.json
@@ -184,7 +216,7 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
         FEAT_LEGACY = ["x", "y", "z", "rgb" if color_src == "rgb" else "intensity"]
         FEAT_SPEC = (list(FEAT_LEGACY) if mode == "infer"
                      else tc.parse_feat_spec(FEAT_CHANNELS, FEAT_LEGACY))
-        tc.ptv3_check_spec(FEAT_SPEC, "PTv3")
+        tc.ptv3_check_spec(FEAT_SPEC, "this backbone")
         if "rgb" in FEAT_SPEC:
             color_src = "rgb"
         elif "intensity" in FEAT_SPEC and ds_meta.get("has_intensity"):
@@ -192,14 +224,20 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
         # Keyed by color_src: tiles bake the color channels in, so RGB-era
         # caches ("ptv3_cold") are abandoned, not silently reused. A custom
         # feature spec gets its own family too (legacy spec = "" tag).
-        PREP_DIR = (f"{ds_root}/prep/ptv3_{color_src}"
+        # "pcssl" family, shared by concerto/sonata/utonia (identical tile
+        # builder in this one file). Deliberately NOT the ptv3_ family: that
+        # trainer has its own copy of the tile code, and silent cross-reuse
+        # would break the day either copy drifts.
+        PREP_DIR = (f"{ds_root}/prep/pcssl_{color_src}"
                     f"{tc.feat_spec_tag(FEAT_SPEC, FEAT_LEGACY)}_chunk{int(CHUNK_XY)}")
 
     def _in_ch(spec):
-        # spec widths: the color slot (rgb OR intensity) is 3 wide — PTv3
-        # expands single-channel color to 3 (see build_feat) — the rest 1;
-        # + log d_k (D3b) appended after the spec.
-        return (sum(3 if n in ("rgb", "intensity") else 1 for n in spec)
+        # spec widths: the color slot (rgb OR intensity) is 3 wide — the color
+        # slot expands single-channel color to 3 (see build_feat) — the rest 1;
+        # + the always-appended 3-wide zero normal block (the pretrained stem
+        # was trained on [coord, color, normal] and datasets carry no normals);
+        # + log d_k (D3b) appended after that.
+        return (sum(3 if n in ("rgb", "intensity") else 1 for n in spec) + 3
                 + (1 if DG_LOGDK_FEAT else 0))
     IN_CH = _in_ch(FEAT_SPEC)
 
@@ -208,16 +246,31 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
         return tc.ptv3_load_canonical(npz_path, color_src)
 
     # --- Model builder + prediction helpers ----------------------------------
-    from ptv3.model import PointTransformerV3
-    # PTv3's 5x5x5 stem needs the spconv-cu118 build — cu124's conv backward
-    # device-asserts on it (the STEM_KERNEL=3 workaround lives in git history).
+    import importlib
+    _mdl = importlib.import_module(f"{PKG}.model")   # /opt/<PKG>/<PKG>/model.py
+
+    def _upcast_feat(point):
+        """Upstream upcast walk (demo/2_sem_seg.py): the encoder-only forward
+        returns the COARSEST level; walk the traceable GridPooling chain back
+        up, concatenating each level's features onto its parent's points ->
+        per-input-point features of dim sum(enc_channels). Autograd flows
+        through the whole walk, so it works for training, not just eval."""
+        while "pooling_parent" in point.keys():
+            parent = point.pop("pooling_parent")
+            inverse = point.pop("pooling_inverse")
+            parent.feat = torch.cat([parent.feat, point.feat[inverse]], dim=-1)
+            point = parent
+        return point.feat
 
     def build_feat(cxyz, rgbf, extras=None):
-        """Spec-ordered PTv3 features: x/y/z from the (augmented, centered,
+        """Spec-ordered features: x/y/z from the (augmented, centered,
         voxel-deduped) coords, rgb/intensity = the tile's 3 baked color
         channels (single-channel intensity was expanded to 3 at prep — the
-        arch rule), feat_* from `extras` (feat_hag included). log d_k appends
-        after the spec. The legacy spec reproduces [cxyz, rgbf] exactly."""
+        arch rule), feat_* from `extras` (feat_hag included). A 3-wide ZERO
+        normal block always follows the spec (the pretrained stem's normal
+        slot; zero normals are the upstream demos' documented fallback).
+        log d_k appends after that. The legacy spec thus reproduces the
+        pretraining layout [coord, color, normal] exactly."""
         cols = []
         for n in FEAT_SPEC:
             if n in ("rgb", "intensity"):
@@ -226,29 +279,87 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                 cols.append(cxyz[:, "xyz".index(n):"xyz".index(n) + 1])
             else:
                 cols.append(extras[n][:, None])
+        cols.append(np.zeros((len(cxyz), 3), np.float32))   # normal slot
         if DG_LOGDK_FEAT:
             cols.append(dg.local_density_logdk(cxyz, DG_LOGDK_K)[:, None])
         return np.concatenate(cols, axis=1).astype(np.float32)
 
-    def build_model(num_classes):
-        backbone = PointTransformerV3(
-            in_channels=IN_CH,   # spec channels (+ log d_k, D3b)
-            order=("z", "z-trans", "hilbert", "hilbert-trans"),
-            stride=(2, 2, 2, 2),
-            enc_depths=(2, 2, 2, 6, 2),
-            enc_channels=(32, 64, 128, 256, 512),
-            enc_num_head=(2, 4, 8, 16, 32),
-            enc_patch_size=(1024, 1024, 1024, 1024, 1024),
-            dec_depths=(2, 2, 2, 2),
-            dec_channels=(64, 64, 128, 256),
-            dec_num_head=(4, 4, 8, 16),
-            dec_patch_size=(1024, 1024, 1024, 1024),
-            drop_path=DROP_PATH,
-            enable_flash=USE_FLASH_ATTN,
-            cls_mode=False,
-        ).cuda()
-        head = torch.nn.Linear(64, num_classes).cuda()
-        return backbone, head
+    def _stem_is_pretrained():
+        # Only the exact pretraining layout maps channel-for-channel onto the
+        # pretrained stem: legacy spec + zero normals, nothing appended. Any
+        # custom spec (feat_hag included) / log-dk gets a fresh stem (right
+        # width, random init).
+        return (FEAT_SPEC == FEAT_LEGACY and not DG_LOGDK_FEAT)
+
+    def build_model(num_classes, from_config=None):
+        """Build encoder + linear seg head.
+
+        Training: download the pretrained checkpoint (cached under
+        /outputs/hf_cache/<PKG>), rebuild its architecture with our overrides
+        (flash off, our in_channels, our drop_path) and load every weight
+        whose module survived — all of them for the legacy layout, everything
+        but the input embedding for a custom stem.
+
+        Inference/resume: `from_config` (embedded in our checkpoints) rebuilds
+        the exact architecture offline; the caller loads our weights on top.
+        Returns (backbone, head, config, stem_pretrained)."""
+        stem_pre = _stem_is_pretrained()
+        if from_config is not None:
+            config = dict(from_config)
+            sd = None
+        else:
+            ckpt = _mdl.load(HF_NAME, repo_id=HF_REPO,
+                             download_root=f"/outputs/hf_cache/{PKG}",
+                             ckpt_only=True)
+            config = dict(ckpt["config"])
+            sd = ckpt["state_dict"]
+        # a ckpt config may omit keys left at ctor defaults — mirror those
+        # defaults (upstream model.py) wherever we read or rewrite them
+        n_stages = len(config.get("enc_depths", (3, 3, 3, 12, 3)))
+        if not USE_FLASH_ATTN:
+            # the upstream no-flash fallback (demo pattern): standard attention
+            # + patch size clamped to 1024
+            config["enable_flash"] = False
+            config["upcast_attention"] = True
+            config["upcast_softmax"] = True
+            config["enc_patch_size"] = [min(int(s), 1024) for s in
+                                        config.get("enc_patch_size",
+                                                   [1024] * n_stages)]
+        config["in_channels"] = IN_CH
+        config["drop_path"] = DROP_PATH
+        config["freeze_encoder"] = False     # freezing is handled below, not by
+                                             # the ctor (it would freeze a fresh
+                                             # custom stem too)
+        backbone = _mdl.PointTransformerV3(**config).cuda()
+        if sd is not None:
+            if not stem_pre:
+                sd = {k: v for k, v in sd.items()
+                      if not k.startswith("embedding.")}
+            missing, unexpected = backbone.load_state_dict(sd, strict=False)
+            # only stem keys may legitimately be missing (custom stem)
+            bad = ([k for k in missing if not k.startswith("embedding.")]
+                   + list(unexpected))
+            if bad:
+                raise RuntimeError(f"pretrained {HF_NAME} did not match the "
+                                   f"rebuilt architecture: {bad[:8]}")
+            print(f"  loaded pretrained {HF_NAME} "
+                  f"({'pretrained' if stem_pre else 'custom (re-initialized)'} "
+                  f"input stem, {IN_CH} channels)", flush=True)
+        if FREEZE:
+            # linear probe: freeze the encoder; the embedding only when it IS
+            # the pretrained one — a frozen random stem would be garbage in.
+            for p in backbone.enc.parameters():
+                p.requires_grad = False
+            if stem_pre:
+                for p in backbone.embedding.parameters():
+                    p.requires_grad = False
+        # per-point feature dim after the upcast walk (encoder-only ckpts);
+        # a decoder-bearing config ends the walk at dec_channels[0] instead.
+        head_in = (int(sum(config.get("enc_channels", (48, 96, 192, 384, 512))))
+                   if config.get("enc_mode")
+                   else int(config.get("dec_channels", (96, 96, 192, 384))[0]))
+        head = torch.nn.Linear(head_in, num_classes).cuda()
+        return backbone, head, config, stem_pre
 
     from scipy.spatial import cKDTree
 
@@ -290,9 +401,10 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                         offset = torch.tensor([len(vx)], dtype=torch.long).cuda()
                         gc = keys[first] - keys[first].min(0)   # unique, dedup-consistent
                         grid_coord = torch.from_numpy(np.ascontiguousarray(gc)).long().cuda()
-                        point = backbone({"coord": coord, "grid_coord": grid_coord,
-                                          "feat": featt, "offset": offset})
-                        fe = point["feat"] if isinstance(point, dict) else point.feat
+                        fe = _upcast_feat(backbone({"coord": coord,
+                                                    "grid_coord": grid_coord,
+                                                    "feat": featt,
+                                                    "offset": offset}))
                         vp = torch.softmax(head(fe).float(), -1).cpu().numpy()[inverse]
                         pprob = vp if pprob is None else pprob + vp
                     # view sums exceed 1 — renormalize to a distribution
@@ -306,12 +418,8 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
             if miss.any() and (~miss).any():
                 _, nn = cKDTree(xyz[~miss]).query(xyz[miss])
                 pred[miss] = pred[~miss][nn]           # conf/probs stay 0: no votes
-            elif miss.any():
-                # nothing predicted (tiny scene) — lowest NON-excluded class so
-                # EXCLUDE_CLASSES holds even here; conf stays 0.
-                pred[:] = min(set(range(num_classes)) - set(exclude_idx or ()))
             # rgb carries the p95-normalized intensity grayscale the model saw.
-            return xyz, pred, rgb[:, 0] / 255.0, conf, probs
+            return xyz, np.clip(pred, 0, num_classes - 1), rgb[:, 0] / 255.0, conf, probs
         return _predict_scene
 
     # ==========================================================================
@@ -345,12 +453,18 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
         try:
             FEAT_SPEC = (tc.parse_feat_spec(",".join(mf), FEAT_LEGACY)
                          if mf and len(set(mf)) == len(mf) else list(FEAT_LEGACY))
-            tc.ptv3_check_spec(FEAT_SPEC, "PTv3")
+            tc.ptv3_check_spec(FEAT_SPEC, "this backbone")
         except ValueError:
             FEAT_SPEC = list(FEAT_LEGACY)
         IN_CH = _in_ch(FEAT_SPEC)
 
-        backbone, head = build_model(num_classes)
+        # pcssl checkpoints embed the model config -> rebuild the exact
+        # architecture offline (no HuggingFace access at inference)
+        if "config" not in ckpt:
+            raise ValueError(f"{weights} has no embedded model config — not a "
+                             f"local_train_{BB_KEY}.py checkpoint?")
+        backbone, head, model_cfg, stem_pre = build_model(
+            num_classes, from_config=ckpt["config"])
         backbone.load_state_dict(bsd)
         head.load_state_dict(hsd)
         backbone.eval(); head.eval()
@@ -369,7 +483,9 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
         pred_dir = f"{run_dir}/predictions"
         os.makedirs(pred_dir, exist_ok=True)
         exc_idx = tc.exclude_class_idx(class_names)
-        infer_cfg = {"backbone": "PTv3", "mode": "infer", "weights": weights,
+        infer_cfg = {"backbone": BB_KEY, "mode": "infer", "weights": weights,
+                     "pretrained": HF_NAME,
+                     "stem": "pretrained" if stem_pre else "custom",
                      "infer_input": infer_input, "num_classes": num_classes,
                      "class_names": class_names, "grid_size": GRID_SIZE,
                      "color_source": color_src, "features": FEAT_SPEC,
@@ -386,17 +502,18 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
     # TRAINING MODE
     # ==========================================================================
     print("=" * 70)
-    print(f"  PTv3  {dataset}  ({tc.gpu_name()}, {N_EPOCHS} ep, batch {BATCH_SIZE})")
+    print(f"  {BB_KEY} [{HF_NAME}{', frozen encoder' if FREEZE else ''}]  "
+          f"{dataset}  ({tc.gpu_name()}, {N_EPOCHS} ep, batch {BATCH_SIZE})")
     print("=" * 70)
     print(f"  CUDA: {torch.cuda.is_available()}  "
           f"{torch.cuda.get_device_name(0) if torch.cuda.is_available() else ''}")
-    # Clear a stale STOP from an old run BEFORE the slow prep (tiling): a stop
-    # clicked during startup must survive to the loop.
+    # Clear a stale STOP from an old run BEFORE the slow prep (tiling, HF
+    # download): a stop clicked during startup must survive to the loop.
     tc.clear_stop()
     tc.ptv3_ensure_prep(PREP_DIR, ds_root, CHUNK_XY, STRIDE, load_canonical)
 
     tag = dataset
-    _pt = "ptv3"
+    _pt = BB_KEY
 
     resume_info = (tc.find_latest_unfinished_run(f"{tag}_{_pt}")
                    if (RESUME or AUTO_RESUME) else None)
@@ -414,7 +531,10 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
         resume_ckpt, start_epoch = None, 0
         with open(f"{run_dir}/run.json", "w") as f:
             cfg = {
-                "backbone": "PTv3", "n_epochs": N_EPOCHS, "batch_size": BATCH_SIZE,
+                "backbone": BB_KEY, "n_epochs": N_EPOCHS, "batch_size": BATCH_SIZE,
+                "pretrained": HF_NAME, "hf_repo": HF_REPO,
+                "stem": "pretrained" if _stem_is_pretrained() else "custom",
+                "freeze_encoder": FREEZE,
                 "dataset": dataset,
                 "mode": mode, "gpu": tc.gpu_name(),
                 "num_classes": NUM_CLASSES, "grid_size": GRID_SIZE,
@@ -452,11 +572,16 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
             json.dump(cfg, f, indent=2)
 
     # --- Model --------------------------------------------------------------
-    backbone, head = build_model(NUM_CLASSES)
-    print(f"  Params: {sum(p.numel() for p in backbone.parameters()):,}")
+    backbone, head, model_cfg, stem_pre = build_model(NUM_CLASSES)
+    n_all = sum(p.numel() for p in backbone.parameters())
+    n_train = (sum(p.numel() for p in backbone.parameters() if p.requires_grad)
+               + sum(p.numel() for p in head.parameters()))
+    print(f"  Params: {n_all:,} ({n_train:,} trainable)")
 
+    # frozen params (linear probe) stay out of the optimizer entirely
     optim = torch.optim.AdamW(
-        list(backbone.parameters()) + list(head.parameters()),
+        [p for p in backbone.parameters() if p.requires_grad]
+        + list(head.parameters()),
         lr=BASE_LR, weight_decay=WEIGHT_DECAY,
     )
     if resume_ckpt is not None:
@@ -634,11 +759,9 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
     print(f"  eval set: {len(val_items)} holdout(val) + {len(test_items)} test scenes",
           flush=True)
 
-    def _forward_logits(batch):
-        point = backbone(batch)
-        return head(point["feat"] if isinstance(point, dict) else point.feat)
-    evaluate = tc.ptv3_make_evaluate(_forward_logits, build_feat, FEAT_SPEC,
-                                     GRID_SIZE, CHUNK_XY, NUM_CLASSES, names)
+    evaluate = tc.ptv3_make_evaluate(
+        lambda batch: head(_upcast_feat(backbone(batch))), build_feat,
+        FEAT_SPEC, GRID_SIZE, CHUNK_XY, NUM_CLASSES, names)
 
     val_csv = f"{run_dir}/val_metrics.csv"
     if not os.path.exists(val_csv):
@@ -648,7 +771,7 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                 [f"iou_{_name(c)}" for c in range(NUM_CLASSES)])
 
     best = tc.BestCheckpoint(run_dir)
-    tc.write_run_manifest(run_dir, "ptv3", dataset)
+    tc.write_run_manifest(run_dir, _pt, dataset)
 
     def run_eval(ep, write_json=False):
         # Periodic pass scores the held-out VAL scenes only (no test peeking) and
@@ -662,7 +785,8 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
         tc.append_val_row(val_csv, ep, m, names)
         if best.update(m["present_classes_mIoU"]):
             torch.save({"backbone": backbone.state_dict(),
-                        "head": head.state_dict(), "epoch": ep}, best.final)
+                        "head": head.state_dict(), "epoch": ep,
+                        "config": model_cfg}, best.final)
         if write_json:
             swapped = os.path.exists(best.final)
             if swapped:
@@ -700,9 +824,7 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
             picks = [pick_train_tile() for _ in range(BATCH_SIZE)]
             try:
                 batch, label = to_ptv3_batch(picks, training=True)
-                point = backbone(batch)
-                feat = point["feat"] if isinstance(point, dict) else point.feat
-                logits = head(feat)
+                logits = head(_upcast_feat(backbone(batch)))
                 loss = seg_loss(logits, label)
                 optim.zero_grad(); loss.backward()
                 torch.nn.utils.clip_grad_norm_(
@@ -743,7 +865,8 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
               f"s/iter={sec_per_iter:.3f} s/ep={sec_per_epoch:.1f}", flush=True)
         if (ep + 1) % CHECKPOINT_GAP == 0 or ep == N_EPOCHS - 1:
             torch.save({"backbone": backbone.state_dict(), "head": head.state_dict(),
-                        "optim": optim.state_dict(), "epoch": ep},
+                        "optim": optim.state_dict(), "epoch": ep,
+                        "config": model_cfg},
                        f"{run_dir}/checkpoints/ep{ep:03d}.pth")
             # keep only the 2 newest checkpoints (~0.5 GB each with optimizer)
             for old in sorted(glob.glob(f"{run_dir}/checkpoints/ep*.pth"))[:-2]:
@@ -763,7 +886,7 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
     run_eval(ep, write_json=True)
     best.finalize(lambda p: torch.save(
         {"backbone": backbone.state_dict(), "head": head.state_dict(),
-         "epoch": ep}, p))
+         "epoch": ep, "config": model_cfg}, p))
     print(f"  total wall-clock {(time.time() - t_run)/3600:.2f} h")
 
     # Mark the run complete so AUTO_RESUME won't re-resume it on the next launch
@@ -774,7 +897,8 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
 
 def main():
     import argparse
-    ap = argparse.ArgumentParser(description='Local ptv3 trainer/inferencer.')
+    ap = argparse.ArgumentParser(
+        description='Local Pointcept-SSL (concerto/sonata/utonia) fine-tuner/inferencer.')
     ap.add_argument('--dataset', default=None)   # required to train; omitted for --mode infer
     ap.add_argument('--grid', type=float, default=None)
     ap.add_argument('--epochs', type=int, default=None)
@@ -784,8 +908,11 @@ def main():
     ap.add_argument('--mode', default='train')
     ap.add_argument('--weights', default=None)
     ap.add_argument('--infer-input', default=None)
+    ap.add_argument('--freeze-encoder', type=int, default=None,
+                    help='1 = linear probe: freeze the pretrained encoder, '
+                         'train only the seg head (0 = full fine-tune)')
     args = ap.parse_args()
-    train_ptv3(**vars(args))
+    train_pcssl(**vars(args))
 
 
 if __name__ == "__main__":

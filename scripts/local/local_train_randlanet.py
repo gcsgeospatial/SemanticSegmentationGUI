@@ -2,17 +2,13 @@
 Local training script for RandLA-Net (PyTorch) — COLD-START variant.
 
 Trains on a canonical trainer_gui dataset (--dataset NAME) whose three
-materialized train/val/test scene folders live under /datasets. Random initialization (no pretrained weights); the warm sibling
-shares the architecture and feature recipe for a clean init comparison.
+materialized train/val/test scene folders live under /datasets. Random
+initialization (no pretrained weights).
 
 Features are [xyz, intensity, return_number] (5 ch); fc0 is rebuilt 5->8.
 FEAT_CHANNELS env overrides the spec (ordered csv incl. dataset feat_*
-channels); run.json "features" records the resolved list and inference
-rebuilds from it.
---hag appends a HeightAboveGround channel (IN_DIM 5 -> 6), read per point from
-the scene npz "hag" array, which the dataset (or the Inference page's HAG box)
-must provide — this replaces the old copy-paste local_train_randlanet_hag.py
-twin (that file is now a thin wrapper forcing --hag).
+channels, e.g. feat_hag for real HeightAboveGround); run.json "features"
+records the resolved list and inference rebuilds from it.
 Per-scene p95-clipped intensity normalization, vertical-rotation / x-flip /
 isotropic-scale train augmentation, class-weighted CE (+ optional focal /
 Lovász) with rare-class-centered sphere sampling, a held-out val pass every
@@ -21,7 +17,7 @@ scores every val/test scene on its raw points.
 
 Flags:
   --dataset NAME    (required) canonical dataset under /datasets
-  --sub-grid / --num-points / --epochs / --batch / --steps-per-epoch / --hag
+  --sub-grid / --num-points / --epochs / --batch / --steps-per-epoch
   --mode infer --weights runs/<id>/final_model.pth --infer-input <job_id>
 """
 
@@ -30,7 +26,7 @@ from typing import Optional
 # ============================================================================
 # Configuration
 # ============================================================================
-N_EPOCHS      = 100              # was 5 (smoke test); 250-300 for a full run
+N_EPOCHS      = 100              # default when --epochs is omitted; 250-300 for a full run
 BATCH_SIZE    = 6
 VAL_BATCH     = 12
 
@@ -38,7 +34,7 @@ NUM_POINTS    = 45056            # 4096*11, RandLA SemKITTI default
 SUB_GRID_SIZE = 0.30             # 30 cm — sparse aerial LiDAR (~2 pts/m²) vs KITTI
 # Input-feature spec (FEAT_CHANNELS env, GUI picker): comma-separated ordered
 # names; "" = the legacy [x, y, z, intensity, return_number] recipe (IN_DIM 5).
-# HAG (--hag) and log d_k (DG_LOGDK_FEAT) append after the spec, as always.
+# log d_k (DG_LOGDK_FEAT) appends after the spec, as always.
 FEAT_CHANNELS = ""
 
 # --- density domain-generalization (scripts/helper/density.py; see DENSITY_DG.md) ---
@@ -94,7 +90,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                     num_points: Optional[int] = None, epochs: Optional[int] = None,
                     batch: Optional[int] = None, steps_per_epoch: Optional[int] = None,
                     mode: str = "train", weights: Optional[str] = None,
-                    infer_input: Optional[str] = None, hag: bool = False):
+                    infer_input: Optional[str] = None):
     if dataset is None and mode != "infer":
         raise ValueError("--dataset is required: pass a canonical trainer_gui "
                          "dataset name under /datasets. The only "
@@ -123,7 +119,6 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
 
     # --- resolve config: CLI args override the module defaults ---------------
     SUB_GRID_SIZE = sub_grid if sub_grid is not None else globals()["SUB_GRID_SIZE"]
-    HAG = bool(hag)   # --hag: local vars named `hag` below are per-point ARRAYS
     # Input-feature spec: FEAT_CHANNELS env at train (the infer branch below
     # overrides it from run.json — env is ignored at infer). x/y/z come from
     # the recentered (augmented) coords, exactly the columns the old stack fed.
@@ -137,30 +132,27 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                          f"{FEAT_LEGACY} plus dataset feat_* channels")
     # the non-coordinate spec channels — the columns cached feat2 stacks carry
     NONXYZ = [n for n in FEAT_SPEC if n not in ("x", "y", "z")]
-    # Effective input dim: spec channels (all width 1) +1 HAG (--hag), +1
-    # log-d_k (D3b). Shadowed here (before build_net is defined) so
-    # build_net's default, the checkpoint in-dim check, and the run-config all
-    # track it.
-    IN_DIM = len(FEAT_SPEC) + (1 if HAG else 0) + (1 if DG_LOGDK_FEAT else 0)
+    # Effective input dim: spec channels (all width 1) +1 log-d_k (D3b).
+    # Shadowed here (before build_net is defined) so build_net's default, the
+    # checkpoint in-dim check, and the run-config all track it.
+    IN_DIM = len(FEAT_SPEC) + (1 if DG_LOGDK_FEAT else 0)
     NUM_POINTS    = num_points if num_points is not None else globals()["NUM_POINTS"]
     N_EPOCHS      = epochs if epochs is not None else globals()["N_EPOCHS"]
     BATCH_SIZE    = batch if batch is not None else globals()["BATCH_SIZE"]
     STEPS         = steps_per_epoch if steps_per_epoch is not None else 500
     if dataset:
         ds_root = f"{DATASETS_ROOT}/{dataset}"
-        ds_meta, NUM_CLASSES, CLASS_NAMES, HAG_SOURCE = tc.load_dataset_meta(
-            dataset, HAG, "train the plain RandLA-Net.")
-        # No "warm" in the name: the cold sibling shares this cache (identical prep).
-        # --hag gets its own cache family (tiles carry a "hag" array); a custom
-        # feature spec gets its own too (legacy spec = "" tag, old caches valid).
-        PREP_DIR = (f"{ds_root}/prep/randlanet{'_hag' if HAG else ''}"
+        ds_meta, NUM_CLASSES, CLASS_NAMES = tc.load_dataset_meta(dataset)
+        # A custom feature spec gets its own cache family (legacy spec = ""
+        # tag, old caches valid).
+        PREP_DIR = (f"{ds_root}/prep/randlanet"
                     f"_grid{int(round(SUB_GRID_SIZE * 100))}_p95"
                     f"{tc.feat_spec_tag(FEAT_SPEC, FEAT_LEGACY)}")
     else:
         # --mode infer: dataset-free. The real class count/names come from the
         # checkpoint (+ its run.json) in the inference branch; these are placeholders
         # so the inline `class Cfg` (num_classes = NUM_CLASSES) below has a value.
-        ds_meta, NUM_CLASSES, CLASS_NAMES, HAG_SOURCE, PREP_DIR = {}, 0, [], None, None
+        ds_meta, NUM_CLASSES, CLASS_NAMES, PREP_DIR = {}, 0, [], None
 
     # utils/metric.py calls sklearn.metrics.confusion_matrix(y_true, y_pred,
     # np.arange(...)) — the third positional was the `labels` argument in old
@@ -239,8 +231,8 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     def load_canonical(npz_path):
         """Canonical trainer_gui scene -> (xyz, intensity, return_number,
         label, extras); extras = every feat_* channel the scene carries
-        (Phase 2a writes them). Which channels the net actually eats is
-        FEAT_SPEC's call; --hag / DG_LOGDK_FEAT append more."""
+        (Phase 2a writes them, feat_hag included). Which channels the net
+        actually eats is FEAT_SPEC's call; DG_LOGDK_FEAT appends more."""
         z = np.load(npz_path)
         xyz = z["xyz"].astype(np.float32)
         intensity = z["intensity"].astype(np.float32) if "intensity" in z \
@@ -253,39 +245,25 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                   if k.startswith("feat_")}
         return xyz, intensity, ret_num, lab, extras
 
-    def load_canonical_hag(npz_path, xyz):
-        # --hag: real per-point HAG from the dataset's npz. The startup guard already
-        # rejected a dataset without one, so a miss here means a corrupt scene.
-        z = np.load(npz_path)
-        if "hag" in z.files and len(z["hag"]) == len(xyz):
-            return z["hag"].astype(np.float32)
-        raise ValueError(f"{os.path.basename(npz_path)} is missing its 'hag' channel, "
-                         f"which --hag requires. Rebuild the dataset with HAG enabled.")
-
-    def grid_subsample(xyz, intensity, ret_num, hag, lab, extras, grid):
+    def grid_subsample(xyz, intensity, ret_num, lab, extras, grid):
         keys = np.floor(xyz / grid).astype(np.int64)
         uniq = tc.voxel_unique(keys)
-        return (xyz[uniq], intensity[uniq], ret_num[uniq], hag[uniq], lab[uniq],
+        return (xyz[uniq], intensity[uniq], ret_num[uniq], lab[uniq],
                 {n: v[uniq] for n, v in extras.items()})
 
     def _cache_signature():
         # Everything that changes what a cached scene .npz contains. A mismatch
         # means the cache is stale/leaky and must not be silently reused.
-        # Both dicts reproduce the pre-merge signatures byte-for-byte (base and
-        # _hag script), so every existing cache stays valid.
         sig = {
             "format_version": 1,
-            "pipeline": "randlanet_hag" if HAG else "randlanet",
+            "pipeline": "randlanet",
             "dataset": dataset,
             "sub_grid_size": SUB_GRID_SIZE,
             "num_classes": NUM_CLASSES,
             # spec-derived; reproduces the legacy string byte-for-byte for the
             # default spec, so every existing cache stays valid.
-            "feature_recipe": ",".join(FEAT_SPEC).replace("x,y,z", "xyz")
-                              + (",hag" if HAG else ""),
+            "feature_recipe": ",".join(FEAT_SPEC).replace("x,y,z", "xyz"),
         }
-        if HAG:
-            sig["hag_source"] = HAG_SOURCE
         # The dataset carries the split decision in dataset_meta.json; fold its
         # seed/mode in so a re-split of the dataset invalidates the cache.
         sp = ds_meta.get("split", {}) if isinstance(ds_meta, dict) else {}
@@ -315,14 +293,10 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                 try:
                     xyz, intensity, ret_num, lab, extras = load_canonical(pc_path)
                     n_in = len(xyz)
-                    # --hag: the scene's real per-point HAG rides through the
-                    # subsample and is saved into the cache tiles; without --hag
-                    # the tile layout is exactly the pre-merge one (no hag key).
-                    # Every feat_* the scene carries rides along too.
-                    hag = (load_canonical_hag(pc_path, xyz) if HAG
-                           else np.zeros(len(xyz), np.float32))
-                    xyz, intensity, ret_num, hag, lab, extras = grid_subsample(
-                        xyz, intensity, ret_num, hag, lab, extras, SUB_GRID_SIZE)
+                    # Every feat_* the scene carries rides through the
+                    # subsample into the cache tiles (feat_hag included).
+                    xyz, intensity, ret_num, lab, extras = grid_subsample(
+                        xyz, intensity, ret_num, lab, extras, SUB_GRID_SIZE)
                 except Exception as e:
                     print(f"  skip {pc_path}: {e}", flush=True); continue
                 tile = dict(xyz=xyz.astype(np.float32),
@@ -331,8 +305,6 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                             lab=lab.astype(np.int32))
                 for n, v in extras.items():
                     tile[n] = v.astype(np.float32)
-                if HAG:
-                    tile["hag"] = hag.astype(np.float32)
                 np.savez_compressed(out, **tile)
                 open(out + ".done", "w").close()      # mark complete after a clean write
                 any_new = True
@@ -362,7 +334,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
 
     def collate_fn(batch):
         # Items are (pc, feat2, label, point_idx, cloud_idx); feat2 carries the
-        # non-coordinate spec channels then HAG / log d_k. The network input is
+        # non-coordinate spec channels then log d_k. The network input is
         # assembled here in FEAT_SPEC order — x/y/z pulled from the (augmented,
         # centered) coords, exactly the columns the old [pc, feat2] concat fed.
         pcs, feats, lbs, idxs, cinds = zip(*batch)
@@ -378,7 +350,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         ax = {"x": 0, "y": 1, "z": 2}
         cols = [pcs[:, :, ax[n2]] if n2 in ax else feats[:, :, NONXYZ.index(n2)]
                 for n2 in FEAT_SPEC]
-        tail = feats[:, :, len(NONXYZ):]           # HAG / log d_k, appended as always
+        tail = feats[:, :, len(NONXYZ):]           # log d_k, appended as always
         full_feat = np.concatenate([np.stack(cols, axis=2), tail],
                                    axis=2)          # (B, N, IN_DIM)
         d["features"] = torch.from_numpy(full_feat).float().transpose(1, 2)
@@ -404,11 +376,9 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         @staticmethod
         def _load(f):
             z = np.load(f)
-            # --hag caches carry "hag"; base caches don't and never read the slot.
-            hag = z["hag"] if "hag" in z.files else None
             # the feat_* channels the spec needs — a miss is a clear error here
             extras = tc.feat_extras(z, FEAT_SPEC, os.path.basename(f))
-            return (z["xyz"], z["intensity"], z["ret_num"], hag, extras, z["lab"])
+            return (z["xyz"], z["intensity"], z["ret_num"], extras, z["lab"])
 
         def set_rare_classes(self, rare_classes):
             self.rare_idx = [np.where(np.isin(lab, rare_classes))[0]
@@ -416,7 +386,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
             self.rare_scenes = [i for i, r in enumerate(self.rare_idx) if len(r)]
 
         def sample_sphere(self, cloud_idx, center_idx, augment=False, rng=np.random):
-            xyz, intensity, ret_num, hag, extras, lab = self.scenes[cloud_idx]
+            xyz, intensity, ret_num, extras, lab = self.scenes[cloud_idx]
             center = xyz[center_idx:center_idx + 1]
             d2 = np.sum((xyz - center) ** 2, axis=1)
             sel = np.argpartition(d2, min(cfg.num_points, len(xyz) - 1))[:cfg.num_points]
@@ -445,7 +415,6 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                 pc = pc * np.float32(rng.uniform(0.9, 1.1))
             src = {"intensity": intensity, "return_number": ret_num, **extras}
             cols = ([src[n][sel] for n in NONXYZ]
-                    + ([hag[sel]] if HAG else [])
                     + ([dg.local_density_logdk(pc, DG_LOGDK_K)] if DG_LOGDK_FEAT else []))
             feat2 = (np.stack(cols, axis=1) if cols
                      else np.zeros((len(sel), 0))).astype(np.float32)   # D3b: + log d_k on the (augmented) coords
@@ -475,7 +444,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     import traceback
     from scipy.spatial import cKDTree
 
-    def make_predict_scene(net, num_classes):
+    def make_predict_scene(net, num_classes, exclude_idx=None):
         SAVE_PROBS = os.environ.get("TT_SAVE_PROBS") == "1"
 
         def _predict_scene(pc_path):
@@ -485,7 +454,6 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
             z = np.load(pc_path)
             xyz0 = z["xyz"].astype(np.float32)
             itn0, ret0 = tc.scene_arrays(z, len(xyz0))
-            hag0 = tc.scene_hag(z, pc_path, len(xyz0), HAG)
             ex0 = tc.feat_extras(z, FEAT_SPEC, os.path.basename(pc_path))
             keys = np.floor(xyz0 / SUB_GRID_SIZE).astype(np.int64)
             uniq = tc.voxel_unique(keys)
@@ -494,7 +462,6 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
             sub_itn0 = itn0[uniq]
             sub_ret0 = ret0[uniq]
             sub_ex0 = {n: v[uniq] for n, v in ex0.items()}
-            sub_hag0 = hag0[uniq] if HAG else None
             # EVAL_VOTES soft-vote passes over offset block grids (same overlap
             # voting as the eval protocol; votes is n_sub x C float32).
             sub_votes = np.zeros((len(sub_xyz), num_classes), np.float32)
@@ -506,14 +473,12 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                 sub_sorted = sub_xyz[ov]
                 sub_src = {"intensity": sub_itn0[ov], "return_number": sub_ret0[ov],
                            **{n2: v[ov] for n2, v in sub_ex0.items()}}
-                sub_hag = sub_hag0[ov] if HAG else None
                 for s in range(0, len(sub_sorted), N):
                     real = min(N, len(sub_sorted) - s)
                     if real < 64:
                         continue
                     block = sub_sorted[s:s + N]
                     cols = ([sub_src[n2][s:s + N] for n2 in NONXYZ]
-                            + ([sub_hag[s:s + N]] if HAG else [])
                             + ([dg.local_density_logdk(block, DG_LOGDK_K)] if DG_LOGDK_FEAT else []))
                     f2 = (np.stack(cols, axis=1) if cols
                           else np.zeros((len(block), 0), np.float32))   # D3b
@@ -549,9 +514,19 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                     valid = orig >= 0
                     sub_votes[orig[valid]] += prob[valid]
             valid = sub_votes.sum(1) > 0
+            if not valid.any():
+                # tiny scene: every block was skipped (<64 pts), zero votes —
+                # degrade like the KP/PTv3 paths instead of crashing the job.
+                # Lowest NON-excluded class, confidence 0.
+                fb = min(set(range(num_classes)) - set(exclude_idx or ()))
+                return (xyz0, np.full(len(xyz0), fb, np.int64), itn0,
+                        np.zeros(len(xyz0), np.float32),
+                        np.zeros((len(xyz0), num_classes), np.float16)
+                        if SAVE_PROBS else None)
             nn = cKDTree(sub_xyz[valid]).query(xyz0)[1]
             vv = sub_votes[valid]                    # copy — safe to normalize in place
             vv /= vv.sum(1, keepdims=True)           # vote sums exceed 1 -> distribution
+            vv = tc.apply_class_mask(vv, exclude_idx)
             pred = vv.argmax(1)[nn]
             conf = vv.max(1)[nn]
             probs = vv[nn].astype(np.float16) if SAVE_PROBS else None
@@ -580,16 +555,15 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
             if meta.get("grid") is not None:
                 SUB_GRID_SIZE = float(meta["grid"])
         # rebuild the EXACT assembly recorded with the weights (env is ignored
-        # at infer). Manifests without "features" = legacy runs; old manifests
-        # folded "HAG" into the list — strip it, --hag still drives that channel.
-        mf = [n for n in ((meta or {}).get("features") or []) if n != "HAG"]
+        # at infer). Manifests without "features" = legacy runs.
+        mf = (meta or {}).get("features") or []
         try:
             FEAT_SPEC = (tc.parse_feat_spec(",".join(mf), FEAT_LEGACY)
                          if mf else list(FEAT_LEGACY))
         except ValueError:
             FEAT_SPEC = list(FEAT_LEGACY)
         NONXYZ = [n for n in FEAT_SPEC if n not in ("x", "y", "z")]
-        IN_DIM = len(FEAT_SPEC) + (1 if HAG else 0) + (1 if DG_LOGDK_FEAT else 0)
+        IN_DIM = len(FEAT_SPEC) + (1 if DG_LOGDK_FEAT else 0)
 
         fc0_key = next((k for k in sd if k.startswith("fc0.") and sd[k].dim() >= 2), None)
         ckpt_in_dim = int(sd[fc0_key].shape[1]) if fc0_key is not None else 3
@@ -598,9 +572,8 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
             raise ValueError(
                 f"checkpoint fc0 expects {ckpt_in_dim} input channels but this "
                 f"script feeds {IN_DIM} ({FEAT_SPEC}"
-                f"{' + hag' if HAG else ''}{' + logdk' if DG_LOGDK_FEAT else ''}) "
-                f"— use weights trained with the same feature recipe (HAG runs "
-                f"need --hag and vice versa)")
+                f"{' + logdk' if DG_LOGDK_FEAT else ''}) "
+                f"— use weights trained with the same feature recipe")
         net.load_state_dict(sd)
         net.eval()
         print(f"  [infer] loaded {weights} ({num_classes} classes: {class_names}; "
@@ -617,13 +590,15 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         run_dir = f"{DATASETS_ROOT}/_infer/{infer_input}"
         pred_dir = f"{run_dir}/predictions"
         os.makedirs(pred_dir, exist_ok=True)
+        exc_idx = tc.exclude_class_idx(class_names)
         infer_cfg = {"backbone": "RandLA-Net", "mode": "infer", "weights": weights,
                      "infer_input": infer_input, "num_classes": num_classes,
                      "class_names": class_names, "sub_grid_size": SUB_GRID_SIZE,
-                     "hag": HAG, "gpu": tc.gpu_name(),
+                     "gpu": tc.gpu_name(),
+                     "exclude_classes": [class_names[i] for i in exc_idx],
                      "started_utc": datetime.utcnow().isoformat() + "Z"}
 
-        predict_scene = make_predict_scene(net, num_classes)
+        predict_scene = make_predict_scene(net, num_classes, exclude_idx=exc_idx)
         if DG_INFER_ADABN:
             # D2b: re-estimate BN running stats on the target tiles (label-free) so the
             # source-density stats stop mis-normalizing at a different inference density.
@@ -638,7 +613,6 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                     z = np.load(pc_path)
                     xyz0 = z["xyz"].astype(np.float32)
                     itn0, ret0 = tc.scene_arrays(z, len(xyz0))
-                    hag0 = tc.scene_hag(z, pc_path, len(xyz0), HAG)
                     ex0 = tc.feat_extras(z, FEAT_SPEC, os.path.basename(pc_path))
                     keys = np.floor(xyz0 / SUB_GRID_SIZE).astype(np.int64)
                     uniq = tc.voxel_unique(keys)
@@ -646,7 +620,6 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                     # BN stats must see the same feature the net will be fed at predict.
                     s_src = {"intensity": itn0[uniq], "return_number": ret0[uniq],
                              **{n: v[uniq] for n, v in ex0.items()}}
-                    shag = hag0[uniq] if HAG else None
                     for s0 in range(0, len(sx), N):
                         if seen >= cap:
                             return
@@ -655,7 +628,6 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                             continue
                         block = sx[s0:s0 + N]
                         cols = ([s_src[n][s0:s0 + N] for n in NONXYZ]
-                                + ([shag[s0:s0 + N]] if HAG else [])
                                 + ([dg.local_density_logdk(block, DG_LOGDK_K)] if DG_LOGDK_FEAT else []))
                         f2 = (np.stack(cols, axis=1) if cols
                               else np.zeros((len(block), 0), np.float32))   # D3b
@@ -684,14 +656,15 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     # TRAINING MODE
     # ==========================================================================
     print("=" * 70)
-    print(f"  RandLA-Net{' +HAG' if HAG else ''}  {dataset}  "
+    print(f"  RandLA-Net  {dataset}  "
           f"({tc.gpu_name()}, {N_EPOCHS} ep, batch {BATCH_SIZE})")
     print("=" * 70)
+    # Clear a stale STOP from an old run BEFORE the slow prep (conversion): a
+    # stop clicked during startup must survive to the loop.
+    tc.clear_stop()
     train_list, val_list, test_list = ensure_prep()
     tag = dataset
-    # keep the exact pre-merge run-id suffixes so run lineage stays continuous
-    run_id = datetime.utcnow().strftime(
-        f"%Y%m%d_%H%M%S_{tag}_randlanet_cold" + ("_hag" if HAG else ""))
+    run_id = datetime.utcnow().strftime(f"%Y%m%d_%H%M%S_{tag}_randlanet_cold")
     run_dir = f"/outputs/runs/{run_id}"
     os.makedirs(f"{run_dir}/checkpoints", exist_ok=True)
     with open(f"{run_dir}/run.json", "w") as f:
@@ -702,10 +675,9 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
             "n_epochs": N_EPOCHS,
             "batch_size": BATCH_SIZE, "num_points": NUM_POINTS,
             "sub_grid_size": SUB_GRID_SIZE, "in_dim": IN_DIM,
-            # resolved input spec (HAG/log-dk ride outside it, driven by --hag /
+            # resolved input spec (log-dk rides outside it, driven by
             # DG_LOGDK_FEAT) — inference rebuilds this exact assembly from here.
             "features": FEAT_SPEC,
-            "hag_source": HAG_SOURCE,
             "steps_per_epoch": STEPS,
             "eval_votes": EVAL_VOTES,
             "class_balance": {"weighting": CLASS_WEIGHTING, "beta": WEIGHT_BETA,
@@ -764,8 +736,6 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     net = build_net(NUM_CLASSES)
     print(f"  params: {sum(p.numel() for p in net.parameters()):,}")
 
-    # Cold start: random initialization (no pretrained checkpoint).
-
     opt = optim.Adam(net.parameters(), lr=cfg.learning_rate)
     sched = optim.lr_scheduler.ExponentialLR(opt, 0.95)
 
@@ -815,7 +785,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         n_scenes = n_skipped = 0
         N = cfg.num_points
         with torch.no_grad():
-            for i, (xyz, intensity, ret_num, hag, extras, lab) in enumerate(ds.scenes):
+            for i, (xyz, intensity, ret_num, extras, lab) in enumerate(ds.scenes):
                 src = {"intensity": intensity, "return_number": ret_num, **extras}
                 order = np.lexsort((xyz[:, 1], xyz[:, 0]))   # rough spatial locality
                 # EVAL_VOTES soft-vote passes over offset block grids (votes is
@@ -846,7 +816,6 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                             continue
                         pts_blk = xyz[blk]
                         cols = ([src[n][blk] for n in NONXYZ]
-                                + ([hag[blk]] if HAG else [])
                                 + ([dg.local_density_logdk(pts_blk, DG_LOGDK_K)] if DG_LOGDK_FEAT else []))
                         f2 = (np.stack(cols, axis=1) if cols
                               else np.zeros((len(blk), 0))).astype(np.float32)   # D3b
@@ -902,9 +871,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     val_src = {n: (p, c) for n, p, c in val_list}
 
     best = tc.BestCheckpoint(run_dir)
-    # the single inference manifest (run.json); the _hag key keeps the Infer
-    # page mapping HAG runs back to the HAG entry point exactly as before.
-    tc.write_run_manifest(run_dir, "randlanet_hag" if HAG else "randlanet", dataset)
+    tc.write_run_manifest(run_dir, "randlanet", dataset)
 
     def run_eval(ep, write_json=False):
         # VAL always scores the current (most-recent) weights. The final
@@ -956,6 +923,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     t_run = time.time()
     print(f"  starting {N_EPOCHS} epochs, {cfg.train_steps} steps/epoch", flush=True)
     LOG_EVERY = 20
+    ep = N_EPOCHS - 1     # final-eval label when the loop never runs
     for ep in range(N_EPOCHS):
         net.train()
         iou_calc = IoUCalculator(cfg)
@@ -1013,15 +981,18 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
             torch.save({"model": net.state_dict(), "optim": opt.state_dict(),
                         "epoch": ep},
                        f"{run_dir}/checkpoints/ep{ep:03d}.pth")
-        if (ep + 1) % VAL_EVERY == 0 and ep != N_EPOCHS - 1:
+        stop = tc.stop_requested(ep)
+        if (ep + 1) % VAL_EVERY == 0 and ep != N_EPOCHS - 1 and not stop:
             run_eval(ep)               # last epoch handled by the final eval below
+        if stop:
+            break                      # falls through to the final eval + finalize
 
     # --- Final evaluation: the real full-coverage eval over val + test, written
     # to test_metrics.json (the same val number run_eval logs periodically). ----
     print("  final evaluation (val + test)…", flush=True)
-    run_eval(N_EPOCHS - 1, write_json=True)
+    run_eval(ep, write_json=True)
     best.finalize(lambda p: torch.save(
-        {"model": net.state_dict(), "epoch": N_EPOCHS - 1}, p))
+        {"model": net.state_dict(), "epoch": ep}, p))
     print(f"  total wall-clock {(time.time() - t_run)/3600:.2f} h")
 
 
@@ -1037,9 +1008,6 @@ def main():
     ap.add_argument('--mode', default='train')
     ap.add_argument('--weights', default=None)
     ap.add_argument('--infer-input', default=None)
-    ap.add_argument('--hag', action='store_true',
-                    help='append the HeightAboveGround input channel '
-                         '(replaces the old local_train_randlanet_hag.py)')
     args = ap.parse_args()
     train_randlanet(**vars(args))
 

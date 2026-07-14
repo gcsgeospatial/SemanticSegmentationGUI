@@ -68,6 +68,13 @@ class PlottingPage(QWidget):
         left.addWidget(self.show_runs_chk)
         left.addWidget(self.show_avg_chk)
 
+        # Final test metrics (test_metrics.json) for a single selected run.
+        self.test_label = QLabel("")
+        self.test_label.setWordWrap(True)
+        self.test_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.test_label.setVisible(False)
+        left.addWidget(self.test_label)
+
         # ---- right: embedded chart
         self.fig = plots.Figure(figsize=(9, 5.5))
         self.canvas = FigureCanvas(self.fig)
@@ -82,15 +89,10 @@ class PlottingPage(QWidget):
 
     # ------------------------------------------------------------- run discovery
     def _default_roots(self) -> list[Path]:
-        """Run roots: each dataset's own runs/ folder (runs now nest under their
-        dataset) and the repo's runs/. local_train_out is a legacy state key —
-        the Train page no longer writes it — kept read-only so runs made before
-        the workspace-only layout still show up."""
-        roots = [*appstate.dataset_run_roots(), Path(self.repo_root) / "runs"]
-        out = appstate.get("local_train_out", "")
-        if out:
-            roots.append(Path(out) / "runs")
-        return roots
+        """The ONE run-discovery source shared with the Inference picker:
+        appstate.run_roots (dataset-nested runs/, downloaded runs, Runs-page
+        layout, repo runs/, legacy local_train_out)."""
+        return appstate.run_roots(self.repo_root)
 
     def _rescan(self):
         """Reload the list from the default roots, keeping any user-added folders."""
@@ -125,6 +127,7 @@ class PlottingPage(QWidget):
                     item.setSelected(True)
         self.run_list.blockSignals(False)
         self._refresh_metrics()
+        self._update_test_summary()
         self._redraw()
 
     # ------------------------------------------------------------- metric choices
@@ -152,7 +155,46 @@ class PlottingPage(QWidget):
 
     def _on_selection(self):
         self._refresh_metrics()
+        self._update_test_summary()
         self._redraw()
+
+    # ------------------------------------------------------------- final test metrics
+    def _update_test_summary(self):
+        """Compact read-only summary of test_metrics.json when one run is selected."""
+        dirs = self._selected_dirs()
+        text = ""
+        if len(dirs) == 1:
+            tm = plots.read_test_metrics(dirs[0])
+            parts = []
+            for split in ("val", "test"):
+                m = tm.get(split) or {}
+                bits = [f"acc {m['overall_acc']:.3f}" if m.get("overall_acc") is not None else "",
+                        f"mIoU {m['overall_mIoU']:.3f}" if m.get("overall_mIoU") is not None else ""]
+                pc = m.get("per_class_iou") or {}
+                if pc:
+                    bits.append(", ".join(f"{c} {v:.2f}" for c, v in pc.items()))
+                bits = [b for b in bits if b]
+                if bits:
+                    parts.append(f"final {split}: " + " · ".join(bits))
+            text = "\n".join(parts)
+        self.test_label.setText(text)
+        self.test_label.setVisible(bool(text))
+
+    # ------------------------------------------------------------- navigation target
+    def receive_nav(self, run=None, **_):
+        """navigate("Plotting", run=<run dir or id>) preselects that run."""
+        if not run:
+            return
+        want = str(run)
+        want_name = Path(want).name
+        self.run_list.clearSelection()
+        for i in range(self.run_list.count()):
+            item = self.run_list.item(i)
+            key = item.data(Qt.UserRole)
+            if key == want or Path(key).name == want_name:
+                item.setSelected(True)
+                self.run_list.scrollToItem(item)
+                break
 
     # ------------------------------------------------------------- draw
     def _redraw(self):

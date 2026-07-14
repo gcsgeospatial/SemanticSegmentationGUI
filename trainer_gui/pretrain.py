@@ -1,8 +1,8 @@
 """HeightAboveGround for one cloud, by two interchangeable methods.
 
-`hag_for_cloud` is the single engine behind every HAG channel in the app: the
-Datasets page bakes it into a dataset during conversion, and the Inference page
-bakes it into the scenes a *_hag model is about to label.
+`hag_for_cloud` is the single engine behind every feat_hag channel in the app:
+the Datasets page bakes it into a dataset during conversion, and the Inference
+page bakes it into the scenes for runs whose feature spec includes feat_hag.
 
 Two independent axes, never mixed:
   - ground SOURCE: a caller-supplied ground_mask (the file's own ground class,
@@ -28,11 +28,25 @@ import numpy as np
 HAG_FILTERS = ("hag_nn", "hag_delaunay")     # PDAL filters (the accurate path)
 HAG_METHODS = ("grid",) + HAG_FILTERS        # hag_for_cloud methods; "grid" = fast default
 
+# jakteristics geometric features the app offers (their exact spellings).
+GEO_FEATURES = ("eigenvalue_sum", "omnivariance", "eigenentropy", "anisotropy",
+                "planarity", "linearity", "PCA1", "PCA2",
+                "surface_variation", "sphericity", "verticality")
+
 
 def pdal_available() -> bool:
     """Whether python-pdal can be imported (Stage A is disabled without it)."""
     try:
         import pdal  # noqa: F401
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def jakteristics_available() -> bool:
+    """Whether jakteristics can be imported (geo feature channels need it)."""
+    try:
+        import jakteristics  # noqa: F401
         return True
     except Exception:  # noqa: BLE001
         return False
@@ -255,6 +269,37 @@ def hag_for_cloud(cloud, *, ground_mask=None, hag_filter: str = "grid",
         return np.asarray(out["HeightAboveGround"], np.float32)
     except Exception:  # noqa: BLE001
         return None
+
+
+# ------------------------------------------------ Stage A': geometric features
+
+def geo_features_for_cloud(xyz, names, radius: float = 1.0) -> "dict[str, np.ndarray]":
+    """Per-point jakteristics geometric features aligned 1:1 to xyz.
+
+    Returns {jak_name: float32 (n,)}. NaN (too few neighbors within `radius`)
+    becomes 0.0 — the natural "no local structure" value for these ratio
+    features (verticality 0 = horizontal is the one debatable fill; kept for
+    consistency). eigenvalue_sum and omnivariance scale with radius^2 (O(1) at
+    the 1.0 m default); the rest are dimensionless ratios. Raises instead of
+    returning None: geo channels are always explicitly requested, so a missing
+    dependency or bad name must fail the build loud, unlike HAG's soft None."""
+    bad = [n for n in names if n not in GEO_FEATURES]
+    if bad:
+        raise ValueError(f"unknown geometric feature(s) {bad}; "
+                         f"valid: {list(GEO_FEATURES)}")
+    try:
+        from jakteristics import compute_features
+    except ImportError as e:
+        raise RuntimeError("Geometric feature channels need the 'jakteristics' "
+                           "package (pip install jakteristics).") from e
+    pts = np.ascontiguousarray(np.asarray(xyz, dtype=np.float64))
+    # num_threads defaults to all cores — fine while conversion forces
+    # max_workers=1; pass it down if the parallel-worker UI is ever un-hidden.
+    feats = compute_features(pts, search_radius=float(radius),
+                             feature_names=list(names))
+    return {nm: np.nan_to_num(feats[:, i], nan=0.0, posinf=0.0,
+                              neginf=0.0).astype(np.float32)
+            for i, nm in enumerate(names)}
 
 
 # --------------------------------------------------------------------- self-check

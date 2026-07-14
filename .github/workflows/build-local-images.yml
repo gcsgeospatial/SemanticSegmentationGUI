@@ -22,8 +22,7 @@ jobs:
     strategy:
       fail-fast: false      # one backbone failing shouldn't cancel the others
       matrix:
-        key: [ptv3, ptv3_hag, randlanet, randlanet_hag,
-              kpconvx_cold, kpconvx_cold_hag, kpconv, kpconv_hag]
+        key: [ptv3, randlanet, kpconvx_cold, kpconv, concerto, sonata, utonia]
     steps:
       - name: Checkout this repo (Dockerfiles)
         uses: actions/checkout@v4

@@ -5,12 +5,9 @@ KPFCNN, cold start.
 
   Features  : 4 = [1, intensity, return_number, height], where height is
               tile-relative (z - tile_min_z). FEAT_CHANNELS env overrides the
-              spec (ordered csv incl. dataset feat_* channels); run.json
-              "features" records the resolved list.
-  --hag     : swaps the 4th channel to real PDAL HeightAboveGround, which the
-              dataset (or the Inference page's HAG box) must supply. Same 4
-              channels / param count -> a clean A/B of tile-relative height vs
-              true height above ground.
+              spec (ordered csv incl. dataset feat_* channels, e.g. feat_hag
+              for real HeightAboveGround); run.json "features" records the
+              resolved list.
 
 Model: the deformable KPFCNN (train_S3DIS.py architecture verbatim) built from
 the KPConv-PyTorch repo at /opt/kpconv (env KPCONV_SRC overrides; the dev-box
@@ -40,7 +37,6 @@ KPConv-specific mechanics:
 
 Usage:
     python local_train_kpconv.py --dataset <name>
-    python local_train_kpconv.py --dataset <name> --hag
     python local_train_kpconv.py --dataset <name> --mode eval \
         --weights runs/<id>/final_model.pth
     python local_train_kpconv.py --mode infer --infer-input <job> \
@@ -110,8 +106,7 @@ RARE_TILE_PROB  = 0.25       # P(draw the next train tile from a rare-class tile
 
 # Input-feature spec (FEAT_CHANNELS env, GUI picker): comma-separated ordered
 # names; "" = the legacy [intensity, return_number, height] recipe. The
-# constant-1 bias channel is always first and not part of the spec; --hag
-# still swaps what feeds "height", exactly as before.
+# constant-1 bias channel is always first and not part of the spec.
 FEAT_CHANNELS = ""
 
 # Geometry — original KPConv deformable KPFCNN (train_S3DIS.py constants),
@@ -246,8 +241,7 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
                  weights: Optional[str] = None,
                  infer_input: Optional[str] = None, grid: Optional[float] = None,
                  chunk_xy: Optional[float] = None, epochs: Optional[int] = None,
-                 batch: Optional[int] = None, steps_per_epoch: Optional[int] = None,
-                 hag: bool = False):
+                 batch: Optional[int] = None, steps_per_epoch: Optional[int] = None):
     import os, sys, time, json, csv, glob, traceback
     from datetime import datetime
     import numpy as np
@@ -285,11 +279,10 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
     N_EPOCHS    = epochs if epochs is not None else globals()["N_EPOCHS"]
     EPOCH_STEPS = steps_per_epoch if steps_per_epoch is not None else globals()["EPOCH_STEPS"]
     PACK_N      = batch if batch is not None else globals()["PACK_N"]
-    HAG = bool(hag)   # --hag: local vars named `hag` below are per-point ARRAYS
-    FEATURE_MODE = "native_hag" if HAG else globals()["FEATURE_MODE"]
+    FEATURE_MODE = globals()["FEATURE_MODE"]
     # Input-feature spec: FEAT_CHANNELS env at train (the infer block below
-    # overrides it from run.json — env is ignored at infer). "height" is fed by
-    # real HAG under --hag, the tile-relative height otherwise, as always.
+    # overrides it from run.json — env is ignored at infer). "height" is always
+    # tile-relative; real HAG is the ordinary feat_hag dataset channel.
     FEAT_LEGACY = ["intensity", "return_number", "height"]
     FEAT_SPEC = (list(FEAT_LEGACY) if INFER    # env ignored at infer
                  else tc.parse_feat_spec(FEAT_CHANNELS, FEAT_LEGACY))
@@ -303,14 +296,10 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
     DEFORMABLE    = globals()["DEFORMABLE"]
     NEIGHBOR_LIMITS = None   # resolved below: run.json (infer/resume) or calibration
 
-    HAG_SOURCE = None
     ds_root = f"/datasets/{dataset}" if dataset else None
     if ds_root:
-        ds_meta, NUM_CLASSES, CLASS_NAMES, HAG_SOURCE = tc.load_dataset_meta(
-            dataset, HAG,
-            "train the plain KPConv (its 4th channel is the tile-relative "
-            "height, which needs no HAG).")
-        PREP_DIR = (f"{ds_root}/prep/kpconv{'_hag' if HAG else ''}"
+        ds_meta, NUM_CLASSES, CLASS_NAMES = tc.load_dataset_meta(dataset)
+        PREP_DIR = (f"{ds_root}/prep/kpconv"
                     f"_grid{GRID:g}_c{int(CHUNK_XY)}"
                     f"{tc.feat_spec_tag(FEAT_SPEC, FEAT_LEGACY)}")
     else:
@@ -324,21 +313,6 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
         if INFER and weights:
             rj = _run_json_beside(f"/outputs/{weights}")
             if rj:
-                # M5: never load cross-variant weights — both variants are 4-ch,
-                # so no shape check can catch it (run.json's hag_source tags them).
-                if HAG and not rj.get("hag_source"):
-                    raise ValueError(
-                        "These weights are from a plain KPConv run (no 'hag_source' in "
-                        "run.json): its 4th input channel is the native tile-relative "
-                        "height, not real HAG. Re-run inference with the plain "
-                        "'KPConv' backbone.")
-                if not HAG and rj.get("hag_source"):
-                    raise ValueError(
-                        "These weights are from a KPConv + HAG run (run.json has "
-                        "'hag_source'): its 4th input channel is HeightAboveGround, not "
-                        "the native height this script feeds. Re-run inference with the "
-                        "'KPConv + HAG' backbone.")
-                HAG_SOURCE = rj.get("hag_source")
                 NUM_CLASSES = int(rj.get("num_classes") or NUM_CLASSES)
                 CLASS_NAMES = list(rj.get("class_names") or
                                    [f"class {i}" for i in range(NUM_CLASSES)])
@@ -362,6 +336,16 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
                                  if mf else list(FEAT_LEGACY))
                 except ValueError:
                     FEAT_SPEC = list(FEAT_LEGACY)
+                if rj.get("hag_source"):
+                    # ponytail: TEMPORARY shim (remove once legacy runs retire) —
+                    # the deleted --hag variant's 'height' channel was real HAG.
+                    # Feed the baked feat_hag channel in that slot: same width,
+                    # right semantics. Scenes MUST be converted with HAG on.
+                    FEAT_SPEC = ["feat_hag" if n == "height" else n for n in FEAT_SPEC]
+                    print(f"  [legacy-hag] weights from the removed --hag variant "
+                          f"(hag_source={rj['hag_source']}): 'height' -> feat_hag; "
+                          f"input scenes must carry a baked feat_hag channel",
+                          flush=True)
 
     if "rgb" in FEAT_SPEC:
         raise ValueError("the KPConv tile pipeline has no rgb channel — use "
@@ -377,9 +361,10 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
         # spec-derived recipe string reproduces the legacy spellings
         # byte-for-byte, so every existing cache stays valid.
         sp = ds_meta.get("split", {})
-        sig = {
-            "format_version": 1,
-            "pipeline": "kpconv_hag" if HAG else "kpconv",
+        return {
+            # v2: tiles carry the scene's real return_number (was zero-filled)
+            "format_version": 2,
+            "pipeline": "kpconv",
             "grid": GRID,
             "chunk_xy": CHUNK_XY,
             "stride": STRIDE,
@@ -389,30 +374,26 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
             "min_pts_sub": 32,
             "intensity_norm": "p95_clip2",
             "feature_recipe": "bias," + ",".join(
-                "hag" if (n == "height" and HAG)
-                else "ret_num" if n == "return_number" else n
+                "ret_num" if n == "return_number" else n
                 for n in FEAT_SPEC),
             "conv_radius": CONV_RADIUS,
             "deform_radius": DEFORM_RADIUS,
             "arch_hash": arch_hash(_arch(DEFORMABLE)),
         }
-        if HAG:
-            sig["hag_source"] = HAG_SOURCE
-        return sig
 
     def ensure_prep():
         return tc.kp_ensure_prep(
             PREP_DIR, ds_root, _cache_signature(),
             lambda name, pc_path, out_dir: tc.kp_tile_and_save(
-                name, pc_path, out_dir, CHUNK_XY, STRIDE, GRID, NUM_CLASSES, HAG))
+                name, pc_path, out_dir, CHUNK_XY, STRIDE, GRID, NUM_CLASSES))
 
     def find_latest_checkpoint():
-        # Same-recipe runs only: optimizer type, this --hag variant (either the
-        # raw or the manifest-normalized feature_mode spelling) AND the
+        # Same-recipe runs only: optimizer type, feature spec AND the
         # architecture hash must all match.
         return tc.kp_find_latest_checkpoint(
-            OPT_TYPE_STR, {FEATURE_MODE, "hag" if HAG else "native"},
-            arch_hash=arch_hash(_arch(DEFORMABLE)))
+            OPT_TYPE_STR, {FEATURE_MODE},
+            arch_hash=arch_hash(_arch(DEFORMABLE)),
+            features=FEAT_SPEC, legacy_features=FEAT_LEGACY)
 
     print("=" * 70)
     print(f"  KPConv  {dataset or 'infer'}  COLD/{FEATURE_MODE}  "
@@ -422,6 +403,10 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
     print(f"  CUDA: {torch.cuda.is_available()}  device: "
           f"{torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'none'}")
 
+    if not INFER:
+        # Clear a stale STOP from an old run BEFORE the slow prep (tiling,
+        # calibration): a stop clicked during startup must survive to the loop.
+        tc.clear_stop()
     train_list, val_list, test_list = ([], [], []) if INFER else ensure_prep()
 
     resume_info = find_latest_checkpoint() if (RESUME or EVAL_ONLY) else None
@@ -443,15 +428,15 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
         if EVAL_ONLY:
             raise RuntimeError(f"eval mode: no {OPT_TYPE_STR}-recipe run with "
                                f"checkpoints found under /outputs")
-        run_id, run_dir = tc.kp_make_run_dir(
-            "kpconv_hag" if HAG else "kpconv_native")
+        run_id, run_dir = tc.kp_make_run_dir("kpconv_native")
         resume_ckpt, start_epoch = None, 0
 
     train_tiles = sorted(glob.glob(f"{PREP_DIR}/train/*.npz"))
     val_tiles   = sorted(glob.glob(f"{PREP_DIR}/val/*.npz"))
     test_tiles  = sorted(glob.glob(f"{PREP_DIR}/test/*.npz"))
-    print(f"  train_tiles: {len(train_tiles)}   val_tiles: {len(val_tiles)}   "
-          f"test_tiles: {len(test_tiles)}", flush=True)
+    if not INFER:
+        print(f"  train_tiles: {len(train_tiles)}   val_tiles: {len(val_tiles)}   "
+              f"test_tiles: {len(test_tiles)}", flush=True)
     if not train_tiles and not INFER:
         raise RuntimeError("No training tiles after preprocessing — check the dataset.")
 
@@ -518,7 +503,7 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
     # ------------------------------------------------------------------------
     build_feat = tc.kp_make_build_feat(DG_LOGDK_FEAT, DG_LOGDK_K, FEAT_SPEC)
     sample_tile = tc.kp_make_sample_tile(
-        build_feat, HAG, GRID, max_pts=MAX_TILE_PTS, aug_color=AUG_COLOR,
+        build_feat, GRID, max_pts=MAX_TILE_PTS, aug_color=AUG_COLOR,
         density_aug=DG_DENSITY_AUG, coarsen_max=DG_COARSEN_MAX,
         p_native=DG_P_NATIVE)
 
@@ -600,11 +585,10 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
                 "warm_start": False,
                 "feature_mode": FEATURE_MODE,
                 "input_channels": IN_CH,
-                # resolved input spec (bias/HAG/log-dk ride outside it) —
+                # resolved input spec (bias/log-dk ride outside it) —
                 # inference rebuilds this exact assembly from here.
                 "features": FEAT_SPEC,
                 "dataset": dataset,
-                **({"hag_source": HAG_SOURCE} if HAG else {}),
                 "n_epochs": N_EPOCHS, "epoch_steps": EPOCH_STEPS,
                 "pack_n": PACK_N, "accum": ACCUM,
                 "grid_m": GRID, "chunk_xy_m": CHUNK_XY, "stride_m": STRIDE,
@@ -695,33 +679,36 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
               f"{ck.get('epoch', '?') if isinstance(ck, dict) else '?'})", flush=True)
         start_epoch = N_EPOCHS
 
-    # --- class-balanced loss + rare-class oversampling ----------------------
-    class_counts, present_mask = tc.scan_class_balance(
-        train_tiles, NUM_CLASSES,
-        cache_path=None if INFER else f"{PREP_DIR}/class_balance_cache.npz")
-    rare_classes = (list(RARE_CLASSES) if RARE_CLASSES is not None
-                    else tc.auto_rare_classes(class_counts, RARE_FREQ_FRAC))
-    rare_tiles = ([train_tiles[i]
-                   for i in np.nonzero(present_mask[:, rare_classes].any(1))[0]]
-                  if (RARE_OVERSAMPLE and rare_classes) else [])
-    if not INFER:
+    if INFER:
+        # Inference never trains or samples tiles — skip the class-balance scan
+        # (and its noisy zero-count logging); the loss/picker are train-only.
+        seg_loss = pick_train_tile = None
+    else:
+        # --- class-balanced loss + rare-class oversampling ------------------
+        class_counts, present_mask = tc.scan_class_balance(
+            train_tiles, NUM_CLASSES,
+            cache_path=f"{PREP_DIR}/class_balance_cache.npz")
+        rare_classes = (list(RARE_CLASSES) if RARE_CLASSES is not None
+                        else tc.auto_rare_classes(class_counts, RARE_FREQ_FRAC))
+        rare_tiles = ([train_tiles[i]
+                       for i in np.nonzero(present_mask[:, rare_classes].any(1))[0]]
+                      if (RARE_OVERSAMPLE and rare_classes) else [])
         print(f"  class counts: {dict(zip(CLASS_NAMES, class_counts.tolist()))}", flush=True)
         print(f"  rare classes: {[CLASS_NAMES[c] for c in rare_classes]}", flush=True)
         print(f"  rare-class tiles: {len(rare_tiles)} / {len(train_tiles)}", flush=True)
 
-    if CLASS_WEIGHTING:
-        w = tc.class_weights_np(class_counts, WEIGHT_BETA, WEIGHT_CAP)
-        class_weights = torch.tensor(w, dtype=torch.float32).cuda()
-        if not INFER:
+        if CLASS_WEIGHTING:
+            w = tc.class_weights_np(class_counts, WEIGHT_BETA, WEIGHT_CAP)
+            class_weights = torch.tensor(w, dtype=torch.float32).cuda()
             print(f"  class weights: "
                   f"{dict(zip(CLASS_NAMES, [round(float(x), 3) for x in w]))}", flush=True)
-    else:
-        class_weights = None
-    # Shared loss recipe: weighted smoothed CE (or focal) + Lovász-Softmax,
-    # with the all-ignored-pack NaN guard (see train_common.make_seg_loss).
-    seg_loss = tc.make_seg_loss(class_weights, LABEL_SMOOTH, USE_FOCAL,
-                                FOCAL_GAMMA, LOVASZ_WEIGHT)
-    pick_train_tile = tc.make_tile_picker(train_tiles, rare_tiles, RARE_TILE_PROB)
+        else:
+            class_weights = None
+        # Shared loss recipe: weighted smoothed CE (or focal) + Lovász-Softmax,
+        # with the all-ignored-pack NaN guard (see train_common.make_seg_loss).
+        seg_loss = tc.make_seg_loss(class_weights, LABEL_SMOOTH, USE_FOCAL,
+                                    FOCAL_GAMMA, LOVASZ_WEIGHT)
+        pick_train_tile = tc.make_tile_picker(train_tiles, rare_tiles, RARE_TILE_PROB)
 
     def _kp_batch(cxyz, feat):
         return make_kp_batch([(cxyz, feat, None)])[0]
@@ -729,11 +716,12 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
     # Sliding-window inference over already-normalized features (--mode infer),
     # with the D5 density-TTA view averaging (shared KP-family pipeline).
     SAVE_PROBS = os.environ.get("TT_SAVE_PROBS") == "1"
+    EXC_IDX = tc.exclude_class_idx(CLASS_NAMES) if INFER else []
     _predict_points = tc.kp_make_predict_points(
         lambda cxyz, feat: torch.softmax(net(_kp_batch(cxyz, feat), cfg).float(),
                                          -1).cpu().numpy(),
         build_feat, GRID, CHUNK_XY, NUM_CLASSES, DG_INFER_TTA,
-        save_probs=SAVE_PROBS)
+        save_probs=SAVE_PROBS, exclude_idx=EXC_IDX)
 
     # ------------------------------------------------------------------------
     # Arbitrary-folder inference: label the staged npz scenes and stop.
@@ -744,27 +732,25 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
         if (grid is not None and grid != GRID) or (chunk_xy is not None and chunk_xy != CHUNK_XY):
             print(f"  [infer] note: KPConv uses its trained geometry "
                   f"(grid={GRID}, chunk={CHUNK_XY}); --grid/--chunk-xy ignored.", flush=True)
-        if HAG:
-            print("  [infer] 4th channel = real HeightAboveGround; every scene must "
-                  "carry a per-point 'hag' array.", flush=True)
         net.eval()
         scenes = sorted(glob.glob(f"/datasets/_infer/{infer_input}/scenes/*.npz"))
         if not scenes:
             raise FileNotFoundError(f"No scenes under /datasets/_infer/{infer_input}/scenes")
         pred_dir = f"{run_dir}/predictions"
-        infer_cfg = {"backbone": "KPConv-HAG" if HAG else "KPConv", "mode": "infer",
+        infer_cfg = {"backbone": "KPConv", "mode": "infer",
                      "weights": weights,
                      "infer_input": infer_input, "num_classes": NUM_CLASSES,
                      "class_names": CLASS_NAMES, "grid": GRID, "chunk_xy": CHUNK_XY,
                      "neighbor_limits": NEIGHBOR_LIMITS,
-                     "hag": (HAG_SOURCE if HAG else False), "gpu": tc.gpu_name(),
+                     "gpu": tc.gpu_name(),
+                     "exclude_classes": [CLASS_NAMES[i] for i in EXC_IDX],
                      "started_utc": datetime.utcnow().isoformat() + "Z"}
         if DG_INFER_ADABN:
             # D2b: re-estimate BN running stats on the target tiles (label-free).
             print("  [infer] AdaBN: recomputing BN stats on target tiles...", flush=True)
             dg.adabn_recalibrate(
                 net,
-                tc.kp_make_target_batches(scenes, _kp_batch, build_feat, HAG,
+                tc.kp_make_target_batches(scenes, _kp_batch, build_feat,
                                           GRID, CHUNK_XY, NUM_CLASSES),
                 forward=lambda m, b: m(b, cfg))
             net.eval()
@@ -773,10 +759,9 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
             z = np.load(pc_path)
             xyz = z["xyz"].astype(np.float32)
             intensity_n, ret_num = tc.scene_arrays(z, len(xyz))
-            hag = tc.scene_hag(z, pc_path, len(xyz), HAG)   # --hag: real HAG; plain: None
             extras = tc.feat_extras(z, FEAT_SPEC, os.path.basename(pc_path))
             pred, conf, probs = _predict_points(xyz, intensity_n, ret_num,
-                                                hag=hag, extras=extras)
+                                                extras=extras)
             return xyz, pred, intensity_n, conf, probs
 
         tc.run_infer_scenes(scenes, _predict, pred_dir, run_dir, infer_cfg, cls_txt=True)
@@ -806,12 +791,10 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
     # NN-reprojected to the raw cloud (shared KP-family pipeline).
     evaluate = tc.kp_make_evaluate(
         lambda cxyz, feat: net(_kp_batch(cxyz, feat), cfg).cpu().numpy().astype(np.float32),
-        build_feat, HAG, GRID, CHUNK_XY, NUM_CLASSES, CLASS_NAMES)
+        build_feat, GRID, CHUNK_XY, NUM_CLASSES, CLASS_NAMES)
 
     best = tc.BestCheckpoint(run_dir)
-    # the single inference manifest (run.json); the _hag key keeps the Infer
-    # page mapping HAG runs back to the HAG entry point.
-    tc.write_run_manifest(run_dir, "kpconv_hag" if HAG else "kpconv", dataset)
+    tc.write_run_manifest(run_dir, "kpconv", dataset)
 
     def run_eval(ep, write_json=False):
         # Periodic pass scores held-out VAL only and selects the best checkpoint
@@ -868,6 +851,7 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
     print(f"  starting at epoch {start_epoch}, up to {N_EPOCHS}, "
           f"{EPOCH_STEPS} steps/epoch, pack {PACK_N} x accum {ACCUM}", flush=True)
     t_run = time.time()
+    ep = N_EPOCHS - 1     # final-eval label when the loop never runs (EVAL_ONLY)
     for ep in range(start_epoch, N_EPOCHS):
         cur_lr = lr_at(ep)
         for g in optim.param_groups:
@@ -946,14 +930,17 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
             torch.save({"model": net.state_dict(), "optim": optim.state_dict(),
                         "epoch": ep},
                        f"{run_dir}/checkpoints/ep{ep:03d}.pth")
-        if (ep + 1) % VAL_EVERY == 0 and ep != N_EPOCHS - 1:
+        stop = tc.stop_requested(ep)
+        if (ep + 1) % VAL_EVERY == 0 and ep != N_EPOCHS - 1 and not stop:
             run_eval(ep)               # last epoch handled by the final eval below
+        if stop:
+            break                      # falls through to the final eval + finalize
 
     print("  final evaluation over the combined eval set…", flush=True)
-    run_eval(N_EPOCHS - 1, write_json=True)
+    run_eval(ep, write_json=True)
     if not EVAL_ONLY:
         best.finalize(lambda p: torch.save(
-            {"model": net.state_dict(), "epoch": N_EPOCHS - 1}, p))
+            {"model": net.state_dict(), "epoch": ep}, p))
     print(f"  total wall-clock: {(time.time() - t_run)/3600:.2f} h")
 
 
@@ -1002,8 +989,6 @@ def main():
     ap.add_argument('--epochs', type=int, default=None)
     ap.add_argument('--batch', type=int, default=None)
     ap.add_argument('--steps-per-epoch', type=int, default=None)
-    ap.add_argument('--hag', action='store_true',
-                    help='swap the 4th input channel to real HeightAboveGround')
     ap.add_argument('--self-test', action='store_true',
                     help='host wiring check: config derivation + CPU model build; '
                          'no GPU, no compiled C++, no dataset')

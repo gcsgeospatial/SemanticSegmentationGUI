@@ -34,7 +34,7 @@ first and must coarsen `g` (trading resolution) to serve very sparse clouds.
 | D2b | AdaBN: recompute BN stats on target at inference | re-aligns frozen source stats to target `o`; label-free, exact for moments 1–2 | infer path | **WIRE** `density.adabn_recalibrate` |
 | D2c | BN→GroupNorm in magnitude-sensitive blocks | per-sample norm has no cross-sample stat to be wrong | `cfg.model.norm` (line 625) / lib | **stage** (config/lib; retrain) |
 | D2d | RandLA: normalize LocSE rel-coords by mean nbr dist | fixes fixed-k geometry leak (`r_k ∝ rho^-1/2`) | `/opt/randlanet` LocSE | **stage** (library patch; retrain) |
-| D3a | real HAG from robust DTM | per-point, density-invariant by construction; strongest single input | `--hag` on each trainer | **present** (real HAG required; KPConvX_hag replaces its native height) |
+| D3a | real HAG from robust DTM | per-point, density-invariant by construction; strongest single input | `feat_hag` in FEAT_CHANNELS | **present** (ordinary feature channel, baked at conversion) |
 | D3b | explicit `log d_k` input (+ optional FiLM) | net learns density-*conditional* boundary, not entangled; answers D2b's residual | feature assembly + `INPUT_CHANNELS` | **WIRE input** `density.local_density_logdk`; FiLM = stage(lib) |
 | D4 | density-consistency loss `f(x)≈f(decimate(x))` | flattens the feature manifold along density at the same points; uses unlabeled pts | train step | **stage** (in-script, biggest; separate BN per branch) |
 | D5 | density-TTA: average softmax over resamplings | decorrelated density views -> lower posterior variance -> fewer flipped boundary pts | infer path | **WIRE** |
@@ -63,7 +63,7 @@ PTv3 `local_train_ptv3.py`: voxel dedup · `augment_xyz` · `build_model` ·
 train forward · `to_ptv3_batch` · `_predict_scene`.
 RandLA `local_train_randlanet.py`: `grid_subsample` · `build_net` · train forward ·
 `tf_map` · `_predict_scene`.
-`--hag` runs share the base script; the `hag` companion array must be sliced by the same
+`feat_hag` rides the generic feat_* extras dict, which is sliced by the same
 index whenever points are dropped/subsampled.
 
 ## Build & validation order
@@ -84,17 +84,19 @@ tolerance (D1) and average variance (D5), do not expect to canonicalize it away.
 `density.py` self-checks pass (`pixi run python scripts/helper/density.py`); all 6 scripts
 `py_compile`-clean. Verified by compile + helper unit self-checks only — NOT yet run on GPU/data.
 
-| Change | kpconvx | kpconvx_hag | ptv3 | ptv3_hag | randla | randla_hag |
-|--------|:---:|:---:|:---:|:---:|:---:|:---:|
-| config flags + `import density as dg` | ok | ok | ok | ok | ok | ok |
-| **D1** density/grid jitter (train) | ok | ok (hag sliced) | ok | ok (hag via uniq) | ok | ok (hag via sel) |
-| **D5** density-TTA (infer) | ok | ok | ok | ok | ok | ok |
-| **D2b** AdaBN (infer) | ok | ok (real hag) | n/a¹ | n/a¹ | ok | ok (real hag) |
-| **D3b** log d_k input channel | ok | ok | ok | ok | ok | ok |
-| **D2a/D2c** aggregation/norm flags | ok | ok | — | — | — | — |
+| Change | kpconvx | ptv3 | randla |
+|--------|:---:|:---:|:---:|
+| config flags + `import density as dg` | ok | ok | ok |
+| **D1** density/grid jitter (train) | ok (extras sliced) | ok (extras via uniq) | ok (extras via sel) |
+| **D5** density-TTA (infer) | ok | ok | ok |
+| **D2b** AdaBN (infer) | ok | n/a¹ | ok |
+| **D3b** log d_k input channel | ok | ok | ok |
+| **D2a/D2c** aggregation/norm flags | ok | — | — |
 
-The hag AdaBN target-batch builders read the scene's real `hag` array, so BN stats are
-estimated on the same feature predict is fed. ¹ PTv3 BN is pooling/stem only, so BN-TTA barely helps.
+The AdaBN target-batch builders read the scene's feat_* channels (feat_hag included), so BN
+stats are estimated on the same feature predict is fed. ¹ PTv3 BN is pooling/stem only, so
+BN-TTA barely helps. (HAG became the ordinary `feat_hag` channel 2026-07-13; the `*_hag`
+script twins this table used to track are gone.)
 **D3b** (`DG_LOGDK_FEAT`) appends `log` of the k-th-NN distance as an input channel and bumps the
 model input dim by 1 — retrain-only (old weights won't load); KPConvX feeds it through the single
 `build_feat`, PTv3/RandLA at every inline feature site (train/eval/infer/AdaBN). **D2a/D2c**

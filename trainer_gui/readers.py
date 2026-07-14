@@ -107,6 +107,12 @@ def _read_ply(path) -> Cloud:
             intensity = np.asarray(v[key], np.float32)
             break
 
+    ret = None
+    for key in ("return_number", "scalar_return_number", "scalar_ReturnNumber"):
+        if key in names:
+            ret = np.asarray(v[key], np.float32)
+            break
+
     fields = {}
     skip = {"x", "y", "z", "red", "green", "blue", "nx", "ny", "nz", "alpha"}
     for name in v.dtype.names:
@@ -115,7 +121,7 @@ def _read_ply(path) -> Cloud:
         arr = np.asarray(v[name])
         if arr.ndim == 1 and np.issubdtype(arr.dtype, np.number):
             fields[name] = arr
-    return Cloud(xyz=xyz, rgb=rgb, intensity=intensity, fields=fields)
+    return Cloud(xyz=xyz, rgb=rgb, intensity=intensity, return_number=ret, fields=fields)
 
 
 # ---------------------------------------------------------------- ascii
@@ -151,7 +157,14 @@ def _read_pcd(path) -> Cloud:
     rgb = None
     if pc.has_colors():
         rgb = np.clip(np.asarray(pc.colors) * 255.0, 0, 255).astype(np.uint8)
-    return Cloud(xyz=xyz, rgb=rgb)
+    intensity = None
+    try:  # the legacy reader drops non-xyz/rgb attrs; the tensor reader keeps them
+        t = o3d.t.io.read_point_cloud(str(path))
+        if "intensity" in t.point:
+            intensity = t.point["intensity"].numpy().reshape(-1).astype(np.float32)
+    except Exception:
+        pass
+    return Cloud(xyz=xyz, rgb=rgb, intensity=intensity)
 
 
 # ---------------------------------------------------------------- npy / npz
@@ -181,12 +194,18 @@ def _read_numpy(path) -> Cloud:
             rgb = np.clip(c * 255.0 if c.max() <= 1.0 else c, 0, 255).astype(np.uint8)
             break
     intensity = np.asarray(z["intensity"], np.float32) if "intensity" in z else None
+    ret = None
+    for key in ("return_number", "ret_num"):
+        if key in z:
+            ret = np.asarray(z[key], np.float32)
+            break
     fields = {}
-    used = {"xyz", "points", "coord", "coords", "rgb", "color", "colors", "intensity"}
+    used = {"xyz", "points", "coord", "coords", "rgb", "color", "colors", "intensity",
+            "return_number", "ret_num"}
     for key in z.files:
         if key in used:
             continue
         arr = np.asarray(z[key])
         if arr.ndim == 1 and len(arr) == len(xyz) and np.issubdtype(arr.dtype, np.number):
             fields[key] = arr
-    return Cloud(xyz=xyz, rgb=rgb, intensity=intensity, fields=fields)
+    return Cloud(xyz=xyz, rgb=rgb, intensity=intensity, return_number=ret, fields=fields)

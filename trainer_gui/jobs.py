@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import codecs
 import re
 import threading
 import traceback
@@ -110,6 +111,9 @@ class JobRunner(QObject):
         env.insert("PYTHONUNBUFFERED", "1")  # line-by-line streaming
         for k, v in (self._extra_env or {}).items():
             env.insert(k, str(v))
+        # incremental: a multi-byte char ('—', '✓') split across read chunks
+        # must not decode to U+FFFD — the GUI pattern-matches these lines
+        self._dec = codecs.getincrementaldecoder("utf-8")("replace")
         self.proc = QProcess(self)
         self.proc.setProcessEnvironment(env)
         self.proc.setProcessChannelMode(QProcess.MergedChannels)
@@ -131,8 +135,9 @@ class JobRunner(QObject):
         # queued readyRead from the old process fires.
         proc = self.sender()
         if proc is not None:
-            self.output.emit(bytes(proc.readAllStandardOutput())
-                             .decode("utf-8", "replace"))
+            text = self._dec.decode(bytes(proc.readAllStandardOutput()))
+            if text:
+                self.output.emit(text)
 
     def _on_finished(self, code, _status):
         if self._stage == "pre":      # ignore create's exit; run the real command

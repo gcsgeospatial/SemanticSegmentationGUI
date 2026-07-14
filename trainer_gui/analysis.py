@@ -58,8 +58,9 @@ RL_N_LIM = (8192, 45056)    # floor: 32 pts survive the 256x pyramid; cap: the
                             # script's fixed VAL_BATCH=12 eval flush stays at the
                             # proven SemKITTI-recipe level (8 GB class)
 PTV3_CROP = 80_000          # script constant: bigger TRAIN tiles collapse to 15 m
-                            # discs (local_train_ptv3.py 776-781) while eval keeps
-                            # the whole tile; crop triggers at rho > 80k/chunk^2
+                            # discs (local_train_ptv3.py to_ptv3_batch's train
+                            # crop) while eval keeps the whole tile; crop
+                            # triggers at rho > 80k/chunk^2
 PTV3_CROP_RHO = 113.0       # 80k/(pi*15^2): densest cloud PTv3 training ever sees
 PTV3_RAW_TARGET = 40_000    # raw pts/tile the chunk aims for: 50% of the crop so
                             # 5 m rounding / local variation never straddles it

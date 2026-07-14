@@ -323,10 +323,23 @@ def main():
               ip95.max() >= imax.max() and ip95.max() <= 2.0)
 
         # ---------------- backbones: registry contracts
-        check("backbones: registry = the 8 cold/hag scripts",
-              set(BACKBONES) == {"ptv3", "randlanet", "ptv3_hag", "randlanet_hag",
-                                 "kpconvx_cold", "kpconvx_cold_hag",
-                                 "kpconv", "kpconv_hag"})
+        check("backbones: registry = the 4 cold scripts + 3 pcssl encoders",
+              set(BACKBONES) == {"ptv3", "randlanet", "kpconvx_cold", "kpconv",
+                                 "concerto", "sonata", "utonia"})
+        # pcssl family: one shared trainer; the sonata/utonia wrappers must
+        # override the core's PKG/HF/BB_KEY constants per CALL, never at
+        # import (several entry points share one process here).
+        import local_train_concerto as _pc
+        import local_train_sonata as _ps
+        import local_train_utonia as _pu
+        check("backbones: pcssl wrappers don't clobber the shared core at import",
+              _pc.BB_KEY == "concerto" and _pc.HF_NAME == "concerto_base"
+              and _ps._CFG["BB_KEY"] == "sonata"
+              and _pu._CFG["HF_REPO"] == "Pointcept/Utonia")
+        check("backbones: pcssl entries expose --freeze-encoder + --grid + --chunk-xy",
+              all(any(p.flag == "freeze-encoder" for p in BACKBONES[k].params)
+                  and BACKBONES[k].grid_flag == "grid" and BACKBONES[k].has_chunk
+                  for k in ("concerto", "sonata", "utonia")))
         check("backbones: randlanet uses --sub-grid and has no --chunk-xy",
               BACKBONES["randlanet"].grid_flag == "sub-grid"
               and not BACKBONES["randlanet"].has_chunk)
@@ -335,7 +348,7 @@ def main():
         check("backbones: outputs volumes follow the renamed apps",
               BACKBONES["ptv3"].outputs_volume == "ptv3-outputs"
               and BACKBONES["randlanet"].outputs_volume == "randlanet-cold-outputs"
-              and BACKBONES["ptv3_hag"].outputs_volume == "ptv3-hag-outputs")
+              and BACKBONES["kpconvx_cold"].outputs_volume == "kpconvx-cold-outputs")
         check("backbones: each carries a recommended GPU + min VRAM (Train specs bar)",
               all(b.rec_gpu and b.min_vram_gb > 0 for b in BACKBONES.values())
               and BACKBONES["kpconvx_cold"].min_vram_gb >= BACKBONES["randlanet"].min_vram_gb)
@@ -388,6 +401,60 @@ def main():
         check("dg: baseline run (no DG env) records logdk off",
               train_common.write_run_manifest(str(dg_run), "ptv3")["dg"]["logdk"] is False)
 
+        # ---------------- graceful stop: the /outputs/STOP sentinel contract
+        # (GUI touches it, trainer consumes it at epoch end and breaks into the
+        # normal final-eval + finalize path).
+        _orig_sentinel = train_common.STOP_SENTINEL
+        stop_f = tmp / "STOP"
+        train_common.STOP_SENTINEL = str(stop_f)
+        try:
+            check("stop: no sentinel -> not requested", not train_common.stop_requested(3))
+            stop_f.touch()
+            train_common.clear_stop()
+            check("stop: clear_stop removes a stale sentinel", not stop_f.exists())
+            stop_f.touch()
+            check("stop: sentinel -> requested AND consumed",
+                  train_common.stop_requested(3) and not stop_f.exists())
+        finally:
+            train_common.STOP_SENTINEL = _orig_sentinel
+
+        # ---------------- class masking: EXCLUDE_CLASSES parse + prob renorm
+        mask_names = ["ground", "veg", "building"]
+        os.environ["EXCLUDE_CLASSES"] = "veg"
+        try:
+            check("mask: name csv -> index list",
+                  train_common.exclude_class_idx(mask_names) == [1])
+            os.environ["EXCLUDE_CLASSES"] = "bogus"
+            try:
+                train_common.exclude_class_idx(mask_names)
+                bad_raised = False
+            except ValueError:
+                bad_raised = True
+            check("mask: unknown name fails loudly", bad_raised)
+            os.environ["EXCLUDE_CLASSES"] = "ground,veg,building"
+            try:
+                train_common.exclude_class_idx(mask_names)
+                all_raised = False
+            except ValueError:
+                all_raised = True
+            check("mask: excluding every class fails loudly", all_raised)
+        finally:
+            os.environ.pop("EXCLUDE_CLASSES", None)
+        check("mask: unset env -> no exclusions",
+              train_common.exclude_class_idx(mask_names) == [])
+        mp = np.array([[0.5, 0.3, 0.2], [0.1, 0.6, 0.3]], np.float32)
+        mm = train_common.apply_class_mask(mp.copy(), [0])
+        check("mask: excluded column zeroed, rows renormalized, argmax = next best",
+              np.all(mm[:, 0] == 0.0)
+              and np.allclose(mm.sum(1), 1.0, atol=1e-6)
+              and list(mm.argmax(1)) == [1, 1]
+              and np.allclose(mm.max(1), [0.6, 0.6 / 0.9], atol=1e-6))
+        check("mask: empty exclusion is identity",
+              np.array_equal(train_common.apply_class_mask(mp.copy(), []), mp))
+        import inspect
+        check("mask: kp_make_predict_points accepts exclude_idx",
+              "exclude_idx" in inspect.signature(train_common.kp_make_predict_points).parameters)
+
         # Train page's Modal-presence check parses `modal volume ls --json` entries
         # whose basename key varies by CLI version — lock the parser.
         from trainer_gui.pages.infer_page import _entry_name, _localize_paths, _parse_run_ref
@@ -412,19 +479,28 @@ def main():
         check("infer: _manifest_in reads run.json from a downloaded run folder",
               _manifest_in(mdir)["backbone"] == "ptv3"
               and _manifest_in(tmp / "no_such_run") is None)
-        # Post-conversion channel report: flags scenes missing intensity/hag —
-        # the scene npz is the model's literal input, so this is the attribute check.
+        # Post-conversion channel report: flags scenes missing intensity, BLOCKS
+        # on a missing feat_hag (an ordinary hard feat_* requirement) with the
+        # HAG-box hint — the scene npz is the model's literal input.
         from trainer_gui.pages.infer_page import _scene_channel_report
         cdir = tmp / "chan_job" / "scenes"
         cdir.mkdir(parents=True)
         np.savez(cdir / "with_i.npz", xyz=make_xyz(5),
-                 intensity=np.linspace(0, 1, 5, dtype=np.float32))
+                 intensity=np.linspace(0, 1, 5, dtype=np.float32),
+                 feat_hag=np.ones(5, np.float32))
         np.savez(cdir / "no_i.npz", xyz=make_xyz(5))
-        rep_lines, rep_block = _scene_channel_report(tmp / "chan_job", expect_hag=True)
+        rep_lines, rep_block = _scene_channel_report(
+            tmp / "chan_job", features=["intensity", "feat_hag"])
         rep = "\n".join(rep_lines)
-        check("infer: channel report flags missing intensity + hag by scene",
+        check("infer: channel report flags missing intensity + blocks on feat_hag",
               "no_i" in rep and "with_i" not in rep.split("intensity channel in:")[1].split("\n")[0]
-              and "hag missing" in rep and rep_block is False)
+              and "feat_hag" in rep and "Compute Height-Above-Ground" in rep
+              and rep_block is True)
+        hag_ok_lines, hag_ok_block = _scene_channel_report(
+            tmp / "chan_job", features=["intensity"])
+        check("infer: channel report passes when feat_hag isn't in the spec",
+              hag_ok_block is False
+              and not any("feat_hag" in s for s in hag_ok_lines))
 
         # ---------------- feature channels (Phase 2): user-picked extra dims ride
         # as feat_<name> npz keys, meta records the raw-field mapping, inference
@@ -482,6 +558,88 @@ def main():
         except ValueError:
             pfs_raised = True
         check("feat: parse_feat_spec raises on an unknown channel name", pfs_raised)
+
+        # ---------------- computed geometric channels (jakteristics): engine
+        # numerics, meta record, single-cloud ferry, infer recompute + gating.
+        from trainer_gui import pretrain
+        gp = np.mgrid[0:40, 0:40].reshape(2, -1).T.astype(np.float64) * 0.4
+        geo_plane = np.c_[gp, np.zeros(len(gp))]              # 16x16 m flat plane
+        geo_wall = np.c_[np.full(len(gp), 30.0), gp]          # vertical plane at x=30
+        geo_xyz = np.vstack([geo_plane, geo_wall])
+        g1 = pretrain.geo_features_for_cloud(
+            geo_xyz, ["planarity", "linearity", "verticality", "PCA1"], 1.0)
+        g2 = pretrain.geo_features_for_cloud(
+            geo_xyz, ["planarity", "linearity", "verticality", "PCA1"], 1.0)
+        n_pl = len(geo_plane)
+        check("geo: engine deterministic, float32, finite",
+              all(np.array_equal(g1[k], g2[k]) for k in g1)
+              and all(v.dtype == np.float32 and np.isfinite(v).all()
+                      for v in g1.values()))
+        check("geo: plane reads planar+horizontal, wall reads vertical",
+              g1["planarity"][:n_pl].mean() > 0.8
+              and g1["verticality"][:n_pl].mean() < 0.2
+              and g1["verticality"][n_pl:].mean() > 0.8)
+        try:
+            pretrain.geo_features_for_cloud(geo_xyz, ["bogus"], 1.0)
+            geo_raised = False
+        except ValueError:
+            geo_raised = True
+        check("geo: unknown feature name raises ValueError", geo_raised)
+
+        staged_geo = dataset.convert_dataset(
+            "geo_demo", str(feat_root / "train"), spec, classes, [0], tmp / "staging",
+            val_inputs=[str(feat_root / "val")], feature_fields=["eig_lin"],
+            geo_features=["planarity", "PCA1"], geo_radius=1.5)
+        zg = np.load(sorted((staged_geo / "train").glob("*.npz"))[0])
+        check("geo: staged npz carries feat_geo_planarity + feat_geo_pca1 (f32, finite)",
+              all(k in zg.files and zg[k].dtype == np.float32
+                  and np.isfinite(zg[k]).all()
+                  for k in ("feat_geo_planarity", "feat_geo_pca1")))
+        mg = json.loads((staged_geo / "dataset_meta.json").read_text())
+        check("geo: meta feature_channels records @geo: sentinel + raw norm + radius",
+              mg["source"]["feature_channels"]
+              == [{"name": "eig_lin", "source_field": "eig_lin", "norm": "p95abs"},
+                  {"name": "geo_planarity", "source_field": "@geo:planarity",
+                   "norm": "raw", "radius": 1.5},
+                  {"name": "geo_pca1", "source_field": "@geo:PCA1",
+                   "norm": "raw", "radius": 1.5}])
+
+        # Single-cloud split: values must be the WHOLE-cloud computation ferried
+        # into the tiles (exact float match), not per-split recomputes.
+        staged_gsp = dataset.convert_dataset(
+            "geo_spatial", str(laz_root / "train" / "scene0.laz"), spec, classes, [0],
+            tmp / "staging", split=dataset.SplitConfig(val_frac=0.3, test_frac=0.3,
+                                                       mode="random", seed=42,
+                                                       seam_buffer_m=0.0, tile_m=20.0),
+            geo_features=["planarity"])
+        cloud_g = dataset.read_points(laz_root / "train" / "scene0.laz")
+        whole = pretrain.geo_features_for_cloud(cloud_g.xyz, ["planarity"], 1.0)["planarity"]
+        by_xy = {tuple(np.round(p, 3)): v for p, v in zip(cloud_g.xyz, whole)}
+        ferry_ok = True
+        for sp_name in ("train", "val", "test"):
+            zs = np.load(next((staged_gsp / sp_name).glob("*.npz")))
+            for p, v in zip(zs["xyz"], zs["feat_geo_planarity"]):
+                if by_xy.get(tuple(np.round(np.asarray(p, np.float64), 3))) != v:
+                    ferry_ok = False
+                    break
+        check("geo: single-cloud split ferries whole-cloud values exactly", ferry_ok)
+
+        job_geo = dataset.convert_infer_job("geo_job", str(feat_root / "val"),
+                                            tmp / "staging",
+                                            geo_features=["planarity"], geo_radius=1.0)
+        zgj = np.load(next((job_geo / "scenes").glob("*.npz")))
+        check("geo: convert_infer_job recomputes feat_geo_planarity, no label key",
+              "feat_geo_planarity" in zgj.files and "label" not in zgj.files)
+        GSPEC = ["x", "y", "z", "feat_geo_planarity"]
+        gok_lines, gok_block = _scene_channel_report(job_geo, features=GSPEC)
+        check("geo: channel report passes a job carrying the computed channel",
+              gok_block is False)
+        gbad_lines, gbad_block = _scene_channel_report(tmp / "chan_job", features=GSPEC)
+        check("geo: channel report blocks a job missing the computed channel",
+              gbad_block is True and any("feat_geo_planarity" in s for s in gbad_lines))
+        check("geo: parse_feat_spec accepts feat_geo_* names",
+              train_common.parse_feat_spec("intensity,feat_geo_pca1", [])
+              == ["intensity", "feat_geo_pca1"])
         check("infer: _entry_name reads path/Filename/name across CLI shapes",
               _entry_name({"path": "/ds/dataset_meta.json"}) == "dataset_meta.json"
               and _entry_name({"Filename": "train/"}) == "train"
@@ -672,26 +830,30 @@ def main():
             val_inputs=[str(laz_root / "val")], test_inputs=[str(laz_root / "test")],
             compute_hag=True, ground_value=2, progress=print)
         zih = np.load(staged_ih / "train" / "scene0.npz")
-        check("convert_dataset(compute_hag): tiles carry a hag channel inline",
-              "hag" in zih.files and zih["hag"].shape[0] == zih["xyz"].shape[0])
+        check("convert_dataset(compute_hag): tiles carry a feat_hag channel inline",
+              "feat_hag" in zih.files
+              and zih["feat_hag"].shape[0] == zih["xyz"].shape[0])
         mih = json.loads((staged_ih / "dataset_meta.json").read_text())
         check("convert_dataset(compute_hag): meta records grid+labels ground + has_hag",
               mih["has_hag"] is True
               and mih["source"]["hag_source"] == "grid+labels"
               and mih["source"]["hag_ground_value"] == 2
               and mih["source"]["hag_use_smrf"] is False)
+        check("convert_dataset(compute_hag): feature_channels catalogs the hag entry",
+              {"name": "hag", "source_field": "@hag:grid+labels", "norm": "raw"}
+              in mih["source"]["feature_channels"])
 
         # convert_infer_job with the HAG box ticked + a ground class: resolves the
-        # 'classification' field off files[0], masks ground by value, bakes a hag
-        # channel — and STILL writes no label key (empty value_to_index). Guards the
-        # whole opt-in HAG path; grid needs no PDAL.
+        # 'classification' field off files[0], masks ground by value, bakes a
+        # feat_hag channel — and STILL writes no label key (empty value_to_index).
+        # Guards the whole opt-in HAG path; grid needs no PDAL.
         job_h = dataset.convert_infer_job("hag_job", str(laz_root / "val"),
                                           tmp / "staging", hag=True, hag_filter="grid",
                                           ground_value=2, progress=print)
         zjh = np.load(next((job_h / "scenes").glob("*.npz")))
-        check("convert_infer_job(hag, ground_value): hag baked, no label key",
-              "hag" in zjh.files and "label" not in zjh.files
-              and zjh["hag"].shape[0] == zjh["xyz"].shape[0])
+        check("convert_infer_job(hag, ground_value): feat_hag baked, no label key",
+              "feat_hag" in zjh.files and "label" not in zjh.files
+              and zjh["feat_hag"].shape[0] == zjh["xyz"].shape[0])
         # Ground SOURCE and interpolation are separate axes now; the old smrf_fill
         # union is gone — a ground class means labels only, no second source.
         import inspect
@@ -706,13 +868,14 @@ def main():
                                           tmp / "staging", hag=True, hag_filter="grid")
         zjd = np.load(next((job_d / "scenes").glob("*.npz")))
         check("convert_infer_job(ground_value): labeled ground != detected ground",
-              "hag" in zjd.files and not np.allclose(zjh["hag"], zjd["hag"]))
-        # HAG off = the default: not one wasted ground pass, no hag channel.
+              "feat_hag" in zjd.files
+              and not np.allclose(zjh["feat_hag"], zjd["feat_hag"]))
+        # HAG off = the default: not one wasted ground pass, no feat_hag channel.
         job_n = dataset.convert_infer_job("nohag_job", str(laz_root / "val"),
                                           tmp / "staging")
         zjn = np.load(next((job_n / "scenes").glob("*.npz")))
-        check("convert_infer_job(): HAG is opt-in — no hag channel by default",
-              "hag" not in zjn.files)
+        check("convert_infer_job(): HAG is opt-in — no feat_hag channel by default",
+              "feat_hag" not in zjn.files)
 
         # ---------------- analysis.scan_folder on raw files
         stats = analysis.scan_folder(dataset.discover_scenes(laz_root / "train"))
@@ -1036,14 +1199,14 @@ def main():
             # backbone selection: unset = all; an explicit list filters in local mode only.
             check("appstate: backbones all enabled by default (unset)",
                   appstate.enabled_backbones() is None
-                  and appstate.backbone_enabled("ptv3_hag"))
+                  and appstate.backbone_enabled("kpconv"))
             appstate.set_enabled_backbones(["ptv3", "randlanet", "kpconvx_cold"])
             check("appstate: explicit selection hides the others in local mode",
                   appstate.backbone_enabled("randlanet")
-                  and not appstate.backbone_enabled("ptv3_hag"))
+                  and not appstate.backbone_enabled("kpconv"))
             appstate.set_exec_mode("modal")
             check("appstate: selection does NOT filter in modal mode",
-                  appstate.backbone_enabled("ptv3_hag"))
+                  appstate.backbone_enabled("kpconv"))
             appstate.set_exec_mode("local")
         finally:
             if _old_appdata is None:

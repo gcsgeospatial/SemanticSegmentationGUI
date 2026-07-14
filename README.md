@@ -101,25 +101,26 @@ use Hugging Face / S3 for the `.pth` weights. Full details: `docker/README.md`.
 | Model | key | Local script |
 |---|---|---|
 | PTv3 | `ptv3` | `scripts/local/local_train_ptv3.py` |
-| PTv3 + HAG | `ptv3_hag` | `scripts/local/local_train_ptv3_hag.py` |
 | RandLA-Net | `randlanet` | `scripts/local/local_train_randlanet.py` |
-| RandLA-Net + HAG | `randlanet_hag` | `scripts/local/local_train_randlanet_hag.py` |
 | KPConvX-L | `kpconvx_cold` | `scripts/local/local_train_kpconvx_cold.py` |
-| KPConvX-L + HAG | `kpconvx_cold_hag` | `scripts/local/local_train_kpconvx_cold_hag.py` |
 | KPConv | `kpconv` | `scripts/local/local_train_kpconv.py` |
-| KPConv + HAG | `kpconv_hag` | `scripts/local/local_train_kpconv_hag.py` |
+| Concerto (pretrained encoder) | `concerto` | `scripts/local/local_train_concerto.py` |
+| Sonata (pretrained encoder) | `sonata` | `scripts/local/local_train_sonata.py` |
+| Utonia (pretrained encoder) | `utonia` | `scripts/local/local_train_utonia.py` |
 
-`_hag` = an extra **HeightAboveGround** input channel (ground = the file's ground
-class when set, else PDAL SMRF detection; interpolated by grid / `hag_nn` / `hag_delaunay`).
-The `_hag` scripts are thin wrappers that run the base script with `--hag` — one
-trainer per backbone, so recipe changes land in one file.
+The `concerto`/`sonata`/`utonia` backbones fine-tune Pointcept's self-supervised
+pretrained encoders (one shared trainer — `local_train_concerto.py`; the other
+two are thin wrappers). Their HuggingFace **weights are CC-BY-NC 4.0
+(non-commercial)**; `--freeze-encoder 1` gives a linear probe.
 
-A `_hag` model **requires a real HAG channel**: train it on a dataset built with
-**Compute Height-Above-Ground**, and tick the same box on the Inference page. There
-is no substitute height — a missing `hag` channel is a hard error, not a silent
-fallback. Checkpoints from before this rule (their `run.json` records
-`hag_source: z_minus_scene_min_proxy`) learned a stand-in height and must be
-retrained; the Inference page refuses them.
+**HeightAboveGround** is an ordinary feature channel (`feat_hag`), not a model
+variant: bake it on the Datasets page with **Compute Height-Above-Ground**
+(ground = the file's ground class when set, else PDAL SMRF detection;
+interpolated by grid / `hag_nn` / `hag_delaunay`), then tick `feat_hag` in the
+Train page's feature list to feed it to any model. Runs trained with `feat_hag`
+record it in `run.json "features"`; the Inference page auto-enables the HAG
+conversion for them, and a scene missing the channel is a hard error, not a
+silent fallback.
 
 ## The normal path: Datasets → Train → Inference
 
@@ -145,9 +146,9 @@ top to bottom:
    (train = the remainder), **Split mode** (Balanced mirrors the class mix /
    Random fills by point count), and the **seed** (default 42). Already have
    split folders? Tick **Separate train/val/test folders (use as-is)**. Optional
-   **Compute Height-Above-Ground (HAG)** bakes a per-point HAG channel (ground =
-   your labeled ground class when set, else SMRF detection; never a mix) — only
-   the `_hag` models read it.
+   **Compute Height-Above-Ground (HAG)** bakes a per-point `feat_hag` channel
+   (ground = your labeled ground class when set, else SMRF detection; never a
+   mix) — select it in the Train page's feature list to use it.
 
 Hit **Build dataset**. It writes `train/ val/ test/` `.npz` to staging; progress
 streams in the console. Done → the dataset appears under **Saved Datasets** and is
@@ -182,9 +183,9 @@ Reads a run's `run.json` + weights, writes predictions to a host folder.
   and points **Weights file** at the sibling `.pth` (override if you want). (Or
   pick **Local .pth file** and choose the architecture yourself.)
 - **Input**: a folder or single cloud to label. Grid/tile come from the run.
-  **Compute Height-Above-Ground** is off by default and only the `_hag` models use
-  it; when on, name the **ground class** (e.g. `2`) if your clouds already carry a
-  ground classification, else ground is detected. Optional label-free
+  **Compute Height-Above-Ground** is off by default and auto-enables for runs
+  trained with `feat_hag`; when on, name the **ground class** (e.g. `2`) if your
+  clouds already carry a ground classification, else ground is detected. Optional label-free
   **density adapt (AdaBN)** / **density TTA** for inference at a different density
   than training. Set the **Output folder** for predictions.
 - **Run inference** converts the input to canonical scenes, then `docker run
@@ -209,8 +210,8 @@ Reads a run's `run.json` + weights, writes predictions to a host folder.
   density stats, per-model recommendations, and the recorded split (mode, seed,
   fractions).
 - `train/<scene>.npz`, `val/<scene>.npz`, `test/<scene>.npz` — `xyz` (f32),
-  `label` (i32, −1 = ignored), plus `rgb`/`intensity`/`return_number`/`hag` when
-  the source has them.
+  `label` (i32, −1 = ignored), plus `rgb`/`intensity`/`return_number`/`feat_hag`
+  when the source has them.
 
 The Datasets page carves all three splits **once** (val % / test % sliders each
 ≥ 5 %, train takes the rest; balanced or random; seeded, default 42). A folder

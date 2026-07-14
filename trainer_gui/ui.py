@@ -20,12 +20,30 @@ def append_log(log: QPlainTextEdit, text: str, newline: bool = True):
     bottom. Autoscrolls only if the view was already at (or within a line of)
     the bottom before this append — the standard `tail -f` behavior — so
     reading earlier output stays put while new lines keep arriving below."""
+    if hasattr(log, "begin_run"):   # logconsole.LogConsole: it owns scroll/color
+        log.append(text, newline)
+        return
     bar = log.verticalScrollBar()
     at_bottom = bar.value() >= bar.maximum() - log.fontMetrics().height()
     log.moveCursor(QTextCursor.End)
     log.insertPlainText(text + ("\n" if newline else ""))
     if at_bottom:
         bar.setValue(bar.maximum())
+
+
+# Cross-page navigation: MainWindow registers its page switcher; pages call
+# navigate("Train", run=...) without importing (or even knowing about) main.
+_navigator = None
+
+
+def set_navigator(fn) -> None:
+    global _navigator
+    _navigator = fn
+
+
+def navigate(page_name: str, **kwargs) -> None:
+    if _navigator is not None:
+        _navigator(page_name, **kwargs)
 
 
 def vsplit(*widgets: QWidget, sizes: list[int] | None = None) -> QWidget:

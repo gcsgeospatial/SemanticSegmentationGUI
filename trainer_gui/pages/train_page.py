@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 
 from PySide6.QtCore import Qt
@@ -18,12 +19,13 @@ from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog, QDoubleSpinBox,
                                QFormLayout, QGroupBox, QHBoxLayout, QHeaderView,
                                QLabel, QLineEdit, QListWidget, QListWidgetItem,
-                               QPlainTextEdit, QPushButton, QSpinBox,
+                               QProgressBar, QPushButton, QSpinBox,
                                QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
 from .. import analysis, appstate, local_cli, modal_cli, theme, ui
 from ..backbones import BACKBONES, GPU_CHOICES
 from ..jobs import FuncWorker, JobRunner, LogParser
+from ..logconsole import LogConsole
 
 # Input-feature picker: the arch-appropriate standard channel names per base
 # backbone (offered in the list) and each trainer's exact legacy default
@@ -35,13 +37,27 @@ _FEAT_STANDARD = {
     "kpconvx_cold": ["intensity", "return_number", "height", "x", "y", "z"],
     "kpconv":       ["intensity", "return_number", "height", "x", "y", "z"],
     "ptv3":         ["x", "y", "z", "intensity", "rgb"],
+    # Pointcept-SSL family: the legacy default hits the pretrained 9-channel
+    # stem ([coord, color, zero-normals]); any other spec re-inits the stem.
+    "concerto":     ["x", "y", "z", "intensity", "rgb"],
+    "sonata":       ["x", "y", "z", "intensity", "rgb"],
+    "utonia":       ["x", "y", "z", "intensity", "rgb"],
 }
 _FEAT_DEFAULTS = {
     "randlanet":    ["x", "y", "z", "intensity", "return_number"],
     "kpconvx_cold": ["intensity", "return_number", "height"],
     "kpconv":       ["intensity", "return_number", "height"],
     "ptv3":         ["x", "y", "z", "intensity"],   # color slot swapped per dataset
+    "concerto":     ["x", "y", "z", "intensity"],
+    "sonata":       ["x", "y", "z", "intensity"],
+    "utonia":       ["x", "y", "z", "intensity"],
 }
+
+# backbones sharing the ptv3 trainer's intensity-first color-slot logic
+_PTV3_LIKE = ("ptv3", "concerto", "sonata", "utonia")
+
+# param flags that live in the collapsed Tuning fold, not the Job box
+_TUNING_FLAGS = ("batch", "steps-per-epoch", "chunk-xy")
 
 
 class TrainPage(QWidget):
@@ -56,10 +72,16 @@ class TrainPage(QWidget):
         self._param_widgets: dict[str, QWidget] = {}
         self._meta: dict | None = None
         self._last_run_id: str | None = None
+        self._out_root: str | None = None      # host /outputs root of the live local run
         self._pending: dict | None = None
         self._last_statuses: dict = {}         # key -> status dict from all_statuses
         self._cfg_dialog: QDialog | None = None  # per-model popup when open
         self._ds_ready = False                 # train/val/test standard met
+        self._built_sig: tuple | None = None   # (backbone, dataset) the params were built for
+        self._key_rows: list[QWidget] = []     # dynamic param rows living in the Job form
+        self._run_live = False
+        self._run_t0: float | None = None
+        self._run_epochs = 0                   # launched epochs, for the progress strip
 
         root = QVBoxLayout(self)
         title = QLabel("Train")
@@ -88,8 +110,13 @@ class TrainPage(QWidget):
         self.cfg_btn.clicked.connect(self._open_model_config)
         model_row.addWidget(self.cfg_btn)
         form.addRow("Model", ui.wrap(model_row))
+        # key params (epochs, grid, …) are inserted here by _rebuild_params
+        self.star_hint = QLabel("★ = dataset recommendation")
+        theme.set_accent(self.star_hint, "muted")
+        form.addRow("", self.star_hint)
         self.smoke_chk = QCheckBox("Smoke run (2 epochs × 50 steps)")
         self.smoke_chk.toggled.connect(self._apply_smoke)
+        self.smoke_chk.toggled.connect(self._refresh_summaries)
         form.addRow("Options", self.smoke_chk)
         # Modal-only: detach = `modal run --detach`, returns as soon as the cloud
         # app starts, freeing this page to launch the next model — the way to
@@ -107,21 +134,8 @@ class TrainPage(QWidget):
                                   "model's recommendation when you switch models.")
         form.addRow("GPU (Modal)", self.gpu_combo)
         self.backbone_combo.currentIndexChanged.connect(self._sync_gpu_default)
+        self.gpu_combo.currentIndexChanged.connect(self._refresh_summaries)
 
-        self.params_box = QGroupBox("Parameters (pre-filled)")
-        self.params_form = QFormLayout(self.params_box)
-        # Validation cadence (VAL_EVERY env; trainer default 10 emits nothing).
-        self.val_every = QSpinBox()
-        self.val_every.setRange(1, 100)
-        self.val_every.setValue(10)
-        self.val_every.setToolTip(
-            "Run the held-out validation pass every N epochs. Lower N = slower "
-            "training but finer best-checkpoint selection (the best model is "
-            "picked among validated epochs only); higher N = faster, coarser.")
-        val_row = QHBoxLayout()
-        val_row.addWidget(QLabel("Validate every N epochs"))
-        val_row.addWidget(self.val_every)
-        val_row.addStretch(1)
         self.warn_label = QLabel("")
         self.warn_label.setWordWrap(True)
         theme.set_accent(self.warn_label, "warn")
@@ -131,27 +145,61 @@ class TrainPage(QWidget):
         self.launch_btn.setObjectName("primary")
         self.launch_btn.clicked.connect(self._launch)
         run_row.addWidget(self.launch_btn)
-        self.stop_btn = QPushButton("Stop process")
+        self.dup_btn = QPushButton("↻ Duplicate previous run")
+        self.dup_btn.setToolTip("Restore dataset + model from the most recent run.")
+        self.dup_btn.clicked.connect(self._duplicate_prev)
+        self.dup_btn.setEnabled(bool(appstate.get("run_history", [])))
+        run_row.addWidget(self.dup_btn)
+        self.stop_ckpt_btn = QPushButton("Stop after epoch")
+        self.stop_ckpt_btn.setToolTip(
+            "Cooperative stop (local runs): the trainer finishes the current epoch, "
+            "then runs its normal final evaluation and best-checkpoint finalize "
+            "(test_metrics.json, final_model.pth). Kill stays available meanwhile.")
+        self.stop_ckpt_btn.clicked.connect(self._stop_graceful)
+        run_row.addWidget(self.stop_ckpt_btn)
+        self.stop_btn = QPushButton("Kill")
+        self.stop_btn.setToolTip("Hard-kill the process now — no final eval; a later "
+                                 "launch resumes from the last periodic checkpoint.")
         self.stop_btn.clicked.connect(self._stop)
         run_row.addWidget(self.stop_btn)
         run_row.addStretch()
 
+        # resolved-job summary, refreshed on any contributing input change
+        self.summary_lbl = QLabel("")
+        self.summary_lbl.setWordWrap(True)
+        theme.set_accent(self.summary_lbl, "muted")
+        self.summary_lbl.setStyleSheet(
+            'font-family: "Cascadia Code", Consolas, monospace; font-size: 12px;')
+
         config_col = QVBoxLayout()
         config_col.addWidget(form_box)
-        config_col.addWidget(self.params_box)
-        config_col.addLayout(val_row)
+        config_col.addWidget(self._tuning_box())
         # TODO(not ready): train-time DG UI disabled pending review; no DG env is
         # sent. analysis.dg_recommend/dg_config_to_env remain the backend hooks.
         config_col.addWidget(self._loss_box())
         config_col.addWidget(self._features_box())
         config_col.addWidget(self.warn_label)
+        config_col.addWidget(self.summary_lbl)
         config_col.addLayout(run_row)
         config_col.addStretch()
 
-        self.log = QPlainTextEdit()
-        self.log.setReadOnly(True)
-        self.log.setObjectName("log")
+        self.log = LogConsole()   # \r-aware, colored console (drop-in for the old QPlainTextEdit)
         self.log.setPlaceholderText("Training logs…")
+        # slim live-progress strip under the console; visible only while a run is live
+        self.progress_lbl = QLabel("")
+        theme.set_accent(self.progress_lbl, "muted")
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 1)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(False)
+        self.progress_bar.setFixedHeight(8)
+        prow = QHBoxLayout()
+        prow.addWidget(self.progress_lbl)
+        prow.addWidget(self.progress_bar, 1)
+        self.progress_row = ui.wrap(prow)
+        log_col = QVBoxLayout()
+        log_col.addWidget(self.log, 1)
+        log_col.addWidget(self.progress_row)
 
         metrics_col = QVBoxLayout()
         metrics_col.addWidget(QLabel("Live epoch metrics"))
@@ -162,7 +210,7 @@ class TrainPage(QWidget):
         self.metrics_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         metrics_col.addWidget(self.metrics_table, 1)
 
-        body = ui.hsplit(self.log, ui.wrap(metrics_col), sizes=[680, 340])
+        body = ui.hsplit(ui.wrap(log_col), ui.wrap(metrics_col), sizes=[680, 340])
         root.addWidget(ui.vsplit(ui.wrap(config_col), body,
                                  sizes=[400, 360]), 1)
 
@@ -181,6 +229,7 @@ class TrainPage(QWidget):
 
         self.apply_exec_mode(appstate.get_exec_mode() == "local")
         self._rebuild_params()
+        self._restore_last_config()
         self.refresh_images()
 
     def apply_exec_mode(self, local: bool):
@@ -193,6 +242,9 @@ class TrainPage(QWidget):
                "Runs on a Modal cloud GPU — upload the dataset from the Datasets page "
                "first; the finished run lands on the model's outputs volume."))
         self.cfg_btn.setVisible(local)                      # docker image mgmt
+        # stop/kill only while live; graceful stop stays local-only (the sentinel
+        # rides the /outputs bind mount; Modal volumes can't take it mid-run)
+        self._set_run_live(self._run_live)
         self.form.setRowVisible(self.gpu_combo, not local)  # cloud GPU pick
         self.form.setRowVisible(self.detach_chk, not local) # parallel cloud launches
         self.reload_datasets()
@@ -396,31 +448,77 @@ class TrainPage(QWidget):
         return BACKBONES.get(key) if key else None
 
     def _rebuild_params(self):
-        while self.params_form.rowCount():
-            self.params_form.removeRow(0)
-        self._param_widgets.clear()
         b = self._backbone()
+        sig = (b.key if b else None, self.dataset_combo.currentText())
+        if sig == self._built_sig and self._param_widgets:
+            # same backbone + dataset (re-select / programmatic refresh):
+            # never clobber user-edited values
+            self._update_cfg_dialog()
+            self._refresh_summaries()
+            return
+        prev = {f: self._wvalue(w) for f, w in self._param_widgets.items()}
+        if self.smoke_chk.isChecked():   # smoke-locked values aren't user edits
+            prev.pop("epochs", None)
+            prev.pop("steps-per-epoch", None)
+        same_bb = self._built_sig is not None and self._built_sig[0] == sig[0]
+        self._built_sig = sig
+        for w in self._key_rows:
+            self.form.removeRow(w)
+        self._key_rows.clear()
+        while self.tuning_form.rowCount():
+            self.tuning_form.removeRow(0)
+        self._param_widgets.clear()
         if b is None:
             self.warn_label.setText("")
+            self.form.setRowVisible(self.star_hint, False)
             self._rebuild_feat_list()
             self._update_cfg_dialog()
+            self._refresh_summaries()
             return
         recs = (self._meta or {}).get("recommendations", {}).get(b.key, {})
+        row = 3   # Job-form insert point: right after the Model row
         for spec in b.params:
-            value = recs.get(spec.recommend_key, spec.default) if spec.recommend_key else spec.default
-            if spec.kind == "float":
+            rec = recs.get(spec.recommend_key) if spec.recommend_key and \
+                spec.recommend_key in recs else None
+            # survive rebuilds: keep the user's value unless a fresh dataset
+            # recommendation supersedes it (epochs survives even a model switch)
+            if spec.flag in prev and ((same_bb and rec is None) or spec.flag == "epochs"):
+                value = prev[spec.flag]
+            elif rec is not None:
+                value = rec
+            else:
+                value = spec.default
+            if spec.flag == "freeze-encoder":   # 0/1 int param -> checkbox
+                w = QCheckBox("Freeze encoder (linear probe)")
+                w.setChecked(bool(int(value)))
+                w.toggled.connect(self._refresh_summaries)
+            elif spec.kind == "float":
                 w = QDoubleSpinBox()
                 w.setDecimals(spec.decimals)
                 w.setSingleStep(spec.step)
                 w.setRange(spec.lo, 1_000_000.0)   # spec.hi is a reco band, not a cap
                 w.setValue(float(value))
+                w.valueChanged.connect(self._refresh_summaries)
             else:
                 w = QSpinBox()
                 w.setRange(int(spec.lo), 100_000_000)
                 w.setValue(int(value))
-            label = spec.label + ("  ★" if spec.recommend_key and spec.recommend_key in recs else "")
-            self.params_form.addRow(label, w)
+                w.valueChanged.connect(self._refresh_summaries)
+            label = spec.label + ("  ★" if rec is not None else "")
+            if spec.flag in _TUNING_FLAGS:
+                self.tuning_form.addRow(label, w)
+            elif spec.flag == "freeze-encoder":
+                self.form.insertRow(row, "", w)
+                self._key_rows.append(w)
+                row += 1
+            else:
+                self.form.insertRow(row, label, w)
+                self._key_rows.append(w)
+                row += 1
             self._param_widgets[spec.flag] = w
+        self.form.setRowVisible(
+            self.star_hint,
+            any(s.recommend_key and s.recommend_key in recs for s in b.params))
         if self._meta:
             warns = analysis.warnings_for(self._meta)
             self.warn_label.setText("\n".join("⚠ " + w for w in warns))
@@ -429,6 +527,86 @@ class TrainPage(QWidget):
         self._apply_smoke()          # re-lock epochs/steps for smoke runs
         self._rebuild_feat_list()    # feature picker follows model + dataset
         self._update_cfg_dialog()    # sync popup with model
+        self._refresh_summaries()
+
+    @staticmethod
+    def _wvalue(w):
+        """Param widget -> value (freeze-encoder checkbox maps to 0/1)."""
+        return int(w.isChecked()) if isinstance(w, QCheckBox) else w.value()
+
+    @staticmethod
+    def _wset(w, v):
+        if isinstance(w, QCheckBox):
+            w.setChecked(bool(int(v)))
+        elif isinstance(w, QSpinBox):
+            w.setValue(int(v))
+        else:
+            w.setValue(float(v))
+
+    # ------------------------------------------- tuning fold (collapsed default)
+    def _tuning_box(self) -> QGroupBox:
+        box = QGroupBox("Tuning")
+        box.setCheckable(True)
+        box.setChecked(False)
+        outer = QVBoxLayout(box)
+        inner = QWidget()
+        lay = QVBoxLayout(inner)
+        lay.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(inner)
+        box.toggled.connect(inner.setVisible)
+        # checking the box re-enables every child; re-lock smoke-held fields
+        box.toggled.connect(lambda *_: self._apply_smoke())
+        inner.setVisible(False)
+        self.tuning_box = box    # title echoes current values (_refresh_summaries)
+        self.tuning_form = QFormLayout()   # batch/steps/tile rows, per backbone
+        lay.addLayout(self.tuning_form)
+        # Validation cadence (VAL_EVERY env; trainer default 10 emits nothing).
+        self.val_every = QSpinBox()
+        self.val_every.setRange(1, 100)
+        self.val_every.setValue(10)
+        self.val_every.setToolTip(
+            "Run the held-out validation pass every N epochs. Lower N = slower "
+            "training but finer best-checkpoint selection (the best model is "
+            "picked among validated epochs only); higher N = faster, coarser.")
+        self.val_every.valueChanged.connect(self._refresh_summaries)
+        val_row = QHBoxLayout()
+        val_row.addWidget(QLabel("Validate every N epochs"))
+        val_row.addWidget(self.val_every)
+        val_row.addStretch(1)
+        lay.addLayout(val_row)
+        return box
+
+    def _refresh_summaries(self):
+        """Echo current values into the Tuning fold title + launch summary bar."""
+        if not hasattr(self, "summary_lbl"):   # during early construction
+            return
+        parts = []
+        w = self._param_widgets.get("batch")
+        if w is not None:
+            parts.append(f"batch {w.value()}")
+        w = self._param_widgets.get("steps-per-epoch")
+        if w is not None:
+            parts.append(f"steps {w.value()}")
+        w = self._param_widgets.get("chunk-xy")
+        if w is not None:
+            parts.append(f"tile {w.value():g} m")
+        parts.append(f"val every {self.val_every.value()}")
+        self.tuning_box.setTitle("Tuning — " + " · ".join(parts))
+        b = self._backbone()
+        name = self.dataset_combo.currentText()
+        if b is None or not name:
+            self.summary_lbl.setText("")
+            return
+        smoke = self.smoke_chk.isChecked()
+        ep_w = self._param_widgets.get("epochs")
+        ep = 2 if smoke else (ep_w.value() if ep_w is not None else 0)
+        gw = self._param_widgets.get(b.grid_flag)
+        grid = f" · grid {gw.value():g} m" if gw is not None else ""
+        mode = ("Docker (local)" if appstate.get_exec_mode() == "local"
+                else f"Modal ({self.gpu_combo.currentText()})")
+        self.summary_lbl.setText(
+            f"▶ {b.label} · {name} · {ep} ep{grid}"
+            + (" · smoke" if smoke else "") + f" · {mode}")
 
     # ------------------------------------------- loss / class balance (per run)
     def _loss_box(self) -> QGroupBox:
@@ -548,11 +726,11 @@ class TrainPage(QWidget):
         b = self._backbone()
         if b is None:
             return
-        base = b.key[:-4] if b.key.endswith("_hag") else b.key
+        base = b.key
         std = _FEAT_STANDARD.get(base, [])
         defaults = list(_FEAT_DEFAULTS.get(base, std))
         meta = self._meta or {}
-        if base == "ptv3" and not meta.get("has_intensity", True) \
+        if base in _PTV3_LIKE and not meta.get("has_intensity", True) \
                 and meta.get("has_rgb"):
             defaults = ["x", "y", "z", "rgb"]   # the trainer's rgb-dataset legacy
         extra = ((meta.get("source") or {}).get("feature_channels")
@@ -568,12 +746,10 @@ class TrainPage(QWidget):
             it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
             it.setCheckState(Qt.Checked if n in defaults else Qt.Unchecked)
             self.feat_list.addItem(it)
-        tip = ("Channel spec for this run (FEAT_CHANNELS). feat_* entries are "
-               "the dataset's extra feature channels.")
-        if b.key.endswith("_hag"):
-            tip += ("\nHAG is not in this list: it rides separately via the "
-                    "_hag model choice and is appended after these channels.")
-        self.feat_box.setToolTip(tip)
+        self.feat_box.setToolTip(
+            "Channel spec for this run (FEAT_CHANNELS). feat_* entries are "
+            "the dataset's extra feature channels (feat_hag = real "
+            "HeightAboveGround, when the dataset baked it).")
 
     def _feat_collect(self) -> str:
         """Checked names in list order -> FEAT_CHANNELS csv; '' = don't emit
@@ -584,6 +760,24 @@ class TrainPage(QWidget):
                  for i in range(self.feat_list.count())
                  if self.feat_list.item(i).checkState() == Qt.Checked]
         return ",".join(names)
+
+    def _apply_feat_csv(self, csv: str):
+        """Restore a saved FEAT_CHANNELS csv: check the listed names (moved to the
+        top in csv order), uncheck the rest. '' = group off (trainer defaults)."""
+        if not csv:
+            self.feat_box.setChecked(False)
+            return
+        self.feat_box.setChecked(True)
+        row = 0
+        for n in csv.split(","):
+            for i in range(row, self.feat_list.count()):
+                if self.feat_list.item(i).text() == n:
+                    self.feat_list.insertItem(row, self.feat_list.takeItem(i))
+                    row += 1
+                    break
+        for i in range(self.feat_list.count()):
+            self.feat_list.item(i).setCheckState(
+                Qt.Checked if i < row else Qt.Unchecked)
 
     # ------------------------------------------------------------- launch
     def _launch(self):
@@ -606,7 +800,7 @@ class TrainPage(QWidget):
         info = appstate.known_datasets().get(name, {})
         flags = {"dataset": name}
         for spec in b.params:
-            flags[spec.flag] = self._param_widgets[spec.flag].value()
+            flags[spec.flag] = self._wvalue(self._param_widgets[spec.flag])
         if self.smoke_chk.isChecked():
             flags["epochs"] = 2
             flags["steps-per-epoch"] = 50
@@ -618,7 +812,26 @@ class TrainPage(QWidget):
         feat_csv = self._feat_collect()    # '' = no env (trainer legacy defaults)
         if feat_csv:
             env["FEAT_CHANNELS"] = feat_csv
-        self.log.clear()
+        params = {f: self._wvalue(w) for f, w in self._param_widgets.items()}
+        if self.smoke_chk.isChecked():   # smoke-locked values aren't user edits
+            saved = (appstate.get("train_last_config") or {}).get("params", {})
+            for k in ("epochs", "steps-per-epoch"):
+                params.pop(k, None)
+                if k in saved:
+                    params[k] = saved[k]
+        appstate.put("train_last_config", {
+            "dataset": name, "backbone": b.key,
+            "params": params,
+            "val_every": self.val_every.value(),
+            "smoke": self.smoke_chk.isChecked(),
+            "loss": self._loss_collect(),
+            "features": feat_csv,
+            "gpu": self.gpu_combo.currentText(),
+            "detach": self.detach_chk.isChecked(),
+        })
+        self.log.begin_run(f"{b.label} · {name}")
+        self._run_t0 = time.time()
+        self._run_epochs = int(flags.get("epochs", 0))
         self.metrics_table.setRowCount(0)
         self._last_run_id = None
         self.launch_btn.setEnabled(False)
@@ -675,7 +888,9 @@ class TrainPage(QWidget):
         if not ok:
             self.launch_btn.setEnabled(True)
             return
+        self._out_root = out_root   # anchor for the graceful-stop sentinel
         self.runner.start(prog, args, cwd=self.repo_root)
+        self._set_run_live(True)
 
     # ------------------------------------------------------------- modal path
     def _preflight_modal_run(self, p):
@@ -733,10 +948,29 @@ class TrainPage(QWidget):
                          "no logs/metrics stream here. Reattach with "
                          f"`modal app logs {b.app_name}`; then launch the next model.")
         self.runner.start(prog, args, cwd=self.repo_root, extra_env={"TT_GPU": gpu})
+        self._set_run_live(True)
+
+    def _set_run_live(self, live: bool):
+        """Stop/kill buttons + progress strip only exist while a run is live."""
+        self._run_live = live
+        self.stop_btn.setVisible(live)
+        self.stop_ckpt_btn.setVisible(live and appstate.get_exec_mode() == "local")
+        self.progress_row.setVisible(live)
+        if not live:
+            self.progress_lbl.setText("")
+            self.progress_bar.setValue(0)
+
+    def _run_duration(self) -> str:
+        dur = int(time.time() - self._run_t0) if self._run_t0 else 0
+        return f"{dur // 60}m{dur % 60:02d}s"
 
     def _on_runner_failed(self, err: str):
         # FailedToStart fires failed not finished; re-enable here.
         self.launch_btn.setEnabled(True)
+        self._clear_stop_sentinel()
+        if self._run_live:
+            self.log.end_run(f"{err} · {self._run_duration()}")
+            self._set_run_live(False)
         self._append(f"\n✗ Failed to start: {err}")
 
     def _stop(self):
@@ -750,6 +984,35 @@ class TrainPage(QWidget):
         else:
             self._append("\n[no process running]")
 
+    def _stop_graceful(self):
+        """Drop the STOP sentinel at the run's /outputs root; the trainer consumes
+        it at epoch end, breaks, and runs its normal final eval + finalize."""
+        if not self.runner.running:
+            self._append("\n[no process running]")
+            return
+        if appstate.get_exec_mode() != "local" or not self._out_root:
+            self._append("\n[stop] graceful stop works for local runs only — use Kill "
+                         "(and `modal app stop <app>` for a cloud run).")
+            return
+        try:
+            (Path(self._out_root) / "STOP").touch()
+        except OSError as e:
+            self._append(f"\n[stop] couldn't write the STOP sentinel: {e} — use Kill.")
+            return
+        self._append("\n[stop] Stopping after the current epoch… the run finishes its "
+                     "final evaluation and checkpoint finalize, then exits. "
+                     "(Kill remains available if you can't wait.)")
+
+    def _clear_stop_sentinel(self):
+        """Remove a leftover sentinel (killed after a graceful request, or the
+        trainer crashed before consuming it) so it can't stop the next run."""
+        if self._out_root:
+            try:
+                (Path(self._out_root) / "STOP").unlink()
+            except OSError:
+                pass
+            self._out_root = None
+
     # ------------------------------------------------------------- stream
     def _on_output(self, text: str):
         self._append(text, newline=False)
@@ -757,6 +1020,10 @@ class TrainPage(QWidget):
 
     def _on_finished(self, code: int):
         self.launch_btn.setEnabled(True)
+        self._clear_stop_sentinel()
+        if self._run_live:
+            self.log.end_run(f"exit {code} · {self._run_duration()}")
+            self._set_run_live(False)
         if code == 0:
             extra = (f" Run id: {self._last_run_id}." if self._last_run_id else "")
             self._append(f"\n✓ Done.{extra} See the Runs/Plotting page for artifacts.")
@@ -764,6 +1031,12 @@ class TrainPage(QWidget):
             self._append(f"\n✗ Exited with code {code}.")
 
     def _on_epoch(self, m: dict):
+        total = self._run_epochs
+        if total:
+            self.progress_bar.setRange(0, total)
+            self.progress_bar.setValue(min(m["epoch"], total))
+        self.progress_lbl.setText(f"epoch {m['epoch']}/{total or '?'} · "
+                                  f"loss {m['loss']:.2f} · miou {m['miou']:.2f}")
         r = self.metrics_table.rowCount()
         self.metrics_table.insertRow(r)
         for col, val in enumerate((str(m["epoch"]), f"{m['loss']:.4f}",
@@ -794,6 +1067,65 @@ class TrainPage(QWidget):
         history.append({"run_id": run_id, "backbone": b.key if b else "",
                         "dataset": self.dataset_combo.currentText()})
         appstate.put("run_history", history[-200:])
+        self.dup_btn.setEnabled(True)
+
+    # -------------------------------------------------- restore / duplicate
+    def _duplicate_prev(self):
+        """Repopulate dataset + model from the newest run_history entry."""
+        hist = appstate.get("run_history", [])
+        if not hist:
+            self.dup_btn.setEnabled(False)
+            return
+        e = hist[-1]
+        i = self.dataset_combo.findText(e.get("dataset", ""))
+        if i >= 0:
+            self.dataset_combo.setCurrentIndex(i)
+        i = self.backbone_combo.findData(e.get("backbone", ""))
+        if i >= 0:
+            self.backbone_combo.setCurrentIndex(i)
+        self._append(f"[dup] restored {e.get('backbone', '?')} · "
+                     f"{e.get('dataset', '?')} (run {e.get('run_id', '?')}).")
+
+    def _restore_last_config(self):
+        """Repopulate the page from the last launched config; stale dataset/
+        backbone/param names fall back silently per-field."""
+        cfg = appstate.get("train_last_config")
+        if not isinstance(cfg, dict):
+            return
+        i = self.dataset_combo.findText(cfg.get("dataset", ""))
+        if i >= 0:
+            self.dataset_combo.setCurrentIndex(i)
+        i = self.backbone_combo.findData(cfg.get("backbone"))
+        if i >= 0:
+            self.backbone_combo.setCurrentIndex(i)
+        for flag, val in (cfg.get("params") or {}).items():
+            w = self._param_widgets.get(flag)
+            if w is not None:
+                try:
+                    self._wset(w, val)
+                except (TypeError, ValueError):
+                    pass
+        try:
+            self.val_every.setValue(int(cfg.get("val_every", 10)))
+        except (TypeError, ValueError):
+            pass
+        i = self.gpu_combo.findText(cfg.get("gpu", ""))
+        if i >= 0:
+            self.gpu_combo.setCurrentIndex(i)
+        self.detach_chk.setChecked(bool(cfg.get("detach")))
+        loss = cfg.get("loss") if isinstance(cfg.get("loss"), dict) else {}
+        self.loss_box.setChecked(bool(loss))   # {} = box off (script defaults)
+        if loss:
+            try:
+                self.loss_focal.setChecked(bool(loss.get("focal", False)))
+                self.loss_gamma.setValue(float(loss.get("focal_gamma", 2.0)))
+                self.loss_cw.setChecked(bool(loss.get("class_weighting", True)))
+                self.loss_beta.setValue(float(loss.get("weight_beta", 0.5)))
+                self.loss_rare.setChecked(bool(loss.get("rare_oversample", True)))
+            except (TypeError, ValueError):
+                pass
+        self._apply_feat_csv(str(cfg.get("features", "") or ""))
+        self.smoke_chk.setChecked(bool(cfg.get("smoke")))   # last: re-locks fields
 
     def _append(self, text: str, newline: bool = True):
         ui.append_log(self.log, text, newline)

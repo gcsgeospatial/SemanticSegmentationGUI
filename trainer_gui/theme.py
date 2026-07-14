@@ -107,8 +107,19 @@ QWidget {{ font-size: 14px; }}
                                         selection-color: {c['sel_text']}; }}
 #pageTitle {{ font-size: 22px; font-weight: 600; color: {c['text']}; }}
 #pageSub {{ color: {c['muted']}; margin-bottom: 8px; }}
-#log {{ font-family: Consolas, "Courier New", monospace; font-size: 12px;
+#log {{ font-family: "Cascadia Code", "JetBrains Mono", Consolas, "Courier New", monospace;
+        font-size: 12px;
         background: {c['log_bg']}; color: {c['log_text']}; border: 1px solid {c['border']}; }}
+/* console header strip (logconsole.LogConsole toolbar) — sits on the always-dark
+   terminal core, so its text colors are console constants, not theme tokens */
+#logToolbar {{ background: {c['log_bg']}; border: 1px solid {c['border']}; border-bottom: none; }}
+#logToolbar QToolButton, #logToolbar QPushButton {{
+    background: transparent; color: #8b93a4; border: none; border-radius: 3px;
+    padding: 2px 8px; font-size: 11px; }}
+#logToolbar QToolButton:hover, #logToolbar QPushButton:hover {{
+    color: #d6dae3; background: #232936; }}
+#logToolbar QToolButton:checked, #logToolbar QPushButton:checked {{
+    color: #d6dae3; background: #2c3445; }}
 
 /* Plain line edits get breathing room (Fusion renders them crunched). Combos and
    spin boxes stay native: QSS padding flips them to styled mode, whose arrow

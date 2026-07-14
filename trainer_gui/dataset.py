@@ -358,8 +358,7 @@ def _hag_from_cloud(cloud: Cloud) -> np.ndarray | None:
 
     A cloud that already carries HAG (e.g. LAS/LAZ with a `HeightAboveGround`
     extra dim, which readers.py exposes as a numeric field) keeps it verbatim —
-    it wins over recomputation. *_hag models require a real HAG feature and
-    refuse to run without one.
+    it wins over recomputation. Stored as the `feat_hag` feature channel.
     """
     for name, arr in cloud.fields.items():
         key = name.lower().replace("_", "")
@@ -374,14 +373,17 @@ def _convert_one(cloud: Cloud, raw: np.ndarray | None, value_to_index: dict[int,
                  out_path: Path, intensity_norm: str = "max",
                  compute_hag: bool = False, ground_value: int | None = None,
                  hag_filter: str = "grid",
-                 feature_fields: list[str] | None = None) -> dict:
+                 feature_fields: list[str] | None = None,
+                 geo_features: list[str] | None = None,
+                 geo_radius: float = 1.0) -> dict:
     """Write one (already-read, already-cropped) cloud to a canonical npz.
 
-    compute_hag: also store a per-point real HeightAboveGround ("hag", SMRF->hag)
-    aligned to xyz — for *_hag weights trained on real HAG, or to bake HAG into a
-    dataset during tiling. Computing it here (points already in RAM) is a single
+    compute_hag: also store a per-point real HeightAboveGround aligned to xyz
+    as the ordinary feature channel "feat_hag" (selectable per-run like any
+    feat_* channel). Computing it here (points already in RAM) is a single
     pass — no reload/re-write round trip. Skipped when PDAL can't produce an
-    aligned result; the scene then has no "hag" key and *_hag models refuse it."""
+    aligned result; the scene then has no "feat_hag" key and runs requiring
+    it are blocked by the channel report."""
     out: dict[str, np.ndarray] = {"xyz": cloud.xyz.astype(np.float32)}
 
     class_counts: dict[int, int] = {}
@@ -410,13 +412,26 @@ def _convert_one(cloud: Cloud, raw: np.ndarray | None, value_to_index: dict[int,
         out["return_number"] = cloud.return_number.astype(np.float32)
     source_hag = _hag_from_cloud(cloud)
     if source_hag is not None:
-        out["hag"] = source_hag.astype(np.float32)
-    if compute_hag and "hag" not in out:
+        out["feat_hag"] = source_hag.astype(np.float32)
+    if compute_hag and "feat_hag" not in out:
         from . import pretrain
         gmask = (raw == int(ground_value)) if (raw is not None and ground_value is not None) else None
         h = pretrain.hag_for_cloud(cloud, ground_mask=gmask, hag_filter=hag_filter)
         if h is not None and len(h) == cloud.n:
-            out["hag"] = h.astype(np.float32)
+            out["feat_hag"] = h.astype(np.float32)
+
+    # Computed geometric channels: feat_geo_<nm>, stored RAW (bounded ratios;
+    # NaN->0 at compute). A ferried whole-cloud value in cloud.fields wins over
+    # recomputation (single-cloud split path — seam-consistent values).
+    if geo_features:
+        from . import pretrain
+        have = {nm: np.asarray(cloud.fields[f"feat_geo_{nm.lower()}"], np.float32)
+                for nm in geo_features if f"feat_geo_{nm.lower()}" in cloud.fields}
+        todo = [nm for nm in geo_features if nm not in have]
+        if todo:
+            have.update(pretrain.geo_features_for_cloud(cloud.xyz, todo, geo_radius))
+        for nm in geo_features:
+            out[f"feat_geo_{nm.lower()}"] = have[nm]
 
     # User-selected extra channels: feat_<name>, v/p95(|v|) clipped to [-2, 2]
     # (mirrors the intensity p95 norm). A missing field fails loud — a dataset
@@ -450,7 +465,7 @@ def _convert_one(cloud: Cloud, raw: np.ndarray | None, value_to_index: dict[int,
         "has_rgb": cloud.rgb is not None,
         "has_intensity": cloud.intensity is not None,
         "has_return_number": cloud.return_number is not None,
-        "has_hag": "hag" in out,
+        "has_hag": "feat_hag" in out,
         "feature_scales": feature_scales,
     }
 
@@ -459,13 +474,16 @@ def convert_scene(path: Path, spec: LabelSpec | None, value_to_index: dict[int, 
                   out_path: Path, intensity_norm: str = "max",
                   compute_hag: bool = False, ground_value: int | None = None,
                   hag_filter: str = "grid",
-                  feature_fields: list[str] | None = None) -> dict:
+                  feature_fields: list[str] | None = None,
+                  geo_features: list[str] | None = None,
+                  geo_radius: float = 1.0) -> dict:
     """Read one source file and convert the whole cloud (no cropping)."""
     cloud = read_points(path)
     raw = read_labels(path, cloud, spec) if spec is not None else None
     return _convert_one(cloud, raw, value_to_index, out_path, intensity_norm,
                         compute_hag=compute_hag, ground_value=ground_value,
-                        hag_filter=hag_filter, feature_fields=feature_fields)
+                        hag_filter=hag_filter, feature_fields=feature_fields,
+                        geo_features=geo_features, geo_radius=geo_radius)
 
 
 def _available_ram_bytes() -> int | None:
@@ -525,6 +543,7 @@ def _worker_cap_detail(files: list[Path]) -> tuple[int, str]:
 def _convert_many(files: list[Path], dest_for, spec, value_to_index, intensity_norm, say,
                   *, compute_hag, ground_value, hag_filter,
                   feature_fields: list[str] | None = None,
+                  geo_features: list[str] | None = None, geo_radius: float = 1.0,
                   max_workers: int | None = None) -> list[dict]:
     """Read + convert each file to its npz CONCURRENTLY; returns the stat dicts in
     INPUT order. Order matters: the caller feeds it to allocate_splits positionally,
@@ -541,7 +560,8 @@ def _convert_many(files: list[Path], dest_for, spec, value_to_index, intensity_n
         out_path = dest_for(f)
         st = _convert_one(cloud, raw, value_to_index, out_path, intensity_norm,
                           compute_hag=compute_hag, ground_value=ground_value,
-                          hag_filter=hag_filter, feature_fields=feature_fields)
+                          hag_filter=hag_filter, feature_fields=feature_fields,
+                          geo_features=geo_features, geo_radius=geo_radius)
         st["scene"] = out_path.name
         return st
 
@@ -566,6 +586,7 @@ def _plan_and_convert(input_files: list[Path], val_files: list[Path] | None,
                       compute_hag: bool = False, ground_value: int | None = None,
                       hag_filter: str = "grid",
                       feature_fields: list[str] | None = None,
+                      geo_features: list[str] | None = None, geo_radius: float = 1.0,
                       max_workers: int | None = None) -> dict:
     """Convert sources into out_root/{train,val,test}/*.npz; returns
     {"train": [stats], "val": [stats], "test": [stats]}.
@@ -580,7 +601,8 @@ def _plan_and_convert(input_files: list[Path], val_files: list[Path] | None,
         st = _convert_one(cloud, raw, value_to_index, out_path, intensity_norm,
                           compute_hag=compute_hag and not hag_already,
                           ground_value=ground_value, hag_filter=hag_filter,
-                          feature_fields=feature_fields)
+                          feature_fields=feature_fields,
+                          geo_features=geo_features, geo_radius=geo_radius)
         st["scene"] = out_path.name
         stats[split_name].append(st)
 
@@ -591,7 +613,8 @@ def _plan_and_convert(input_files: list[Path], val_files: list[Path] | None,
                 files, lambda f, sn=split_name: out_root / sn / f"{f.stem}.npz",
                 spec, value_to_index, intensity_norm, say, compute_hag=compute_hag,
                 ground_value=ground_value, hag_filter=hag_filter,
-                feature_fields=feature_fields, max_workers=max_workers))
+                feature_fields=feature_fields, geo_features=geo_features,
+                geo_radius=geo_radius, max_workers=max_workers))
     vfrac = 0.0 if val_files else split.val_frac
     tfrac = 0.0 if test_files else split.test_frac
 
@@ -600,7 +623,8 @@ def _plan_and_convert(input_files: list[Path], val_files: list[Path] | None,
             input_files, lambda f: out_root / "train" / f"{f.stem}.npz",
             spec, value_to_index, intensity_norm, say, compute_hag=compute_hag,
             ground_value=ground_value, hag_filter=hag_filter,
-            feature_fields=feature_fields, max_workers=max_workers))
+            feature_fields=feature_fields, geo_features=geo_features,
+            geo_radius=geo_radius, max_workers=max_workers))
         return stats
 
     # Single cloud -> tile as a measurement, allocate tiles, reassemble per split.
@@ -615,6 +639,16 @@ def _plan_and_convert(input_files: list[Path], val_files: list[Path] | None,
             h = pretrain.hag_for_cloud(cloud, ground_mask=gmask, hag_filter=hag_filter)
             if h is not None and len(h) == cloud.n:
                 cloud.fields["HeightAboveGround"] = h.astype(np.float32)
+        if geo_features:
+            # Whole-cloud once, ferried via fields — tiles then reuse the values
+            # (no seam edge effects). After the HAG block so PDAL never carries
+            # the extra columns through its pipeline.
+            from . import pretrain
+            say(f"  computing {len(geo_features)} geometric feature(s) whole-cloud "
+                f"(r={geo_radius:g} m) ...")
+            for nm, v in pretrain.geo_features_for_cloud(
+                    cloud.xyz, geo_features, geo_radius).items():
+                cloud.fields[f"feat_geo_{nm.lower()}"] = v
         keys, uniq, inv = _atomize(cloud, split.tile_m)
         pts = np.bincount(inv, minlength=len(uniq))
         hist = _tile_hists(inv, len(uniq), raw, value_to_index, num_classes)
@@ -636,7 +670,8 @@ def _plan_and_convert(input_files: list[Path], val_files: list[Path] | None,
     pool = _convert_many(input_files, lambda f: out_root / "_pool" / f"{f.stem}.npz",
                          spec, value_to_index, intensity_norm, say, compute_hag=compute_hag,
                          ground_value=ground_value, hag_filter=hag_filter,
-                         feature_fields=feature_fields, max_workers=max_workers)
+                         feature_fields=feature_fields, geo_features=geo_features,
+                         geo_radius=geo_radius, max_workers=max_workers)
     for st in pool:                                    # map kept input order -> deterministic alloc
         st["_pool_path"] = out_root / "_pool" / st["scene"]
     pts = [st["n_points"] for st in pool]
@@ -665,6 +700,8 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
                     ground_value: int | None = None,
                     hag_filter: str = "grid",
                     feature_fields: list[str] | None = None,
+                    geo_features: list[str] | None = None,
+                    geo_radius: float = 1.0,
                     max_workers: int | None = None,
                     progress=None) -> Path:
     """Convert `inputs` (files and/or folders) into a staged canonical dataset with
@@ -679,6 +716,10 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
     feature_fields: extra per-point source fields baked into EVERY scene as
         feat_<sanitized name> (v / p95(|v|), clipped to [-2, 2]); a scene missing
         a requested field fails loud.
+    geo_features: jakteristics geometric features (pretrain.GEO_FEATURES names)
+        computed from xyz within geo_radius meters at conversion time, baked
+        into every scene as feat_geo_<name> RAW (bounded ratios, NaN->0).
+        Needs the jakteristics package; a missing dep fails loud.
     compute_hag: bake a per-scene HeightAboveGround channel into every scene in
         the SAME pass as conversion. ground_value names the source label value
         that means GROUND — when set, those labels are the ONLY ground source
@@ -726,12 +767,17 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
         src = (f"ground=class {ground_value}" if ground_value is not None
                else ("SMRF" if use_smrf else "grid detection"))
         say(f"computing HeightAboveGround inline ({src} -> {hag_filter}) …")
+    if geo_features:
+        say(f"computing geometric feature(s) inline (jakteristics, "
+            f"r={geo_radius:g} m): {', '.join(geo_features)} …")
     scene_stats = _plan_and_convert(input_files, val_files, test_files, split, spec,
                                     value_to_index, num_classes, out_root,
                                     intensity_norm, say, compute_hag=compute_hag,
                                     ground_value=ground_value,
                                     hag_filter=hag_filter,
                                     feature_fields=feature_fields,
+                                    geo_features=geo_features,
+                                    geo_radius=geo_radius,
                                     max_workers=max_workers)
     for sp in _SPLITS:
         if not scene_stats[sp]:
@@ -818,8 +864,19 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
             "hag_source": hag_src,
             "hag_ground_value": (int(ground_value) if ground_value is not None else None),
             "hag_use_smrf": bool(use_smrf),
-            "feature_channels": [{"name": feat_key(f), "source_field": f, "norm": "p95abs"}
-                                 for f in (feature_fields or [])],
+            # source_field "@geo:<jak name>" marks a COMPUTED channel (recomputed
+            # from xyz at inference — no raw field exists); its radius is the
+            # train-time truth the infer path reproduces.
+            # source_field "@hag:<method>" marks the HAG channel (recomputed
+            # per scene at inference via the conversion HAG options).
+            "feature_channels": ([{"name": feat_key(f), "source_field": f, "norm": "p95abs"}
+                                  for f in (feature_fields or [])]
+                                 + [{"name": f"geo_{nm.lower()}",
+                                     "source_field": f"@geo:{nm}", "norm": "raw",
+                                     "radius": float(geo_radius)}
+                                    for nm in (geo_features or [])]
+                                 + ([{"name": "hag", "source_field": f"@hag:{hag_src}",
+                                      "norm": "raw"}] if hag_src else [])),
             "ignore_values": [int(v) for v in ignore_values],
         },
         "split": {
@@ -860,6 +917,8 @@ def convert_infer_job(job_id: str, input_dir: str, staging_root: Path, progress=
                       intensity_norm: str = "p95", hag: bool = False,
                       hag_filter: str = "grid", ground_value: int | None = None,
                       feature_fields: list[str] | None = None,
+                      geo_features: list[str] | None = None,
+                      geo_radius: float = 1.0,
                       out_dir: Path | None = None) -> Path:
     """Label-less conversion for inference-only jobs -> <staging>/_infer/<job_id>/,
     or to `out_dir` when given (the caller nests it under the owning dataset, e.g.
@@ -870,8 +929,9 @@ def convert_infer_job(job_id: str, input_dir: str, staging_root: Path, progress=
     p95 -> [0,2] for weights trained that way) — a mismatch feeds the net
     out-of-distribution intensity and tanks accuracy for every checkpoint.
 
-    `hag=True` (required by *_hag weights) computes a per-point "hag" channel with
-    `hag_filter`. `ground_value` names the classification value that means ground —
+    `hag=True` (required by runs whose feature spec includes feat_hag) computes a
+    per-point "feat_hag" channel with `hag_filter`. `ground_value` names the
+    classification value that means ground —
     those points become the ONLY ground source, exactly as on the Datasets page.
     Left None, SMRF detects ground for every method (the grid method's opening
     heuristic is the PDAL-less fallback). A PDAL filter without PDAL installed
@@ -888,6 +948,9 @@ def convert_infer_job(job_id: str, input_dir: str, staging_root: Path, progress=
         src = (f"ground=class {ground_value}" if ground_value is not None
                else ("SMRF" if pretrain.pdal_available() else "grid detection"))
         say(f"  computing HeightAboveGround per scene ({src} -> {hag_filter}) …")
+    if geo_features:
+        say(f"  computing geometric feature(s) per scene (jakteristics, "
+            f"r={geo_radius:g} m): {', '.join(geo_features)} …")
     out_root = Path(out_dir) if out_dir else (staging_root / "_infer" / job_id)
     files = discover_scenes(input_dir)
     if not files:
@@ -912,7 +975,8 @@ def convert_infer_job(job_id: str, input_dir: str, staging_root: Path, progress=
         say(f"  converting {path.name} ...")
         st = convert_scene(path, spec, {}, out_path, intensity_norm=intensity_norm,
                            compute_hag=hag, ground_value=ground_value,
-                           hag_filter=hag_filter, feature_fields=feature_fields)
+                           hag_filter=hag_filter, feature_fields=feature_fields,
+                           geo_features=geo_features, geo_radius=geo_radius)
         st["scene"] = out_path.name
         st["source_file"] = str(path)
         scenes.append(out_path.name)

@@ -3,7 +3,7 @@
 # Usage:  bash docker/push_all.sh   (TT_REGISTRY=ghcr.io/gcsgeospatial by default; docker login first)
 set -euo pipefail
 : "${TT_REGISTRY:=ghcr.io/gcsgeospatial}"
-for key in ptv3 ptv3_hag randlanet randlanet_hag kpconvx_cold kpconvx_cold_hag kpconv kpconv_hag; do
+for key in ptv3 randlanet kpconvx_cold kpconv concerto sonata utonia; do
   docker tag "trainer-local-$key" "$TT_REGISTRY/trainer-local-$key:latest"
   docker push "$TT_REGISTRY/trainer-local-$key:latest"
 done

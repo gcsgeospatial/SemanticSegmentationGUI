@@ -34,13 +34,13 @@ import _modal_shim  # noqa: E402
 # backbone key -> script filename (kept in sync with trainer_gui/backbones.py).
 SCRIPTS = {
     "ptv3": "modal_train_ptv3.py",
-    "ptv3_hag": "modal_train_ptv3_hag.py",
     "randlanet": "modal_train_randlanet.py",
-    "randlanet_hag": "modal_train_randlanet_hag.py",
     "kpconvx_cold": "modal_train_kpconvx_cold.py",
-    "kpconvx_cold_hag": "modal_train_kpconvx_cold_hag.py",
     "kpconv": "modal_train_kpconv.py",
-    "kpconv_hag": "modal_train_kpconv_hag.py",
+    # Pointcept-SSL pretrained encoders (fine-tune family; one shared trainer)
+    "concerto": "modal_train_concerto.py",
+    "sonata": "modal_train_sonata.py",
+    "utonia": "modal_train_utonia.py",
 }
 
 # pip wheel channel -> CUDA toolkit tag for the `nvidia/cuda:<ver>-devel` base.

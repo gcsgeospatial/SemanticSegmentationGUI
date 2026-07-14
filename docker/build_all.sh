@@ -5,10 +5,9 @@ export DOCKER_BUILDKIT=1
 cd "$(dirname "$0")/.."
 
 docker buildx build -f docker/ptv3.Dockerfile -t trainer-local-ptv3  --load .
-docker buildx build -f docker/ptv3_hag.Dockerfile -t trainer-local-ptv3_hag  --load .
 docker buildx build -f docker/randlanet.Dockerfile -t trainer-local-randlanet  --load .
-docker buildx build -f docker/randlanet_hag.Dockerfile -t trainer-local-randlanet_hag  --load .
 docker buildx build -f docker/kpconvx_cold.Dockerfile -t trainer-local-kpconvx_cold  --load .
-docker buildx build -f docker/kpconvx_cold_hag.Dockerfile -t trainer-local-kpconvx_cold_hag  --load .
 docker buildx build -f docker/kpconv.Dockerfile -t trainer-local-kpconv  --load .
-docker buildx build -f docker/kpconv_hag.Dockerfile -t trainer-local-kpconv_hag  --load .
+docker buildx build -f docker/concerto.Dockerfile -t trainer-local-concerto  --load .
+docker buildx build -f docker/sonata.Dockerfile -t trainer-local-sonata  --load .
+docker buildx build -f docker/utonia.Dockerfile -t trainer-local-utonia  --load .

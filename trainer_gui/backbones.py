@@ -107,42 +107,6 @@ BACKBONES: dict[str, Backbone] = {b.key: b for b in [
                           step=0.1, decimals=2, recommend_key="grid")]
                + _common(150, 4, steps_default=300, chunk_default=100.0),
     ),
-    # --- HAG variants (real PDAL HeightAboveGround as an extra input channel) ---
-    Backbone(
-        key="ptv3_hag", label="PTv3_hag", script="scripts/modal/modal_train_ptv3_hag.py",
-        app_name="ptv3-hag",
-        rec_gpu="A100", min_vram_gb=24,   # same fp32 non-flash budget as ptv3
-        grid_clamp=(0.15, 2.0), grid_mult=1.25,
-        params=[ParamSpec("grid", "Grid size (m)", "float", 0.05, 0.02, 3.0,
-                          step=0.05, decimals=2, recommend_key="grid")]
-               + _common(250, 4),
-    ),
-    Backbone(
-        key="randlanet_hag", label="RandLA-Net_hag",
-        script="scripts/modal/modal_train_randlanet_hag.py",
-        app_name="randlanet-cold-hag",
-        rec_gpu="A10G", min_vram_gb=8,
-        grid_clamp=(0.06, 2.0), grid_mult=1.2,
-        params=[ParamSpec("sub-grid", "Sub-grid size (m)", "float", 0.12, 0.02, 2.0,
-                          step=0.05, decimals=2, recommend_key="grid"),
-                ParamSpec("num-points", "Points / sample", "int", 45056, 4096, 131072,
-                          recommend_key="num_points")]
-               + _common(250, 6, chunk=False),
-    ),
-    # Both KPConvX scripts now have a --dataset training path (canonical scenes;
-    # the HAG variant requires a real per-point HAG channel, from a dataset built
-    # with HAG or the Inference page's HAG box) plus --mode infer --infer-input
-    # for folder inference.
-    Backbone(
-        key="kpconvx_cold_hag", label="KPConvX-L_hag",
-        script="scripts/modal/modal_train_kpconvx_cold_hag.py",
-        app_name="kpconvx-cold-hag",
-        rec_gpu="A100-80GB", min_vram_gb=24,
-        grid_clamp=(0.4, 2.0), grid_mult=1.5,
-        params=[ParamSpec("grid", "Grid size (m)", "float", 2.0, 0.1, 5.0,
-                          step=0.1, decimals=2, recommend_key="grid")]
-               + _common(150, 4, steps_default=300, chunk_default=100.0),
-    ),
     # --- original KPConv (KPConv-PyTorch, deformable KPFCNN) -----------------
     # Same conv-radius ladder / grid family as KPConvX; heavier though — the
     # deformable blocks materialize [n_points, n_neighbors, K, 3] difference
@@ -156,15 +120,43 @@ BACKBONES: dict[str, Backbone] = {b.key: b for b in [
                           step=0.1, decimals=2, recommend_key="grid")]
                + _common(150, 3, steps_default=300, chunk_default=100.0),
     ),
+    # --- Pointcept-SSL pretrained encoders (Concerto / Sonata / Utonia) ------
+    # Encoder-only PTv3 variants fine-tuned from self-supervised HuggingFace
+    # checkpoints (weights CC-BY-NC 4.0). One shared trainer
+    # (local_train_concerto.py); sonata/utonia are by-filename wrappers.
+    # Same fp32 non-flash attention budget as ptv3, but the encoders are
+    # larger (concerto_base 108M params) -> same 24 GB floor, epochs default
+    # 100 (fine-tuning converges faster than scratch). "Freeze encoder" = the
+    # upstream linear-probe protocol (train only the seg head).
     Backbone(
-        key="kpconv_hag", label="KPConv_hag",
-        script="scripts/modal/modal_train_kpconv_hag.py",
-        app_name="kpconv-hag",
-        rec_gpu="A100-80GB", min_vram_gb=40,
-        grid_clamp=(0.4, 2.0), grid_mult=1.5,
-        params=[ParamSpec("grid", "Grid size (m)", "float", 2.0, 0.1, 5.0,
-                          step=0.1, decimals=2, recommend_key="grid")]
-               + _common(150, 3, steps_default=300, chunk_default=100.0),
+        key="concerto", label="Concerto", script="scripts/modal/modal_train_concerto.py",
+        app_name="concerto",
+        rec_gpu="A100", min_vram_gb=24,
+        grid_clamp=(0.15, 2.0), grid_mult=1.25,
+        params=[ParamSpec("grid", "Grid size (m)", "float", 0.05, 0.02, 3.0,
+                          step=0.05, decimals=2, recommend_key="grid"),
+                ParamSpec("freeze-encoder", "Freeze encoder (0/1)", "int", 0, 0, 1)]
+               + _common(100, 4),
+    ),
+    Backbone(
+        key="sonata", label="Sonata", script="scripts/modal/modal_train_sonata.py",
+        app_name="sonata",
+        rec_gpu="A100", min_vram_gb=24,
+        grid_clamp=(0.15, 2.0), grid_mult=1.25,
+        params=[ParamSpec("grid", "Grid size (m)", "float", 0.05, 0.02, 3.0,
+                          step=0.05, decimals=2, recommend_key="grid"),
+                ParamSpec("freeze-encoder", "Freeze encoder (0/1)", "int", 0, 0, 1)]
+               + _common(100, 4),
+    ),
+    Backbone(
+        key="utonia", label="Utonia", script="scripts/modal/modal_train_utonia.py",
+        app_name="utonia",
+        rec_gpu="A100", min_vram_gb=24,
+        grid_clamp=(0.15, 2.0), grid_mult=1.25,
+        params=[ParamSpec("grid", "Grid size (m)", "float", 0.05, 0.02, 3.0,
+                          step=0.05, decimals=2, recommend_key="grid"),
+                ParamSpec("freeze-encoder", "Freeze encoder (0/1)", "int", 0, 0, 1)]
+               + _common(100, 4),
     ),
 ]}
 

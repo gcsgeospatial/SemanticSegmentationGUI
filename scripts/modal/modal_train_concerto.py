@@ -1,13 +1,15 @@
 """
-Modal shell for PointTransformerV3 — thin subprocess wrapper.
+Modal shell for Concerto (pretrained Pointcept-SSL encoder) — thin subprocess wrapper.
 
 Provisions a GPU container + the outputs / terminal-datasets volumes, then shells
-out to the local trainer (scripts/local/local_train_ptv3.py) so local and cloud
-run byte-identical code. Trains on a canonical trainer_gui dataset passed via
---dataset (staged on the terminal-datasets volume).
+out to the local trainer (scripts/local/local_train_concerto.py) so local and
+cloud run byte-identical code. Fine-tunes the concerto_base pretrained encoder
+(HuggingFace Pointcept/Concerto, cached on the outputs volume) on a canonical
+trainer_gui dataset passed via --dataset.
 
   --dataset NAME                          canonical trainer_gui dataset
   --grid / --chunk-xy / --epochs / --batch / --steps-per-epoch
+  --freeze-encoder 0|1                    1 = linear probe (head only)
   --mode infer --weights runs/<id>/final_model.pth --infer-input <job_id>
 
 GPU type / timeout come from TT_GPU / TT_TIMEOUT_HOURS env vars.
@@ -21,7 +23,7 @@ import modal
 # ============================================================================
 # Configuration
 # ============================================================================
-APP_NAME      = "ptv3"
+APP_NAME      = "concerto"
 GPU_TYPE      = os.environ.get("TT_GPU", "A100")
 TIMEOUT_HOURS = int(os.environ.get("TT_TIMEOUT_HOURS", "24"))
 
@@ -36,14 +38,15 @@ app = modal.App(APP_NAME)
 image = (
     modal.Image.debian_slim(python_version="3.10")
     .apt_install("git", "wget", "build-essential", "cmake", "ninja-build", "libgl1", "libglib2.0-0")
-    # Canonical PTv3/Pointcept stack: torch 2.1 + CUDA 11.8 + spconv-cu118. The
-    # cu124 build's sparse-conv backward device-asserted on valid input and its
-    # implicit-GEMM couldn't NVRTC-compile (missing cumm headers); spconv-cu118 is
-    # the mature, battle-tested build PTv3 is actually developed against. No
-    # flash-attn — PTv3 runs fine on standard attention.
+    # Concerto/Sonata/Utonia stack: torch 2.5 + CUDA 12.4 + spconv-cu124 (the
+    # upstream environment.yml combo). No flash-attn — the trainer runs the
+    # upstream enable_flash=False fallback (standard attention, patch 1024),
+    # exactly like the upstream demos on non-flash setups. huggingface_hub
+    # pulls the pretrained checkpoint at first run (cached under
+    # /outputs/hf_cache, so it persists on the outputs volume).
     .pip_install(
-        "torch==2.1.0",
-        "torchvision==0.16.0",
+        "torch==2.5.0",
+        "torchvision==0.20.0",
         "numpy<2.0",
         "scipy",
         "scikit-learn",
@@ -54,31 +57,30 @@ image = (
         "einops",
         "timm",
         "pandas<3",
-        index_url="https://download.pytorch.org/whl/cu118",
+        "huggingface_hub",
+        "packaging",
+        index_url="https://download.pytorch.org/whl/cu124",
         extra_index_url="https://pypi.org/simple",
     )
     .pip_install(
-        "spconv-cu118",
+        "spconv-cu124",
         "torch-scatter",
-        "torch-cluster",
-        find_links="https://data.pyg.org/whl/torch-2.1.0+cu118.html",
+        find_links="https://data.pyg.org/whl/torch-2.5.0+cu124.html",
     )
     .env({"PYTHONUNBUFFERED": "1"})
 )
 
 # Model source: pinned upstream clone — portable (no local checkout needed to
-# build). Bump the SHA deliberately: it IS the architecture version.
+# build). Bump the SHA deliberately: it IS the architecture version. The repo
+# root holds the concerto/ package dir; the trainer adds /opt/concerto to
+# sys.path and imports concerto.model.
 image = image.run_commands(
-    "git clone https://github.com/Pointcept/PointTransformerV3.git /opt/ptv3"
-    " && git -C /opt/ptv3 checkout --detach 3229e9b7de1770c8ad17c316f8e349982de509f8"
-    " && rm -rf /opt/ptv3/.git",
+    "git clone https://github.com/Pointcept/Concerto.git /opt/concerto"
+    " && git -C /opt/concerto checkout --detach 10a7d17cff4dddff028f1522c2e72de4c4515df7"
+    " && rm -rf /opt/concerto/.git",
 )
-# model.py uses a package-relative import (`from .serialization import encode`),
-# so it must be imported as `ptv3.model`, not top-level `model`. Make /opt/ptv3
-# a package; we add /opt (its parent) to sys.path at runtime.
-image = image.run_commands("touch /opt/ptv3/__init__.py")
 
-image = image.add_local_file("scripts/local/local_train_ptv3.py", "/root/local_train_ptv3.py")
+image = image.add_local_file("scripts/local/local_train_concerto.py", "/root/local_train_concerto.py")
 image = image.add_local_file("scripts/helper/train_common.py", "/root/train_common.py")
 # density.py: the DG/env-knob helper every local trainer imports (`import density
 # as dg`) — without it cloud runs die on ModuleNotFoundError at startup.
@@ -105,15 +107,16 @@ datasets_volume = modal.Volume.from_name(
     # intermittent crash costs only the epochs since the last checkpoint.
     retries=modal.Retries(max_retries=10, backoff_coefficient=1.0, initial_delay=5.0),
 )
-def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
-               epochs: Optional[int] = None, batch: Optional[int] = None,
-               steps_per_epoch: Optional[int] = None, chunk_xy: Optional[float] = None,
-               mode: str = "train", weights: Optional[str] = None,
-               infer_input: Optional[str] = None,
-               env_json: Optional[str] = None):
+def train_concerto(dataset: Optional[str] = None, grid: Optional[float] = None,
+                   epochs: Optional[int] = None, batch: Optional[int] = None,
+                   steps_per_epoch: Optional[int] = None, chunk_xy: Optional[float] = None,
+                   mode: str = "train", weights: Optional[str] = None,
+                   infer_input: Optional[str] = None,
+                   freeze_encoder: Optional[int] = None,
+                   env_json: Optional[str] = None):
     """Modal shell: provision the GPU container + volumes, then run the LOCAL
-    trainer. All training/inference logic lives in local_train_ptv3.py — this only
-    shells out to it, so local and cloud run byte-identical code."""
+    trainer. All training/inference logic lives in local_train_concerto.py —
+    this only shells out to it, so local and cloud run byte-identical code."""
     import sys
     sys.path.insert(0, "/root")
     # Make the retries=10 promise real: the trainer resumes an unfinished run
@@ -121,7 +124,7 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
     os.environ["AUTO_RESUME"] = "1"
     import train_common
     train_common.modal_shell_run(
-        "/root/local_train_ptv3.py",
+        "/root/local_train_concerto.py",
         [
             ("--dataset", dataset),
             ("--grid", grid),
@@ -132,6 +135,7 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
             ("--mode", mode),
             ("--weights", weights),
             ("--infer-input", infer_input),
+            ("--freeze-encoder", freeze_encoder),
         ],
         env_json,
         [outputs_volume, datasets_volume],
@@ -144,9 +148,11 @@ def main(dataset: Optional[str] = None, grid: Optional[float] = None,
          steps_per_epoch: Optional[int] = None, chunk_xy: Optional[float] = None,
          mode: str = "train", weights: Optional[str] = None,
          infer_input: Optional[str] = None,
-               env_json: Optional[str] = None):
+         freeze_encoder: Optional[int] = None,
+         env_json: Optional[str] = None):
     what = f"infer({weights})" if mode == "infer" else f"train({dataset})"
     print(f"Launching {APP_NAME} [{what}] on {GPU_TYPE} for up to {TIMEOUT_HOURS}h.")
-    train_ptv3.remote(dataset=dataset, grid=grid, epochs=epochs, batch=batch,
-                      steps_per_epoch=steps_per_epoch, chunk_xy=chunk_xy, mode=mode,
-                      weights=weights, infer_input=infer_input, env_json=env_json)
+    train_concerto.remote(dataset=dataset, grid=grid, epochs=epochs, batch=batch,
+                          steps_per_epoch=steps_per_epoch, chunk_xy=chunk_xy, mode=mode,
+                          weights=weights, infer_input=infer_input,
+                          freeze_encoder=freeze_encoder, env_json=env_json)

@@ -123,6 +123,7 @@ class MainWindow(QWidget):
             ui.polish_forms(page)
             self.stack.addWidget(ui.scroll_v(page))
 
+        ui.set_navigator(self._navigate)   # pages jump via ui.navigate("Train", …)
         self.nav.setCurrentRow(0)
 
     def _on_mode_change(self):
@@ -145,6 +146,15 @@ class MainWindow(QWidget):
         mode = self.theme_combo.currentData()
         appstate.put("ui_theme", mode)
         theme.apply(QApplication.instance(), mode)
+
+    def _navigate(self, page_name: str, **kwargs):
+        """ui.navigate target: switch pages (setCurrentRow fires _go's reload
+        hooks), then hand any payload to the page's receive_nav if it has one."""
+        self.nav.setCurrentRow(PAGES.index(page_name))
+        page = {"Datasets": self.datasets_page, "Train": self.train_page,
+                "Inference": self.infer_page, "Plotting": self.plotting_page}[page_name]
+        if kwargs and hasattr(page, "receive_nav"):
+            page.receive_nav(**kwargs)
 
     def _go(self, row: int):
         # PAGES = [Datasets, Train, Inference, Plotting]
