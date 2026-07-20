@@ -51,7 +51,7 @@ requirements:
     - ${{ compiler('cxx') }}
   host:
     - python 3.11.*
-    - setuptools
+    - setuptools <60   # compiled exts build via numpy.distutils/distutils; >=60 breaks the compiler API
     - numpy <2
     - cython
   run:

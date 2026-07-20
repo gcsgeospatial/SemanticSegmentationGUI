@@ -31,7 +31,7 @@ requirements:
     - ${{ compiler('cxx') }}
   host:
     - python 3.11.*
-    - setuptools
+    - setuptools <60   # cpp_wrappers setup.py uses numpy.distutils; >=60 breaks its compiler API
     - numpy <2
   run:
     - python 3.11.*
