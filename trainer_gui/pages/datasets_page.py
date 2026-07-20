@@ -525,8 +525,11 @@ class DatasetsPage(QWidget):
         if meta.get("classes"):
             groups: dict[int, tuple[str, list[int]]] = {}
             for cl in meta["classes"]:
-                groups.setdefault(int(cl["index"]), (str(cl["name"]), []))[1].append(
-                    int(cl["source_value"]))
+                # written metas collapse to "source_values" (list); pre-persist
+                # in-memory rows carry singular "source_value" (see dataset.py)
+                vals = cl.get("source_values") or [cl.get("source_value", cl["index"])]
+                groups.setdefault(int(cl["index"]), (str(cl["name"]), []))[1].extend(
+                    int(v) for v in vals)
             rows = [(vals, nm, True) for nm, vals in groups.values()]
             rows += [([int(v)], f"class_{v}", False) for v in src.get("ignore_values", [])]
             self.class_table.setRowCount(len(rows))
