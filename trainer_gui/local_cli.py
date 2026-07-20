@@ -72,7 +72,7 @@ def env_preflight(backbone, repo_root: str = "") -> tuple[bool, str]:
         return True, ""
     return False, (f"[local] pixi env '{env_name(backbone)}' isn't installed on this "
                    f"host. Install it from Configure model… (or run `pixi install "
-                   f"--manifest-path envs/pixi.toml -e {env_name(backbone)}`), then "
+                   f"--manifest-path envs/pixi.toml --frozen -e {env_name(backbone)}`), then "
                    f"launch again.")
 
 
@@ -124,9 +124,12 @@ def run_script(script: str, flags: dict, backbone, *, repo_root: str = "",
     `script` (the modal_train_*.py name) is accepted for call-site parity with
     modal_cli but unused: locally we run the decoupled local_train_<key>.py
     directly. Returns (program, args, env) — pass env to JobRunner extra_env.
-    `--locked` = the committed pixi.lock is the contract; a manifest edit
-    without re-locking fails loudly instead of silently re-solving."""
-    args = ["run", "--manifest-path", manifest_path(repo_root), "--locked",
+    `--frozen` = the committed pixi.lock is the contract: install exactly what
+    it says, never re-solve. Was `--locked`, but pixi's up-to-date check
+    false-positives on multi-env pypi index attribution (pandas flagged as
+    cu124 in every env; still broken in pixi 0.73) — revisit when
+    prefix-dev/pixi fixes the satisfiability check."""
+    args = ["run", "--manifest-path", manifest_path(repo_root), "--frozen",
             "-e", env_name(backbone),
             "python", f"scripts/local/local_train_{backbone.key}.py"]
     for key, val in flags.items():
@@ -143,7 +146,7 @@ def install(backbone, repo_root: str = "") -> tuple[str, list[str]]:
     action of the env manager UI (streamed by the same runner that ran
     docker pull)."""
     return pixi_exe(), ["install", "--manifest-path", manifest_path(repo_root),
-                        "--locked", "-e", env_name(backbone)]
+                        "--frozen", "-e", env_name(backbone)]
 
 
 def installed_weights(backbone, repo_root: str = "") -> list[tuple[str, str]]:

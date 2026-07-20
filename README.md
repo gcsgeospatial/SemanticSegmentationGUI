@@ -38,7 +38,7 @@ per-model **pixi environment** (`envs/pixi.toml` — one env per backbone, all
 CUDA/torch deps + the pinned model sources as `trainer-src-*` conda packages):
 
 ```
-pixi run --manifest-path envs/pixi.toml --locked -e <model> \
+pixi run --manifest-path envs/pixi.toml --frozen -e <model> \
   python scripts/local/local_train_<model>.py --flags...
 ```
 

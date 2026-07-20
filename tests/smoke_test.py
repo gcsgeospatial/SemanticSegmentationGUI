@@ -1197,8 +1197,8 @@ def main():
             prog, args, renv = local_cli.run_script(
                 "modal_train_ptv3.py", {"dataset": "myds", "grid": 0.05, "epochs": 250},
                 BB["ptv3"], repo_root="/repo", gpu="A100")
-            check("local_cli: pixi run --locked -e <env> from the envs manifest",
-                  args[0] == "run" and "--locked" in args
+            check("local_cli: pixi run --frozen -e <env> from the envs manifest",
+                  args[0] == "run" and "--frozen" in args
                   and args[args.index("-e") + 1] == "ptv3"
                   and args[args.index("--manifest-path") + 1].replace("\\", "/")
                       .endswith("envs/pixi.toml"))
@@ -1259,8 +1259,8 @@ def main():
             # all_statuses reports one row per backbone with the manager's contract
             # (works whether or not pixi is installed on this box).
             pprog, pargs = local_cli.install(BB["randlanet"])
-            check("local_cli: install() = `pixi install --locked -e <env>`",
-                  pargs[0] == "install" and "--locked" in pargs
+            check("local_cli: install() = `pixi install --frozen -e <env>`",
+                  pargs[0] == "install" and "--frozen" in pargs
                   and pargs[pargs.index("-e") + 1] == "randlanet")
             st = local_cli.all_statuses()
             check("local_cli: all_statuses has one contract-shaped row per backbone",
