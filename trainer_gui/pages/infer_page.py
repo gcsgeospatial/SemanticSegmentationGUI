@@ -381,7 +381,7 @@ class InferPage(QWidget):
         self.apply_exec_mode(appstate.get_exec_mode() == "local")
 
     def apply_exec_mode(self, local: bool):
-        """Reword copy for the backend, apply the local backbone filter."""
+        """Reword copy for the backend, refresh the env-install marks."""
         if self._manifest:
             self._invalidate_manifest()   # a run's config doesn't survive a backend switch
         self.sub.setText(
@@ -427,18 +427,34 @@ class InferPage(QWidget):
         self.wf.setRowVisible(self.pth_row_w, not from_run)
 
     def reload_backbones(self):
-        """Populate the model dropdown, honoring the local-mode backbone filter."""
+        """Populate the model dropdown (every backbone) with env-install marks."""
         prev = self.backbone_combo.currentData()
         self.backbone_combo.blockSignals(True)
         self.backbone_combo.clear()
         for key, b in BACKBONES.items():
-            if appstate.backbone_enabled(key):
-                self.backbone_combo.addItem(b.label, key)
+            self.backbone_combo.addItem(b.label, key)
         i = self.backbone_combo.findData(prev)
         if i >= 0:
             self.backbone_combo.setCurrentIndex(i)
         self.backbone_combo.blockSignals(False)
+        self._refresh_env_marks()
         self._sync_controls()
+
+    def _refresh_env_marks(self):
+        """Local mode: mark models whose pixi env isn't installed yet, so the
+        block at Run time isn't a surprise. Pure directory scan per backbone."""
+        local = appstate.get_exec_mode() == "local"
+        for i in range(self.backbone_combo.count()):
+            b = BACKBONES.get(self.backbone_combo.itemData(i))
+            if b is None:
+                continue
+            missing = local and not local_cli.installed(b, self.repo_root)
+            self.backbone_combo.setItemText(
+                i, b.label + ("  — env not installed" if missing else ""))
+
+    def showEvent(self, ev):
+        super().showEvent(ev)
+        self._refresh_env_marks()   # env may have been installed from the Train page
 
     # ------------------------------------------------------------- class names
     def _set_run_classes(self, names):
@@ -751,9 +767,6 @@ class InferPage(QWidget):
                 b = BACKBONES.get(self.backbone_combo.itemData(i))
                 if b and b.outputs_volume not in vols:
                     vols.append(b.outputs_volume)
-            if not vols:
-                self._append("✗ No models enabled — enable one on the Train page first.")
-                return
         self._pending_cfg_run = rid
         self._append(f"Fetching run config for '{rid}' from Modal…")
         self.cfg_fetcher.start(_fetch_run_config, vols, rid)

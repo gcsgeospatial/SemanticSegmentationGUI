@@ -120,8 +120,8 @@ def set_exec_mode(mode: str) -> None:
 # Defaults for the local backend. Roots default to the dirs the GUI already
 # uses (so a converted dataset / inference job is immediately reachable); every
 # value is overridable from state.json["local_config"] for I/O modularity.
-# (Older state.json files may carry retired docker keys — images/registry/
-# extra_args — which are simply ignored.)
+# (Older state.json files may carry retired keys — images/registry/extra_args
+# from docker, enabled_backbones from the removed model filter — all ignored.)
 _DEFAULT_LOCAL_CONFIG = {
     "datasets_root": "",   # -> TT_DATASETS_ROOT (default: workspace_dir())
     "outputs_root": "",    # -> TT_OUTPUTS_ROOT  (default: local_runs_dir())
@@ -138,30 +138,6 @@ def local_config() -> dict:
 
 def set_local_config(cfg: dict) -> None:
     put("local_config", cfg)
-
-
-# ---- which backbones to show in local mode (hide images your driver can't run) --
-
-def enabled_backbones():
-    """Backbone keys enabled for local mode, or None = all. Lets you hide a
-    backbone whose env you can't run (e.g. a cu124 stack on an older driver)
-    or simply don't use. Stored explicitly once the user picks."""
-    val = get("local_config", {}).get("enabled_backbones")
-    return None if val is None else set(val)
-
-
-def set_enabled_backbones(keys) -> None:
-    cfg = {**get("local_config", {}), "enabled_backbones": list(keys)}
-    put("local_config", cfg)
-
-
-def backbone_enabled(key: str) -> bool:
-    """True if this backbone should appear. Only filters in local mode; an unset
-    selection means all are enabled."""
-    if get_exec_mode() != "local":
-        return True
-    en = enabled_backbones()
-    return en is None or key in en
 
 
 def _state_path() -> Path:
