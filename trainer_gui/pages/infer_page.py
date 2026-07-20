@@ -7,6 +7,7 @@ Stages (one JobRunner):
 
 from __future__ import annotations
 
+import csv
 import json
 import os
 import shutil
@@ -19,7 +20,7 @@ from PySide6.QtGui import QCursor
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout,
                                QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget,
                                QListWidgetItem, QMenu, QPushButton, QRadioButton,
-                               QVBoxLayout, QWidget)
+                               QSpinBox, QVBoxLayout, QWidget)
 
 from .. import analysis, appstate, dataset, local_cli, modal_cli, plots, pretrain, ui
 from ..backbones import BACKBONES
@@ -249,8 +250,34 @@ class InferPage(QWidget):
             # if a PDAL filter is picked anyway.
             self.hag_chk.setText("Compute Height-Above-Ground (HAG) - grid only, "
                                  "PDAL not installed")
-        # TODO(not ready): AdaBN/TTA infer UI hidden until reviewed; backend reads
-        # DG_INFER_ADABN / DG_INFER_TTA — see scripts/DENSITY_DG.md.
+        # Label-free domain-adaptation knobs + probability export. Env-driven
+        # (DG_INFER_ADABN / DG_INFER_TTA / TT_SAVE_PROBS); backend details in
+        # scripts/DENSITY_DG.md.
+        self.adabn_chk = QCheckBox("AdaBN - recalibrate BatchNorm on these scenes")
+        self.adabn_chk.setToolTip(
+            "Recomputes BatchNorm statistics on the target tiles (label-free) before "
+            "predicting. KPConvX / RandLA only - the PTv3 family ignores it.\n"
+            "Output depends on this job's density and class mix, so the same model "
+            "can score differently per area; note it when comparing runs.")
+        self.tta_spin = QSpinBox()
+        self.tta_spin.setRange(0, 5)
+        self.tta_spin.setSuffix(" views")
+        self.tta_spin.setToolTip(
+            "Extra density/scale views averaged into each tile's prediction "
+            "(DG_INFER_TTA). 0 = off. Each view adds a full pass over the tile, "
+            "so inference time scales with the count.")
+        self.probs_chk = QCheckBox("Save class probabilities")
+        self.probs_chk.setToolTip(
+            "Store the full per-point class distribution (float16) in each "
+            "prediction npz (TT_SAVE_PROBS). Needed for soft ensemble voting and "
+            "offline confidence/mask analysis; costs ~2 bytes x classes per point.")
+        dg_row = QHBoxLayout()
+        dg_row.addWidget(self.adabn_chk)
+        dg_row.addWidget(QLabel("TTA"))
+        dg_row.addWidget(self.tta_spin)
+        dg_row.addWidget(self.probs_chk)
+        dg_row.addStretch()
+        iform.addRow("Domain adaptation", ui.wrap(dg_row))
 
         # Per-job class mask: untick classes absent from these scenes (e.g. water).
         self.class_list = QListWidget()
@@ -620,15 +647,20 @@ class InferPage(QWidget):
 
     def _infer_dg_env(self, dg: dict | None = None) -> dict:
         """DG_* env for inference. logdk recovered from run.json (it changed the input
-        width, so must be recomputed or the load fails). AdaBN/TTA toggles are hidden
-        for now (not ready); no DG_INFER_ADABN / DG_INFER_TTA env is sent — see the
-        TODO in __init__. `dg` overrides the loaded run's block (ensemble members
-        carry their own)."""
+        width, so must be recomputed or the load fails); AdaBN / TTA / save-probs come
+        from the Domain-adaptation row. `dg` overrides the loaded run's block (ensemble
+        members carry their own)."""
         dg = self._dg if dg is None else dg
         env: dict[str, str] = {}
         if dg.get("logdk"):
             env["DG_LOGDK_FEAT"] = "1"
             env["DG_LOGDK_K"] = str(int(dg.get("logdk_k", 8)))
+        if self.adabn_chk.isChecked():
+            env["DG_INFER_ADABN"] = "1"
+        if self.tta_spin.value() > 0:
+            env["DG_INFER_TTA"] = str(self.tta_spin.value())
+        if self.probs_chk.isChecked():
+            env["TT_SAVE_PROBS"] = "1"
         if env:
             self._append("[dg] inference: " + " ".join(f"{k}={v}" for k, v in sorted(env.items())))
         # Class mask rides the same env dict (local -e / modal --env-json), so it
@@ -1623,6 +1655,34 @@ class InferPage(QWidget):
             lines.append(f"  saved -> {mpath}")
         except OSError as e:
             lines.append(f"  (couldn't save metrics json: {e})")
+        # Accumulate one row per comparison in <workspace>/gt_metrics.csv so
+        # one-at-a-time scoring builds the experiment table by itself. The file
+        # is rewritten with the union of all headers, so a later run with a
+        # different class set widens the table instead of losing columns.
+        row = {"when": datetime.now().strftime("%Y-%m-%d %H:%M"),
+               "prediction": str(pred), "ground_truth": str(gt),
+               "scene": m["scene"] or Path(pred).stem,
+               "accuracy": f"{m['accuracy']:.4f}", "miou": f"{m['miou']:.4f}",
+               "labeled": str(m["labeled"])}
+        row.update({f"iou_{nm(c)}": f"{iou:.4f}"
+                    for c, iou in m["per_class_iou"].items()})
+        cpath = appstate.workspace_dir() / "gt_metrics.csv"
+        try:
+            rows = []
+            if cpath.exists():
+                with open(cpath, newline="", encoding="utf-8") as f:
+                    rows = [r for r in csv.DictReader(f) if any(r.values())]
+            rows.append(row)
+            core = ["when", "prediction", "ground_truth", "scene",
+                    "accuracy", "miou", "labeled"]
+            extra = sorted({k for r in rows for k in r if k} - set(core))
+            with open(cpath, "w", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=core + extra, restval="")
+                w.writeheader()
+                w.writerows(rows)
+            lines.append(f"  csv   -> {cpath}")
+        except (OSError, csv.Error) as e:
+            lines.append(f"  (couldn't update stats csv: {e})")
         self._append("\n".join(lines))
         self._last_pred_dir = Path(pred).parent
         self.plot_btn.setEnabled(True)

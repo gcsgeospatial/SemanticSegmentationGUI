@@ -123,8 +123,8 @@ def main():
         check("laz npz: label i32 in {-1,0,1,2}",
               z["label"].dtype == np.int32 and set(np.unique(z["label"])) <= {-1, 0, 1, 2})
         check("laz npz: ignored value 0 -> -1", (z["label"] == -1).sum() > 0)
-        check("laz npz: intensity normalized 0..1",
-              0.0 <= z["intensity"].min() and z["intensity"].max() <= 1.0)
+        check("laz npz: intensity p95-normalized 0..2 (default matches the GUI)",
+              0.0 <= z["intensity"].min() and z["intensity"].max() <= 2.0)
         meta = json.loads((staged / "dataset_meta.json").read_text())
         check("meta: num_classes 3", meta["num_classes"] == 3)
         check("meta: class names ordered", meta["class_names"] == ["Ground", "Veg", "Building"])

@@ -20,7 +20,14 @@ channels = [
     "conda-forge",
     "https://repo.prefix.dev/gcsgeospatial",
 ]
-platforms = ["linux-64", "win-64"]   # win-64 exists ONLY for the pkg tooling env
+# Named cuda variants: each feature binds to the entry matching its wheel stack.
+# Plain linux-64/win-64 exist ONLY for the pkg tooling env.
+platforms = [
+    "linux-64", "win-64",
+    { name = "linux-64-cuda118", platform = "linux-64", cuda = "11.8" },
+    { name = "linux-64-cuda121", platform = "linux-64", cuda = "12.1" },
+    { name = "linux-64-cuda120", platform = "linux-64", cuda = "12.0" },
+]
 requires-pixi = ">=0.60"
 
 # ---------------------------------------------------------------- ptv3 --------
@@ -28,10 +35,7 @@ requires-pixi = ">=0.60"
 # PTv3's 5x5x5 stem (see local_train_ptv3.py).
 
 [feature.ptv3]
-platforms = ["linux-64"]
-
-[feature.ptv3.system-requirements]
-cuda = "11.8"
+platforms = ["linux-64-cuda118"]
 
 [feature.ptv3.dependencies]
 python = "3.11.*"
@@ -69,10 +73,7 @@ sanity = "python -c \"import os, sys, torch, spconv, torch_scatter; sys.path.ins
 # torch 2.2.2 + cu121; compiled knn/subsampling exts ship in trainer-src-randlanet.
 
 [feature.randlanet]
-platforms = ["linux-64"]
-
-[feature.randlanet.system-requirements]
-cuda = "12.1"
+platforms = ["linux-64-cuda121"]
 
 [feature.randlanet.dependencies]
 python = "3.11.*"
@@ -104,10 +105,7 @@ sanity = "python -c \"import os, sys, torch; sys.path.insert(0, os.environ['RAND
 # torch 2.3.0 + cu121; compiled cpp_wrappers + kernel cache ship in trainer-src-kpconv.
 
 [feature.kpconv]
-platforms = ["linux-64"]
-
-[feature.kpconv.system-requirements]
-cuda = "12.1"
+platforms = ["linux-64-cuda121"]
 
 [feature.kpconv.dependencies]
 python = "3.11.*"
@@ -142,10 +140,7 @@ sanity = "python -c \"import os, sys, torch; sys.path.insert(0, os.environ['KPCO
 # NVIDIA driver).
 
 [feature.kpconvx-cold]
-platforms = ["linux-64"]
-
-[feature.kpconvx-cold.system-requirements]
-cuda = "12.1"
+platforms = ["linux-64-cuda121"]
 
 [feature.kpconvx-cold.dependencies]
 python = "3.11.*"
@@ -186,10 +181,7 @@ sanity = "python -c \"import os, sys, torch, pykeops; sys.path.insert(0, os.envi
 # + torch-scatter + huggingface_hub), differing only in the trainer-src package.
 
 [feature.concerto]
-platforms = ["linux-64"]
-
-[feature.concerto.system-requirements]
-cuda = "12.4"
+platforms = ["linux-64-cuda120"]   # cu124 wheels: any 12.x driver (minor-version compat)
 
 [feature.concerto.dependencies]
 python = "3.11.*"
@@ -224,10 +216,7 @@ torch-scatter = "*"
 sanity = "python -c \"import os, sys, torch, spconv, torch_scatter, huggingface_hub; sys.path.insert(0, os.environ['CONCERTO_SRC']); import concerto; print('concerto env ok, torch', torch.__version__)\""
 
 [feature.sonata]
-platforms = ["linux-64"]
-
-[feature.sonata.system-requirements]
-cuda = "12.4"
+platforms = ["linux-64-cuda120"]   # cu124 wheels: any 12.x driver (minor-version compat)
 
 [feature.sonata.dependencies]
 python = "3.11.*"
@@ -262,10 +251,7 @@ torch-scatter = "*"
 sanity = "python -c \"import os, sys, torch, spconv, torch_scatter, huggingface_hub; sys.path.insert(0, os.environ['SONATA_SRC']); import sonata; print('sonata env ok, torch', torch.__version__)\""
 
 [feature.utonia]
-platforms = ["linux-64"]
-
-[feature.utonia.system-requirements]
-cuda = "12.4"
+platforms = ["linux-64-cuda120"]   # cu124 wheels: any 12.x driver (minor-version compat)
 
 [feature.utonia.dependencies]
 python = "3.11.*"
@@ -303,6 +289,9 @@ sanity = "python -c \"import os, sys, torch, spconv, torch_scatter, huggingface_
 # Packaging env (both platforms): builds the trainer-src-* source packages and
 # trainer-weights-* checkpoint packages with rattler-build, and uploads them.
 # TT_PREFIX_CHANNEL overrides the destination channel (default gcsgeospatial).
+
+[feature.pkg]
+platforms = ["linux-64", "win-64"]
 
 [feature.pkg.dependencies]
 rattler-build = ">=0.40"

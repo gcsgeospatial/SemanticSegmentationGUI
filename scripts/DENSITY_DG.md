@@ -113,14 +113,14 @@ model input dim by 1 — retrain-only (old weights won't load); KPConvX feeds it
   (or a monkey-patch shim) before they can be wired.
 - **D0/D0b explicit knob** — all three backbones already grid-canonicalize density at inference, so a
   separate knob is a no-op for the current grids; expose only if a deploy needs a g0 ≠ the model grid.
-- **GUI wiring for train-time DG** — the Train-page DG panel is hidden and injects no `DG_*` env;
-  the scripts' `DG_*` env route is the supported path until the GUI wiring is re-enabled.
+- ~~GUI wiring for train-time DG~~ — wired: the Train page's "Density generalization (advanced)"
+  box injects `DG_*` env at launch (`analysis.dg_config_to_env`); the direct env route still works.
 
 **How to turn on — three ways (all the same `DG_*` knobs).** The GUI is split by lifecycle.
-> **Note:** train-time DG is currently **disabled in the GUI** — the Train-page panel is hidden
-> and no `DG_*` env is injected at launch. Route 2 (direct `DG_*` env vars on the standalone
-> `local_train_*.py` scripts) remains fully functional. The inference-side AdaBN/TTA toggles are
-> also hidden for now; only the run.json logdk recovery is live.
+> **Note:** both GUI routes are live: the Train page's "Density generalization (advanced)" box
+> injects `DG_*` env at launch, and the Inference page's "Domain adaptation" row sets
+> `DG_INFER_ADABN` / `DG_INFER_TTA` / `TT_SAVE_PROBS` (run.json logdk recovery unchanged).
+> Route 2 (direct `DG_*` env vars on the standalone `local_train_*.py` scripts) still works.
 - **Train-time** (`density_aug`, `logdk`) — bake into the weights:
 1. **GUI**: Datasets page -> select a saved dataset -> **"Density generalization (advanced)"** panel.
    It reads the dataset's stored density, takes your **target inference density**, and **Recommend**

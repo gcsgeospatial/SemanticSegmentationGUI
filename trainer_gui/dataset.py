@@ -410,7 +410,7 @@ def _hag_from_cloud(cloud: Cloud) -> np.ndarray | None:
 
 
 def _convert_one(cloud: Cloud, raw: np.ndarray | None, value_to_index: dict[int, int],
-                 out_path: Path, intensity_norm: str = "max",
+                 out_path: Path, intensity_norm: str = "p95",
                  compute_hag: bool = False, ground_value: int | None = None,
                  hag_filter: str = "grid",
                  feature_fields: list[str] | None = None,
@@ -522,7 +522,7 @@ def _convert_one(cloud: Cloud, raw: np.ndarray | None, value_to_index: dict[int,
 
 
 def convert_scene(path: Path, spec: LabelSpec | None, value_to_index: dict[int, int],
-                  out_path: Path, intensity_norm: str = "max",
+                  out_path: Path, intensity_norm: str = "p95",
                   compute_hag: bool = False, ground_value: int | None = None,
                   hag_filter: str = "grid",
                   feature_fields: list[str] | None = None,
@@ -747,7 +747,7 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
                     classes: list[dict], ignore_values: list[int],
                     staging_root: Path, *, val_inputs=None, test_inputs=None,
                     split: SplitConfig | None = None,
-                    intensity_norm: str = "max", compute_hag: bool = False,
+                    intensity_norm: str = "p95", compute_hag: bool = False,
                     ground_value: int | None = None,
                     hag_filter: str = "grid",
                     feature_fields: list[str] | None = None,

@@ -994,11 +994,18 @@ def kp_make_build_feat(logdk_feat, logdk_k,
 
     "height" is always tile-relative: z - min(z) over the tile. Real
     HeightAboveGround is the ordinary feat_hag channel, fed via `extras`
-    like every feat_<name> dataset channel. With `drop`, zero all but the
-    first spec channel (feature-drop; legacy: keep intensity)."""
+    like every feat_<name> dataset channel. With `drop`, zero the SENSOR
+    channels (intensity / return_number / rgb) wherever they sit in the
+    spec; geometry-derived channels (height, x/y/z, feat_*) always survive
+    — they come from the coords and are never missing at inference."""
     import numpy as np
     import density as dg
     spec = list(spec)
+    # ponytail: sensor set is the fixed names; a sensor-derived feat_* channel
+    # (e.g. NDVI from a source dim) would need a per-channel flag in the
+    # dataset catalog to join the drop.
+    drop_idx = [i for i, n in enumerate(spec)
+                if n in ("intensity", "return_number", "rgb")]
 
     def build_feat(xyz, intensity, ret_num, drop=False, extras=None):
         bias = np.ones((len(xyz), 1), np.float32)
@@ -1011,8 +1018,8 @@ def kp_make_build_feat(logdk_feat, logdk_k,
             raise ValueError(f"feature channel(s) {missing} not available "
                              f"here; have {sorted(src)}")
         attrs = np.stack([src[n] for n in spec], axis=1).astype(np.float32)
-        if drop:
-            attrs[:, 1:] = 0.0   # feature-drop: keep the first spec channel only
+        if drop and drop_idx:
+            attrs[:, drop_idx] = 0.0   # feature-drop: sensor channels only
         cols = [bias, attrs]
         if logdk_feat:           # D3b: never dropped — the density signal to condition on
             cols.append(dg.local_density_logdk(xyz, logdk_k)[:, None])
@@ -2052,8 +2059,9 @@ def _demo():  # ponytail: one runnable check -- `python train_common.py`
     xyz10 = np.random.RandomState(0).rand(10, 3).astype(np.float32)
     f = bf(xyz10, np.ones(10, np.float32), np.zeros(10, np.float32))
     assert f.shape == (10, 4) and np.all(f[:, 0] == 1.0)
-    assert np.all(bf(xyz10, np.ones(10, np.float32), np.ones(10, np.float32),
-                     drop=True)[:, 2:] == 0.0)          # drop keeps bias+intensity
+    fd = bf(xyz10, np.ones(10, np.float32), np.ones(10, np.float32), drop=True)
+    assert np.all(fd[:, 1:3] == 0.0)                    # drop zeroes intensity+ret_num
+    assert np.allclose(fd[:, 3], xyz10[:, 2] - xyz10[:, 2].min())  # geometry survives
     # spec-ordered assembly (bias always first, not in the spec)
     bfs = kp_make_build_feat(False, 8, spec=["height", "intensity", "feat_q"])
     fq = np.arange(10, dtype=np.float32)

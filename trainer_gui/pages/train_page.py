@@ -181,8 +181,7 @@ class TrainPage(QWidget):
         config_col = QVBoxLayout()
         config_col.addWidget(form_box)
         config_col.addWidget(self._tuning_box())
-        # TODO(not ready): train-time DG UI disabled pending review; no DG env is
-        # sent. analysis.dg_recommend/dg_config_to_env remain the backend hooks.
+        config_col.addWidget(self._dg_box())
         config_col.addWidget(self._loss_box())
         config_col.addWidget(self.warn_label)
         config_col.addWidget(self.summary_lbl)
@@ -664,6 +663,91 @@ class TrainPage(QWidget):
                 "weight_beta": round(self.loss_beta.value(), 2),
                 "rare_oversample": self.loss_rare.isChecked()}
 
+    # ------------------------------------ density generalization (per run)
+    def _dg_box(self) -> QGroupBox:
+        box = QGroupBox("Density generalization (advanced)")
+        box.setCheckable(True)
+        box.setChecked(False)
+        outer = QVBoxLayout(box)
+        inner = QWidget()
+        lay = QVBoxLayout(inner)
+        lay.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(inner)
+        box.toggled.connect(inner.setVisible)
+        inner.setVisible(False)
+        self.dg_box = box        # unchecked = off, baseline training
+
+        hint = QLabel("Train-time tolerance for inference clouds sparser than the "
+                      "training data (scripts/DENSITY_DG.md). Trades some native-"
+                      "density accuracy for robustness; recorded in run.json's dg "
+                      "block, which inference reads back automatically.")
+        hint.setWordWrap(True)
+        theme.set_accent(hint, "muted")
+        lay.addWidget(hint)
+
+        self.dg_aug = QCheckBox("Density augmentation (random coarsen per tile)")
+        self.dg_aug.setToolTip(
+            "Re-subsamples a share of training tiles to a coarser random grid "
+            "(DG_DENSITY_AUG) so the model also sees sparse versions of the data.\n"
+            "Coarsen-only: helps when inference is SPARSER than training; the "
+            "voxel grid already canonicalizes denser inputs for free.")
+        self.dg_coarsen = QDoubleSpinBox()
+        self.dg_coarsen.setRange(1.5, 6.0)
+        self.dg_coarsen.setSingleStep(0.5)
+        self.dg_coarsen.setValue(2.5)
+        self.dg_coarsen.setToolTip("Max coarsening factor over the model grid "
+                                   "(DG_COARSEN_MAX). Size it to the sparsest "
+                                   "density you expect at inference.")
+        self.dg_coarsen.setEnabled(False)
+        self.dg_pnative = QDoubleSpinBox()
+        self.dg_pnative.setRange(0.0, 1.0)
+        self.dg_pnative.setSingleStep(0.05)
+        self.dg_pnative.setValue(0.5)
+        self.dg_pnative.setToolTip("Share of tiles kept at native density "
+                                   "(DG_P_NATIVE). Lower = more mass on the "
+                                   "coarse end; 0.5 is the default.")
+        self.dg_pnative.setEnabled(False)
+        self.dg_aug.toggled.connect(self.dg_coarsen.setEnabled)
+        self.dg_aug.toggled.connect(self.dg_pnative.setEnabled)
+        r1 = QHBoxLayout()
+        r1.addWidget(self.dg_aug)
+        r1.addWidget(QLabel("max coarsen ×"))
+        r1.addWidget(self.dg_coarsen)
+        r1.addWidget(QLabel("p(native)"))
+        r1.addWidget(self.dg_pnative)
+        r1.addStretch(1)
+        lay.addLayout(r1)
+
+        self.dg_logdk = QCheckBox("log dₖ local-density input channel")
+        self.dg_logdk.setToolTip(
+            "Appends log of the k-th-neighbour distance as an input feature "
+            "(DG_LOGDK_FEAT) so the model can condition on local density.\n"
+            "Changes the input width: baked into the weights, retrain-only, and "
+            "re-initializes the pretrained stem on Concerto/Sonata/Utonia. Only "
+            "meaningful together with density augmentation.")
+        self.dg_k = QSpinBox()
+        self.dg_k.setRange(4, 32)
+        self.dg_k.setValue(8)
+        self.dg_k.setToolTip("k for the k-th-neighbour distance (DG_LOGDK_K).")
+        self.dg_k.setEnabled(False)
+        self.dg_logdk.toggled.connect(self.dg_k.setEnabled)
+        r2 = QHBoxLayout()
+        r2.addWidget(self.dg_logdk)
+        r2.addWidget(QLabel("k"))
+        r2.addWidget(self.dg_k)
+        r2.addStretch(1)
+        lay.addLayout(r2)
+        return box
+
+    def _dg_collect(self) -> dict:
+        if not self.dg_box.isChecked():         # off -> baseline (no DG env)
+            return {}
+        return {"density_aug": self.dg_aug.isChecked(),
+                "coarsen_max": round(self.dg_coarsen.value(), 2),
+                "p_native": round(self.dg_pnative.value(), 2),
+                "logdk": self.dg_logdk.isChecked(),
+                "logdk_k": self.dg_k.value()}
+
     # -------------------------------------------- input features (per run)
     def _features_row(self) -> QWidget:
         """Compact picker for the Job form: a 'Custom' toggle + a wrapping
@@ -780,7 +864,9 @@ class TrainPage(QWidget):
             flags["steps-per-epoch"] = 50
 
         loss_env = analysis.loss_config_to_env(self._loss_collect())
+        dg_env = analysis.dg_config_to_env(self._dg_collect())
         env = dict(loss_env)
+        env.update(dg_env)
         if self.val_every.value() != 10:   # default emits nothing (script default)
             env["VAL_EVERY"] = str(self.val_every.value())
         feat_csv = self._feat_collect()    # '' = no env (trainer legacy defaults)
@@ -808,6 +894,7 @@ class TrainPage(QWidget):
             "val_every": self.val_every.value(),
             "smoke": self.smoke_chk.isChecked(),
             "loss": self._loss_collect(),
+            "dg": self._dg_collect(),
             "features": feat_csv,
             "gpu": self.gpu_combo.currentText(),
             "detach": self.detach_chk.isChecked(),
@@ -821,6 +908,9 @@ class TrainPage(QWidget):
         if loss_env:
             self._append("[loss] overrides: "
                          + " ".join(f"{k}={v}" for k, v in sorted(loss_env.items())))
+        if dg_env:
+            self._append("[dg] overrides: "
+                         + " ".join(f"{k}={v}" for k, v in sorted(dg_env.items())))
         if feat_csv:
             self._append(f"[features] FEAT_CHANNELS={feat_csv}")
         payload = {"backbone": b, "flags": flags, "dataset": name,
@@ -1088,6 +1178,17 @@ class TrainPage(QWidget):
                 self.loss_cw.setChecked(bool(loss.get("class_weighting", True)))
                 self.loss_beta.setValue(float(loss.get("weight_beta", 0.5)))
                 self.loss_rare.setChecked(bool(loss.get("rare_oversample", True)))
+            except (TypeError, ValueError):
+                pass
+        dg = cfg.get("dg") if isinstance(cfg.get("dg"), dict) else {}
+        self.dg_box.setChecked(bool(dg))       # {} = box off (baseline)
+        if dg:
+            try:
+                self.dg_aug.setChecked(bool(dg.get("density_aug", False)))
+                self.dg_coarsen.setValue(float(dg.get("coarsen_max", 2.5)))
+                self.dg_pnative.setValue(float(dg.get("p_native", 0.5)))
+                self.dg_logdk.setChecked(bool(dg.get("logdk", False)))
+                self.dg_k.setValue(int(dg.get("logdk_k", 8)))
             except (TypeError, ValueError):
                 pass
         self._apply_feat_csv(str(cfg.get("features", "") or ""))
