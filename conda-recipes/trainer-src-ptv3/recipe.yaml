@@ -1,0 +1,31 @@
+# PTv3 model sources pinned at the same SHA the modal recipe clones.
+# Build: pixi run --manifest-path envs/pixi.toml build-src
+# The package installs the repo to $PREFIX/opt/ptv3 and exports PTV3_SRC on
+# activation; trainers fall back to /opt/ptv3 (Modal) when the var is unset.
+
+context:
+  sha: "3229e9b7de1770c8ad17c316f8e349982de509f8"
+
+package:
+  name: trainer-src-ptv3
+  version: "1.0.0"   # bump when the sha moves
+
+source:
+  git: https://github.com/Pointcept/PointTransformerV3.git
+  rev: ${{ sha }}
+
+build:
+  number: 0
+  noarch: generic
+  script: |
+    mkdir -p "$PREFIX/opt/ptv3"
+    cp -r "$SRC_DIR"/. "$PREFIX/opt/ptv3/"
+    rm -rf "$PREFIX/opt/ptv3/.git"
+    touch "$PREFIX/opt/ptv3/__init__.py"
+    mkdir -p "$PREFIX/etc/conda/activate.d"
+    printf 'export PTV3_SRC="${CONDA_PREFIX}/opt/ptv3"\n' > "$PREFIX/etc/conda/activate.d/trainer-src-ptv3.sh"
+
+about:
+  repository: https://github.com/Pointcept/PointTransformerV3
+  summary: PTv3 sources pinned at ${{ sha }} for the trainer-gui local backend
+  license: MIT

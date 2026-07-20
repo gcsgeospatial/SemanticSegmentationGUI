@@ -1,0 +1,45 @@
+# KPConvX (apple/ml-kpconvx Standalone/KPConvX subtree) + compiled
+# cpp_wrappers, pinned at the same SHA the modal recipe clones. linux-64:
+# ships cp311 pybind extensions (torch-free; variants key on python only).
+
+context:
+  sha: "54e644a9f3bddd4c344a58193897a44582b0fea4"
+
+package:
+  name: trainer-src-kpconvx
+  version: "1.0.0"   # bump when the sha moves
+
+source:
+  git: https://github.com/apple/ml-kpconvx.git
+  rev: ${{ sha }}
+
+build:
+  number: 0
+  script: |
+    cd "$SRC_DIR/Standalone/KPConvX/cpp_wrappers/cpp_subsampling" && $PYTHON setup.py build_ext --inplace
+    cd "$SRC_DIR/Standalone/KPConvX/cpp_wrappers/cpp_neighbors" && $PYTHON setup.py build_ext --inplace
+    cd "$SRC_DIR/Standalone/KPConvX"
+    touch cpp_wrappers/__init__.py cpp_wrappers/cpp_subsampling/__init__.py \
+          cpp_wrappers/cpp_neighbors/__init__.py
+    mkdir -p "$PREFIX/opt/kpconvx"
+    cp -r "$SRC_DIR/Standalone/KPConvX"/. "$PREFIX/opt/kpconvx/"
+    mkdir -p "$PREFIX/etc/conda/activate.d"
+    printf 'export KPCONVX_SRC="${CONDA_PREFIX}/opt/kpconvx"\n' > "$PREFIX/etc/conda/activate.d/trainer-src-kpconvx.sh"
+
+requirements:
+  build:
+    - ${{ compiler('cxx') }}
+  host:
+    - python 3.11.*
+    - setuptools
+    - numpy <2
+  run:
+    - python 3.11.*
+  ignore_run_exports:
+    from_package:
+      - numpy   # the env supplies numpy<2 via pip; don't pin a conda numpy
+
+about:
+  repository: https://github.com/apple/ml-kpconvx
+  summary: KPConvX standalone sources + compiled cpp_wrappers at ${{ sha }}
+  license: LicenseRef-Apple-Sample-Code

@@ -73,7 +73,7 @@ class MainWindow(QWidget):
         sl.addWidget(mode_label)
         self.mode_combo = QComboBox()
         self.mode_combo.addItem("Modal (cloud)", "modal")
-        self.mode_combo.addItem("Local (Docker)", "local")
+        self.mode_combo.addItem("Local (pixi)", "local")
         self.mode_combo.setCurrentIndex(max(0, self.mode_combo.findData(appstate.get_exec_mode())))
         self.mode_combo.currentIndexChanged.connect(self._on_mode_change)
         sl.addWidget(self.mode_combo)
@@ -138,7 +138,7 @@ class MainWindow(QWidget):
             page.apply_exec_mode(local)
 
     def _apply_mode_tag(self, mode: str):
-        self.tag.setText("point-cloud training - local (Docker)" if mode == "local"
+        self.tag.setText("point-cloud training - local (pixi)" if mode == "local"
                          else "point-cloud training on Modal")
 
     def _on_theme_change(self):

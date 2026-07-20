@@ -12,8 +12,28 @@ import json
 import os
 import time
 
+# Path contract: inside containers (Modal) these stay the fixed /datasets +
+# /outputs mounts; the pixi local backend has no container, so the GUI points
+# them at the real host dirs via TT_* env vars. Unset vars = container layout,
+# byte-for-byte.
+DATASETS_ROOT = os.environ.get("TT_DATASETS_ROOT", "/datasets")
+OUTPUTS_ROOT = os.environ.get("TT_OUTPUTS_ROOT", "/outputs")
 
-def write_pred(path, xyz, pred, intensity=None, confidence=None, probs=None):
+
+def dataset_dir(name):
+    """Root of a canonical dataset. TT_DATASET_DIR overrides for a staged
+    dataset living outside the workspace (was an extra bind mount)."""
+    return os.environ.get("TT_DATASET_DIR") or f"{DATASETS_ROOT}/{name}"
+
+
+def infer_dir(job):
+    """Inference job dir (scenes/ + predictions live here). TT_INFER_DIR
+    overrides (was an extra bind mount)."""
+    return os.environ.get("TT_INFER_DIR") or f"{DATASETS_ROOT}/_infer/{job}"
+
+
+def write_pred(path, xyz, pred, intensity=None, confidence=None, probs=None,
+               crs_wkt=None):
     """Write one inferred scene as a compact npz — xyz + per-point class index
     (+ optional intensity, per-point confidence = max of the normalized class
     distribution, and the full float16 distribution when TT_SAVE_PROBS=1). The
@@ -32,6 +52,8 @@ def write_pred(path, xyz, pred, intensity=None, confidence=None, probs=None):
         d["confidence"] = np.asarray(confidence, np.float32)
     if probs is not None:
         d["probs"] = np.asarray(probs, np.float16)
+    if crs_wkt:            # source CRS (WKT string) — the exporter georeferences
+        d["crs_wkt"] = np.asarray(str(crs_wkt))     # the las/laz deliverable with it
     np.savez(path, **d)
 
 
@@ -76,7 +98,7 @@ class BestCheckpoint:
             save_last(self.final)
 
 
-STOP_SENTINEL = "/outputs/STOP"   # module attr, not a default arg: smoke test repoints it
+STOP_SENTINEL = f"{OUTPUTS_ROOT}/STOP"   # module attr, not a default arg: smoke test repoints it
 
 
 def clear_stop():
@@ -157,7 +179,7 @@ def write_run_manifest(run_dir, backbone, dataset=None, weights="final_model.pth
             break
     inorm = "p95"   # default; overridden below by the dataset's recorded intensity_norm
     if dataset:
-        mp = f"/datasets/{dataset}/dataset_meta.json"
+        mp = f"{dataset_dir(dataset)}/dataset_meta.json"
         try:
             with open(mp, encoding="utf-8") as f:
                 inorm = _intensity_norm_from_meta(json.load(f))
@@ -631,11 +653,17 @@ def append_val_row(val_csv, ep, m, class_names):
 # ---------------------------------------------------------- inference scenes
 
 def scene_arrays(z, n):
-    """(intensity, ret_num) from an inference scene npz, with the shared
-    fallbacks (missing intensity -> 0.5; return_number/ret_num -> zeros)."""
+    """(intensity, ret_num) from a canonical scene npz — THE one place the
+    missing-channel fallbacks are decided, so train tiling and inference feed
+    the same distribution (intensity -> RGB grayscale -> zeros;
+    return_number/ret_num -> zeros)."""
     import numpy as np
-    intensity = (z["intensity"].astype(np.float32) if "intensity" in z
-                 else np.full(n, 0.5, np.float32))
+    if "intensity" in z:
+        intensity = z["intensity"].astype(np.float32)
+    elif "rgb" in z:
+        intensity = z["rgb"].astype(np.float32).mean(1) / 255.0
+    else:
+        intensity = np.zeros(n, np.float32)
     ret_num = (z["return_number"].astype(np.float32) if "return_number" in z
                else (z["ret_num"].astype(np.float32) if "ret_num" in z
                      else np.zeros(n, np.float32)))
@@ -656,7 +684,13 @@ def run_infer_scenes(scenes, predict, pred_dir, run_dir, infer_cfg, cls_txt=Fals
         name = os.path.splitext(os.path.basename(pc_path))[0]
         t0 = time.time()
         xyz, pred, inten, conf, probs = predict(pc_path)
-        write_pred(f"{pred_dir}/{name}_pred.npz", xyz, pred, inten, conf, probs)
+        try:                            # ferry the scene's CRS into the pred npz
+            with np.load(pc_path) as z:
+                crs = str(z["crs_wkt"]) if "crs_wkt" in z.files else None
+        except OSError:                 # predict() is the scene's real reader —
+            crs = None                  # a missing/odd file is its problem, not ours
+        write_pred(f"{pred_dir}/{name}_pred.npz", xyz, pred, inten, conf, probs,
+                   crs_wkt=crs)
         if cls_txt:
             np.savetxt(f"{pred_dir}/{name}_pred_CLS.txt", pred, fmt="%d")
         scene_stats.append({"scene": os.path.basename(pc_path),
@@ -680,21 +714,14 @@ def run_infer_scenes(scenes, predict, pred_dir, run_dir, infer_cfg, cls_txt=Fals
 def kp_load_canonical(npz_path):
     """Canonical trainer_gui scene (.npz) -> (xyz, intensity, ret_num, lab,
     extras), extras = every feat_* channel the scene carries (Phase 2a writes
-    them). ret_num falls back to zeros when the scene has no return_number —
-    matching scene_arrays, so train and infer see the same distribution. xyz
-    is origin-offset (per-scene floor-min) before the float32 cast so
-    projected (UTM) coords keep sub-meter precision."""
+    them). Missing intensity/return_number fall back via scene_arrays — the
+    single definition inference also uses, so train and infer see the same
+    distribution. xyz is origin-offset (per-scene floor-min) before the
+    float32 cast so projected (UTM) coords keep sub-meter precision."""
     import numpy as np
     z = np.load(npz_path)
     xyz = (z["xyz"] - np.floor(z["xyz"].min(0))).astype(np.float32)
-    if "intensity" in z.files:
-        intensity = z["intensity"].astype(np.float32)
-    elif "rgb" in z.files:
-        intensity = z["rgb"].astype(np.float32).mean(1) / 255.0
-    else:
-        intensity = np.zeros(len(xyz), np.float32)
-    ret_num = (z["return_number"].astype(np.float32)
-               if "return_number" in z.files else np.zeros(len(xyz), np.float32))
+    intensity, ret_num = scene_arrays(z, len(xyz))
     lab = z["label"].astype(np.int32) if "label" in z.files \
         else np.full(len(xyz), -1, np.int32)
     extras = {k: z[k].astype(np.float32) for k in z.files if k.startswith("feat_")}
@@ -784,15 +811,43 @@ def make_prefetcher(make_batch, depth=2):
     return nxt
 
 
+def train_stride(chunk_xy):
+    """Train-split tile stride: chunk_xy * TT_TRAIN_STRIDE (default 0.75 ->
+    ~1.8x point duplication instead of the legacy 0.5's 4x; 1.0 = no overlap).
+    Val/test always keep chunk_xy/2 — the eval's per-voxel voting needs the
+    up-to-4 cover."""
+    return chunk_xy * float(os.environ.get("TT_TRAIN_STRIDE", "0.75"))
+
+
+def train_stride_tag():
+    """Prep-dir suffix carrying the train-stride factor, so a factor change
+    lands in a fresh cache instead of mixing grids. Empty for the legacy 0.5
+    — those existing caches stay valid untagged."""
+    f = float(os.environ.get("TT_TRAIN_STRIDE", "0.75"))
+    return "" if f == 0.5 else f"_ts{f:g}"
+
+
+def _savez_fast(path, **arrays):
+    """np.savez_compressed but zlib level 1: ~2.4x faster writes for ~6%
+    bigger tiles (measured on real tiles); np.load reads it unchanged."""
+    import io
+    import zipfile
+    import numpy as np
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
+        for name, a in arrays.items():
+            buf = io.BytesIO()
+            np.lib.format.write_array(buf, np.asanyarray(a))
+            zf.writestr(name + ".npy", buf.getvalue())
+
+
 @contextlib.contextmanager
 def npz_save_pool():
-    """`with npz_save_pool() as save:` -> save(path, **arrays) queues an
-    np.savez_compressed on a thread pool — zlib releases the GIL, so tile
+    """`with npz_save_pool() as save:` -> save(path, **arrays) queues a
+    _savez_fast on a thread pool — zlib releases the GIL, so tile
     writes scale with cores instead of serializing behind the tiling loop.
     Queue is bounded at 2x workers (backpressure: raw ptv3 tiles are ~10MB
     each and would otherwise pile up in RAM); worker exceptions surface on a
     later save() or at exit."""
-    import numpy as np
     from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
     workers = os.cpu_count() or 4
     ex = ThreadPoolExecutor(workers)
@@ -804,7 +859,7 @@ def npz_save_pool():
             done, pending = wait(pending, return_when=FIRST_COMPLETED)
             for f in done:
                 f.result()
-        pending.add(ex.submit(np.savez_compressed, path, **arrays))
+        pending.add(ex.submit(_savez_fast, path, **arrays))
 
     try:
         yield save
@@ -901,7 +956,9 @@ def kp_tile_and_save(name, pc_path, out_dir, chunk_xy, stride, grid, num_classes
 def kp_ensure_prep(prep_dir, ds_root, sig, tile_fn):
     """Idempotent prep for the KP twins: split folders read verbatim, cache
     signature validated (validate_cache), each un-.done scene tiled via
-    tile_fn(name, pc_path, out_dir). Returns (train, val, test) scene lists."""
+    tile_fn(name, pc_path, out_dir, split) — split so the caller can widen
+    the train stride (train_stride) while val/test keep the voting overlap.
+    Returns (train, val, test) scene lists."""
     print(f"  ensuring preprocessed cache -> {prep_dir}", flush=True)
     for split in ("train", "val", "test"):
         os.makedirs(f"{prep_dir}/{split}", exist_ok=True)
@@ -911,18 +968,18 @@ def kp_ensure_prep(prep_dir, ds_root, sig, tile_fn):
         [("train", train_list), ("val", val_list), ("test", test_list)],
         lambda d, name: (f"{d}/{name}_x*.npz", f"{d}/{name}.done"))]
 
-    def tile_remaining(items, out_dir):
+    def tile_remaining(items, out_dir, split):
         for name, pc_path, _cls in items:
             if os.path.exists(f"{out_dir}/{name}.done"):
                 continue
-            n = tile_fn(name, pc_path, out_dir)
+            n = tile_fn(name, pc_path, out_dir, split)
             if n is not None:          # None == load failed; leave unmarked to retry
                 open(f"{out_dir}/{name}.done", "w").close()
             any_new[0] = True
 
     for split, items in (("train", train_list), ("val", val_list), ("test", test_list)):
         print(f"  [{split}] {len(items)} scenes", flush=True)
-        tile_remaining(items, f"{prep_dir}/{split}")
+        tile_remaining(items, f"{prep_dir}/{split}", split)
     print("  preprocessing cache updated." if any_new[0]
           else "  all scenes already cached.", flush=True)
     return train_list, val_list, test_list
@@ -1003,10 +1060,10 @@ def kp_make_sample_tile(build_feat, grid, max_pts, aug_color,
 
 
 def kp_make_run_dir(variant):
-    """Fresh timestamped run dir: /outputs/runs/<utc>_<variant>."""
+    """Fresh timestamped run dir: <OUTPUTS_ROOT>/runs/<utc>_<variant>."""
     from datetime import datetime
     run_id = datetime.utcnow().strftime(f"%Y%m%d_%H%M%S_{variant}")
-    run_dir = f"/outputs/runs/{run_id}"
+    run_dir = f"{OUTPUTS_ROOT}/runs/{run_id}"
     os.makedirs(f"{run_dir}/checkpoints", exist_ok=True)
     return run_id, run_dir
 
@@ -1025,7 +1082,7 @@ def kp_find_latest_checkpoint(opt_type, feature_modes, arch_hash=None,
     def _ep(p):
         return int(os.path.basename(p)[2:5])   # ep149.pth -> 149
 
-    for rd in sorted(glob.glob("/outputs/runs/*"), reverse=True):
+    for rd in sorted(glob.glob(f"{OUTPUTS_ROOT}/runs/*"), reverse=True):
         ckpts = glob.glob(f"{rd}/checkpoints/ep*.pth")
         if not ckpts:
             continue
@@ -1182,6 +1239,8 @@ def kp_make_predict_points(forward_prob, build_feat, grid, chunk_xy,
         pred = np.full(len(xyz), -1, np.int64)
         conf = np.zeros(len(xyz), np.float32)
         probs = np.zeros((len(xyz), num_classes), np.float16) if save_probs else None
+        n_done = n_skipped = 0
+        last_err = None
         with torch.no_grad():
             for idx in xy_chunk_groups(xyz, chunk_xy, min_pts=64):
                 cols = [intensity_n[idx], ret_num[idx]]
@@ -1203,13 +1262,25 @@ def kp_make_predict_points(forward_prob, build_feat, grid, chunk_xy,
                     prob /= np.maximum(prob.sum(-1, keepdims=True), 1e-12)
                     prob = apply_class_mask(prob, exclude_idx)
                     sub_pred = prob.argmax(-1)
-                except Exception:
+                except Exception as ex:
+                    n_skipped += 1
+                    last_err = ex
                     continue
                 _, nn = cKDTree(sx).query(xyz[idx])
                 pred[idx] = sub_pred[nn]
                 conf[idx] = prob.max(-1)[nn]
                 if save_probs:
                     probs[idx] = prob[nn].astype(np.float16)
+                n_done += 1
+        if n_skipped:
+            print(f"  [infer] WARNING: {n_skipped} window(s) failed "
+                  f"(last error: {last_err})", flush=True)
+        if n_skipped and not n_done:
+            # every window the scene HAD errored — filling would ship a
+            # uniform, confidence-0 label map as if it were a prediction.
+            raise RuntimeError(
+                f"inference produced nothing: all {n_skipped} window(s) "
+                f"failed (last error: {last_err})")
         miss = pred < 0
         if miss.any() and (~miss).any():
             _, nn = cKDTree(xyz[~miss]).query(xyz[miss])
@@ -1353,6 +1424,26 @@ def ptv3_ensure_prep(prep_dir, ds_root, chunk_xy, stride, load_canonical):
     os.makedirs(f"{prep_dir}/val",   exist_ok=True)
     os.makedirs(f"{prep_dir}/test",  exist_ok=True)
     print(f"  ensuring preprocessed cache -> {prep_dir}", flush=True)
+    # PREP_DIR encodes color/feat/chunk/stride but NOT the class layout, and a
+    # dataset rebuilt under the same name keeps this folder — so stamp the
+    # signature (KP/RandLA's validate_cache) or reordered classes silently
+    # reuse tiles labeled in the OLD index space. Empty lists: ptv3 keeps its
+    # glob idempotency, there are no .done markers to migrate.
+    meta = {}
+    try:
+        with open(f"{ds_root}/dataset_meta.json") as f:
+            meta = json.load(f)
+    except (OSError, ValueError):
+        pass
+    sp = meta.get("split", {}) if isinstance(meta.get("split"), dict) else {}
+    validate_cache(prep_dir, {"pipeline": "ptv3",
+                              "chunk_xy": chunk_xy,
+                              "stride": stride,
+                              "train_stride": train_stride(chunk_xy),
+                              "num_classes": meta.get("num_classes"),
+                              "class_names": meta.get("class_names"),
+                              "split_seed": sp.get("seed"),
+                              "split_mode": sp.get("mode")}, [], None)
     any_new = [False]
     def already_tiled(out_dir, scene):
         return bool(glob.glob(f"{out_dir}/{scene}_x*.npz"))
@@ -1370,7 +1461,8 @@ def ptv3_ensure_prep(prep_dir, ds_root, chunk_xy, stride, load_canonical):
     if not train_paths:
         raise FileNotFoundError(f"No canonical scenes under {ds_root}/train")
     print(f"  [train] {len(train_paths)} canonical scenes", flush=True)
-    tile_remaining(train_paths, f"{prep_dir}/train", chunk_xy, stride)
+    tile_remaining(train_paths, f"{prep_dir}/train", chunk_xy,
+                   train_stride(chunk_xy))
     # stride (not chunk_xy) so val/test tiles overlap and the final
     # eval can vote per-voxel over the up-to-4 covering tiles.
     print(f"  [val] {len(val_paths)} canonical scenes", flush=True)
@@ -1435,19 +1527,41 @@ def ptv3_lr_at(ep, base_lr, warmup_pct, n_epochs):
     return float(0.5 * base_lr * (1.0 + np.cos(np.pi * prog)))
 
 
-def find_latest_unfinished_run(suffix):
+RESUME_RECIPE_KEYS = ("grid_size", "chunk_xy", "features", "n_epochs",
+                      "num_classes", "class_names")
+
+
+def find_latest_unfinished_run(suffix, cfg=None):
     """Latest UNFINISHED run dir ending in `suffix` with checkpoints (resume
     target). Runs marked DONE are skipped, so a completed experiment isn't
     re-resumed on the next launch — but a crashed/retried one is picked
-    straight back up. Returns (run_dir, ckpt_path, epoch) or None."""
+    straight back up. `cfg` is the fresh run's config dict: a candidate whose
+    run.json disagrees on RESUME_RECIPE_KEYS is skipped (kp_find_latest_
+    checkpoint's rule), so a resumed run never keeps publishing a run.json its
+    weights don't match — on mismatch the caller falls through to a fresh run
+    and writes a correct one. Returns (run_dir, ckpt_path, epoch) or None."""
     import glob
     def _ep(p):
         return int(os.path.basename(p)[2:5])
-    for rd in sorted(glob.glob("/outputs/runs/*"), reverse=True):
+    def _n(v):                      # run.json round-trips tuples as lists
+        return list(v) if isinstance(v, (list, tuple)) else v
+    for rd in sorted(glob.glob(f"{OUTPUTS_ROOT}/runs/*"), reverse=True):
         if not rd.endswith(suffix):
             continue
         if os.path.exists(f"{rd}/DONE"):
             continue
+        if cfg is not None:
+            try:
+                with open(f"{rd}/run.json") as f:
+                    rc = json.load(f)
+            except (OSError, ValueError):
+                rc = {}
+            bad = {k: rc.get(k) for k in RESUME_RECIPE_KEYS
+                   if _n(rc.get(k)) != _n(cfg.get(k))}
+            if bad:
+                print(f"  resume: skipping {os.path.basename(rd)} "
+                      f"(recipe mismatch: {bad})", flush=True)
+                continue
         ckpts = glob.glob(f"{rd}/checkpoints/ep*.pth")
         if ckpts:
             latest = max(ckpts, key=_ep)
@@ -1663,9 +1777,9 @@ def env_overrides(g, names):
 
 
 def load_dataset_meta(dataset):
-    """Load /datasets/<dataset>/dataset_meta.json.
+    """Load <dataset_dir>/dataset_meta.json.
     Returns (ds_meta, num_classes, class_names)."""
-    meta_path = f"/datasets/{dataset}/dataset_meta.json"
+    meta_path = f"{dataset_dir(dataset)}/dataset_meta.json"
     if not os.path.exists(meta_path):
         raise FileNotFoundError(f"{meta_path} not found — build the dataset "
                                 f"with the trainer_gui app first.")
@@ -1966,8 +2080,9 @@ def _demo():  # ponytail: one runnable check -- `python train_common.py`
                  label=rng.randint(0, 3, 4000).astype(np.int32))
     prep = os.path.join(ds, "prep")
     sig = {"pipeline": "demo", "grid": 2.0}
-    tile_fn = lambda name, pc, outd: kp_tile_and_save(
-        name, pc, outd, 30.0, 15.0, 2.0, 3)
+    tile_fn = lambda name, pc, outd, split: kp_tile_and_save(
+        name, pc, outd, 30.0,
+        train_stride(30.0) if split == "train" else 15.0, 2.0, 3)
     tr, va, te = kp_ensure_prep(prep, ds, sig, tile_fn)
     assert [n for n, _, _ in tr] == ["s0"] and os.path.exists(f"{prep}/train/s0.done")
     import glob as _glob
@@ -2031,6 +2146,16 @@ def _demo():  # ponytail: one runnable check -- `python train_common.py`
     zp = np.load(f"{ij}/predictions/s0_pred.npz")
     assert (zp["confidence"].dtype == np.float32
             and zp["probs"].dtype == np.float16 and zp["probs"].shape == (4000, 3))
+    assert "crs_wkt" not in zp.files                 # scene had none -> pred has none
+
+    # crs_wkt ferry: a scene npz carrying a CRS string lands it in the pred npz
+    np.savez(f"{ij}/c0.npz", xyz=z0["xyz"], intensity=z0["intensity"],
+             crs_wkt=np.asarray('PROJCS["demo"]'))
+    run_infer_scenes([f"{ij}/c0.npz"],
+                     lambda p: (z0["xyz"], pr, z0["intensity"], cf, None),
+                     f"{ij}/predictions", ij, {"backbone": "demo"})
+    with np.load(f"{ij}/predictions/c0_pred.npz") as zc:
+        assert str(zc["crs_wkt"]) == 'PROJCS["demo"]'
 
     # env_overrides: env wins over the module default, order preserved
     os.environ["LOSS_FOCAL_GAMMA"] = "3.5"

@@ -24,6 +24,7 @@ class Cloud:
     intensity: np.ndarray | None = None  # (N,) float32, raw (not normalized)
     return_number: np.ndarray | None = None
     fields: dict = field(default_factory=dict)  # name -> (N,) array, label candidates
+    crs_wkt: str | None = None           # source CRS as WKT2 (las/laz only today)
 
     @property
     def n(self) -> int:
@@ -57,6 +58,10 @@ def _read_las(path) -> Cloud:
 
     las = laspy.read(str(path))
     xyz = np.column_stack([las.x, las.y, las.z]).astype(np.float64)
+    try:        # GeoTIFF-key or WKT VLR -> pyproj CRS; malformed/absent -> None
+        crs = las.header.parse_crs()
+    except Exception:
+        crs = None
 
     dims = {d.name.lower() for d in las.point_format.dimensions}
     rgb = None
@@ -81,7 +86,8 @@ def _read_las(path) -> Cloud:
             continue
         if arr.ndim == 1 and np.issubdtype(arr.dtype, np.number):
             fields[d.name] = arr
-    return Cloud(xyz=xyz, rgb=rgb, intensity=intensity, return_number=ret, fields=fields)
+    return Cloud(xyz=xyz, rgb=rgb, intensity=intensity, return_number=ret, fields=fields,
+                 crs_wkt=crs.to_wkt() if crs is not None else None)
 
 
 # ---------------------------------------------------------------- ply

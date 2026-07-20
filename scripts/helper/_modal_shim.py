@@ -6,7 +6,7 @@ Lets each training script import and run with NO Modal account / network:
   * `@app.function(...)` / `@app.local_entrypoint()` -> return plain callables;
     `train_X.remote(**kw)` (and `__call__`) run the wrapped body **in-process**.
   * `Image.debian_slim().apt_install().pip_install()...` -> a *recorder*: every
-    builder call is captured (kind + payload) so gen_dockerfiles.py can emit a
+    builder call is captured (kind + payload) so tools/check_env_sync.py can diff a
     Dockerfile straight from the recipe the script already wrote.
 
 Activate before importing a train script:

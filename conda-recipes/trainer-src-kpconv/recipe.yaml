@@ -1,0 +1,52 @@
+# KPConv-PyTorch sources + compiled cpp_wrappers, pinned at the same SHA the
+# modal recipe clones. linux-64 (not noarch): ships cp311 pybind extensions.
+# The exts are torch-free plain C++/numpy, so variants key on python only.
+
+context:
+  sha: "d19c575d3fa9fcfd5a74845b5b27aac7e50472c7"
+
+package:
+  name: trainer-src-kpconv
+  version: "1.0.0"   # bump when the sha moves
+
+source:
+  git: https://github.com/HuguesTHOMAS/KPConv-PyTorch.git
+  rev: ${{ sha }}
+
+build:
+  number: 0
+  script: |
+    cd "$SRC_DIR/cpp_wrappers/cpp_subsampling" && $PYTHON setup.py build_ext --inplace
+    cd "$SRC_DIR/cpp_wrappers/cpp_neighbors" && $PYTHON setup.py build_ext --inplace
+    cd "$SRC_DIR"
+    touch cpp_wrappers/__init__.py cpp_wrappers/cpp_subsampling/__init__.py \
+          cpp_wrappers/cpp_neighbors/__init__.py
+    # pre-bake the kernel-point disposition cache (kernels/dispositions/) so
+    # first run doesn't pay the optimization. Fallback if upstream ever makes
+    # load_kernels import torch: drop this line, first run caches into the
+    # (writable) env prefix instead.
+    MPLBACKEND=Agg $PYTHON -c "from kernels.kernel_points import load_kernels; load_kernels(1.0, 15, dimension=3, fixed='center')"
+    mkdir -p "$PREFIX/opt/kpconv"
+    cp -r "$SRC_DIR"/. "$PREFIX/opt/kpconv/"
+    rm -rf "$PREFIX/opt/kpconv/.git"
+    mkdir -p "$PREFIX/etc/conda/activate.d"
+    printf 'export KPCONV_SRC="${CONDA_PREFIX}/opt/kpconv"\n' > "$PREFIX/etc/conda/activate.d/trainer-src-kpconv.sh"
+
+requirements:
+  build:
+    - ${{ compiler('cxx') }}
+  host:
+    - python 3.11.*
+    - setuptools
+    - numpy <2
+    - matplotlib-base   # kernel_points.py imports it (Agg, headless)
+  run:
+    - python 3.11.*
+  ignore_run_exports:
+    from_package:
+      - numpy   # the env supplies numpy<2 via pip; don't pin a conda numpy
+
+about:
+  repository: https://github.com/HuguesTHOMAS/KPConv-PyTorch
+  summary: KPConv-PyTorch sources + compiled cpp_wrappers at ${{ sha }}
+  license: MIT

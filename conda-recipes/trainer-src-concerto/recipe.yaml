@@ -1,0 +1,28 @@
+# Concerto model sources pinned at the same SHA the modal recipe clones.
+# Repo root holds the concerto/ package dir; CONCERTO_SRC goes on sys.path.
+
+context:
+  sha: "10a7d17cff4dddff028f1522c2e72de4c4515df7"
+
+package:
+  name: trainer-src-concerto
+  version: "1.0.0"   # bump when the sha moves
+
+source:
+  git: https://github.com/Pointcept/Concerto.git
+  rev: ${{ sha }}
+
+build:
+  number: 0
+  noarch: generic
+  script: |
+    mkdir -p "$PREFIX/opt/concerto"
+    cp -r "$SRC_DIR"/. "$PREFIX/opt/concerto/"
+    rm -rf "$PREFIX/opt/concerto/.git"
+    mkdir -p "$PREFIX/etc/conda/activate.d"
+    printf 'export CONCERTO_SRC="${CONDA_PREFIX}/opt/concerto"\n' > "$PREFIX/etc/conda/activate.d/trainer-src-concerto.sh"
+
+about:
+  repository: https://github.com/Pointcept/Concerto
+  summary: Concerto sources pinned at ${{ sha }} for the trainer-gui local backend
+  license: MIT

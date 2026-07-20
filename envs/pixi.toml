@@ -1,0 +1,326 @@
+# Per-architecture training environments (linux-64/CUDA only) — replaces docker/.
+#
+# One [feature.<key>] + one [environments] entry per backbone; environment names
+# equal Backbone.key so the GUI maps `pixi run -e <key>` with no lookup table.
+# Deps mirror each scripts/modal/modal_train_<key>.py recipe (the Modal source of
+# truth); tools/check_env_sync.py enforces the mirror.
+#
+# This is a SEPARATE workspace from the root pixi.toml on purpose: pixi locks all
+# environments of a workspace together, and the win-64 GUI solve must not drag in
+# seven linux-64 CUDA stacks.
+#
+# Model sources come from trainer-src-* conda packages (conda-recipes/), which
+# install to $PREFIX/opt/<pkg> and export <PKG>_SRC on activation. UNCOMMENT the
+# trainer-src-* dep in each feature (and the prefix.dev channel) after the first
+# `pixi run -e pkg build-src` + `upload` on the Linux box — see
+# conda-recipes/README.md.
+
+[workspace]
+name = "trainer-envs"
+channels = [
+    "conda-forge",
+    # "https://repo.prefix.dev/gcsgeospatial",   # uncomment once trainer-src-* are published
+]
+platforms = ["linux-64", "win-64"]   # win-64 exists ONLY for the pkg tooling env
+requires-pixi = ">=0.60"
+
+# ---------------------------------------------------------------- ptv3 --------
+# torch 2.1.0 + cu118 REQUIRED: spconv cu124's conv-backward is broken for
+# PTv3's 5x5x5 stem (see local_train_ptv3.py).
+
+[feature.ptv3]
+platforms = ["linux-64"]
+
+[feature.ptv3.system-requirements]
+cuda = "11.8"
+
+[feature.ptv3.dependencies]
+python = "3.11.*"
+# trainer-src-ptv3 = "*"
+
+[feature.ptv3.pypi-options]
+# Mirror of the modal recipe's pip call: --index-url cu118 --extra-index-url pypi
+index-url = "https://download.pytorch.org/whl/cu118"
+extra-index-urls = ["https://pypi.org/simple"]
+index-strategy = "unsafe-best-match"   # pip-like: +cuXXX pins only exist on the torch index
+find-links = [{ url = "https://data.pyg.org/whl/torch-2.1.0+cu118.html" }]
+no-build = true    # wheels only -> lockable from the Windows dev box
+
+[feature.ptv3.pypi-dependencies]
+torch = { version = "==2.1.0+cu118" }
+torchvision = { version = "==0.16.0+cu118" }
+numpy = "<2.0"
+scipy = "*"
+scikit-learn = "*"
+plyfile = "*"
+tqdm = "*"
+tensorboard = "*"
+addict = "*"
+einops = "*"
+timm = "*"
+pandas = "<3"
+spconv-cu118 = "*"
+torch-scatter = "*"
+torch-cluster = "*"
+
+[feature.ptv3.tasks]
+sanity = "python -c \"import os, sys, torch, spconv, torch_scatter; sys.path.insert(0, os.path.dirname(os.environ['PTV3_SRC'])); import ptv3; print('ptv3 env ok, torch', torch.__version__)\""
+
+# ---------------------------------------------------------- randlanet ---------
+# torch 2.2.2 + cu121; compiled knn/subsampling exts ship in trainer-src-randlanet.
+
+[feature.randlanet]
+platforms = ["linux-64"]
+
+[feature.randlanet.system-requirements]
+cuda = "12.1"
+
+[feature.randlanet.dependencies]
+python = "3.11.*"
+# trainer-src-randlanet = "*"
+
+[feature.randlanet.pypi-options]
+index-url = "https://download.pytorch.org/whl/cu121"
+extra-index-urls = ["https://pypi.org/simple"]
+index-strategy = "unsafe-best-match"   # pip-like: +cuXXX pins only exist on the torch index
+no-build = true
+
+[feature.randlanet.pypi-dependencies]
+torch = { version = "==2.2.2+cu121" }
+torchvision = { version = "==0.17.2+cu121" }
+numpy = "<2.0"
+scipy = "*"
+scikit-learn = "*"
+tqdm = "*"
+tensorboard = "*"
+pyyaml = "*"
+matplotlib = "*"
+cython = "*"
+pandas = "<3"
+
+[feature.randlanet.tasks]
+sanity = "python -c \"import os, sys, torch; sys.path.insert(0, os.environ['RANDLANET_SRC']); from utils.data_process import DataProcessing; print('randlanet env ok, torch', torch.__version__)\""
+
+# ------------------------------------------------------------- kpconv ---------
+# torch 2.3.0 + cu121; compiled cpp_wrappers + kernel cache ship in trainer-src-kpconv.
+
+[feature.kpconv]
+platforms = ["linux-64"]
+
+[feature.kpconv.system-requirements]
+cuda = "12.1"
+
+[feature.kpconv.dependencies]
+python = "3.11.*"
+# trainer-src-kpconv = "*"
+
+[feature.kpconv.activation.env]
+MPLBACKEND = "Agg"   # headless matplotlib (kernel_points.py imports it)
+
+[feature.kpconv.pypi-options]
+index-url = "https://download.pytorch.org/whl/cu121"
+extra-index-urls = ["https://pypi.org/simple"]
+index-strategy = "unsafe-best-match"   # pip-like: +cuXXX pins only exist on the torch index
+no-build = true
+
+[feature.kpconv.pypi-dependencies]
+torch = { version = "==2.3.0+cu121" }
+torchvision = { version = "==0.18.0+cu121" }
+numpy = "<2.0"
+scipy = "*"
+scikit-learn = "*"
+matplotlib = "*"
+tqdm = "*"
+tensorboard = "*"
+pandas = "<3"
+
+[feature.kpconv.tasks]
+sanity = "python -c \"import os, sys, torch; sys.path.insert(0, os.environ['KPCONV_SRC']); import cpp_wrappers.cpp_subsampling.grid_subsampling; print('kpconv env ok, torch', torch.__version__)\""
+
+# ------------------------------------------------------- kpconvx-cold ---------
+# torch 2.3.0 + cu121 + pykeops. pykeops JIT-compiles CUDA kernels at runtime,
+# so this env carries nvcc + a host C++ compiler (the GPU box needs only the
+# NVIDIA driver).
+
+[feature.kpconvx-cold]
+platforms = ["linux-64"]
+
+[feature.kpconvx-cold.system-requirements]
+cuda = "12.1"
+
+[feature.kpconvx-cold.dependencies]
+python = "3.11.*"
+cuda-nvcc = "12.1.*"
+cuda-cudart-dev = "12.1.*"
+cuda-nvrtc-dev = "12.1.*"
+cuda-version = "12.1.*"
+cxx-compiler = "*"
+# trainer-src-kpconvx = "*"
+
+[feature.kpconvx-cold.pypi-options]
+index-url = "https://download.pytorch.org/whl/cu121"
+extra-index-urls = ["https://pypi.org/simple"]
+index-strategy = "unsafe-best-match"   # pip-like: +cuXXX pins only exist on the torch index
+# no-build stays OFF here: pykeops ships only an sdist (pure python; its CUDA
+# kernels JIT at runtime), so the solver must be allowed to read sdist metadata.
+
+[feature.kpconvx-cold.pypi-dependencies]
+torch = { version = "==2.3.0+cu121" }
+torchvision = { version = "==0.18.0+cu121" }
+numpy = "<2.0"
+scipy = "*"
+scikit-learn = "*"
+easydict = "*"
+h5py = "*"
+matplotlib = "*"
+timm = "*"
+pykeops = "*"
+tqdm = "*"
+tensorboard = "*"
+pandas = "<3"
+
+[feature.kpconvx-cold.tasks]
+sanity = "python -c \"import os, sys, torch, pykeops; sys.path.insert(0, os.environ['KPCONVX_SRC']); import cpp_wrappers.cpp_subsampling.grid_subsampling; print('kpconvx env ok, torch', torch.__version__)\""
+
+# --------------------------------------------- concerto / sonata / utonia -----
+# The pcssl encoder family: identical dep stacks (torch 2.5.0 + cu124 + spconv
+# + torch-scatter + huggingface_hub), differing only in the trainer-src package.
+
+[feature.concerto]
+platforms = ["linux-64"]
+
+[feature.concerto.system-requirements]
+cuda = "12.4"
+
+[feature.concerto.dependencies]
+python = "3.11.*"
+# trainer-src-concerto = "*"
+
+[feature.concerto.pypi-options]
+index-url = "https://download.pytorch.org/whl/cu124"
+extra-index-urls = ["https://pypi.org/simple"]
+index-strategy = "unsafe-best-match"   # pip-like: +cuXXX pins only exist on the torch index
+find-links = [{ url = "https://data.pyg.org/whl/torch-2.5.0+cu124.html" }]
+no-build = true
+
+[feature.concerto.pypi-dependencies]
+torch = { version = "==2.5.0+cu124" }
+torchvision = { version = "==0.20.0+cu124" }
+numpy = "<2.0"
+scipy = "*"
+scikit-learn = "*"
+plyfile = "*"
+tqdm = "*"
+tensorboard = "*"
+addict = "*"
+einops = "*"
+timm = "*"
+pandas = "<3"
+huggingface-hub = "*"
+packaging = "*"
+spconv-cu124 = "*"
+torch-scatter = "*"
+
+[feature.concerto.tasks]
+sanity = "python -c \"import os, sys, torch, spconv, torch_scatter, huggingface_hub; sys.path.insert(0, os.environ['CONCERTO_SRC']); import concerto; print('concerto env ok, torch', torch.__version__)\""
+
+[feature.sonata]
+platforms = ["linux-64"]
+
+[feature.sonata.system-requirements]
+cuda = "12.4"
+
+[feature.sonata.dependencies]
+python = "3.11.*"
+# trainer-src-sonata = "*"
+
+[feature.sonata.pypi-options]
+index-url = "https://download.pytorch.org/whl/cu124"
+extra-index-urls = ["https://pypi.org/simple"]
+index-strategy = "unsafe-best-match"   # pip-like: +cuXXX pins only exist on the torch index
+find-links = [{ url = "https://data.pyg.org/whl/torch-2.5.0+cu124.html" }]
+no-build = true
+
+[feature.sonata.pypi-dependencies]
+torch = { version = "==2.5.0+cu124" }
+torchvision = { version = "==0.20.0+cu124" }
+numpy = "<2.0"
+scipy = "*"
+scikit-learn = "*"
+plyfile = "*"
+tqdm = "*"
+tensorboard = "*"
+addict = "*"
+einops = "*"
+timm = "*"
+pandas = "<3"
+huggingface-hub = "*"
+packaging = "*"
+spconv-cu124 = "*"
+torch-scatter = "*"
+
+[feature.sonata.tasks]
+sanity = "python -c \"import os, sys, torch, spconv, torch_scatter, huggingface_hub; sys.path.insert(0, os.environ['SONATA_SRC']); import sonata; print('sonata env ok, torch', torch.__version__)\""
+
+[feature.utonia]
+platforms = ["linux-64"]
+
+[feature.utonia.system-requirements]
+cuda = "12.4"
+
+[feature.utonia.dependencies]
+python = "3.11.*"
+# trainer-src-utonia = "*"
+
+[feature.utonia.pypi-options]
+index-url = "https://download.pytorch.org/whl/cu124"
+extra-index-urls = ["https://pypi.org/simple"]
+index-strategy = "unsafe-best-match"   # pip-like: +cuXXX pins only exist on the torch index
+find-links = [{ url = "https://data.pyg.org/whl/torch-2.5.0+cu124.html" }]
+no-build = true
+
+[feature.utonia.pypi-dependencies]
+torch = { version = "==2.5.0+cu124" }
+torchvision = { version = "==0.20.0+cu124" }
+numpy = "<2.0"
+scipy = "*"
+scikit-learn = "*"
+plyfile = "*"
+tqdm = "*"
+tensorboard = "*"
+addict = "*"
+einops = "*"
+timm = "*"
+pandas = "<3"
+huggingface-hub = "*"
+packaging = "*"
+spconv-cu124 = "*"
+torch-scatter = "*"
+
+[feature.utonia.tasks]
+sanity = "python -c \"import os, sys, torch, spconv, torch_scatter, huggingface_hub; sys.path.insert(0, os.environ['UTONIA_SRC']); import utonia; print('utonia env ok, torch', torch.__version__)\""
+
+# ------------------------------------------------------------ pkg tooling -----
+# Packaging env (both platforms): builds the trainer-src-* source packages and
+# trainer-weights-* checkpoint packages with rattler-build, and uploads them.
+# TT_PREFIX_CHANNEL overrides the destination channel (default gcsgeospatial).
+
+[feature.pkg.dependencies]
+rattler-build = ">=0.40"
+python = "3.11.*"
+
+# task cwd defaults to this manifest's dir (envs/), hence the ../ paths
+[feature.pkg.tasks]
+build-src = "rattler-build build --recipe-dir ../conda-recipes -c conda-forge --output-dir ../conda-recipes/output"
+package-weights = "python ../tools/package_weights.py"
+upload = "rattler-build upload prefix -c ${TT_PREFIX_CHANNEL:-gcsgeospatial} ../conda-recipes/output/**/*.conda"
+
+[environments]
+ptv3 = { features = ["ptv3"], no-default-feature = true }
+randlanet = { features = ["randlanet"], no-default-feature = true }
+kpconv = { features = ["kpconv"], no-default-feature = true }
+kpconvx-cold = { features = ["kpconvx-cold"], no-default-feature = true }
+concerto = { features = ["concerto"], no-default-feature = true }
+sonata = { features = ["sonata"], no-default-feature = true }
+utonia = { features = ["utonia"], no-default-feature = true }
+pkg = { features = ["pkg"], no-default-feature = true }

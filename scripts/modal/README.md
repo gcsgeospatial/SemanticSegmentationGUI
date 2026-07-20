@@ -15,10 +15,11 @@ Pointcept/PointTransformerV3, RandLA-Net = tsunghan-wu/RandLA-Net-pytorch,
 KPConvX = apple/ml-kpconvx `Standalone/KPConvX`), each at a fixed commit SHA in
 the image recipe — so images build identically on any machine, with no local
 model checkouts. Bump a SHA deliberately; it is the architecture version. After
-editing any image recipe, re-run `python tools/gen_dockerfiles.py` so the local
-Dockerfiles follow.
+editing any image recipe, mirror the change in `envs/pixi.toml` and the
+matching `conda-recipes/trainer-src-*` recipe — `python tools/check_env_sync.py`
+(run by the smoke test) fails until they agree.
 
-Contracts (mirroring the local Docker path):
+Contracts (mirroring the local pixi path):
 
 - datasets: the single `terminal-datasets` volume (override: `TT_DATASET_VOLUME`)
   mounted at `/datasets`, one dataset per `/<name>` — the Datasets page uploads

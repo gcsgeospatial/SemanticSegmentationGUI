@@ -4,7 +4,7 @@ Desktop GUI (PySide6) for training and running point-cloud semantic-segmentation
 models. Bring a folder of point clouds, pick a model, train it, run inference,
 view the predicted cloud — all in one window.
 
-Two execution backends: **Local (Docker)** and **Modal (cloud)** — switched in
+Two execution backends: **Local (pixi)** and **Modal (cloud)** — switched in
 the sidebar. Both run the same `scripts/local/` trainers (the Modal shells
 subprocess them on a cloud GPU; see `scripts/modal/README.md`). Everything
 below is the local path.
@@ -15,12 +15,12 @@ below is the local path.
 cd trainer_gui
 pixi install     # one-time: builds .pixi env (python 3.11 + open3d + pdal + qt)
 pixi run gui     # launch
-pixi run test    # smoke checks, no Docker/Modal needed
+pixi run test    # smoke checks, no GPU/Modal needed
 ```
 
 Python is pinned to 3.11 (Open3D has no 3.13 wheels). [pixi](https://pixi.sh)
 does the rest on win-64 and linux-64. In the sidebar, set **Execution backend →
-Local (Docker)**.
+Local (pixi)**.
 
 <details><summary>pip alternative (Python 3.10–3.12)</summary>
 
@@ -33,28 +33,28 @@ trainer-gui        # or: python -m trainer_gui
 
 ## How it runs training/inference
 
-The GUI never trains in-process. It builds a `docker run` command and executes
-it. One Docker image per model, each with the CUDA stack + model source **baked
-in** — the image is self-contained.
+The GUI never trains in-process. Locally it runs each trainer inside a
+per-model **pixi environment** (`envs/pixi.toml` — one env per backbone, all
+CUDA/torch deps + the pinned model sources as `trainer-src-*` conda packages):
 
 ```
-docker run --rm --gpus all --ipc=host -w /workspace \
-  -v <repo>:/workspace  -v <staging>:/datasets  -v <output>:/outputs \
-  trainer-local-<model>  python scripts/local/local_train_<model>.py --flags...
+pixi run --manifest-path envs/pixi.toml --locked -e <model> \
+  python scripts/local/local_train_<model>.py --flags...
 ```
 
-Three host dirs are bind-mounted; nothing is uploaded or downloaded — inputs are
-already on the host, and checkpoints/predictions land straight back in `/outputs`:
+No container, no mounts: the GUI passes host dirs via env vars (the
+`train_common` path contract; unset = the fixed container paths Modal uses):
 
-| Mount | Host dir | Holds |
+| Env var | Host dir | Holds |
 |---|---|---|
-| `/workspace` | repo root | the `scripts/local/*.py` that run |
-| `/datasets` | staging root | canonical datasets + `_infer/<job>` inputs |
-| `/outputs` | your chosen folder | `runs/<id>/` weights + predictions |
+| `TT_DATASETS_ROOT` | staging root | canonical datasets + `_infer/<job>` inputs |
+| `TT_OUTPUTS_ROOT` | your chosen folder | `runs/<id>/` weights + predictions |
+| `TT_DATASET_DIR` / `TT_INFER_DIR` / `TT_PRED_DIR` | overrides | out-of-workspace datasets / infer jobs |
+| `TT_TRAIN_STRIDE` | — | train-tile stride as a fraction of chunk_xy (default 0.75; 0.5 = legacy 4× overlap, 1.0 = none). Val/test always keep chunk/2 for eval voting. Changing it re-tiles into a fresh `_ts*` prep dir. |
 
-Code lives in `trainer_gui/local_cli.py`. **No Docker on PATH → the GUI prints
-the exact command instead of running it** (dry-run — this dev box is Intel Arc,
-no CUDA).
+Code lives in `trainer_gui/local_cli.py`. **No pixi on PATH (or not a
+Linux/CUDA host) → the GUI prints the exact command instead of running it**
+(dry-run — this dev box is Intel Arc, no CUDA).
 
 ## The scripts
 
@@ -64,37 +64,37 @@ scripts/local/    the real trainers/inferencers — plain argparse, no modal.
 scripts/modal/    thin shells that bake the local twin into a modal.Image
                   and subprocess it in the cloud (train_common.modal_shell_run).
 scripts/helper/   train_common.py (shared training/manifest logic),
-                  density.py, _modal_shim.py (used only by gen_dockerfiles.py)
+                  density.py, _modal_shim.py (used by tools/check_env_sync.py)
 ```
 
 Each `local_train_<model>.py` takes the same kebab-case flags the GUI fills in
 (`--dataset --grid --epochs --batch ...`) and one `--mode infer` path.
 
-## The Docker images
+## The pixi environments & conda packages
 
-One image per model, generated — never hand-write a Dockerfile:
-
-```bash
-python tools/gen_dockerfiles.py          # regenerate docker/*.Dockerfile + build/pull/push scripts
-                                          # RE-RUN after editing any script's image recipe
-bash docker/build_all.sh                  # build — works on any machine with Docker + Buildx
-```
-
-Model sources are **git-cloned at pinned SHAs during the build** — no local
-model checkouts and no GPU needed at build time (an NVIDIA GPU is still
-required at **run** time; the images are CUDA-based). Every other machine just
-needs the built image.
-
-**Distribute build-once-run-anywhere:**
+One pixi environment per model in `envs/pixi.toml` (env name = backbone key,
+`_` → `-`), locked in `envs/pixi.lock` — solvable from any OS, installable on
+the Linux GPU box:
 
 ```bash
-TT_REGISTRY=ghcr.io/<you> bash docker/push_all.sh   # build machine
-TT_REGISTRY=ghcr.io/<you> bash docker/pull_all.sh   # any other machine
+pixi install --manifest-path envs/pixi.toml -e <model>    # or the GUI's Install button
+pixi run --manifest-path envs/pixi.toml -e <model> sanity # import check
 ```
 
-Set `TT_REGISTRY` (or `local_config["registry"]` in the app state JSON) before
-launching and `docker run` auto-pulls missing images. Registry = the images;
-use Hugging Face / S3 for the `.pth` weights. Full details: `docker/README.md`.
+Model sources are **conda packages** (`conda-recipes/trainer-src-*`, pinned
+upstream SHAs, C++ extensions prebuilt) on a public prefix.dev channel — users
+need zero auth. Trained checkpoints ship the same way:
+
+```bash
+pixi run --manifest-path envs/pixi.toml -e pkg package-weights <run_dir>
+pixi run --manifest-path envs/pixi.toml -e pkg upload
+```
+
+and installed `trainer-weights-*` packages show up in the Infer page's
+**Installed…** picker. The modal recipes stay the dependency source of truth —
+`tools/check_env_sync.py` (run by the smoke test) fails on any drift between
+them, `envs/pixi.toml`, and the recipe SHAs. Full details:
+`conda-recipes/README.md`.
 
 ## Models
 
@@ -159,15 +159,15 @@ ready to pick on the Train page.
 Writes `/outputs/runs/<id>/` (weights + logs + `run.json`).
 
 - Pick the **Dataset** (the status line confirms *✓ train/val/test standard met*)
-  and a **Model**. **Configure model…** opens a popup showing that model's Docker
-  image status, a **Pull** button, and the registry field.
+  and a **Model**. **Configure model…** opens a popup showing that model's pixi
+  env status and an **Install / update env** button.
 - **Parameters** are pre-filled from the density analysis (**★** = recommended) —
   grid/sub-grid, epochs, batch, steps/epoch, tile size. All editable.
 - **Smoke run** (2 epochs × 50 steps) validates a new dataset end-to-end fast.
 - Optional: per-run **Domain generalization** (train robust to a different
   inference density) and **Loss & class balance** knobs.
-- Set the **Output folder** (bound to `/outputs`), hit **Launch training**. The
-  exact `docker run` is echoed to the log; then logs stream live and per-epoch
+- Set the **Output folder** (becomes `TT_OUTPUTS_ROOT`), hit **Launch training**.
+  The exact `pixi run` is echoed to the log; then logs stream live and per-epoch
   **Loss / Acc / mIoU** fill the metrics table. **Stop process** kills it.
 
 On finish, each run dir has the weights and a **`run.json`** — the single file
@@ -188,9 +188,10 @@ Reads a run's `run.json` + weights, writes predictions to a host folder.
   clouds already carry a ground classification, else ground is detected. Optional label-free
   **density adapt (AdaBN)** / **density TTA** for inference at a different density
   than training. Set the **Output folder** for predictions.
-- **Run inference** converts the input to canonical scenes, then `docker run
-  --mode infer` with the scenes bind-mounted and predictions written straight to
-  your output folder (no upload/download).
+- **Run inference** converts the input to canonical scenes, then `pixi run …
+  --mode infer` with scenes and predictions pointed at your host folders via
+  the TT_* env (no upload/download). **Installed…** lists weights that came in
+  as `trainer-weights-*` conda packages.
 - View results in place: **View a point cloud…**, **Compare to ground truth…**
   (prints accuracy + per-class mIoU, paints mismatches), **Export comparison
   PLY…**, and **Class colours & names…** to set the legend.
@@ -223,11 +224,12 @@ and never re-split.
 
 ```
 trainer_gui/     the PySide6 app (pip/pixi package) — pages/, local_cli.py, ...
-scripts/local/   the real trainers/inferencers (run in Docker)
+scripts/local/   the real trainers/inferencers (run in per-model pixi envs)
 scripts/modal/   thin shells (see its README.md)
 scripts/helper/  train_common.py, density.py, _modal_shim.py
-docker/          generated Dockerfiles + build/pull/push scripts
-tools/           gen_dockerfiles.py
+envs/            pixi.toml + pixi.lock — one training env per backbone
+conda-recipes/   trainer-src-* recipes + README (rattler-build / prefix.dev)
+tools/           check_env_sync.py (modal↔pixi drift), package_weights.py
 ```
 
 ## Tests

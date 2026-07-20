@@ -2,7 +2,7 @@
 
 Stages (one JobRunner):
   Modal: convert -> upload scenes -> [upload weights] -> run -> download.
-  Local: convert -> docker run (scenes mounted, predictions to host).
+  Local: convert -> pixi run (TT_* env points scenes + predictions at host dirs).
 """
 
 from __future__ import annotations
@@ -15,9 +15,10 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QCursor
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout,
                                QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget,
-                               QListWidgetItem, QPushButton, QRadioButton,
+                               QListWidgetItem, QMenu, QPushButton, QRadioButton,
                                QVBoxLayout, QWidget)
 
 from .. import analysis, appstate, dataset, local_cli, modal_cli, plots, pretrain, ui
@@ -127,6 +128,11 @@ class InferPage(QWidget):
         pth_btn = QPushButton("Browse…")
         pth_btn.clicked.connect(self._pick_pth)
         pth_row.addWidget(pth_btn)
+        inst_btn = QPushButton("Installed…")
+        inst_btn.setToolTip("Weights installed as trainer-weights-* conda packages "
+                            "in this model's pixi env")
+        inst_btn.clicked.connect(self._pick_installed_weights)
+        pth_row.addWidget(inst_btn)
         self.pth_row_w = ui.wrap(pth_row)
         wf.addRow("File", self.pth_row_w)
         # Folded manifest echo: while a run manifest is applied, the locked
@@ -376,11 +382,11 @@ class InferPage(QWidget):
 
     def apply_exec_mode(self, local: bool):
         """Reword copy for the backend, apply the local backbone filter."""
-        if local and self._manifest and self._manifest_path is None:
-            self._invalidate_manifest()   # a modal-fetched config doesn't apply locally
+        if self._manifest:
+            self._invalidate_manifest()   # a run's config doesn't survive a backend switch
         self.sub.setText(
             "Label point clouds with a trained model. "
-            + ("Pick a run.json (or a local .pth), a folder of clouds, and run in Docker."
+            + ("Pick a run.json (or a local .pth), a folder of clouds, and run locally."
                if local else
                "Pick a run (or a local .pth), a folder of clouds, and run on Modal."))
         # ponytail: ensemble ships local-only — modal would need a per-member
@@ -858,8 +864,13 @@ class InferPage(QWidget):
 
     def _sync_controls(self):
         """Auto-fill grid + tile from the backbone's defaults; disable tile for RandLA."""
-        if self.backbone_combo.currentData() is None: 
+        if self.backbone_combo.currentData() is None:
             return
+        if self._manifest is not None and self.from_run_radio.isChecked():
+            return   # the run's grid/tile are authoritative (and folded into the
+                     # summary line) — defaults here would silently undercut them.
+                     # Safe on load: _apply_manifest_fields sets the combo BEFORE
+                     # assigning self._manifest, so the defaults still get applied.
         b = self._backbone()
         gp = next((p for p in b.params if p.recommend_key == "grid"), None)
         if gp:
@@ -877,6 +888,22 @@ class InferPage(QWidget):
                                               "PyTorch checkpoints (*.pth *.pt)")
         if path:
             self.pth_edit.setText(path)
+
+    def _pick_installed_weights(self):
+        """Menu of trainer-weights-* conda packages installed in the selected
+        backbone's pixi env; picking one fills the .pth path like Browse…"""
+        b = self._backbone()
+        items = local_cli.installed_weights(b, self.repo_root) if b else []
+        if not items:
+            self._append("[local] no trainer-weights-* packages installed"
+                         + (f" in the '{local_cli.env_name(b)}' env" if b else "")
+                         + " — add one with `pixi add`, or use Browse…")
+            return
+        menu = QMenu(self)
+        for name, path in items:
+            menu.addAction(name, lambda p=path: (self.from_file_radio.setChecked(True),
+                                                 self.pth_edit.setText(p)))
+        menu.exec(QCursor.pos())
 
     def _pick_input(self):
         d = QFileDialog.getExistingDirectory(self, "Folder of point clouds to label")
@@ -1455,33 +1482,29 @@ class InferPage(QWidget):
         self.runner.start(prog, args, cwd=self.repo_root)
 
     def _start_local_infer(self, member: dict | None = None):
-        """Local Docker inference: scenes bind-mounted, predictions to host. No
+        """Local pixi inference: the trainer reads the staged scenes and writes
+        predictions straight to host dirs via the TT_* env contract. No
         up/download. `member` (an ensemble member dict) overrides the UI-derived
         backbone/weights/grid and lands predictions in its own _m<k> dir."""
         b = BACKBONES[member["backbone"]] if member else self._backbone()
-        # Scenes (and where predictions get written) are self._staged on the host.
-        extra_mounts = [(str(self._staged), f"/datasets/_infer/{self._job_id}")]
         # Predictions: <workspace>/inference/<run_tag>/predictions_<job> (same
-        # spot as the Modal download), mounted over the container's predictions
-        # dir — grouped per model so a run's outputs live together.
+        # spot as the Modal download), via TT_PRED_DIR — grouped per model so a
+        # run's outputs live together. Scenes come from self._staged
+        # (TT_INFER_DIR).
         suffix = f"_m{self._ens_idx + 1}" if member else ""
         self._pred_dir = (appstate.workspace_dir() / "inference"
                           / self._weights_run_tag(member)
                           / f"predictions_{self._job_id}{suffix}")
         self._pred_dir.mkdir(parents=True, exist_ok=True)
-        extra_mounts.append(
-            (str(self._pred_dir), f"/datasets/_infer/{self._job_id}/predictions"))
-        # Weights: the picked .pth or run.json's sibling; mount its dir.
+        # Weights: the picked .pth or run.json's sibling — passed absolute.
         if member:
             wpath = Path(member["weights"])
         else:
             wpath = Path(self.pth_edit.text().strip()) \
                 if self.from_file_radio.isChecked() else self._resolved_weights()
-        extra_mounts.append((str(wpath.parent), "/outputs/_local_weights"))
-        weights = f"_local_weights/{wpath.name}"
         flags = {
             "mode": "infer",
-            "weights": weights,
+            "weights": str(wpath),
             "infer-input": self._job_id,
             b.grid_flag: member["grid"] if member else self.grid_spin.value(),
         }
@@ -1491,13 +1514,14 @@ class InferPage(QWidget):
         if member:
             env["TT_SAVE_PROBS"] = "1"   # the soft vote averages the saved dists
         self._stage = "run_local"
-        prog, args = local_cli.run_script(b.script, flags, b, repo_root=self.repo_root,
-                                          extra_mounts=extra_mounts, env=env)
-        self._append(f"[local] Running inference in Docker ({b.label})…")
-        self._append(f"[local] $ {local_cli.preview(prog, args)}\n")
-        if not local_cli.have_docker():
-            self._append("[local] docker not found on PATH; printed the command only. "
-                         "On a Docker+GPU host predictions land in "
+        prog, args, run_env = local_cli.run_script(
+            b.script, flags, b, repo_root=self.repo_root,
+            infer_dir=str(self._staged), pred_dir=str(self._pred_dir), env=env)
+        self._append(f"[local] Running inference in the pixi env ({b.label})…")
+        self._append(f"[local] $ {local_cli.preview(prog, args, run_env)}\n")
+        if not local_cli.runnable():
+            self._append("[local] pixi not found (or not a Linux/CUDA host); printed "
+                         "the command only. On the GPU box predictions land in "
                          f"{self._pred_dir.as_posix()}.")
             self._ens_running = False
             self.run_btn.setEnabled(True)
@@ -1509,17 +1533,17 @@ class InferPage(QWidget):
             self._ens_running = False
             self.run_btn.setEnabled(True)
             return
-        ok, msg = local_cli.image_preflight(b)
+        ok, msg = local_cli.env_preflight(b, self.repo_root)
         if msg:
             self._append(msg)
         if not ok:
             self._ens_running = False
             self.run_btn.setEnabled(True)
             return
-        self.runner.start(prog, args, cwd=self.repo_root)
+        self.runner.start(prog, args, cwd=self.repo_root, extra_env=run_env)
 
     def _on_output(self, text: str):
-        # Local Docker logs print container bind-mount paths (/datasets/_infer/<job>/…)
+        # Legacy container-style paths (/datasets/_infer/<job>/…) in trainer logs
         # that mean nothing on the host; show the real output folder the files land in.
         disp = (_localize_paths(text, self._job_id, self._pred_dir, self._staged)
                 if self._stage == "run_local" else text)
@@ -1634,7 +1658,9 @@ def _vote_members(member_dirs: list, out_dir: str, progress=None):
                     continue
                 slim = {k: z[k] for k in z.files if k != "probs"}
             np.savez(p, **slim)
-    say("  (dropped the per-member probs payloads; classification npz kept)")
+    say("  (dropped the per-member probs payloads; classification npz kept — "
+        "re-running ensemble_vote.py over these dirs will HARD-vote, which can "
+        "give different labels than the soft vote above)")
     return Path(out_dir)
 
 
@@ -1657,8 +1683,8 @@ def _scene_channel_report(staged,
     trainers read. The scene npz IS the model's input (fixed contract), so what's
     in it is exactly what inference sees. `features` is the run's ordered spec
     (run.json "features"): x/y/z/height cost nothing (xyz always present),
-    intensity / return_number missing = zeros + a warning (the trainers'
-    scene_arrays fallback), rgb / feat_* (incl. feat_hag) are HARD
+    intensity / return_number missing = constant filler + a warning (the
+    trainers' own fallback), rgb / feat_* (incl. feat_hag) are HARD
     requirements -> blocking=True names which scenes lack what. None = legacy
     behavior (xyz + intensity), never blocking."""
     import numpy as np
@@ -1687,8 +1713,9 @@ def _scene_channel_report(staged,
              f"is exactly what the model reads."]
     if want_i and missing_i:
         lines.append(f"⚠ no intensity channel in: {', '.join(missing_i)} — the source "
-                     f"file(s) had no intensity field. Models trained with intensity "
-                     f"see zeros here and accuracy will suffer.")
+                     f"file(s) had no intensity field. The trainer substitutes a "
+                     f"constant filler, so models trained with real intensity see "
+                     f"an unfamiliar value and accuracy will suffer.")
     elif want_i:
         # ponytail: value sanity from scene 0 only — full scan if this ever misleads
         with np.load(scenes[0]) as z:

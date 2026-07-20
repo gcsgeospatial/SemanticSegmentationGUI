@@ -37,11 +37,23 @@ import numpy as np
 REPO_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
 
 
-def soft_vote(probs):
+def soft_vote(probs, labels=None):
     """probs: (M, N, C) normalized distributions, one per model. Returns
-    ((N,) argmax labels, (N,) f32 confidence = max of the averaged distribution)."""
-    p = np.asarray(probs, np.float32).mean(0)
-    return p.argmax(1), p.max(1).astype(np.float32)
+    ((N,) argmax labels, (N,) f32 confidence = max of the averaged distribution).
+    A model that never covered a point leaves an all-zero row there (predict_points
+    NN-fills the label only), so average over the COVERING models, not over M —
+    otherwise a lone member's 0.99 is diluted to 0.33 and the export threshold
+    rewrites the point to Unclassified. Points no model covered have no
+    distribution at all; they fall back to a plain vote over `labels`."""
+    probs = np.asarray(probs, np.float32)
+    cov = (probs.sum(-1) > 0).sum(0)                  # (N,) models that saw each point
+    p = probs.sum(0) / np.maximum(cov, 1)[:, None]
+    lab, conf = p.argmax(1), p.max(1).astype(np.float32)
+    miss = cov == 0
+    if labels is not None and miss.any():
+        labels = np.asarray(labels)[:, miss]
+        lab[miss], conf[miss] = weighted_vote(labels, np.ones(labels.shape, np.float32))
+    return lab, conf
 
 
 def weighted_vote(labels, weights):
@@ -76,7 +88,9 @@ def load_pred(path):
     through the GUI's readers (probs never survive an export — npz only)."""
     if path.endswith(".npz"):
         z = np.load(path)
-        return (z["xyz"].astype(np.float32), z["classification"].astype(np.int64),
+        # xyz float64: preds carry georeferenced (UTM ~1e6) coords — a float32
+        # cast quantizes the voted deliverable's northing to 0.5 m steps.
+        return (z["xyz"].astype(np.float64), z["classification"].astype(np.int64),
                 z["intensity"] if "intensity" in z.files else None,
                 z["confidence"].astype(np.float32) if "confidence" in z.files else None,
                 z["probs"].astype(np.float32) if "probs" in z.files else None)
@@ -89,17 +103,19 @@ def load_pred(path):
     if lab is None:
         raise ValueError(f"{path}: no 'classification' field (has {list(c.fields)})")
     conf = c.fields.get("confidence")
-    return (c.xyz.astype(np.float32), np.asarray(lab, np.int64), c.intensity,
+    return (c.xyz.astype(np.float64), np.asarray(lab, np.int64), c.intensity,
             np.asarray(conf, np.float32) if conf is not None else None, None)
 
 
-def write_out(path, xyz, cls, intensity, confidence, agree):
+def write_out(path, xyz, cls, intensity, confidence, agree, crs_wkt=None):
     if path.endswith(".npz"):
         d = {"xyz": xyz, "classification": cls.astype(np.int32),
              "confidence": np.asarray(confidence, np.float32),
              "agreement": np.asarray(agree, np.float32)}
         if intensity is not None:
             d["intensity"] = intensity
+        if crs_wkt:
+            d["crs_wkt"] = np.asarray(str(crs_wkt))
         np.savez(path, **d)
         return
     # ponytail: agreement is npz-only — dataset._write_pred has no agreement
@@ -109,13 +125,15 @@ def write_out(path, xyz, cls, intensity, confidence, agree):
     from pathlib import Path
     _write_pred(Path(path), np.asarray(xyz, np.float64),
                 np.clip(cls, 0, 255).astype(np.uint8), path.rsplit(".", 1)[1],
-                confidence=np.asarray(confidence, np.float32))
+                confidence=np.asarray(confidence, np.float32), crs_wkt=crs_wkt)
 
 
 def align_idx(ref_xyz, xyz):
     """Row map from xyz onto ref_xyz: None when the clouds already match row-for-
-    row (fast path); else NN indices so lab/conf/probs can all be re-rowed."""
-    if len(xyz) == len(ref_xyz) and np.allclose(xyz, ref_xyz, atol=1e-4):
+    row (fast path); else NN indices so lab/conf/probs can all be re-rowed.
+    rtol=0 is load-bearing: on UTM coords numpy's default rtol=1e-5 would make
+    the tolerance ~50 m and any same-length cloud would take the fast path."""
+    if len(xyz) == len(ref_xyz) and np.allclose(xyz, ref_xyz, rtol=0.0, atol=1e-4):
         return None
     from scipy.spatial import cKDTree      # lazy: only the mismatch path needs it
     return cKDTree(xyz).query(ref_xyz)[1]
@@ -195,14 +213,22 @@ def ensemble(input_dirs, out_dir, log=print):
             probs.append(pb)
         stacked = np.stack(labs)
         if all(p is not None for p in probs):
-            voted, conf = soft_vote(np.stack(probs))     # soft vote: average the dists
+            log(f"  {stem}: soft vote (all {len(probs)} members carry probs)")
+            voted, conf = soft_vote(np.stack(probs), stacked)
         else:                                            # fallback: weighted hard vote
+            noprobs = [d for d, p in zip(input_dirs, probs) if p is None]
+            # the two branches genuinely disagree — say which one ran
+            log(f"  {stem}: weighted hard vote (no probs in {noprobs})")
             w = np.stack([c if c is not None else np.ones(len(ref_lab), np.float32)
                           for c in confs])
             voted, conf = weighted_vote(stacked, w)
         agree = agreement(stacked, voted)
+        crs = None
+        if ref_path.endswith(".npz"):    # ferry the reference member's CRS along
+            with np.load(ref_path) as zr:
+                crs = str(zr["crs_wkt"]) if "crs_wkt" in zr.files else None
         out_path = f"{out_dir}/{os.path.basename(ref_path)}"
-        write_out(out_path, ref_xyz, voted, ref_itn, conf, agree)
+        write_out(out_path, ref_xyz, voted, ref_itn, conf, agree, crs_wkt=crs)
         log(f"  {os.path.basename(out_path)}: {len(voted)} pts, "
             f"mean confidence {float(conf.mean()):.3f}, "
             f"mean agreement {float(agree.mean()):.3f}")
@@ -219,6 +245,13 @@ def self_test():
     lab, conf = soft_vote(sv)
     hard, _ = weighted_vote(np.array([[0], [1], [1]]), np.ones((3, 1), np.float32))
     assert hard.tolist() == [1] and lab.tolist() == [0] and abs(conf[0] - 0.6) < 1e-6
+    # coverage: pt0 all-covered, pt1 seen by model 0 only, pt2 seen by nobody
+    cv = np.array([[[0.9, 0.1], [0.2, 0.8], [0.0, 0.0]],
+                   [[0.45, 0.55], [0.0, 0.0], [0.0, 0.0]],
+                   [[0.45, 0.55], [0.0, 0.0], [0.0, 0.0]]], np.float32)
+    lab, conf = soft_vote(cv, np.array([[0, 1, 3], [1, 1, 3], [1, 1, 4]]))
+    assert lab.tolist() == [0, 1, 3]          # pt2 keeps the NN-filled majority, not 0
+    assert np.allclose(conf, [0.6, 0.8, 2 / 3])   # pt1 undiluted by the 2 non-covering
     # weighted hard vote: confidence flips the majority; conf = winning share
     lab, conf = weighted_vote(np.array([[0, 0], [1, 0], [1, 0]]),
                               np.array([[0.9, 1.0], [0.2, 1.0], [0.2, 1.0]], np.float32))

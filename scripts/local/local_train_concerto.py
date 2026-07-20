@@ -150,7 +150,9 @@ RESUME           = False   # force-resume the latest matching run (see AUTO_RESU
 # runs default off — a fresh local launch is a fresh run.
 AUTO_RESUME      = os.environ.get("AUTO_RESUME", "0") == "1"
 
-DATASETS_ROOT = "/datasets"   # bind-mounted datasets root (trainer_gui canonical datasets)
+# Fixed mount inside cloud containers; the pixi local backend points
+# TT_DATASETS_ROOT at the real host dir (see train_common path contract).
+DATASETS_ROOT = os.environ.get("TT_DATASETS_ROOT", "/datasets")
 
 def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
                 epochs: Optional[int] = None, batch: Optional[int] = None,
@@ -184,9 +186,10 @@ def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
     # The sonata/utonia wrappers overwrite these module globals before calling.
     PKG, HF_NAME, HF_REPO, BB_KEY = (globals()["PKG"], globals()["HF_NAME"],
                                      globals()["HF_REPO"], globals()["BB_KEY"])
-    # upstream repo cloned at /opt/<PKG> (repo root holds the <PKG>/ package dir),
-    # so `import <PKG>.model` resolves from there
-    sys.path.insert(0, f"/opt/{PKG}")
+    # upstream repo root holds the <PKG>/ package dir, so `import <PKG>.model`
+    # resolves from there. <PKG>_SRC (conda trainer-src-<pkg> package activation)
+    # points at the clone; the container images bake it at /opt/<PKG>.
+    sys.path.insert(0, os.environ.get(f"{PKG.upper()}_SRC", f"/opt/{PKG}"))
 
     # --- resolve config: CLI args override the module defaults ---------------
     GRID_SIZE   = grid if grid is not None else globals()["GRID_SIZE"]
@@ -205,7 +208,7 @@ def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
     # --mode infer is dataset-free: the inference branch below reads the class
     # count/names straight from the checkpoint (+ its run.json), so skip the meta.
     if dataset:
-        ds_root = f"{DATASETS_ROOT}/{dataset}"
+        ds_root = tc.dataset_dir(dataset)
         ds_meta, NUM_CLASSES, CLASS_NAMES = tc.load_dataset_meta(dataset)
         if not ds_meta.get("has_intensity"):
             color_src = "rgb" if ds_meta.get("has_rgb") else "gray"
@@ -233,7 +236,8 @@ def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
         # (0.5m y quantization + the float32-mean centering bug) — a new dir
         # name abandons them instead of silently mixing frames.
         PREP_DIR = (f"{ds_root}/prep/pcssl_{color_src}"
-                    f"{tc.feat_spec_tag(FEAT_SPEC, FEAT_LEGACY)}_chunk{int(CHUNK_XY)}_loc")
+                    f"{tc.feat_spec_tag(FEAT_SPEC, FEAT_LEGACY)}_chunk{int(CHUNK_XY)}_loc"
+                    f"{tc.train_stride_tag()}")
 
     def _in_ch(spec):
         # spec widths: the color slot (rgb OR intensity) is 3 wide — the color
@@ -313,7 +317,7 @@ def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
             sd = None
         else:
             ckpt = _mdl.load(HF_NAME, repo_id=HF_REPO,
-                             download_root=f"/outputs/hf_cache/{PKG}",
+                             download_root=f"{tc.OUTPUTS_ROOT}/hf_cache/{PKG}",
                              ckpt_only=True)
             config = dict(ckpt["config"])
             sd = ckpt["state_dict"]
@@ -422,12 +426,15 @@ def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
             if miss.any() and (~miss).any():
                 _, nn = cKDTree(xyz[~miss]).query(xyz[miss])
                 pred[miss] = pred[~miss][nn]           # conf/probs stay 0: no votes
+            elif miss.any():
+                # nothing predicted (tiny scene) — lowest NON-excluded class so
+                # EXCLUDE_CLASSES holds even here; conf stays 0.
+                pred[:] = min(set(range(num_classes)) - set(exclude_idx or ()))
             # rgb carries the p95-normalized intensity grayscale the model saw.
             # Return the scene's ORIGINAL coords, not the origin-shifted ones
             # load_canonical computed on — the _pred.npz is the georeferenced
             # deliverable.
-            return (z0["xyz"], np.clip(pred, 0, num_classes - 1),
-                    rgb[:, 0] / 255.0, conf, probs)
+            return z0["xyz"], pred, rgb[:, 0] / 255.0, conf, probs
         return _predict_scene
 
     # ==========================================================================
@@ -436,9 +443,9 @@ def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
     if mode == "infer":
         if not weights or not infer_input:
             raise ValueError("--mode infer requires --weights and --infer-input")
-        wpath = f"/outputs/{weights}"
+        wpath = weights if os.path.isabs(weights) else f"{tc.OUTPUTS_ROOT}/{weights}"
         if not os.path.exists(wpath):
-            raise FileNotFoundError(f"weights not found under /outputs: {wpath}")
+            raise FileNotFoundError(f"weights not found: {wpath}")
         ckpt = tc.load_ckpt_safe(wpath, map_location="cpu")
         bsd, hsd = ckpt["backbone"], ckpt["head"]
         num_classes = int(hsd["weight"].shape[0])
@@ -479,16 +486,16 @@ def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
         print(f"  [infer] loaded {weights} ({num_classes} classes; "
               f"final_model = best-val epoch {ckpt.get('epoch', '?')})", flush=True)
 
-        scenes = sorted(glob.glob(f"{DATASETS_ROOT}/_infer/{infer_input}/scenes/*.npz"))
+        run_dir = tc.infer_dir(infer_input)
+        scenes = sorted(glob.glob(f"{run_dir}/scenes/*.npz"))
         if not scenes:
-            raise FileNotFoundError(f"No scenes under {DATASETS_ROOT}/_infer/{infer_input}/scenes")
+            raise FileNotFoundError(f"No scenes under {run_dir}/scenes")
 
         run_id = datetime.utcnow().strftime("%Y%m%d_%H%M%S_infer")
-        # Predictions live next to the input scenes under the shared /datasets tree
-        # (not the per-model runs dir), so inference output lands in
+        # Predictions live next to the input scenes under the shared datasets
+        # tree (not the per-model runs dir), so inference output lands in
         # one consistent place no matter which model produced it.
-        run_dir = f"{DATASETS_ROOT}/_infer/{infer_input}"
-        pred_dir = f"{run_dir}/predictions"
+        pred_dir = os.environ.get("TT_PRED_DIR") or f"{run_dir}/predictions"
         os.makedirs(pred_dir, exist_ok=True)
         exc_idx = tc.exclude_class_idx(class_names)
         infer_cfg = {"backbone": BB_KEY, "mode": "infer", "weights": weights,
@@ -523,7 +530,13 @@ def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
     tag = dataset
     _pt = BB_KEY
 
-    resume_info = (tc.find_latest_unfinished_run(f"{tag}_{_pt}")
+    # Only the RESUME_RECIPE_KEYS subset of cfg: a candidate run.json that
+    # disagrees is skipped, so a resume never republishes a manifest its
+    # weights don't match. cfg itself is built below, in the fresh-run branch.
+    _recipe = {"grid_size": GRID_SIZE, "chunk_xy": CHUNK_XY, "features": FEAT_SPEC,
+               "n_epochs": N_EPOCHS, "num_classes": NUM_CLASSES,
+               "class_names": CLASS_NAMES}
+    resume_info = (tc.find_latest_unfinished_run(f"{tag}_{_pt}", _recipe)
                    if (RESUME or AUTO_RESUME) else None)
     if resume_info:
         run_dir, resume_ckpt, resume_epoch = resume_info
@@ -534,7 +547,7 @@ def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
               f"-> epoch {start_epoch}/{N_EPOCHS}", flush=True)
     else:
         run_id = datetime.utcnow().strftime(f"%Y%m%d_%H%M%S_{tag}_{_pt}")
-        run_dir = f"/outputs/runs/{run_id}"
+        run_dir = f"{tc.OUTPUTS_ROOT}/runs/{run_id}"
         os.makedirs(f"{run_dir}/checkpoints", exist_ok=True)
         resume_ckpt, start_epoch = None, 0
         with open(f"{run_dir}/run.json", "w") as f:
@@ -585,6 +598,14 @@ def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
     n_train = (sum(p.numel() for p in backbone.parameters() if p.requires_grad)
                + sum(p.numel() for p in head.parameters()))
     print(f"  Params: {n_all:,} ({n_train:,} trainable)")
+
+    def _set_backbone_mode():
+        """Train-mode switch that honours --freeze-encoder. requires_grad=False
+        alone still lets BN re-estimate running stats and DropPath fire inside
+        the 'frozen' extractor; eval() is what actually stops both."""
+        backbone.train(not FREEZE)
+        if FREEZE and not stem_pre:
+            backbone.embedding.train()   # random stem is still being trained
 
     # frozen params (linear probe) stay out of the optimizer entirely
     optim = torch.optim.AdamW(
@@ -814,7 +835,7 @@ def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
                 json.dump({"val": m, "test": mt,
                            "val_scenes": [n for n, _, _ in val_items],
                            "test_scenes": [n for n, _, _ in test_items]}, fj, indent=2)
-        backbone.train(); head.train()
+        _set_backbone_mode(); head.train()
         return m
 
     LOG_EVERY = 20  # intra-epoch heartbeat
@@ -836,11 +857,12 @@ def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
         cur_lr = tc.ptv3_lr_at(ep, BASE_LR, WARMUP_PCT, N_EPOCHS)
         for g in optim.param_groups:
             g["lr"] = cur_lr
-        backbone.train(); head.train()
+        _set_backbone_mode(); head.train()
         ep_loss = 0.0
         ep_conf = torch.zeros(NUM_CLASSES, NUM_CLASSES, dtype=torch.long,
                               device="cuda")
         t_ep = time.time(); t_chunk = t_ep; n_steps = 0; last_log_step = 0
+        n_oom = 0
         print(f"  ep {ep:3d} starting (lr={cur_lr:.2e})…", flush=True)
         for step in range(STEPS):
             try:
@@ -867,8 +889,14 @@ def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
                 ).reshape(NUM_CLASSES, NUM_CLASSES)
             except RuntimeError as e:
                 if "out of memory" in str(e).lower():
+                    n_oom += 1
                     torch.cuda.empty_cache(); continue
                 raise
+        if n_steps == 0:
+            raise RuntimeError(f"epoch {ep}: 0 optimizer steps — {n_oom} OOM steps; "
+                               f"lower --batch or --chunk-xy.")
+        if n_oom:
+            print(f"  ep {ep:3d} note: {n_oom} OOM steps skipped", flush=True)
         sec_per_iter = (time.time() - t_ep) / max(n_steps, 1)
         sec_per_epoch = time.time() - t_ep
         conf = ep_conf.cpu().numpy()

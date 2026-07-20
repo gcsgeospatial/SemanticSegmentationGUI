@@ -1,0 +1,28 @@
+# Utonia model sources pinned at the same SHA the modal recipe clones.
+# Repo root holds the utonia/ package dir; UTONIA_SRC goes on sys.path.
+
+context:
+  sha: "da776a0bd3a48c6df83ac2ae0e27b26141cc7e31"
+
+package:
+  name: trainer-src-utonia
+  version: "1.0.0"   # bump when the sha moves
+
+source:
+  git: https://github.com/Pointcept/Utonia.git
+  rev: ${{ sha }}
+
+build:
+  number: 0
+  noarch: generic
+  script: |
+    mkdir -p "$PREFIX/opt/utonia"
+    cp -r "$SRC_DIR"/. "$PREFIX/opt/utonia/"
+    rm -rf "$PREFIX/opt/utonia/.git"
+    mkdir -p "$PREFIX/etc/conda/activate.d"
+    printf 'export UTONIA_SRC="${CONDA_PREFIX}/opt/utonia"\n' > "$PREFIX/etc/conda/activate.d/trainer-src-utonia.sh"
+
+about:
+  repository: https://github.com/Pointcept/Utonia
+  summary: Utonia sources pinned at ${{ sha }} for the trainer-gui local backend
+  license: MIT

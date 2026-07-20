@@ -1,0 +1,28 @@
+# Sonata model sources pinned at the same SHA the modal recipe clones.
+# Repo root holds the sonata/ package dir; SONATA_SRC goes on sys.path.
+
+context:
+  sha: "18c09ff8d713494f78a8213792262b910977a65d"
+
+package:
+  name: trainer-src-sonata
+  version: "1.0.0"   # bump when the sha moves
+
+source:
+  git: https://github.com/facebookresearch/sonata.git
+  rev: ${{ sha }}
+
+build:
+  number: 0
+  noarch: generic
+  script: |
+    mkdir -p "$PREFIX/opt/sonata"
+    cp -r "$SRC_DIR"/. "$PREFIX/opt/sonata/"
+    rm -rf "$PREFIX/opt/sonata/.git"
+    mkdir -p "$PREFIX/etc/conda/activate.d"
+    printf 'export SONATA_SRC="${CONDA_PREFIX}/opt/sonata"\n' > "$PREFIX/etc/conda/activate.d/trainer-src-sonata.sh"
+
+about:
+  repository: https://github.com/facebookresearch/sonata
+  summary: Sonata sources pinned at ${{ sha }} for the trainer-gui local backend
+  license: Apache-2.0

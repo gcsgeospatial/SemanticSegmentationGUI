@@ -46,7 +46,7 @@ def run_script(script: str, flags: dict, detach: bool = False,
 
     `env` (the GUI's LOSS_*/RARE_*/DG_*/EVAL_VOTES knob overrides) rides as one
     --env-json flag; the modal shell applies it to the trainer subprocess in the
-    cloud — the exact mirror of local_cli's `docker run -e` passthrough."""
+    cloud — the exact mirror of local_cli's extra_env passthrough."""
     args = ["run"]
     if detach:
         args.append("--detach")

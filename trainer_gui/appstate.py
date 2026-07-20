@@ -101,13 +101,13 @@ def runs_dir() -> Path:
 
 
 def local_runs_dir() -> Path:
-    """Where local (Docker) training writes runs/<id>/... — bind-mounted /outputs."""
+    """Where local training writes runs/<id>/... — the TT_OUTPUTS_ROOT default."""
     d = app_dir() / "local_runs"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
 
-# ---- execution mode: "modal" (cloud) | "local" (Docker on a GPU host) --------
+# ---- execution mode: "modal" (cloud) | "local" (pixi env on a GPU host) ------
 
 def get_exec_mode() -> str:
     return "local" if get("exec_mode") == "local" else "modal"
@@ -117,38 +117,22 @@ def set_exec_mode(mode: str) -> None:
     put("exec_mode", "local" if mode == "local" else "modal")
 
 
-# The org we publish the trainer-local-* images under, on GitHub Container
-# Registry. Used as the registry when the user hasn't set one — so the GUI pulls
-# from it out of the box. Override via local_config['registry'] or TT_REGISTRY;
-# clear it to "" explicitly for local-build-only (no pulling).
-DEFAULT_REGISTRY = "ghcr.io/gcsgeospatial"
-
 # Defaults for the local backend. Roots default to the dirs the GUI already
 # uses (so a converted dataset / inference job is immediately reachable); every
 # value is overridable from state.json["local_config"] for I/O modularity.
+# (Older state.json files may carry retired docker keys — images/registry/
+# extra_args — which are simply ignored.)
 _DEFAULT_LOCAL_CONFIG = {
-    "images": {},          # backbone.key -> docker image tag (default trainer-local-<key>)
-    "registry": "",        # registry prefix, e.g. "ghcr.io/you" -> pull instead of build
-    "datasets_root": "",   # host -> /datasets (default: workspace_dir())
-    "outputs_root": "",    # host -> /outputs  (default: local_runs_dir())
-    "gpus": "all",         # docker --gpus value ("all" | "0" | "" to disable)
-    "extra_args": [],      # extra `docker run` args
+    "datasets_root": "",   # -> TT_DATASETS_ROOT (default: workspace_dir())
+    "outputs_root": "",    # -> TT_OUTPUTS_ROOT  (default: local_runs_dir())
+    "gpus": "all",         # GPU selection ("all" | CUDA device id | "" to disable)
 }
 
 
 def local_config() -> dict:
-    saved = get("local_config", {})
-    cfg = {**_DEFAULT_LOCAL_CONFIG, **saved}
+    cfg = {**_DEFAULT_LOCAL_CONFIG, **get("local_config", {})}
     cfg["datasets_root"] = cfg["datasets_root"] or str(workspace_dir())
     cfg["outputs_root"] = cfg["outputs_root"] or str(local_runs_dir())
-    # Registry precedence: a saved value (even "") wins; else TT_REGISTRY (set it
-    # once in the env, no JSON edit); else our DEFAULT_REGISTRY so pulling works
-    # out of the box. "registry" absent from saved = never set -> use the default;
-    # present-and-empty = the user opted out (local builds only), so leave it.
-    if "registry" not in saved:
-        cfg["registry"] = os.environ.get("TT_REGISTRY", "") or DEFAULT_REGISTRY
-    else:
-        cfg["registry"] = cfg["registry"] or os.environ.get("TT_REGISTRY", "")
     return cfg
 
 
@@ -160,8 +144,8 @@ def set_local_config(cfg: dict) -> None:
 
 def enabled_backbones():
     """Backbone keys enabled for local mode, or None = all. Lets you hide a
-    backbone whose Docker image you can't run (e.g. a cu124 image on an older
-    driver) or simply don't use. Stored explicitly once the user picks."""
+    backbone whose env you can't run (e.g. a cu124 stack on an older driver)
+    or simply don't use. Stored explicitly once the user picks."""
     val = get("local_config", {}).get("enabled_backbones")
     return None if val is None else set(val)
 

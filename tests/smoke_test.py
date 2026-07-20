@@ -5,7 +5,7 @@ Run:  python tests/smoke_test.py   (from the trainer_gui/ project dir)
 Covers: synthetic LAZ/PLY/ASCII scenes -> canonical conversion (field + companion
 label specs), npz contract, meta + recommendations, inference-job conversion
 (incl. opt-in HAG), density-generalization manifest round-trip, training-log
-parsing, ground-truth comparison stats, Dockerfile generation, local Docker backend.
+parsing, ground-truth comparison stats, modal↔pixi env-sync, local pixi backend.
 
 Every check here guards code the shipped app reaches. If a function's only caller
 is this file, delete the function — don't add a check for it.
@@ -418,6 +418,44 @@ def main():
         finally:
             train_common.STOP_SENTINEL = _orig_sentinel
 
+        # ---------------- path contract: TT_* env roots (pixi local backend).
+        # Unset vars = the container mounts, byte-for-byte (Modal unaffected);
+        # the pixi backend repoints them at real host dirs.
+        import importlib
+        _tt_saved = {k: os.environ.pop(k, None)
+                     for k in ("TT_DATASETS_ROOT", "TT_OUTPUTS_ROOT",
+                               "TT_DATASET_DIR", "TT_INFER_DIR")}
+        try:
+            importlib.reload(train_common)
+            check("paths: container defaults when TT_* unset",
+                  train_common.DATASETS_ROOT == "/datasets"
+                  and train_common.OUTPUTS_ROOT == "/outputs"
+                  and train_common.STOP_SENTINEL == "/outputs/STOP")
+            check("paths: dataset_dir/infer_dir derive from the roots",
+                  train_common.dataset_dir("foo") == "/datasets/foo"
+                  and train_common.infer_dir("job1") == "/datasets/_infer/job1")
+            os.environ["TT_DATASETS_ROOT"] = str(tmp / "ds")
+            os.environ["TT_OUTPUTS_ROOT"] = str(tmp / "out")
+            importlib.reload(train_common)
+            check("paths: TT_* env repoints roots + sentinel",
+                  train_common.DATASETS_ROOT == str(tmp / "ds")
+                  and train_common.OUTPUTS_ROOT == str(tmp / "out")
+                  and train_common.STOP_SENTINEL == f"{tmp / 'out'}/STOP")
+            check("paths: derived dirs follow the repointed roots",
+                  train_common.dataset_dir("foo") == f"{tmp / 'ds'}/foo"
+                  and train_common.infer_dir("j") == f"{tmp / 'ds'}/_infer/j")
+            os.environ["TT_DATASET_DIR"] = str(tmp / "staged")
+            os.environ["TT_INFER_DIR"] = str(tmp / "staged_infer")
+            check("paths: TT_DATASET_DIR / TT_INFER_DIR override the derived dirs",
+                  train_common.dataset_dir("foo") == str(tmp / "staged")
+                  and train_common.infer_dir("j") == str(tmp / "staged_infer"))
+        finally:
+            for k, v in _tt_saved.items():
+                os.environ.pop(k, None)
+                if v is not None:
+                    os.environ[k] = v
+            importlib.reload(train_common)
+
         # ---------------- class masking: EXCLUDE_CLASSES parse + prob renorm
         mask_names = ["ground", "veg", "building"]
         os.environ["EXCLUDE_CLASSES"] = "veg"
@@ -689,6 +727,60 @@ def main():
               and list(np.asarray(pv["classification"]).astype(int)) == list(ex_cls))
         (exd / "sceneX_pred.npz").unlink()
 
+        # ---------------- CRS: captured at conversion, restored at export
+        import pyproj
+        utm33 = pyproj.CRS.from_epsg(32633)
+        ch = laspy.LasHeader(point_format=6, version="1.4")
+        ch.offsets = [500000, 4200000, 0]
+        ch.scales = [0.001] * 3
+        ch.add_crs(utm33)
+        cl = laspy.LasData(ch)
+        cl.x = ex_xyz[:, 0] + 500000
+        cl.y = ex_xyz[:, 1] + 4200000
+        cl.z = ex_xyz[:, 2]
+        cl.classification = ex_cls.astype(np.uint8)
+        cl.write(str(exd / "crs_src.las"))
+        dataset.convert_scene(exd / "crs_src.las", None, {}, exd / "crs_scene.npz")
+        with np.load(exd / "crs_scene.npz") as zs:
+            check("crs: conversion stores the source CRS as a WKT string in the npz",
+                  "crs_wkt" in zs.files
+                  and pyproj.CRS.from_wkt(str(zs["crs_wkt"])).to_epsg() == 32633)
+            np.savez(exd / "crsY_pred.npz", xyz=zs["xyz"],
+                     classification=ex_cls.astype(np.int32), crs_wkt=zs["crs_wkt"])
+        crs_las = dataset.export_predictions(exd, "las")[0]
+        rcrs = laspy.read(str(crs_las)).header.parse_crs()
+        check("crs: the las deliverable gets the CRS back (WKT VLR round-trip)",
+              rcrs is not None and rcrs.to_epsg() == 32633)
+        for f in ("crs_src.las", "crs_scene.npz", "crsY_pred.npz", "crsY_pred.las"):
+            (exd / f).unlink()
+
+        # geographic (lon/lat) input fails loud at conversion — every meter-
+        # denominated knob (tile_m, chunk_xy, radii, grids) would mean degrees.
+        gh = laspy.LasHeader(point_format=6, version="1.4")
+        gh.offsets = [0, 0, 0]
+        gh.scales = [1e-7, 1e-7, 0.001]
+        gh.add_crs(pyproj.CRS.from_epsg(4326))
+        gl = laspy.LasData(gh)
+        gl.x = 13.0 + ex_xyz[:, 0] * 1e-5
+        gl.y = 52.0 + ex_xyz[:, 1] * 1e-5
+        gl.z = ex_xyz[:, 2]
+        gl.write(str(exd / "geo_src.las"))
+        try:
+            dataset.convert_scene(exd / "geo_src.las", None, {}, exd / "geo.npz")
+            geo_raised = False
+        except ValueError as e:
+            geo_raised = "geographic" in str(e).lower()
+        check("crs: geographic (lon/lat) source is refused with a reproject message",
+              geo_raised and not (exd / "geo.npz").exists())
+        (exd / "geo_src.las").unlink()
+
+        # no CRS at all: degree-looking coords only WARN (returned in stats),
+        # and a projected-magnitude cloud stays silent.
+        wsub = dataset._crs_check(None, np.array([[13.0, 52.0, 0.0], [13.1, 52.1, 1.0]]), "g")
+        wutm = dataset._crs_check(None, np.array([[5e5, 4.2e6, 0.0], [5e5 + 90, 4.2e6 + 90, 1.0]]), "u")
+        check("crs: no-CRS heuristic warns on degree-like coords, silent on UTM-like",
+              wsub is not None and wutm is None)
+
         # write_pred (Phase 0): confidence + probs ride in the npz with the
         # dtype/shape contract the export threshold below depends on.
         train_common.write_pred(exd / "sceneC_pred.npz", ex_xyz, ex_cls,
@@ -942,7 +1034,7 @@ def main():
             if img is None or not getattr(img, "steps", None):
                 recipe_ok = False
         check(f"local: modal shim imports all {len(SCRIPTS)} train scripts + finds main", shim_ok)
-        check("local: every script records an Image recipe for Dockerfile gen", recipe_ok)
+        check("local: every script records an Image recipe (env-sync source of truth)", recipe_ok)
         # the shim's catch-all __getattr__ must RAISE on dunders, else inspect.getmodule
         # reads modal.__file__ as a function and torch's import blows up (endswith bug).
         _modal_shim.install()
@@ -1014,24 +1106,25 @@ def main():
         check("local: modal wrapper bakes its local_train script into the image",
               any(k == "copy_file" and "local_train_ptv3.py" in p["src"] for k, p in _steps))
 
-        # gen_dockerfiles: recipe -> a buildable Dockerfile (cuda base, ctx, quoting)
-        import tools.gen_dockerfiles as gen
-        df = gen.build_dockerfile("ptv3", "modal_train_ptv3.py")
-        check("gen: ptv3 Dockerfile uses a CUDA devel base + python bootstrap",
-              "FROM nvidia/cuda:" in df and "-devel-ubuntu22.04" in df
-              and "ln -sf /usr/bin/python3 /usr/bin/python" in df)
-        check("gen: Dockerfile pins a heredoc-capable frontend on line 1",
-              df.splitlines()[0] == "# syntax=docker/dockerfile:1")
-        check("gen: shell-unsafe pip version specs are quoted",
-              "'numpy<2.0'" in df and "'pandas<3'" in df)
-        check("gen: model repo is a pinned upstream clone (no build-contexts)",
-              "git clone https://github.com/Pointcept/PointTransformerV3.git /opt/ptv3" in df
-              and "checkout --detach" in df and "COPY --from" not in df)
-        check("gen: local_train script is NOT baked (bind-mounted at /workspace locally)",
-              "local_train" not in df)
-        dfr = gen.build_dockerfile("randlanet", "modal_train_randlanet.py")
-        check("gen: multi-line run command emitted as a RUN heredoc",
-              "RUN <<'TT_EOT'" in dfr and "build_ext --inplace" in dfr)
+        # check_env_sync: pixi features + conda recipes mirror the modal recipes
+        # (the modal.Image recipes stay the source of truth; drift fails here).
+        import tools.check_env_sync as sync
+        check("sync: all 7 pixi features + recipe SHAs match their modal recipes",
+              sync.check_all() == [])
+        _ms = sync.modal_spec("modal_train_ptv3.py")
+        check("sync: modal_spec reads pins + cu index + pinned SHA from the recipe",
+              _ms["pins"].get("torch") == "==2.1.0"
+              and _ms["index_url"] == "https://download.pytorch.org/whl/cu118"
+              and _ms["sha"] and len(_ms["sha"]) >= 7)
+        # the checker actually catches drift (not vacuously green)
+        _bad = {**_ms, "pins": {**_ms["pins"], "torch": "==9.9.9"}}
+        import tomllib as _toml
+        with open(Path(sync.REPO) / "envs" / "pixi.toml", "rb") as _f:
+            _man = _toml.load(_f)
+        _errs = sync.compare("ptv3", _bad, sync.pixi_spec("ptv3", _man),
+                             sync.recipe_sha("trainer-src-ptv3"))
+        check("sync: a pin mismatch is reported as drift",
+              any("torch" in e and "drift" in e for e in _errs))
 
         # cross-platform app dir: APPDATA overrides everywhere; else native per-OS
         check("appstate: _app_base honors APPDATA on every platform",
@@ -1093,43 +1186,38 @@ def main():
             check("appstate: kept runs re-registered on the Plotting page",
                   str(keep_ds / "runs") in appstate.get("plot_extra_roots", []))
 
-            # Registry defaults to our GHCR org when never set (pulling works out
-            # of the box); TT_REGISTRY/env or an explicit value override it.
-            _saved_reg = os.environ.pop("TT_REGISTRY", None)
-            check("appstate: registry defaults to ghcr.io/gcsgeospatial when unset",
-                  appstate.local_config()["registry"] == "ghcr.io/gcsgeospatial")
-            if _saved_reg is not None:
-                os.environ["TT_REGISTRY"] = _saved_reg
             cfg = appstate.local_config()
             check("appstate: local_config fills datasets/outputs roots + gpus",
                   bool(cfg["datasets_root"]) and bool(cfg["outputs_root"])
-                  and isinstance(cfg["images"], dict) and cfg["gpus"] == "all")
-            # registry="" here = opt out of the default, so the bare local tag shows.
-            appstate.set_local_config({**cfg, "images": {"ptv3": "myimg:1"},
-                                       "gpus": "0", "registry": ""})
+                  and cfg["gpus"] == "all")
+            appstate.set_local_config({**cfg, "gpus": "0"})
             check("appstate: local_config overrides round-trip",
-                  appstate.local_config()["images"]["ptv3"] == "myimg:1"
-                  and appstate.local_config()["gpus"] == "0")
+                  appstate.local_config()["gpus"] == "0")
 
-            prog, args = local_cli.run_script(
+            prog, args, renv = local_cli.run_script(
                 "modal_train_ptv3.py", {"dataset": "myds", "grid": 0.05, "epochs": 250},
                 BB["ptv3"], repo_root="/repo", gpu="A100")
-            joined = " ".join(args)
-            check("local_cli: docker run with ipc=host + gpus + workspace/datasets/outputs mounts",
-                  args[0] == "run" and "--ipc=host" in args and "--gpus" in args
-                  and "/repo:/workspace" in args
-                  and ":/datasets" in joined and ":/outputs" in joined)
+            check("local_cli: pixi run --locked -e <env> from the envs manifest",
+                  args[0] == "run" and "--locked" in args
+                  and args[args.index("-e") + 1] == "ptv3"
+                  and args[args.index("--manifest-path") + 1].replace("\\", "/")
+                      .endswith("envs/pixi.toml"))
             check("local_cli: invokes the decoupled scripts/local/local_train_<key>.py with the flags",
                   "scripts/local/local_train_ptv3.py" in args and "local_run.py" not in args
                   and "--dataset" in args and "myds" in args and "--grid" in args)
-            _, args_o = local_cli.run_script(
+            check("local_cli: env carries the TT_* path contract + CUDA device pick",
+                  renv["TT_DATASETS_ROOT"] and renv["TT_OUTPUTS_ROOT"]
+                  and renv["CUDA_VISIBLE_DEVICES"] == "0"   # gpus="0" set above
+                  and renv["TT_GPU"] == "A100")
+            _, _, renv_o = local_cli.run_script(
                 "modal_train_ptv3.py", {"dataset": "d"}, BB["ptv3"],
-                repo_root="/repo", outputs_root="/myout")
-            check("local_cli: outputs_root override binds the chosen folder to /outputs",
-                  "/myout:/outputs" in " ".join(args_o))
-            check("local_cli: image tag override respected (else trainer-local-<key>)",
-                  local_cli.image_for(BB["ptv3"]) == "myimg:1"
-                  and local_cli.image_for(BB["randlanet"]) == "trainer-local-randlanet")
+                repo_root="/repo", outputs_root="/myout", dataset_dir="/elsewhere/d")
+            check("local_cli: outputs_root + out-of-workspace dataset land in TT_* env",
+                  renv_o["TT_OUTPUTS_ROOT"] == "/myout"
+                  and renv_o["TT_DATASET_DIR"] == "/elsewhere/d")
+            check("local_cli: env names = backbone keys with '_' -> '-' (pixi rule)",
+                  local_cli.env_name(BB["kpconvx_cold"]) == "kpconvx-cold"
+                  and local_cli.env_name(BB["ptv3"]) == "ptv3")
 
             # ---- workspace re-root: one root owns every dataset; runs + infer nest
             # under it, host-side only (container paths /datasets, /outputs unchanged).
@@ -1144,12 +1232,12 @@ def main():
             # base /datasets = workspace (so /datasets/<name> resolves with no extra
             # mount); the dataset's own folder bound to /outputs => runs at <ds>/runs/<id>.
             ds_root = ws / "myds"
-            _, wargs = local_cli.run_script(
+            _, _, wenv = local_cli.run_script(
                 "modal_train_ptv3.py", {"dataset": "myds"}, BB["ptv3"],
                 repo_root="/repo", outputs_root=str(ds_root))
-            wj = " ".join(wargs)
-            check("local_cli: workspace -> /datasets and the dataset folder -> /outputs",
-                  f"{ws.as_posix()}:/datasets" in wj and f"{ds_root.as_posix()}:/outputs" in wj)
+            check("local_cli: workspace -> TT_DATASETS_ROOT, dataset folder -> TT_OUTPUTS_ROOT",
+                  wenv["TT_DATASETS_ROOT"] == str(ws)
+                  and wenv["TT_OUTPUTS_ROOT"] == str(ds_root))
             check("appstate: scratch_infer_dir sits under the workspace",
                   appstate.scratch_infer_dir() == ws / "_scratch" / "infer")
             # infer job nested under its owning dataset via out_dir (container path fixed)
@@ -1167,34 +1255,35 @@ def main():
                   and (ds_root / "runs") in appstate.dataset_run_roots())
             appstate.forget_dataset("myds")
 
-            # registry distribution: a configured registry makes the default tag
-            # pullable (build once, pull anywhere); local-only tags must be built.
-            appstate.set_local_config({**appstate.local_config(), "images": {},
-                                       "registry": "ghcr.io/acme"})
-            check("local_cli: registry prefixes the default image tag + marks it pullable",
-                  local_cli.image_for(BB["randlanet"]) == "ghcr.io/acme/trainer-local-randlanet"
-                  and local_cli.is_pullable(BB["randlanet"]))
-            ok_pull, _ = local_cli.image_preflight(BB["randlanet"])   # absent but pullable
-            check("local_cli: missing-but-pullable image is allowed to run (docker auto-pulls)",
-                  ok_pull is True)
-
-            # GUI image manager: pull() targets the same tag image_for/run use, and
+            # GUI env manager: install() targets the same env run_script uses, and
             # all_statuses reports one row per backbone with the manager's contract
-            # (works whether or not docker is installed on this box).
-            pprog, pargs = local_cli.pull(BB["randlanet"])
-            check("local_cli: pull() = `docker pull <image_for tag>`",
-                  pargs == ["pull", local_cli.image_for(BB["randlanet"])])
+            # (works whether or not pixi is installed on this box).
+            pprog, pargs = local_cli.install(BB["randlanet"])
+            check("local_cli: install() = `pixi install --locked -e <env>`",
+                  pargs[0] == "install" and "--locked" in pargs
+                  and pargs[pargs.index("-e") + 1] == "randlanet")
             st = local_cli.all_statuses()
             check("local_cli: all_statuses has one contract-shaped row per backbone",
                   len(st) == len(BB)
-                  and all({"key", "label", "tag", "present", "pullable", "docker"} <= set(s)
+                  and all({"key", "label", "env", "installed", "pixi"} <= set(s)
                           for s in st)
                   and {s["key"] for s in st} == set(BB))
-            appstate.set_local_config({**appstate.local_config(), "registry": ""})
-            ok_local, msg_local = local_cli.image_preflight(BB["randlanet"])  # absent, local-only
-            check("local_cli: missing local-only image blocks with a build hint",
-                  ok_local is False and "build_all" in msg_local
-                  and not local_cli.is_pullable(BB["randlanet"]))
+            # env preflight: a missing env blocks with an install hint (fake repo
+            # root = nothing installed); a conda-meta dir flips it to installed.
+            ok_env, msg_env = local_cli.env_preflight(BB["randlanet"], str(tmp / "norepo"))
+            check("local_cli: missing pixi env blocks with an install hint",
+                  ok_env is False and "pixi install" in msg_env)
+            _envroot = tmp / "fakerepo" / "envs" / ".pixi" / "envs" / "randlanet"
+            (_envroot / "conda-meta").mkdir(parents=True)
+            check("local_cli: an installed env (conda-meta present) passes preflight",
+                  local_cli.env_preflight(BB["randlanet"], str(tmp / "fakerepo"))[0])
+            # installed weight packages: share/trainer-weights/<name>/final_model.pth
+            _w = _envroot / "share" / "trainer-weights" / "trainer-weights-myds-ptv3"
+            _w.mkdir(parents=True)
+            (_w / "final_model.pth").write_bytes(b"x")
+            check("local_cli: installed_weights lists conda-packaged checkpoints",
+                  local_cli.installed_weights(BB["randlanet"], str(tmp / "fakerepo"))
+                  == [("trainer-weights-myds-ptv3", str(_w / "final_model.pth"))])
 
             # backbone selection: unset = all; an explicit list filters in local mode only.
             check("appstate: backbones all enabled by default (unset)",

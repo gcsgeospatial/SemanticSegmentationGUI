@@ -81,7 +81,9 @@ BACKBONES: dict[str, Backbone] = {b.key: b for b in [
         # ~113 pts/m2, so finer grids train on mostly-empty cells while eval runs
         # full (the DG mismatch); at 0.15 train fill is ~92% vs eval ~100%
         grid_clamp=(0.15, 2.0), grid_mult=1.25,
-        params=[ParamSpec("grid", "Grid size (m)", "float", 0.05, 0.02, 3.0,
+        # default 0.5 = the script's own GRID_SIZE; 0.05 is PTv3's dense-LiDAR
+        # upstream value, a no-op downsample on ~2 pts/m2 ALS and below the clamp
+        params=[ParamSpec("grid", "Grid size (m)", "float", 0.5, 0.02, 3.0,
                           step=0.05, decimals=2, recommend_key="grid")]
                + _common(250, 4),
     ),
@@ -90,7 +92,8 @@ BACKBONES: dict[str, Backbone] = {b.key: b for b in [
         app_name="randlanet-cold",
         rec_gpu="A10G", min_vram_gb=8,
         grid_clamp=(0.06, 2.0), grid_mult=1.2,
-        params=[ParamSpec("sub-grid", "Sub-grid size (m)", "float", 0.12, 0.02, 2.0,
+        # default 0.30 = the script's own SUB_GRID_SIZE (sparse aerial LiDAR)
+        params=[ParamSpec("sub-grid", "Sub-grid size (m)", "float", 0.30, 0.02, 2.0,
                           step=0.05, decimals=2, recommend_key="grid"),
                 ParamSpec("num-points", "Points / sample", "int", 45056, 4096, 131072,
                           recommend_key="num_points")]
@@ -133,7 +136,7 @@ BACKBONES: dict[str, Backbone] = {b.key: b for b in [
         app_name="concerto",
         rec_gpu="A100", min_vram_gb=24,
         grid_clamp=(0.15, 2.0), grid_mult=1.25,
-        params=[ParamSpec("grid", "Grid size (m)", "float", 0.05, 0.02, 3.0,
+        params=[ParamSpec("grid", "Grid size (m)", "float", 0.5, 0.02, 3.0,
                           step=0.05, decimals=2, recommend_key="grid"),
                 ParamSpec("freeze-encoder", "Freeze encoder (0/1)", "int", 0, 0, 1)]
                + _common(100, 4),
@@ -143,7 +146,7 @@ BACKBONES: dict[str, Backbone] = {b.key: b for b in [
         app_name="sonata",
         rec_gpu="A100", min_vram_gb=24,
         grid_clamp=(0.15, 2.0), grid_mult=1.25,
-        params=[ParamSpec("grid", "Grid size (m)", "float", 0.05, 0.02, 3.0,
+        params=[ParamSpec("grid", "Grid size (m)", "float", 0.5, 0.02, 3.0,
                           step=0.05, decimals=2, recommend_key="grid"),
                 ParamSpec("freeze-encoder", "Freeze encoder (0/1)", "int", 0, 0, 1)]
                + _common(100, 4),
@@ -153,7 +156,7 @@ BACKBONES: dict[str, Backbone] = {b.key: b for b in [
         app_name="utonia",
         rec_gpu="A100", min_vram_gb=24,
         grid_clamp=(0.15, 2.0), grid_mult=1.25,
-        params=[ParamSpec("grid", "Grid size (m)", "float", 0.05, 0.02, 3.0,
+        params=[ParamSpec("grid", "Grid size (m)", "float", 0.5, 0.02, 3.0,
                           step=0.05, decimals=2, recommend_key="grid"),
                 ParamSpec("freeze-encoder", "Freeze encoder (0/1)", "int", 0, 0, 1)]
                + _common(100, 4),

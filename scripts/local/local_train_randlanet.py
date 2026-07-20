@@ -21,6 +21,7 @@ Flags:
   --mode infer --weights runs/<id>/final_model.pth --infer-input <job_id>
 """
 
+import os
 from typing import Optional
 
 # ============================================================================
@@ -84,7 +85,9 @@ RARE_FREQ_THRESH = 0.02          # classes under 2% of train points count as rar
 RARE_CENTER_PROB = 0.25          # P(center the next train sphere on a rare-class point)
 VAL_EVERY        = 10            # held-out val pass every N epochs (no weight updates)
 
-DATASETS_ROOT = "/datasets"   # bind-mounted datasets root (trainer_gui canonical datasets)
+# Fixed mount inside cloud containers; the pixi local backend points
+# TT_DATASETS_ROOT at the real host dir (see train_common path contract).
+DATASETS_ROOT = os.environ.get("TT_DATASETS_ROOT", "/datasets")
 
 def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = None,
                     num_points: Optional[int] = None, epochs: Optional[int] = None,
@@ -141,7 +144,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     BATCH_SIZE    = batch if batch is not None else globals()["BATCH_SIZE"]
     STEPS         = steps_per_epoch if steps_per_epoch is not None else 500
     if dataset:
-        ds_root = f"{DATASETS_ROOT}/{dataset}"
+        ds_root = tc.dataset_dir(dataset)
         ds_meta, NUM_CLASSES, CLASS_NAMES = tc.load_dataset_meta(dataset)
         # A custom feature spec gets its own cache family (legacy spec = ""
         # tag, old caches valid).
@@ -164,7 +167,9 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         return _orig_cm(y_true, y_pred, labels=labels, **kwargs)
     _skm.confusion_matrix = _cm_compat
 
-    sys.path.insert(0, "/opt/randlanet")
+    # RANDLANET_SRC (conda trainer-src-randlanet package activation) points at
+    # the clone; the container images bake it at /opt/randlanet.
+    sys.path.insert(0, os.environ.get("RANDLANET_SRC", "/opt/randlanet"))
     from network.RandLANet import Network
     import network.pytorch_utils as pt_utils
     from utils.metric import compute_acc, IoUCalculator
@@ -238,10 +243,10 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         # before the float32 cast so projected (UTM) coords keep sub-meter
         # precision in the prep cache (float32 spacing at y~5e6 is 0.5m).
         xyz = (z["xyz"] - np.floor(z["xyz"].min(0))).astype(np.float32)
-        intensity = z["intensity"].astype(np.float32) if "intensity" in z \
-            else np.full(len(xyz), 0.5, np.float32)
-        ret_num = z["return_number"].astype(np.float32) if "return_number" in z \
-            else np.zeros(len(xyz), np.float32)
+        # tc.scene_arrays is the single fallback definition, shared with the
+        # two inference sites below — a local copy here is how train/infer
+        # drifted apart (constant 0.5 at prep vs grayscale at predict).
+        intensity, ret_num = tc.scene_arrays(z, len(xyz))
         lab = z["label"].astype(np.int32) if "label" in z \
             else np.full(len(xyz), -1, np.int32)
         extras = {k: z[k].astype(np.float32) for k in z.files
@@ -258,14 +263,19 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         # Everything that changes what a cached scene .npz contains. A mismatch
         # means the cache is stale/leaky and must not be silently reused.
         sig = {
-            "format_version": 1,
             # v2: cached xyz is scene-local (load_canonical's origin shift) —
-            # a global-frame cache must not be reused (0.5m y quantization).
+            # a global-frame cache must not be reused (0.5m y quantization) —
+            # and missing intensity now falls back via tc.scene_arrays
+            # (RGB grayscale, not a constant 0.5), which changes tile content.
+            "format_version": 2,
             "coord_frame": "scene-local",
             "pipeline": "randlanet",
             "dataset": dataset,
             "sub_grid_size": SUB_GRID_SIZE,
             "num_classes": NUM_CLASSES,
+            # a class REORDER at constant count changes the label index space
+            # without changing num_classes (the KP trainers carry this too).
+            "class_names": CLASS_NAMES,
             # spec-derived; reproduces the legacy string byte-for-byte for the
             # default spec, so every existing cache stays valid.
             "feature_recipe": ",".join(FEAT_SPEC).replace("x,y,z", "xyz"),
@@ -468,32 +478,41 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
             keys = np.floor(xyz0 / SUB_GRID_SIZE).astype(np.int64)
             uniq = tc.voxel_unique(keys)
             sub_xyz = xyz0[uniq]
-            order = np.lexsort((sub_xyz[:, 1], sub_xyz[:, 0]))   # rough spatial locality
-            sub_itn0 = itn0[uniq]
-            sub_ret0 = ret0[uniq]
-            sub_ex0 = {n: v[uniq] for n, v in ex0.items()}
-            # EVAL_VOTES soft-vote passes over offset block grids (same overlap
-            # voting as the eval protocol; votes is n_sub x C float32).
+            sub_src = {"intensity": itn0[uniq], "return_number": ret0[uniq],
+                       **{n2: v[uniq] for n2, v in ex0.items()}}
+            # EVAL_VOTES soft-vote passes of the sphere sweep below (same
+            # overlap voting as the eval protocol; votes is n_sub x C float32).
             sub_votes = np.zeros((len(sub_xyz), num_classes), np.float32)
             N = cfg.num_points
             n_passes = max(int(EVAL_VOTES), 1)
+            # Sphere sweep (matches training geometry: the N nearest neighbours
+            # of a seed point, not an x-major lexsort slab, which on a 1 km²
+            # tile is a few-metre-wide sliver with a different kNN graph).
+            # ponytail: capped at 2x the ideal sphere count — the thin residue
+            # left uncovered is filled by the NN reprojection below.
+            max_blocks = 2 * (len(sub_xyz) // N + 1)
             with torch.no_grad():
               for vp in range(n_passes):
-                ov = np.roll(order, -(N * vp) // n_passes) if vp else order
-                sub_sorted = sub_xyz[ov]
-                sub_src = {"intensity": sub_itn0[ov], "return_number": sub_ret0[ov],
-                           **{n2: v[ov] for n2, v in sub_ex0.items()}}
-                for s in range(0, len(sub_sorted), N):
-                    real = min(N, len(sub_sorted) - s)
+                rng = np.random.RandomState(20250720 + vp)
+                uncov = np.ones(len(sub_xyz), bool)
+                for _ in range(max_blocks):
+                    rem = np.flatnonzero(uncov)
+                    if not len(rem):
+                        break
+                    seed = int(rng.choice(rem))
+                    d2 = np.sum((sub_xyz - sub_xyz[seed]) ** 2, axis=1)
+                    sel = np.argpartition(d2, min(N, len(sub_xyz) - 1))[:N]
+                    uncov[sel] = False
+                    real = len(sel)
                     if real < 64:
                         continue
-                    block = sub_sorted[s:s + N]
-                    cols = ([sub_src[n2][s:s + N] for n2 in NONXYZ]
+                    block = sub_xyz[sel]
+                    cols = ([sub_src[n2][sel] for n2 in NONXYZ]
                             + ([dg.local_density_logdk(block, DG_LOGDK_K)] if DG_LOGDK_FEAT else []))
                     f2 = (np.stack(cols, axis=1) if cols
                           else np.zeros((len(block), 0), np.float32))   # D3b
-                    orig = ov[s:s + real].astype(np.int64)      # indices into sub_xyz
-                    if real < N:                         # pad the final short block
+                    orig = sel.astype(np.int64)                 # indices into sub_xyz
+                    if real < N:                         # pad the short sphere
                         pad = np.random.choice(real, N - real)
                         block = np.concatenate([block, block[pad]], axis=0)
                         f2 = np.concatenate([f2, f2[pad]], axis=0)
@@ -502,10 +521,9 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                     # order (training spheres shuffle); shuffle, unshuffle on scatter.
                     perm = np.random.permutation(N)
                     block, f2, orig = block[perm], f2[perm], orig[perm]
-                    # float64 mean: raw inference scenes carry global-UTM
-                    # coords, where a float32 mean mis-centers by ~500m
-                    pc0 = (block - block.mean(0, keepdims=True, dtype=np.float64)
-                           ).astype(np.float32)
+                    # centered on the seed, as sample_sphere does (sub_xyz is
+                    # already scene-local, so this is exact in float32)
+                    pc0 = (block - sub_xyz[seed]).astype(np.float32)
                     # D5 density-TTA: isotropic scale s rescales the LocSE relative-coord
                     # magnitudes (a density view); average softmax over views. views=[1.0]
                     # when off -> identical to the old single-view behavior.
@@ -553,9 +571,9 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     if mode == "infer":
         if not weights or not infer_input:
             raise ValueError("--mode infer requires --weights and --infer-input")
-        wpath = f"/outputs/{weights}"
+        wpath = weights if os.path.isabs(weights) else f"{tc.OUTPUTS_ROOT}/{weights}"
         if not os.path.exists(wpath):
-            raise FileNotFoundError(f"weights not found under /outputs: {wpath}")
+            raise FileNotFoundError(f"weights not found: {wpath}")
         ckpt = tc.load_ckpt_safe(wpath, map_location=device)
         sd = ckpt.get("model", ckpt.get("model_state_dict", ckpt.get("state_dict", ckpt)))
         fc3_key = next((k for k in sd if k.startswith("fc3.") and k.endswith("weight")), None)
@@ -567,6 +585,12 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
             class_names = meta.get("class_names") or class_names
             if meta.get("grid") is not None:
                 SUB_GRID_SIZE = float(meta["grid"])
+            # the trained block size — fc0's width matches either way, so a
+            # mismatch here is silent (a different spatial context per block).
+            if meta.get("num_points"):
+                cfg.num_points = int(meta["num_points"])
+                cfg.num_sub_points = [cfg.num_points // r
+                                      for r in (4, 16, 64, 256)]
         # rebuild the EXACT assembly recorded with the weights (env is ignored
         # at infer). Manifests without "features" = legacy runs.
         mf = (meta or {}).get("features") or []
@@ -592,16 +616,16 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         print(f"  [infer] loaded {weights} ({num_classes} classes: {class_names}; "
               f"final_model = best-val epoch {ckpt.get('epoch', '?')})", flush=True)
 
-        scenes = sorted(glob.glob(f"{DATASETS_ROOT}/_infer/{infer_input}/scenes/*.npz"))
+        run_dir = tc.infer_dir(infer_input)
+        scenes = sorted(glob.glob(f"{run_dir}/scenes/*.npz"))
         if not scenes:
-            raise FileNotFoundError(f"No scenes under {DATASETS_ROOT}/_infer/{infer_input}/scenes")
+            raise FileNotFoundError(f"No scenes under {run_dir}/scenes")
 
         run_id = datetime.utcnow().strftime("%Y%m%d_%H%M%S_infer")
-        # Predictions live next to the input scenes under the shared /datasets tree
-        # (not the per-model runs dir), so inference output lands in
+        # Predictions live next to the input scenes under the shared datasets
+        # tree (not the per-model runs dir), so inference output lands in
         # one consistent place no matter which model produced it.
-        run_dir = f"{DATASETS_ROOT}/_infer/{infer_input}"
-        pred_dir = f"{run_dir}/predictions"
+        pred_dir = os.environ.get("TT_PRED_DIR") or f"{run_dir}/predictions"
         os.makedirs(pred_dir, exist_ok=True)
         exc_idx = tc.exclude_class_idx(class_names)
         infer_cfg = {"backbone": "RandLA-Net", "mode": "infer", "weights": weights,
@@ -624,7 +648,10 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                     if seen >= cap:
                         return
                     z = np.load(pc_path)
-                    xyz0 = z["xyz"].astype(np.float32)
+                    raw0 = z["xyz"]
+                    # scene-local frame, as the predict path (global-UTM
+                    # float32 quantizes y to 0.5m, coarser than SUB_GRID_SIZE)
+                    xyz0 = (raw0 - np.floor(raw0.min(0))).astype(np.float32)
                     itn0, ret0 = tc.scene_arrays(z, len(xyz0))
                     ex0 = tc.feat_extras(z, FEAT_SPEC, os.path.basename(pc_path))
                     keys = np.floor(xyz0 / SUB_GRID_SIZE).astype(np.int64)
@@ -633,14 +660,27 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                     # BN stats must see the same feature the net will be fed at predict.
                     s_src = {"intensity": itn0[uniq], "return_number": ret0[uniq],
                              **{n: v[uniq] for n, v in ex0.items()}}
-                    for s0 in range(0, len(sx), N):
+                    # Sphere sweep, seed-centered — the whole point of AdaBN is
+                    # to recalibrate on the distribution predict will feed the
+                    # net, so this must match _predict_scene's geometry (and
+                    # sample_sphere's), not an x-major lexsort slab.
+                    rng = np.random.RandomState(20250720)
+                    uncov = np.ones(len(sx), bool)
+                    for _ in range(2 * (len(sx) // N + 1)):
                         if seen >= cap:
                             return
-                        real = min(N, len(sx) - s0)
+                        rem = np.flatnonzero(uncov)
+                        if not len(rem):
+                            break
+                        seed_i = int(rng.choice(rem))
+                        d2 = np.sum((sx - sx[seed_i]) ** 2, axis=1)
+                        sel = np.argpartition(d2, min(N, len(sx) - 1))[:N]
+                        uncov[sel] = False
+                        real = len(sel)
                         if real < 64:
                             continue
-                        block = sx[s0:s0 + N]
-                        cols = ([s_src[n][s0:s0 + N] for n in NONXYZ]
+                        block = sx[sel]
+                        cols = ([s_src[n][sel] for n in NONXYZ]
                                 + ([dg.local_density_logdk(block, DG_LOGDK_K)] if DG_LOGDK_FEAT else []))
                         f2 = (np.stack(cols, axis=1) if cols
                               else np.zeros((len(block), 0), np.float32))   # D3b
@@ -650,8 +690,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                             f2 = np.concatenate([f2, f2[pad]], 0)
                         perm = np.random.permutation(N)
                         block, f2 = block[perm], f2[perm]
-                        pc_c = (block - block.mean(0, keepdims=True,
-                                                   dtype=np.float64)).astype(np.float32)
+                        pc_c = (block - sx[seed_i]).astype(np.float32)
                         item = (pc_c, f2.astype(np.float32), np.zeros(N, np.int64),
                                 np.arange(N, dtype=np.int32), np.array([0], np.int32))
                         batch = collate_fn([item])
@@ -679,7 +718,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     train_list, val_list, test_list = ensure_prep()
     tag = dataset
     run_id = datetime.utcnow().strftime(f"%Y%m%d_%H%M%S_{tag}_randlanet_cold")
-    run_dir = f"/outputs/runs/{run_id}"
+    run_dir = f"{tc.OUTPUTS_ROOT}/runs/{run_id}"
     os.makedirs(f"{run_dir}/checkpoints", exist_ok=True)
     with open(f"{run_dir}/run.json", "w") as f:
         json.dump({
@@ -786,7 +825,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     def evaluate(ds, name2src, label):
         """Full-coverage eval scored on the ORIGINAL raw points (official
         protocol). Each scene's 0.30 m subsampled points are predicted via
-        spatially-sorted NUM_POINTS blocks, over EVAL_VOTES offset passes whose
+        NUM_POINTS-point spheres (training's geometry), over EVAL_VOTES passes whose
         per-point softmax probs are summed (overlap voting — the protocol the
         PTv3/KPConvX evals use); the voted predictions are then propagated to
         the raw cloud by nearest neighbour and scored against the raw GT,
@@ -801,9 +840,8 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         with torch.no_grad():
             for i, (xyz, intensity, ret_num, extras, lab) in enumerate(ds.scenes):
                 src = {"intensity": intensity, "return_number": ret_num, **extras}
-                order = np.lexsort((xyz[:, 1], xyz[:, 0]))   # rough spatial locality
-                # EVAL_VOTES soft-vote passes over offset block grids (votes is
-                # n_sub x C float32 — a few MB per class per million points).
+                # EVAL_VOTES soft-vote passes of the sphere sweep below (votes
+                # is n_sub x C float32 — a few MB per class per million points).
                 votes = np.zeros((len(xyz), NUM_CLASSES), np.float32)
                 pend_items, pend_blocks = [], []
 
@@ -821,33 +859,48 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                     pend_items, pend_blocks = [], []
 
                 n_passes = max(int(EVAL_VOTES), 1)
+                # Sphere sweep: the same geometry training samples (the N
+                # nearest neighbours of a seed point). Contiguous lexsort slabs
+                # gave the net an x-major sliver — a different kNN graph and
+                # receptive field than any training sphere, so val mIoU (and
+                # best-checkpoint selection) scored the wrong geometry.
+                # Seeds are drawn from the still-uncovered points; each pass
+                # reseeds (fixed seed, so rows stay comparable across epochs).
+                # ponytail: capped at 2x the ideal sphere count — the thin
+                # residue left uncovered is filled by the NN reprojection below.
+                max_blocks = 2 * (len(xyz) // N + 1)
                 for vp in range(n_passes):
-                    ov = np.roll(order, -(N * vp) // n_passes) if vp else order
-                    for s in range(0, len(ov), N):
-                        blk = ov[s:s + N]
-                        real = len(blk)
+                    rng = np.random.RandomState(20250720 + vp)
+                    uncov = np.ones(len(xyz), bool)
+                    for _ in range(max_blocks):
+                        rem = np.flatnonzero(uncov)
+                        if not len(rem):
+                            break
+                        seed = int(rng.choice(rem))
+                        d2 = np.sum((xyz - xyz[seed]) ** 2, axis=1)
+                        sel = np.argpartition(d2, min(N, len(xyz) - 1))[:N]
+                        uncov[sel] = False
+                        real = len(sel)
                         if real < 64:
                             continue
-                        pts_blk = xyz[blk]
-                        cols = ([src[n][blk] for n in NONXYZ]
+                        pts_blk = xyz[sel]
+                        cols = ([src[n][sel] for n in NONXYZ]
                                 + ([dg.local_density_logdk(pts_blk, DG_LOGDK_K)] if DG_LOGDK_FEAT else []))
                         f2 = (np.stack(cols, axis=1) if cols
-                              else np.zeros((len(blk), 0))).astype(np.float32)   # D3b
-                        orig = blk.astype(np.int64)
-                        if real < N:                         # pad the final short block
+                              else np.zeros((len(sel), 0))).astype(np.float32)   # D3b
+                        orig = sel.astype(np.int64)
+                        if real < N:                         # pad the short sphere
                             pad = np.random.choice(real, N - real)
                             pts_blk = np.concatenate([pts_blk, pts_blk[pad]], axis=0)
                             f2 = np.concatenate([f2, f2[pad]], axis=0)
                             orig = np.concatenate([orig, np.full(N - real, -1, np.int64)])
                         # RandLA-Net subsamples by taking the FIRST points at each
                         # layer (tf_map), so the input MUST be shuffled — training
-                        # spheres are (sample_sphere). The lexsort-ordered block
-                        # collapses the multi-scale subsampling onto one corner and
-                        # wrecks predictions. Shuffle, then track originals.
+                        # spheres are (sample_sphere). Shuffle, track originals.
                         perm = np.random.permutation(N)
                         pts_blk, f2, orig = pts_blk[perm], f2[perm], orig[perm]
-                        pc_c = (pts_blk - pts_blk.mean(0, keepdims=True,
-                                                       dtype=np.float64)).astype(np.float32)
+                        # centered on the seed, as sample_sphere does
+                        pc_c = (pts_blk - xyz[seed]).astype(np.float32)
                         pend_items.append((pc_c, f2, np.zeros(N, np.int64),
                                            np.arange(N, dtype=np.int32),
                                            np.array([0], np.int32)))

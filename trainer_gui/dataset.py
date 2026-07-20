@@ -178,6 +178,7 @@ def _subset(cloud: Cloud, raw: np.ndarray | None, mask: np.ndarray):
         intensity=cloud.intensity[mask] if cloud.intensity is not None else None,
         return_number=cloud.return_number[mask] if cloud.return_number is not None else None,
         fields={k: v[mask] for k, v in cloud.fields.items()},
+        crs_wkt=cloud.crs_wkt,
     )
     return sub, (raw[mask] if raw is not None else None)
 
@@ -353,6 +354,45 @@ def _seam_drop(xy, keys, uniq, split_of_point, tile_m: float,
 
 # --------------------------------------------------------------------- conversion
 
+def _crs_check(crs_wkt: str | None, xyz: np.ndarray, name: str) -> str | None:
+    """Validate a scene's CRS against the meter-denominated pipeline (tile_m,
+    chunk_xy, geo_radius, subsample grids are ALL meters). Geographic (lon/lat)
+    coords fail loud — every one of those knobs would silently mean degrees.
+    Returns a warning string (non-meter linear units; or, with no CRS at all,
+    coordinates that look like degrees) or None. pyproj missing or WKT
+    unparseable degrades to no check — same as a file with no CRS."""
+    if crs_wkt:
+        try:
+            from pyproj import CRS
+            crs = CRS.from_wkt(crs_wkt)
+        except Exception:
+            return None
+        if crs.is_geographic:
+            raise ValueError(
+                f"{name}: cloud is in a geographic CRS ({crs.name}) — coordinates "
+                "are lon/lat DEGREES, but tile sizes, radii and grids are meters. "
+                "Reproject to a projected CRS (e.g. UTM) and re-convert.")
+        try:
+            unit = crs.axis_info[0].unit_name
+            factor = float(crs.axis_info[0].unit_conversion_factor)
+        except (AttributeError, IndexError):
+            return None
+        if abs(factor - 1.0) > 1e-6:
+            return (f"⚠ {name}: CRS unit is '{unit}' ({factor:g} m), not meters — "
+                    f"tile/radius/grid settings are meter-denominated and will be "
+                    f"off by that factor.")
+        return None
+    xy = xyz[:, :2]
+    lo, hi = xy.min(0), xy.max(0)
+    if ((hi - lo).max() < 10.0 and abs(lo[0]) <= 360 and abs(hi[0]) <= 360
+            and abs(lo[1]) <= 90 and abs(hi[1]) <= 90):
+        return (f"⚠ {name}: no CRS, and the coordinates fit lon/lat bounds with a "
+                "tiny extent — if these are degrees, reproject to a projected "
+                "(meter) CRS before converting; meter-denominated settings would "
+                "otherwise be wrong.")
+    return None
+
+
 def _hag_from_cloud(cloud: Cloud) -> np.ndarray | None:
     """Return a source HeightAboveGround/HAG field when one exists and aligns 1:1.
 
@@ -388,7 +428,12 @@ def _convert_one(cloud: Cloud, raw: np.ndarray | None, value_to_index: dict[int,
     # coords, where float32 spacing is 0.5m — a cast here quantizes northing
     # to half-meter steps before any trainer ever sees the points. Trainers
     # origin-shift to a scene-local frame before their own float32 casts.
+    crs_warning = _crs_check(cloud.crs_wkt, cloud.xyz, out_path.stem)
     out: dict[str, np.ndarray] = {"xyz": cloud.xyz.astype(np.float64)}
+    if cloud.crs_wkt:
+        # 0-d unicode array: rides the npz inert (every consumer filters keys by
+        # feat_* prefix or (N,)-shape), ferried into pred npz -> export add_crs.
+        out["crs_wkt"] = np.asarray(cloud.crs_wkt)
 
     class_counts: dict[int, int] = {}
     # No class mapping = inference: `raw` was read only to locate ground (see
@@ -471,6 +516,8 @@ def _convert_one(cloud: Cloud, raw: np.ndarray | None, value_to_index: dict[int,
         "has_return_number": cloud.return_number is not None,
         "has_hag": "feat_hag" in out,
         "feature_scales": feature_scales,
+        "crs_wkt": cloud.crs_wkt,
+        "crs_warning": crs_warning,
     }
 
 
@@ -796,6 +843,11 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
               for sp in _SPLITS}
 
     all_stats = [s for sp in _SPLITS for s in scene_stats[sp]]
+    for w in sorted({s["crs_warning"] for s in all_stats if s.get("crs_warning")}):
+        say(w)
+    if len({s.get("crs_wkt") for s in all_stats} - {None}) > 1:
+        say("⚠ scenes carry MORE THAN ONE CRS — the model would train on mixed "
+            "zones/unit systems; reproject all sources to one CRS for a clean dataset.")
     total_pts = sum(s["n_points"] for s in all_stats)
     total_area = sum(s["area_m2"] for s in all_stats)
     density = total_pts / max(total_area, 1.0)
@@ -983,6 +1035,8 @@ def convert_infer_job(job_id: str, input_dir: str, staging_root: Path, progress=
                            geo_features=geo_features, geo_radius=geo_radius)
         st["scene"] = out_path.name
         st["source_file"] = str(path)
+        if st.get("crs_warning"):
+            say("  " + st["crs_warning"])
         scenes.append(out_path.name)
         stats.append(st)
     meta = {
@@ -1013,7 +1067,9 @@ def export_predictions(pred_dir, fmt: str, progress=None, class_map=None,
     (+ confidence when the npz has one). class_map ({model index: source value},
     None = identity) remaps classes so exports carry the input's own codes; when
     unclass_threshold is set, points with confidence below it export as ASPRS
-    class 1 "Unclassified" (0 if 1 is a mapped class) — old npz without confidence
+    class 1 "Unclassified" — 0 if 1 is a mapped class, or 255 when there is no
+    class_map at all and the export therefore carries raw model indices (where
+    0 and 1 are both real classes) — old npz without confidence
     skip the threshold silently. The npz keeps the raw prediction so a new
     threshold re-exports without re-running inference. Returns the written paths."""
     fmt = fmt.lower().lstrip(".")
@@ -1026,13 +1082,24 @@ def export_predictions(pred_dir, fmt: str, progress=None, class_map=None,
         unclass = 0
         say("  (class 1 is taken by the model's own classes — low-confidence "
             "points export as class 0 instead)")
+    elif unclass_threshold is not None and not class_map:
+        # Raw model indices: 0 and 1 are both real classes (0 always, 1 whenever
+        # K>=2), so neither is safe. cls is clipped to uint8 below, leaving 255
+        # free. ponytail: breaks at K>255, which the uint8 cast already can't do.
+        unclass = 255
+        say("  (no class map — export carries raw model indices; low-confidence "
+            "points export as 255)")
     written: list[Path] = []
+    no_crs: list[str] = []
     for src in sorted(Path(pred_dir).glob("*_pred.npz")):
         with np.load(src) as d:
             xyz = np.asarray(d["xyz"], np.float64)
             cls = np.asarray(d["classification"], np.int64)
             conf = (np.asarray(d["confidence"], np.float32)
                     if "confidence" in d.files else None)
+            crs_wkt = str(d["crs_wkt"]) if "crs_wkt" in d.files else None
+        if crs_wkt is None and fmt in ("las", "laz"):
+            no_crs.append(src.name)
         if class_map:                       # model indices -> source values
             lut = np.arange(max(int(cls.max(initial=0)), max(class_map)) + 1)
             for i, v in class_map.items():
@@ -1046,24 +1113,36 @@ def export_predictions(pred_dir, fmt: str, progress=None, class_map=None,
         # ponytail: uint8 classification (LAS pf6 / uchar); >255 classes would clip.
         cls = np.clip(cls, 0, 255).astype(np.uint8)
         dst = src.with_suffix(f".{fmt}")
-        _write_pred(dst, xyz, cls, fmt, confidence=conf)
+        _write_pred(dst, xyz, cls, fmt, confidence=conf, crs_wkt=crs_wkt)
         written.append(dst)
         say(f"  {src.name} -> {dst.name} ({len(xyz):,} pts"
             + (f"; {low:,} below confidence {unclass_threshold:g} -> class {unclass}"
                if unclass_threshold is not None and conf is not None else "") + ")")
+    if no_crs:
+        say(f"  ⚠ no CRS recorded in {', '.join(no_crs)} — those {fmt} deliverables "
+            "carry no georeferencing (predictions from before CRS support, or "
+            "sources without one). Re-running the inference job re-stages with CRS.")
     return written
 
 
 def _write_pred(dst: Path, xyz: np.ndarray, cls: np.ndarray, fmt: str,
-                confidence=None):
+                confidence=None, crs_wkt=None):
     """One classified cloud -> dst. xyz float, cls uint8; confidence (float32)
     rides along in las/laz (Extra Bytes VLR — CloudCompare reads it as a scalar
-    field) and txt/csv; ply stays classification-only."""
+    field) and txt/csv; ply stays classification-only. crs_wkt (the source's
+    CRS, ferried scene npz -> pred npz) is restored as the las/laz WKT VLR so
+    the deliverable is georeferenced; other formats can't carry it."""
     if fmt in ("las", "laz"):
         import laspy
         h = laspy.LasHeader(point_format=6, version="1.4")   # 8-bit classification
         if confidence is not None:
             h.add_extra_dim(laspy.ExtraBytesParams(name="confidence", type=np.float32))
+        if crs_wkt:
+            try:
+                from pyproj import CRS
+                h.add_crs(CRS.from_wkt(crs_wkt))
+            except Exception:
+                pass    # a CRS-less deliverable beats no deliverable
         h.offsets = xyz.min(0)
         h.scales = [0.001] * 3
         las = laspy.LasData(h)
@@ -1074,8 +1153,10 @@ def _write_pred(dst: Path, xyz: np.ndarray, cls: np.ndarray, fmt: str,
         las.write(str(dst))
     elif fmt == "ply":
         # confidence is las/laz/txt/csv-only; the ply deliverable stays class-only.
+        # double, not float: georeferenced (UTM ~1e6) coords quantize to 0.5 m
+        # steps in a conforming reader's float32 parse.
         header = ("ply\nformat ascii 1.0\n" + f"element vertex {len(xyz)}\n"
-                  "property float x\nproperty float y\nproperty float z\n"
+                  "property double x\nproperty double y\nproperty double z\n"
                   "property uchar classification\nend_header")
         np.savetxt(dst, np.column_stack([xyz, cls]),
                    fmt=["%.3f"] * 3 + ["%d"], header=header, comments="")

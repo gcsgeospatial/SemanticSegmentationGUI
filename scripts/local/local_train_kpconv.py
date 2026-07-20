@@ -280,6 +280,10 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
     EPOCH_STEPS = steps_per_epoch if steps_per_epoch is not None else globals()["EPOCH_STEPS"]
     PACK_N      = batch if batch is not None else globals()["PACK_N"]
     FEATURE_MODE = globals()["FEATURE_MODE"]
+    # LR_DECAY is quoted for the 150-epoch default; scale it with N_EPOCHS so a
+    # short run still completes the same /10 decay instead of training at a
+    # near-constant lr0. At N_EPOCHS=150 this reproduces the module constant.
+    LR_DECAY    = 0.1 ** (1.0 / N_EPOCHS)
     # Input-feature spec: FEAT_CHANNELS env at train (the infer block below
     # overrides it from run.json — env is ignored at infer). "height" is always
     # tile-relative; real HAG is the ordinary feat_hag dataset channel.
@@ -296,12 +300,13 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
     DEFORMABLE    = globals()["DEFORMABLE"]
     NEIGHBOR_LIMITS = None   # resolved below: run.json (infer/resume) or calibration
 
-    ds_root = f"/datasets/{dataset}" if dataset else None
+    ds_root = tc.dataset_dir(dataset) if dataset else None
     if ds_root:
         ds_meta, NUM_CLASSES, CLASS_NAMES = tc.load_dataset_meta(dataset)
         PREP_DIR = (f"{ds_root}/prep/kpconv"
                     f"_grid{GRID:g}_c{int(CHUNK_XY)}"
-                    f"{tc.feat_spec_tag(FEAT_SPEC, FEAT_LEGACY)}")
+                    f"{tc.feat_spec_tag(FEAT_SPEC, FEAT_LEGACY)}"
+                    f"{tc.train_stride_tag()}")
     else:
         # Folder inference (--mode infer): no --dataset. Reproduce the TRAINED
         # geometry, class layout AND neighbor_limits from the run's run.json (the
@@ -309,9 +314,10 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
         # tiles, so PREP_DIR is an unused placeholder.
         NUM_CLASSES = 5
         CLASS_NAMES = [f"class {i}" for i in range(NUM_CLASSES)]
-        PREP_DIR = "/outputs/_infer_unused"
+        PREP_DIR = f"{tc.OUTPUTS_ROOT}/_infer_unused"
         if INFER and weights:
-            rj = _run_json_beside(f"/outputs/{weights}")
+            rj = _run_json_beside(weights if os.path.isabs(weights)
+                                  else f"{tc.OUTPUTS_ROOT}/{weights}")
             if rj:
                 NUM_CLASSES = int(rj.get("num_classes") or NUM_CLASSES)
                 CLASS_NAMES = list(rj.get("class_names") or
@@ -373,6 +379,10 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
             "min_pts_mask": 64,
             "min_pts_sub": 32,
             "intensity_norm": "p95_clip2",
+            # kp_tile_and_save bakes labels against the class layout: merging or
+            # reordering classes must invalidate the cache.
+            "num_classes": NUM_CLASSES,
+            "class_names": CLASS_NAMES,
             "feature_recipe": "bias," + ",".join(
                 "ret_num" if n == "return_number" else n
                 for n in FEAT_SPEC),
@@ -382,10 +392,14 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
         }
 
     def ensure_prep():
+        # train tiles at the (wider) TT_TRAIN_STRIDE; val/test keep chunk/2 so
+        # the final eval can vote over the up-to-4 overlapping covering tiles.
         return tc.kp_ensure_prep(
             PREP_DIR, ds_root, _cache_signature(),
-            lambda name, pc_path, out_dir: tc.kp_tile_and_save(
-                name, pc_path, out_dir, CHUNK_XY, STRIDE, GRID, NUM_CLASSES))
+            lambda name, pc_path, out_dir, split: tc.kp_tile_and_save(
+                name, pc_path, out_dir, CHUNK_XY,
+                tc.train_stride(CHUNK_XY) if split == "train" else STRIDE,
+                GRID, NUM_CLASSES))
 
     def find_latest_checkpoint():
         # Same-recipe runs only: optimizer type, feature spec AND the
@@ -412,8 +426,9 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
     resume_info = find_latest_checkpoint() if (RESUME or EVAL_ONLY) else None
     if INFER:
         run_id = datetime.utcnow().strftime("%Y%m%d_%H%M%S_infer")
-        run_dir = f"/datasets/_infer/{infer_input}"
-        os.makedirs(f"{run_dir}/predictions", exist_ok=True)
+        run_dir = tc.infer_dir(infer_input)
+        os.makedirs(os.environ.get("TT_PRED_DIR") or f"{run_dir}/predictions",
+                    exist_ok=True)
         resume_ckpt, start_epoch = None, 0
     elif resume_info:
         run_dir, resume_ckpt, resume_epoch = resume_info
@@ -661,16 +676,18 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
               f"at epoch {start_epoch}", flush=True)
 
     if EVAL_ONLY:
-        fm = f"/outputs/{weights}" if weights else f"{run_dir}/final_model.pth"
+        fm = ((weights if os.path.isabs(weights) else f"{tc.OUTPUTS_ROOT}/{weights}")
+              if weights else f"{run_dir}/final_model.pth")
         if weights and not os.path.exists(fm):
-            raise FileNotFoundError(f"--weights not found under /outputs: {fm}")
+            raise FileNotFoundError(f"--weights not found: {fm}")
         if os.path.exists(fm):
             net.load_state_dict(torch.load(fm, map_location="cuda", weights_only=True)["model"])
             print(f"  EVAL-ONLY: loaded {fm}", flush=True)
         start_epoch = N_EPOCHS
 
     if INFER:
-        fm = f"/outputs/{weights}" if weights else None
+        fm = ((weights if os.path.isabs(weights) else f"{tc.OUTPUTS_ROOT}/{weights}")
+              if weights else None)
         if not fm or not os.path.exists(fm):
             raise FileNotFoundError(f"--mode infer requires --weights; not found: {fm}")
         ck = tc.load_ckpt_safe(fm, map_location="cuda")
@@ -733,10 +750,10 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
             print(f"  [infer] note: KPConv uses its trained geometry "
                   f"(grid={GRID}, chunk={CHUNK_XY}); --grid/--chunk-xy ignored.", flush=True)
         net.eval()
-        scenes = sorted(glob.glob(f"/datasets/_infer/{infer_input}/scenes/*.npz"))
+        scenes = sorted(glob.glob(f"{run_dir}/scenes/*.npz"))
         if not scenes:
-            raise FileNotFoundError(f"No scenes under /datasets/_infer/{infer_input}/scenes")
-        pred_dir = f"{run_dir}/predictions"
+            raise FileNotFoundError(f"No scenes under {run_dir}/scenes")
+        pred_dir = os.environ.get("TT_PRED_DIR") or f"{run_dir}/predictions"
         infer_cfg = {"backbone": "KPConv", "mode": "infer",
                      "weights": weights,
                      "infer_input": infer_input, "num_classes": NUM_CLASSES,

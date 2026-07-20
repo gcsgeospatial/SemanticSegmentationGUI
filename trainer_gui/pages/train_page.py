@@ -1,10 +1,10 @@
 """Train page: dataset + model + params -> a training run, with live logs and
 epoch metrics. Two backends, chosen by the sidebar's Execution backend switch:
-local (docker run on your GPU; output folder on the host) and Modal (modal run
-on a cloud GPU; dataset read from / run written to Modal volumes). Dataset
-check verifies the train/val/test standard; per-model image status/pull live
-in a popup. Loss / class-balance knobs reach the trainer as env either way
-(docker -e locally, --env-json through the modal shell in the cloud).
+local (pixi run on your GPU; output folder on the host via TT_* env) and Modal
+(modal run on a cloud GPU; dataset read from / run written to Modal volumes).
+Dataset check verifies the train/val/test standard; per-model pixi-env
+status/install live in a popup. Loss / class-balance knobs reach the trainer
+as env either way (extra_env locally, --env-json through the modal shell).
 """
 
 from __future__ import annotations
@@ -65,8 +65,8 @@ class TrainPage(QWidget):
     def __init__(self, repo_root: str):
         super().__init__()
         self.repo_root = repo_root
-        self.runner = JobRunner(self)          # training process (docker or modal run)
-        self.pull_runner = JobRunner(self)     # docker pull, streamed to log
+        self.runner = JobRunner(self)          # training process (pixi or modal run)
+        self.pull_runner = JobRunner(self)     # pixi install, streamed to log
         self.status_worker = FuncWorker(self)  # off-thread image-presence check
         self.modal_worker = FuncWorker(self)   # off-thread modal volume preflight
         self.parser = LogParser(self)
@@ -107,7 +107,7 @@ class TrainPage(QWidget):
         model_row = QHBoxLayout()
         model_row.addWidget(self.backbone_combo, 1)
         self.cfg_btn = QPushButton("Configure model…")
-        self.cfg_btn.setToolTip("Docker image status + pull.")
+        self.cfg_btn.setToolTip("Pixi env status + install.")
         self.cfg_btn.clicked.connect(self._open_model_config)
         model_row.addWidget(self.cfg_btn)
         form.addRow("Model", ui.wrap(model_row))
@@ -239,15 +239,15 @@ class TrainPage(QWidget):
         self.refresh_images()
 
     def apply_exec_mode(self, local: bool):
-        """Re-scheme for the chosen backend: hide Docker-only / Modal-only rows."""
+        """Re-scheme for the chosen backend: hide local-only / Modal-only rows."""
         self.sub.setText(
             "Pick a dataset and model. Parameters are pre-filled from density analysis; "
             "edit before launching. "
-            + ("Runs locally in Docker on your GPU."
+            + ("Runs locally in the model's pixi env on your GPU."
                if local else
                "Runs on a Modal cloud GPU — upload the dataset from the Datasets page "
                "first; the finished run lands on the model's outputs volume."))
-        self.cfg_btn.setVisible(local)                      # docker image mgmt
+        self.cfg_btn.setVisible(local)                      # pixi env mgmt
         # stop/kill only while live; graceful stop stays local-only (the sentinel
         # rides the /outputs bind mount; Modal volumes can't take it mid-run)
         self._set_run_live(self._run_live)
@@ -262,7 +262,7 @@ class TrainPage(QWidget):
             if i >= 0:
                 self.gpu_combo.setCurrentIndex(i)
 
-    # ------------------------------------------------- per-model Docker popup
+    # --------------------------------------------- per-model pixi-env popup
     def _open_model_config(self):
         b = self._backbone()
         if b is None:
@@ -279,18 +279,9 @@ class TrainPage(QWidget):
         self._cfg_status = QLabel()
         lay.addWidget(self._cfg_status)
 
-        reg_row = QHBoxLayout()
-        reg_row.addWidget(QLabel("Registry"))
-        self.registry_edit = QLineEdit()
-        self.registry_edit.setPlaceholderText("e.g. ghcr.io/gcsgeospatial  (clear = local builds only)")
-        self.registry_edit.setText(appstate.local_config().get("registry", ""))
-        self.registry_edit.editingFinished.connect(self._on_registry_change)
-        reg_row.addWidget(self.registry_edit, 1)
-        lay.addLayout(reg_row)
-
         btn_row = QHBoxLayout()
-        self._cfg_pull_btn = QPushButton("Pull")
-        self._cfg_pull_btn.clicked.connect(self._pull_current)
+        self._cfg_pull_btn = QPushButton("Install / update env")
+        self._cfg_pull_btn.clicked.connect(self._install_current)
         refresh = QPushButton("Refresh")
         refresh.clicked.connect(self.refresh_images)
         close = QPushButton("Close")
@@ -305,20 +296,18 @@ class TrainPage(QWidget):
         dlg.finished.connect(lambda *_: setattr(self, "_cfg_dialog", None))
         self._update_cfg_dialog()
         self.refresh_images()        # async; _apply_statuses refreshes the dialog
-        dlg.show()                   # non-modal: pull progress shows in the main log
+        dlg.show()                   # non-modal: install progress shows in the main log
 
     @staticmethod
     def _status_text(s: dict | None):
-        """(text, accent-role, pull-enabled) for an image-status dict."""
+        """(text, accent-role, install-enabled) for an env-status dict."""
         if s is None:
             return "checking…", "muted", False
-        if not s["docker"]:
-            return "docker not found", "muted", False
-        if s["present"]:
-            return "✓ present", "ok", False
-        if s["pullable"]:
-            return "✗ not pulled", "warn", True
-        return "✗ build it (set a registry to pull)", "warn", False
+        if not s["pixi"]:
+            return "pixi not found", "muted", False
+        if s["installed"]:
+            return "✓ installed", "ok", True     # update stays available
+        return "✗ not installed", "warn", True
 
     def _update_cfg_dialog(self):
         if self._cfg_dialog is None:
@@ -327,14 +316,14 @@ class TrainPage(QWidget):
         if b is None:
             return
         self._cfg_model_lbl.setText(b.label)
-        self._cfg_tag.setText(f"image: {local_cli.image_for(b)}")
-        text, role, can_pull = self._status_text(self._last_statuses.get(b.key))
+        self._cfg_tag.setText(f"pixi env: {local_cli.env_name(b)}  (envs/pixi.toml)")
+        text, role, can_install = self._status_text(self._last_statuses.get(b.key))
         self._cfg_status.setText(f"status: {text}")
         theme.set_accent(self._cfg_status, role)
-        self._cfg_pull_btn.setEnabled(can_pull and not self.pull_runner.running)
+        self._cfg_pull_btn.setEnabled(can_install and not self.pull_runner.running)
 
     def refresh_images(self):
-        """Re-check image presence off the GUI thread; updates the popup when done."""
+        """Re-check env presence off the GUI thread; updates the popup when done."""
         if self.status_worker.running:
             return
         self.status_worker.start(local_cli.all_statuses)
@@ -343,34 +332,29 @@ class TrainPage(QWidget):
         self._last_statuses = {s["key"]: s for s in statuses}
         self._update_cfg_dialog()
 
-    def _on_registry_change(self):
-        cfg = {**appstate.get("local_config", {}), "registry": self.registry_edit.text().strip()}
-        appstate.set_local_config(cfg)
-        self.refresh_images()        # registry change affects pullability
-
-    def _pull_current(self):
+    def _install_current(self):
         b = self._backbone()
         if b is None:
             return
         s = self._last_statuses.get(b.key)
-        if not (s and s["docker"] and s["pullable"] and not s["present"]):
-            self._append("[local] Nothing to pull - image present or not pullable "
-                         "(set a registry; `docker login` if private).")
+        if not (s and s["pixi"]):
+            self._append("[local] pixi not found on PATH - install pixi "
+                         "(https://pixi.sh), then retry.")
             return
         if self.pull_runner.running:
             return
         self._cfg_pull_btn.setEnabled(False)
-        prog, args = local_cli.pull(b)
+        prog, args = local_cli.install(b, self.repo_root)
         self._append(f"\n[local] $ {local_cli.preview(prog, args)}\n")
         self.pull_runner.start(prog, args, cwd=self.repo_root)
 
     def _on_pull_finished(self, code: int):
-        self._append("[local] ✓ pulled." if code == 0
-                     else f"[local] ✗ pull failed (exit {code}). `docker login` if private.")
+        self._append("[local] ✓ env installed." if code == 0
+                     else f"[local] ✗ env install failed (exit {code}).")
         self.refresh_images()
 
     def _on_pull_failed(self, err: str):
-        self._append(f"\n[local] ✗ docker pull failed to start: {err}")
+        self._append(f"\n[local] ✗ pixi install failed to start: {err}")
         self._update_cfg_dialog()
 
     # ------------------------------------------------------------- datasets
@@ -594,7 +578,7 @@ class TrainPage(QWidget):
         ep = 2 if smoke else (ep_w.value() if ep_w is not None else 0)
         sw = self._param_widgets.get("steps-per-epoch")
         steps = 50 if smoke else (sw.value() if sw is not None else 0)
-        mode = ("Docker (local)" if appstate.get_exec_mode() == "local"
+        mode = ("pixi (local)" if appstate.get_exec_mode() == "local"
                 else f"Modal ({self.gpu_combo.currentText()})")
         self.summary_lbl.setText(
             f"▶ {b.label} · {name} · {ep} ep × {steps} steps"
@@ -802,6 +786,15 @@ class TrainPage(QWidget):
         feat_csv = self._feat_collect()    # '' = no env (trainer legacy defaults)
         if feat_csv:
             env["FEAT_CHANNELS"] = feat_csv
+        # A local trainer inherits these from the GUI's process env; the Modal
+        # container only ever sees --env-json, so forward them when actually set
+        # (never a default — that would freeze the container's own defaults).
+        # AUTO_RESUME rides along so a user who *wants* to continue a run the
+        # Modal shells no longer auto-resume (TT_MODAL_RETRY is preemption-only)
+        # can still ask for it, rather than losing hours of GPU time silently.
+        for k in ("TT_TRAIN_STRIDE", "TT_AMP", "TT_PREFETCH", "AUTO_RESUME"):
+            if os.environ.get(k):
+                env[k] = os.environ[k]
         params = {f: self._wvalue(w) for f, w in self._param_widgets.items()}
         if self.smoke_chk.isChecked():   # smoke-locked values aren't user edits
             saved = (appstate.get("train_last_config") or {}).get("params", {})
@@ -840,30 +833,31 @@ class TrainPage(QWidget):
     def _start_local_run(self, p):
         b, flags, name, info = p["backbone"], p["flags"], p["dataset"], p["info"]
         staged = info.get("staged_dir", "")
-        # Runs nest per dataset in the workspace: bind <workspace>/<dataset> ->
-        # /outputs so the container's /outputs/runs/<id> lands at
-        # <workspace>/<dataset>/runs/<id>, right beside the dataset's data.
+        # Runs nest per dataset in the workspace: TT_OUTPUTS_ROOT =
+        # <workspace>/<dataset>, so the trainer's runs/<id> lands right beside
+        # the dataset's data.
         base = str(appstate.workspace_dir())
         out_root = str(Path(base) / name)
         os.makedirs(out_root, exist_ok=True)
-        extra_mounts = []
+        dataset_dir = ""
         if not (staged and os.path.isdir(staged)):
             self._append(f"[local] ⚠ No staged copy of '{name}' - "
-                         f"container won't find /datasets/{name}.")
+                         f"the trainer won't find the dataset.")
         elif Path(staged).parent != Path(appstate.local_config()["datasets_root"]):
-            # Dataset lives outside the workspace (pre-existing/relocated); the base
-            # /datasets mount won't expose it, so bind it explicitly. A nested dataset
-            # needs no extra mount — base /datasets = workspace already covers it.
-            extra_mounts.append((staged, f"/datasets/{name}"))
-        prog, args = local_cli.run_script(b.script, flags, b, repo_root=self.repo_root,
-                                          extra_mounts=extra_mounts, outputs_root=out_root,
-                                          env=p.get("env", {}))
-        self._append(f"\n[local] $ {local_cli.preview(prog, args)}\n")
-        if not local_cli.have_docker():
+            # Dataset lives outside the workspace (pre-existing/relocated); the
+            # TT_DATASETS_ROOT base won't expose it, so point TT_DATASET_DIR
+            # straight at it. A nested dataset needs no override.
+            dataset_dir = staged
+        prog, args, run_env = local_cli.run_script(
+            b.script, flags, b, repo_root=self.repo_root,
+            outputs_root=out_root, dataset_dir=dataset_dir, env=p.get("env", {}))
+        self._append(f"\n[local] $ {local_cli.preview(prog, args, run_env)}\n")
+        if not local_cli.runnable():
             self._append(
-                "[local] docker not found on PATH - printed the command instead of running "
-                "it. On a Docker+GPU host, build the images (docker/build_all), then launch: "
-                f"training writes to {out_root}/runs/<id>.")
+                "[local] pixi not found (or not a Linux/CUDA host) - printed the "
+                "command instead of running it. On the GPU box: install the env from "
+                "Configure model…, then launch: training writes to "
+                f"{out_root}/runs/<id>.")
             self.launch_btn.setEnabled(True)
             return
         ok_gpu, msg_gpu = local_cli.gpu_preflight()
@@ -872,14 +866,14 @@ class TrainPage(QWidget):
         if not ok_gpu:
             self.launch_btn.setEnabled(True)
             return
-        ok, msg = local_cli.image_preflight(b)
+        ok, msg = local_cli.env_preflight(b, self.repo_root)
         if msg:
             self._append(msg)
         if not ok:
             self.launch_btn.setEnabled(True)
             return
         self._out_root = out_root   # anchor for the graceful-stop sentinel
-        self.runner.start(prog, args, cwd=self.repo_root)
+        self.runner.start(prog, args, cwd=self.repo_root, extra_env=run_env)
         self._set_run_live(True)
 
     # ------------------------------------------------------------- modal path

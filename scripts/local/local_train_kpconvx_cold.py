@@ -160,7 +160,9 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
         "FOCAL_GAMMA", "CLASS_WEIGHTING", "WEIGHT_BETA", "RARE_OVERSAMPLE",
         "KP_AGGREGATION", "KP_NORM", "VAL_EVERY", "FEAT_CHANNELS"])
 
-    sys.path.insert(0, "/opt/kpconvx")
+    # KPCONVX_SRC (conda trainer-src-kpconvx package activation) points at the
+    # source tree; the container images bake it at /opt/kpconvx.
+    sys.path.insert(0, os.environ.get("KPCONVX_SRC", "/opt/kpconvx"))
     EVAL_ONLY = (mode == "eval")
     INFER     = (mode == "infer")   # arbitrary-folder inference (trainer_gui)
 
@@ -184,6 +186,14 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
     EPOCH_STEPS = steps_per_epoch if steps_per_epoch is not None else globals()["EPOCH_STEPS"]
     PACK_N      = batch if batch is not None else globals()["PACK_N"]
     FEATURE_MODE = globals()["FEATURE_MODE"]
+    # The 1-cycle phases are quoted for the 100-epoch default; scale them with
+    # N_EPOCHS so a short run still traverses the whole curve instead of dying
+    # in the warmup ramp. At N_EPOCHS=100 the scale is 1.0, so the default
+    # schedule (30/5/120) is bit-for-bit unchanged.
+    _cyc_scale     = N_EPOCHS / 100.0
+    CYC_RAISE      = max(1, round(globals()["CYC_RAISE"] * _cyc_scale))
+    CYC_PLATEAU    = round(globals()["CYC_PLATEAU"] * _cyc_scale)
+    CYC_DECREASE10 = globals()["CYC_DECREASE10"] * _cyc_scale
     # Input-feature spec: FEAT_CHANNELS env at train (the infer branch below
     # overrides it from run.json — env is ignored at infer). "height" is always
     # tile-relative; real HAG is the ordinary feat_hag dataset channel.
@@ -194,14 +204,15 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
     # --dataset NAME selects a canonical trainer_gui dataset under /datasets
     # (bind-mounted); NUM_CLASSES / CLASS_NAMES / PREP_DIR are locals so the
     # whole function tracks the dataset's class layout.
-    ds_root = f"/datasets/{dataset}" if dataset else None
+    ds_root = tc.dataset_dir(dataset) if dataset else None
     if ds_root:
         ds_meta, NUM_CLASSES, CLASS_NAMES = tc.load_dataset_meta(dataset)
         # A custom feature spec gets its own cache family (legacy spec = ""
         # tag, old caches valid).
         PREP_DIR = (f"{ds_root}/prep/kpconvx_cold"
                     f"_grid{GRID:g}_c{int(CHUNK_XY)}"
-                    f"{tc.feat_spec_tag(FEAT_SPEC, FEAT_LEGACY)}")
+                    f"{tc.feat_spec_tag(FEAT_SPEC, FEAT_LEGACY)}"
+                    f"{tc.train_stride_tag()}")
     else:
         # Folder inference (--mode infer): no --dataset. Reproduce the TRAINED
         # geometry + class layout from the run's run.json (the self-contained
@@ -209,9 +220,10 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
         # INFER never reads cached tiles, so PREP_DIR is an unused placeholder.
         NUM_CLASSES = 5
         CLASS_NAMES = [f"class {i}" for i in range(NUM_CLASSES)]
-        PREP_DIR = "/outputs/_infer_unused"
+        PREP_DIR = f"{tc.OUTPUTS_ROOT}/_infer_unused"
         if INFER and weights:
-            meta = tc.infer_meta(f"/outputs/{weights}")
+            meta = tc.infer_meta(weights if os.path.isabs(weights)
+                                 else f"{tc.OUTPUTS_ROOT}/{weights}")
             if meta:
                 NUM_CLASSES = int(meta.get("num_classes") or NUM_CLASSES)
                 CLASS_NAMES = list(meta.get("class_names") or
@@ -265,18 +277,24 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
             "min_pts_mask": 64,
             "min_pts_sub": 32,
             "intensity_norm": "p95_clip2",
+            # kp_tile_and_save bakes labels against the class layout: merging or
+            # reordering classes must invalidate the cache.
+            "num_classes": NUM_CLASSES,
+            "class_names": CLASS_NAMES,
             "feature_recipe": "bias," + ",".join(
                 "ret_num" if n == "return_number" else n
                 for n in FEAT_SPEC),
         }
 
     def ensure_prep():
-        # val/test also tile at stride 50 so the final eval can vote over the
-        # up-to-4 overlapping tiles covering each point.
+        # train tiles at the (wider) TT_TRAIN_STRIDE; val/test keep chunk/2 so
+        # the final eval can vote over the up-to-4 overlapping covering tiles.
         return tc.kp_ensure_prep(
             PREP_DIR, ds_root, _cache_signature(),
-            lambda name, pc_path, out_dir: tc.kp_tile_and_save(
-                name, pc_path, out_dir, CHUNK_XY, STRIDE, GRID, NUM_CLASSES))
+            lambda name, pc_path, out_dir, split: tc.kp_tile_and_save(
+                name, pc_path, out_dir, CHUNK_XY,
+                tc.train_stride(CHUNK_XY) if split == "train" else STRIDE,
+                GRID, NUM_CLASSES))
 
     def find_latest_checkpoint():
         # Only same-recipe runs are valid resume targets: AdamW recipe AND this
@@ -303,10 +321,12 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
     if INFER:
         # Inference-only: fresh *_infer run dir, weights loaded after net build.
         run_id = datetime.utcnow().strftime("%Y%m%d_%H%M%S_infer")
-        # Predictions live next to the input scenes under /datasets/_infer (not the
-        # per-model runs dir), so inference output is in one consistent place.
-        run_dir = f"/datasets/_infer/{infer_input}"
-        os.makedirs(f"{run_dir}/predictions", exist_ok=True)
+        # Predictions live next to the input scenes under the datasets _infer
+        # tree (not the per-model runs dir), so inference output is in one
+        # consistent place.
+        run_dir = tc.infer_dir(infer_input)
+        os.makedirs(os.environ.get("TT_PRED_DIR") or f"{run_dir}/predictions",
+                    exist_ok=True)
         resume_ckpt, start_epoch = None, 0
     elif resume_info:
         run_dir, resume_ckpt, resume_epoch = resume_info
@@ -443,16 +463,18 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
         # Prefer explicit --weights, then the run's final_model.pth, else keep
         # the checkpoint weights loaded above. start_epoch = N_EPOCHS empties
         # the training loop, so the script falls straight to the final eval.
-        fm = f"/outputs/{weights}" if weights else f"{run_dir}/final_model.pth"
+        fm = ((weights if os.path.isabs(weights) else f"{tc.OUTPUTS_ROOT}/{weights}")
+              if weights else f"{run_dir}/final_model.pth")
         if weights and not os.path.exists(fm):
-            raise FileNotFoundError(f"--weights not found under /outputs: {fm}")
+            raise FileNotFoundError(f"--weights not found: {fm}")
         if os.path.exists(fm):
             net.load_state_dict(torch.load(fm, map_location="cuda", weights_only=True)["model"])
             print(f"  EVAL-ONLY: loaded {fm}", flush=True)
         start_epoch = N_EPOCHS
 
     if INFER:
-        fm = f"/outputs/{weights}" if weights else None
+        fm = ((weights if os.path.isabs(weights) else f"{tc.OUTPUTS_ROOT}/{weights}")
+              if weights else None)
         if not fm or not os.path.exists(fm):
             raise FileNotFoundError(f"--mode infer requires --weights; not found: {fm}")
         ck = tc.load_ckpt_safe(fm, map_location="cuda")
@@ -575,10 +597,10 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
             print(f"  [infer] note: KPConvX uses its trained geometry "
                   f"(grid={GRID}, chunk={CHUNK_XY}); --grid/--chunk-xy ignored.", flush=True)
         net.eval()
-        scenes = sorted(glob.glob(f"/datasets/_infer/{infer_input}/scenes/*.npz"))
+        scenes = sorted(glob.glob(f"{run_dir}/scenes/*.npz"))
         if not scenes:
-            raise FileNotFoundError(f"No scenes under /datasets/_infer/{infer_input}/scenes")
-        pred_dir = f"{run_dir}/predictions"
+            raise FileNotFoundError(f"No scenes under {run_dir}/scenes")
+        pred_dir = os.environ.get("TT_PRED_DIR") or f"{run_dir}/predictions"
         infer_cfg = {"backbone": "KPConvX-L", "mode": "infer",
                      "weights": weights,
                      "infer_input": infer_input, "num_classes": NUM_CLASSES,

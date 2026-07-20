@@ -111,7 +111,7 @@ class DatasetsPage(QWidget):
         self.sub.setText(
             "Point at clouds (las/laz, ply, txt/csv, pcd, npy/npz), name classes, "
             "split train/val, Build."
-            + (" Staged on disk, ready to train in Docker."
+            + (" Staged on disk, ready to train locally."
                if local else
                " Then upload to a per-dataset Modal volume."))
         self._reload_known()
