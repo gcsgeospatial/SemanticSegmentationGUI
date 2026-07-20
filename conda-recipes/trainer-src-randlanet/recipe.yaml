@@ -33,7 +33,11 @@ build:
         )],
     )
     PY
-    cd "$SRC_DIR/utils/nearest_neighbors" && $PYTHON setup.py build_ext --inplace
+    # the checked-in knn.cpp is stale Cython output (#include "longintrepr.h",
+    # removed in py3.11) — regenerate it from knn.pyx with the host cython
+    cd "$SRC_DIR/utils/nearest_neighbors"
+    "$PREFIX/bin/cython" --cplus knn.pyx -o knn.cpp
+    $PYTHON setup.py build_ext --inplace
     mkdir -p lib/python
     touch __init__.py lib/__init__.py lib/python/__init__.py
     cp nearest_neighbors*.so lib/python/
@@ -53,7 +57,7 @@ requirements:
     - python 3.11.*
     - setuptools <60   # compiled exts build via numpy.distutils/distutils; >=60 breaks the compiler API
     - numpy <2
-    - cython
+    - cython <3   # 0.29.x line: regenerates the old-style knn.pyx for py3.11
   run:
     - python 3.11.*
   ignore_run_exports:
