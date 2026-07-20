@@ -1,18 +1,51 @@
 version: 7
 platforms:
 - name: linux-64
+  virtual-packages:
+  - __unix=0=0
+  - __linux=4.18
+  - __glibc=2.28
+  - __archspec=0=x86_64
+- name: p1
+  subdir: linux-64
+  virtual-packages:
+  - __cuda=11.8
+  - __unix=0=0
+  - __linux=4.18
+  - __glibc=2.28
+  - __archspec=0=x86_64
+- name: p2
+  subdir: linux-64
+  virtual-packages:
+  - __cuda=12.1
+  - __unix=0=0
+  - __linux=4.18
+  - __glibc=2.28
+  - __archspec=0=x86_64
+- name: p3
+  subdir: linux-64
+  virtual-packages:
+  - __cuda=12.4
+  - __unix=0=0
+  - __linux=4.18
+  - __glibc=2.28
+  - __archspec=0=x86_64
 - name: win-64
+  virtual-packages:
+  - __win=10.0
+  - __archspec=0=x86_64
 environments:
   concerto:
     channels:
     - url: https://conda.anaconda.org/conda-forge/
+    - url: https://repo.prefix.dev/gcsgeospatial/
     indexes:
     - https://download.pytorch.org/whl/cu124
     - https://pypi.org/simple
     find-links:
     - url: https://data.pyg.org/whl/torch-2.5.0+cu124.html
     packages:
-      linux-64:
+      p3:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/_openmp_mutex-4.5-20_gnu.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/bzip2-1.0.8-hda65f42_9.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/ld_impl_linux-64-2.46.1-default_hbd61a6d_102.conda
@@ -35,6 +68,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/zstd-1.5.7-hb78ec9c_6.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/ca-certificates-2026.6.17-hbd8a1cb_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/tzdata-2025c-hc9c84f9_1.conda
+      - conda: https://repo.prefix.dev/gcsgeospatial/noarch/trainer-src-concerto-1.0.0-h4616a5c_0.conda
       - pypi: https://data.pyg.org/whl/torch-2.5.0%2Bcu124/torch_scatter-2.1.2%2Bpt25cu124-cp311-cp311-linux_x86_64.whl
       - pypi: https://download-r2.pytorch.org/whl/cu124/torch-2.5.0%2Bcu124-cp311-cp311-linux_x86_64.whl
       - pypi: https://download-r2.pytorch.org/whl/cu124/torchvision-0.20.0%2Bcu124-cp311-cp311-linux_x86_64.whl
@@ -112,15 +146,17 @@ environments:
   default:
     channels:
     - url: https://conda.anaconda.org/conda-forge/
+    - url: https://repo.prefix.dev/gcsgeospatial/
     packages: {}
   kpconv:
     channels:
     - url: https://conda.anaconda.org/conda-forge/
+    - url: https://repo.prefix.dev/gcsgeospatial/
     indexes:
     - https://download.pytorch.org/whl/cu121
     - https://pypi.org/simple
     packages:
-      linux-64:
+      p2:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/_openmp_mutex-4.5-20_gnu.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/bzip2-1.0.8-hda65f42_9.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/ld_impl_linux-64-2.46.1-default_hbd61a6d_102.conda
@@ -132,6 +168,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/liblzma-5.8.3-hb03c661_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/libnsl-2.0.1-hb9d3cd8_1.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/libsqlite-3.53.3-h0c1763c_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-64/libstdcxx-15.2.0-h934c35e_19.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/libuuid-2.42.2-h5347b49_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/libxcrypt-4.4.36-hd590300_1.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/libzlib-1.3.2-h25fd6f3_2.conda
@@ -142,7 +179,9 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/tk-8.6.13-noxft_h366c992_103.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/zstd-1.5.7-hb78ec9c_6.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/ca-certificates-2026.6.17-hbd8a1cb_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/noarch/python_abi-3.11-8_cp311.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/tzdata-2025c-hc9c84f9_1.conda
+      - conda: https://repo.prefix.dev/gcsgeospatial/linux-64/trainer-src-kpconv-1.0.0-hb0f4dca_0.conda
       - pypi: https://download-r2.pytorch.org/whl/cu121/torch-2.3.0%2Bcu121-cp311-cp311-linux_x86_64.whl
       - pypi: https://download-r2.pytorch.org/whl/cu121/torchvision-0.18.0%2Bcu121-cp311-cp311-linux_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/09/7d/af933f0f6e0767995b4e2d705a0665e454d1c19402aa7e895de3951ebb04/scipy-1.17.1-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
@@ -197,11 +236,12 @@ environments:
   kpconvx-cold:
     channels:
     - url: https://conda.anaconda.org/conda-forge/
+    - url: https://repo.prefix.dev/gcsgeospatial/
     indexes:
     - https://download.pytorch.org/whl/cu121
     - https://pypi.org/simple
     packages:
-      linux-64:
+      p2:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/_openmp_mutex-4.5-20_gnu.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/binutils-2.46.1-default_h4852527_102.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/binutils_impl_linux-64-2.46.1-default_hfdba357_102.conda
@@ -256,8 +296,10 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/kernel-headers_linux-64-4.18.0-he073ed8_9.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/libgcc-devel_linux-64-12.4.0-h1762d19_102.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/libstdcxx-devel_linux-64-12.4.0-h1762d19_102.conda
+      - conda: https://conda.anaconda.org/conda-forge/noarch/python_abi-3.11-8_cp311.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/sysroot_linux-64-2.28-h4ee821c_9.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/tzdata-2025c-hc9c84f9_1.conda
+      - conda: https://repo.prefix.dev/gcsgeospatial/linux-64/trainer-src-kpconvx-1.0.0-hb0f4dca_0.conda
       - pypi: https://download-r2.pytorch.org/whl/cu121/torch-2.3.0%2Bcu121-cp311-cp311-linux_x86_64.whl
       - pypi: https://download-r2.pytorch.org/whl/cu121/torchvision-0.18.0%2Bcu121-cp311-cp311-linux_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/04/4b/29cac41a4d98d144bf5f6d33995617b185d14b22401f75ca86f384e87ff1/h11-0.16.0-py3-none-any.whl
@@ -329,6 +371,7 @@ environments:
   pkg:
     channels:
     - url: https://conda.anaconda.org/conda-forge/
+    - url: https://repo.prefix.dev/gcsgeospatial/
     packages:
       linux-64:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/_openmp_mutex-4.5-20_gnu.conda
@@ -377,13 +420,14 @@ environments:
   ptv3:
     channels:
     - url: https://conda.anaconda.org/conda-forge/
+    - url: https://repo.prefix.dev/gcsgeospatial/
     indexes:
     - https://download.pytorch.org/whl/cu118
     - https://pypi.org/simple
     find-links:
     - url: https://data.pyg.org/whl/torch-2.1.0+cu118.html
     packages:
-      linux-64:
+      p1:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/_openmp_mutex-4.5-20_gnu.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/bzip2-1.0.8-hda65f42_9.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/ld_impl_linux-64-2.46.1-default_hbd61a6d_102.conda
@@ -406,6 +450,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/zstd-1.5.7-hb78ec9c_6.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/ca-certificates-2026.6.17-hbd8a1cb_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/tzdata-2025c-hc9c84f9_1.conda
+      - conda: https://repo.prefix.dev/gcsgeospatial/noarch/trainer-src-ptv3-1.0.0-h4616a5c_0.conda
       - pypi: https://data.pyg.org/whl/torch-2.1.0%2Bcu118/torch_cluster-1.6.3%2Bpt21cu118-cp311-cp311-linux_x86_64.whl
       - pypi: https://data.pyg.org/whl/torch-2.1.0%2Bcu118/torch_scatter-2.1.2%2Bpt21cu118-cp311-cp311-linux_x86_64.whl
       - pypi: https://download-r2.pytorch.org/whl/cu118/torch-2.1.0%2Bcu118-cp311-cp311-linux_x86_64.whl
@@ -472,11 +517,12 @@ environments:
   randlanet:
     channels:
     - url: https://conda.anaconda.org/conda-forge/
+    - url: https://repo.prefix.dev/gcsgeospatial/
     indexes:
     - https://download.pytorch.org/whl/cu121
     - https://pypi.org/simple
     packages:
-      linux-64:
+      p2:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/_openmp_mutex-4.5-20_gnu.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/bzip2-1.0.8-hda65f42_9.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/ld_impl_linux-64-2.46.1-default_hbd61a6d_102.conda
@@ -488,6 +534,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/liblzma-5.8.3-hb03c661_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/libnsl-2.0.1-hb9d3cd8_1.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/libsqlite-3.53.3-h0c1763c_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-64/libstdcxx-15.2.0-h934c35e_19.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/libuuid-2.42.2-h5347b49_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/libxcrypt-4.4.36-hd590300_1.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/libzlib-1.3.2-h25fd6f3_2.conda
@@ -498,7 +545,9 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/tk-8.6.13-noxft_h366c992_103.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/zstd-1.5.7-hb78ec9c_6.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/ca-certificates-2026.6.17-hbd8a1cb_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/noarch/python_abi-3.11-8_cp311.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/tzdata-2025c-hc9c84f9_1.conda
+      - conda: https://repo.prefix.dev/gcsgeospatial/linux-64/trainer-src-randlanet-1.0.0-hb0f4dca_0.conda
       - pypi: https://download-r2.pytorch.org/whl/cu121/torch-2.2.2%2Bcu121-cp311-cp311-linux_x86_64.whl
       - pypi: https://download-r2.pytorch.org/whl/cu121/torchvision-0.17.2%2Bcu121-cp311-cp311-linux_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/09/7d/af933f0f6e0767995b4e2d705a0665e454d1c19402aa7e895de3951ebb04/scipy-1.17.1-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
@@ -555,13 +604,14 @@ environments:
   sonata:
     channels:
     - url: https://conda.anaconda.org/conda-forge/
+    - url: https://repo.prefix.dev/gcsgeospatial/
     indexes:
     - https://download.pytorch.org/whl/cu124
     - https://pypi.org/simple
     find-links:
     - url: https://data.pyg.org/whl/torch-2.5.0+cu124.html
     packages:
-      linux-64:
+      p3:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/_openmp_mutex-4.5-20_gnu.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/bzip2-1.0.8-hda65f42_9.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/ld_impl_linux-64-2.46.1-default_hbd61a6d_102.conda
@@ -584,6 +634,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/zstd-1.5.7-hb78ec9c_6.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/ca-certificates-2026.6.17-hbd8a1cb_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/tzdata-2025c-hc9c84f9_1.conda
+      - conda: https://repo.prefix.dev/gcsgeospatial/noarch/trainer-src-sonata-1.0.0-h4616a5c_0.conda
       - pypi: https://data.pyg.org/whl/torch-2.5.0%2Bcu124/torch_scatter-2.1.2%2Bpt25cu124-cp311-cp311-linux_x86_64.whl
       - pypi: https://download-r2.pytorch.org/whl/cu124/torch-2.5.0%2Bcu124-cp311-cp311-linux_x86_64.whl
       - pypi: https://download-r2.pytorch.org/whl/cu124/torchvision-0.20.0%2Bcu124-cp311-cp311-linux_x86_64.whl
@@ -661,13 +712,14 @@ environments:
   utonia:
     channels:
     - url: https://conda.anaconda.org/conda-forge/
+    - url: https://repo.prefix.dev/gcsgeospatial/
     indexes:
     - https://download.pytorch.org/whl/cu124
     - https://pypi.org/simple
     find-links:
     - url: https://data.pyg.org/whl/torch-2.5.0+cu124.html
     packages:
-      linux-64:
+      p3:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/_openmp_mutex-4.5-20_gnu.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/bzip2-1.0.8-hda65f42_9.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/ld_impl_linux-64-2.46.1-default_hbd61a6d_102.conda
@@ -690,6 +742,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/zstd-1.5.7-hb78ec9c_6.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/ca-certificates-2026.6.17-hbd8a1cb_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/tzdata-2025c-hc9c84f9_1.conda
+      - conda: https://repo.prefix.dev/gcsgeospatial/noarch/trainer-src-utonia-1.0.0-h4616a5c_0.conda
       - pypi: https://data.pyg.org/whl/torch-2.5.0%2Bcu124/torch_scatter-2.1.2%2Bpt25cu124-cp311-cp311-linux_x86_64.whl
       - pypi: https://download-r2.pytorch.org/whl/cu124/torch-2.5.0%2Bcu124-cp311-cp311-linux_x86_64.whl
       - pypi: https://download-r2.pytorch.org/whl/cu124/torchvision-0.20.0%2Bcu124-cp311-cp311-linux_x86_64.whl
@@ -1552,6 +1605,18 @@ packages:
   run_exports: {}
   size: 11883113
   timestamp: 1740240215984
+- conda: https://conda.anaconda.org/conda-forge/noarch/python_abi-3.11-8_cp311.conda
+  build_number: 8
+  sha256: fddf123692aa4b1fc48f0471e346400d9852d96eeed77dbfdd746fa50a8ff894
+  md5: 8fcb6b0e2161850556231336dae58358
+  constrains:
+  - python 3.11.* *_cpython
+  license: BSD-3-Clause
+  license_family: BSD
+  purls: []
+  run_exports: {}
+  size: 7003
+  timestamp: 1752805919375
 - conda: https://conda.anaconda.org/conda-forge/noarch/sysroot_linux-64-2.28-h4ee821c_9.conda
   sha256: c47299fe37aebb0fcf674b3be588e67e4afb86225be4b0d452c7eb75c086b851
   md5: 13dc3adbc692664cd3beabd216434749
@@ -1778,6 +1843,70 @@ packages:
     - vcomp14 >=14.51.36231
   size: 120684
   timestamp: 1781320948530
+- conda: https://repo.prefix.dev/gcsgeospatial/linux-64/trainer-src-kpconv-1.0.0-hb0f4dca_0.conda
+  sha256: 216216d32c3b0ef22103d3dfda8535511cb6fc05f96cba4285b9533af8aa8123
+  md5: 1900461f6f2b77b9d466749a1c345dfe
+  depends:
+  - python 3.11.*
+  - libstdcxx >=15
+  - libgcc >=15
+  - python_abi 3.11.* *_cp311
+  license: MIT
+  run_exports: {}
+  size: 622204
+  timestamp: 1784573801286
+- conda: https://repo.prefix.dev/gcsgeospatial/linux-64/trainer-src-kpconvx-1.0.0-hb0f4dca_0.conda
+  sha256: a2b114b3c77e1083c40aa110005b883d6bd561e8393d3785f092ae0e08daf733
+  md5: 1445cfde7f8bee3511f6b79700e5ea13
+  depends:
+  - python 3.11.*
+  - libstdcxx >=15
+  - libgcc >=15
+  - python_abi 3.11.* *_cp311
+  license: LicenseRef-Apple-Sample-Code
+  run_exports: {}
+  size: 432967
+  timestamp: 1784573801287
+- conda: https://repo.prefix.dev/gcsgeospatial/linux-64/trainer-src-randlanet-1.0.0-hb0f4dca_0.conda
+  sha256: 1178b81e11014668d05adc3ab07ce9cd8554b30299a6b19f771badb396bc6cf9
+  md5: 3281e8aa29e477dc9d153570706061ae
+  depends:
+  - python 3.11.*
+  - libstdcxx >=15
+  - libgcc >=15
+  - python_abi 3.11.* *_cp311
+  license: MIT
+  run_exports: {}
+  size: 14207318
+  timestamp: 1784573801288
+- conda: https://repo.prefix.dev/gcsgeospatial/noarch/trainer-src-concerto-1.0.0-h4616a5c_0.conda
+  sha256: 3545067d2fcfe9445d82818b787ff6f94a63e1d1aef640dd543409bfe077dbd8
+  md5: 1941dd2f9933c9b08729a2135d7c4e70
+  license: MIT
+  run_exports: {}
+  size: 51965
+  timestamp: 1784573801269
+- conda: https://repo.prefix.dev/gcsgeospatial/noarch/trainer-src-ptv3-1.0.0-h4616a5c_0.conda
+  sha256: 255e11b8f7e43a4190b20fca2adbb9901172dea1d8fe97ccdde0585f9fd1b861
+  md5: 4af5c9ec4c442035cd7db677a976731d
+  license: MIT
+  run_exports: {}
+  size: 1382797
+  timestamp: 1784573801287
+- conda: https://repo.prefix.dev/gcsgeospatial/noarch/trainer-src-sonata-1.0.0-h4616a5c_0.conda
+  sha256: 3b9236e9c69868a1613d467ccbf964cfd7359dd7e45ec0132cc5b0269f815a46
+  md5: 62f222ae26ec5f7b8c818120e31a8996
+  license: Apache-2.0
+  run_exports: {}
+  size: 1957479
+  timestamp: 1784573801289
+- conda: https://repo.prefix.dev/gcsgeospatial/noarch/trainer-src-utonia-1.0.0-h4616a5c_0.conda
+  sha256: c08a3b315fc22404d2fee4faa7b2ee7fd025294b1a03b828e890aa9b8bfaae07
+  md5: 4bad4acd1ebdac48f01629063dfaaa23
+  license: MIT
+  run_exports: {}
+  size: 55957
+  timestamp: 1784573801290
 - pypi: https://data.pyg.org/whl/torch-2.1.0%2Bcu118/torch_cluster-1.6.3%2Bpt21cu118-cp311-cp311-linux_x86_64.whl
   name: torch-cluster
   version: 1.6.3+pt21cu118
