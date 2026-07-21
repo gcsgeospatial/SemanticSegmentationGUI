@@ -811,9 +811,12 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
     # Final/periodic eval scored on the ORIGINAL raw points: center-weighted
     # softmax votes over the overlapping cached tiles, per-voxel argmax,
     # NN-reprojected to the raw cloud (shared KP-family pipeline).
-    evaluate = tc.kp_make_evaluate(
-        lambda cxyz, feat: net(_kp_batch(cxyz, feat), cfg).cpu().numpy().astype(np.float32),
-        build_feat, GRID, CHUNK_XY, NUM_CLASSES, CLASS_NAMES)
+    def _fwd_eval(tiles):     # [(cxyz, feat)] -> per-tile logits list
+        b, _ = make_kp_batch([(c, f, None) for c, f in tiles])
+        lg = net(b, cfg).cpu().numpy().astype(np.float32)
+        return np.split(lg, np.cumsum([len(c) for c, _ in tiles])[:-1])
+    evaluate = tc.kp_make_evaluate(_fwd_eval, build_feat, GRID, CHUNK_XY,
+                                   NUM_CLASSES, CLASS_NAMES)
 
     best = tc.BestCheckpoint(run_dir)
     tc.write_run_manifest(run_dir, "kpconv", dataset)

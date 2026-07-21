@@ -878,7 +878,8 @@ class TrainPage(QWidget):
         # AUTO_RESUME rides along so a user who *wants* to continue a run the
         # Modal shells no longer auto-resume (TT_MODAL_RETRY is preemption-only)
         # can still ask for it, rather than losing hours of GPU time silently.
-        for k in ("TT_TRAIN_STRIDE", "TT_AMP", "TT_PREFETCH", "AUTO_RESUME"):
+        for k in ("TT_TRAIN_STRIDE", "TT_AMP", "TT_PREFETCH", "AUTO_RESUME",
+                  "EVAL_BATCH"):
             if os.environ.get(k):
                 env[k] = os.environ[k]
         params = {f: self._wvalue(w) for f, w in self._param_widgets.items()}

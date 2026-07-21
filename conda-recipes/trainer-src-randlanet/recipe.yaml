@@ -16,7 +16,7 @@ source:
   rev: ${{ sha }}
 
 build:
-  number: 0
+  number: 1   # rebuilt with the cython<3 knn.cpp regen — new identity so caches/locks refetch
   script: |
     cat > "$SRC_DIR/utils/nearest_neighbors/setup.py" <<'PY'
     from setuptools import setup, Extension

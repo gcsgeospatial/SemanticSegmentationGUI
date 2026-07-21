@@ -132,7 +132,8 @@ def _dg_block() -> dict | None:
     training process ran under. `logdk` changes the model's input width, so
     inference has to rebuild at that width and recompute the channel (with the same
     k) — record both so run.json is self-describing. AdaBN/TTA are inference-time
-    choices made on the Infer page, NOT a property of the weights, so not here."""
+    choices made on the Infer page, NOT a property of the weights, so not here —
+    write_infer_run records them per inference job instead."""
     try:
         import density as dg   # sibling helper; always importable when a trainer runs
     except ImportError:
@@ -289,6 +290,12 @@ def write_infer_run(run_dir, config, scene_stats):
     used plus per-scene metrics ({scene, points, seconds}). Callers rewrite it
     after every scene, so a crash still leaves the completed scenes' numbers."""
     doc = dict(config)
+    # Inference-time DG toggles: not a property of the weights (run.json keeps
+    # those), but they ARE the record of this job — without them, sweep runs
+    # differing only in AdaBN/TTA leave indistinguishable predictions.
+    doc["adabn"] = os.environ.get("DG_INFER_ADABN") == "1"
+    doc["tta_views"] = int(os.environ.get("DG_INFER_TTA", "0") or 0)
+    doc["save_probs"] = os.environ.get("TT_SAVE_PROBS") == "1"
     doc["scenes"] = scene_stats
     doc["total_points"] = int(sum(s["points"] for s in scene_stats))
     doc["total_seconds"] = round(sum(float(s["seconds"]) for s in scene_stats), 3)
@@ -1138,22 +1145,47 @@ def kp_find_latest_checkpoint(opt_type, feature_modes, arch_hash=None,
 def kp_make_evaluate(forward, build_feat, grid, chunk_xy, num_classes,
                      class_names):
     """The KP twins' voted eval, scored on the ORIGINAL raw points: per scene,
-    run the model over its overlapping cached tiles, sum center-weighted
-    softmax votes per voxel, argmax, then propagate to every raw point by
-    nearest neighbour and score against the raw GT. forward(cxyz, feat) ->
-    (N, C) logits ndarray; an exception skips the tile."""
+    run the model over its overlapping cached tiles (EVAL_BATCH tiles per
+    forward), sum center-weighted softmax votes per voxel, argmax, then
+    propagate to every raw point by nearest neighbour and score against the
+    raw GT. forward(tiles) takes [(cxyz, feat)] and returns the per-tile
+    (N, C) logits list; a failed tile is skipped."""
     import glob
     import numpy as np
     import torch
     from scipy.spatial import cKDTree
 
     def evaluate(scene_items, label):
+        bs = max(1, int(os.environ.get("EVAL_BATCH", "4")))
         t_inter = np.zeros(num_classes, dtype=np.int64)
         t_union = np.zeros(num_classes, dtype=np.int64)
         t_gt = np.zeros(num_classes, dtype=np.int64)
         correct = total = 0
         n_scenes = n_skipped_tiles = n_skipped_scenes = 0
         t_test = time.time()
+
+        def forward_group(group):
+            # A failed batched forward falls back to tile-by-tile (an OOM also
+            # halves bs for the rest of this pass); a tile that still fails
+            # alone is skipped (None), the pre-batching per-tile semantics.
+            nonlocal bs
+            if len(group) > 1:
+                try:
+                    return forward([(c, f) for _, c, f in group])
+                except Exception as e:
+                    if "out of memory" in str(e).lower():
+                        torch.cuda.empty_cache()
+                        bs = max(1, bs // 2)
+            outs = []
+            for _, c, f in group:
+                try:
+                    outs.append(forward([(c, f)])[0])
+                except Exception as e:
+                    if "out of memory" in str(e).lower():
+                        torch.cuda.empty_cache()
+                    outs.append(None)
+            return outs
+
         with torch.no_grad():
             for name, pc_path, _cls, split_dir in scene_items:
                 tiles = sorted(glob.glob(f"{split_dir}/{name}_x*.npz"))
@@ -1161,6 +1193,26 @@ def kp_make_evaluate(forward, build_feat, grid, chunk_xy, num_classes,
                     n_skipped_scenes += 1
                     continue
                 keys_l, log_l, xyz_l = [], [], []
+                group = []
+
+                def flush():
+                    nonlocal n_skipped_tiles
+                    for (xyz, _, _), lg in zip(group, forward_group(group)):
+                        if lg is None:
+                            n_skipped_tiles += 1
+                            continue
+                        # Soft votes tapered toward the tile border (truncated
+                        # context).
+                        e = np.exp(lg - lg.max(1, keepdims=True))
+                        prob = e / e.sum(1, keepdims=True)
+                        cxy = (xyz[:, :2].min(0) + xyz[:, :2].max(0)) / 2
+                        d = np.abs(xyz[:, :2] - cxy).max(1)
+                        wgt = np.clip(1.0 - d / (chunk_xy / 2.0), 0.05, 1.0) ** 2
+                        keys_l.append(np.floor(xyz / grid).astype(np.int64))
+                        log_l.append((prob * wgt[:, None]).astype(np.float32))
+                        xyz_l.append(xyz.astype(np.float32))
+                    group.clear()
+
                 for tile in tiles:
                     try:
                         z = np.load(tile)
@@ -1175,20 +1227,10 @@ def kp_make_evaluate(forward, build_feat, grid, chunk_xy, num_classes,
                                       extras=feat_extras(z, build_feat.spec,
                                                          os.path.basename(tile)))
                     cxyz = (xyz - xyz.mean(0)).astype(np.float32)
-                    try:
-                        lg = forward(cxyz, feat)
-                    except Exception:
-                        n_skipped_tiles += 1
-                        continue
-                    # Soft votes tapered toward the tile border (truncated context).
-                    e = np.exp(lg - lg.max(1, keepdims=True))
-                    prob = e / e.sum(1, keepdims=True)
-                    cxy = (xyz[:, :2].min(0) + xyz[:, :2].max(0)) / 2
-                    d = np.abs(xyz[:, :2] - cxy).max(1)
-                    wgt = np.clip(1.0 - d / (chunk_xy / 2.0), 0.05, 1.0) ** 2
-                    keys_l.append(np.floor(xyz / grid).astype(np.int64))
-                    log_l.append((prob * wgt[:, None]).astype(np.float32))
-                    xyz_l.append(xyz.astype(np.float32))
+                    group.append((xyz, cxyz, feat))
+                    if len(group) >= bs:
+                        flush()
+                flush()
                 if not keys_l:
                     n_skipped_scenes += 1
                     continue
@@ -1205,7 +1247,7 @@ def kp_make_evaluate(forward, build_feat, grid, chunk_xy, num_classes,
                     print(f"  [{label}] skip {name}: raw reload failed: {ex}", flush=True)
                     n_skipped_scenes += 1
                     continue
-                _, nn = cKDTree(rep_xyz).query(raw_xyz)
+                _, nn = cKDTree(rep_xyz).query(raw_xyz, workers=-1)
                 raw_pred = pred_u[nn]
                 v = raw_lab >= 0
                 rp, rl = raw_pred[v], raw_lab[v]
@@ -1580,8 +1622,9 @@ def ptv3_make_evaluate(forward, build_feat, feat_spec, grid, chunk_xy,
                        num_classes, class_names):
     """The PTv3-family voted eval. Per-SCENE overlap voting scored on the
     ORIGINAL raw points (the protocol KPConvX/RandLA use). Per scene: forward
-    its overlapping tiles (stride chunk_xy/2, each point in up to 4 tiles),
-    sum center-tapered softmax votes per grid voxel, argmax, then NN-propagate
+    its overlapping tiles (stride chunk_xy/2, each point in up to 4 tiles;
+    EVAL_BATCH tiles per forward via the multi-entry offset), sum
+    center-tapered softmax votes per grid voxel, argmax, then NN-propagate
     each voxel's prediction to the raw cloud and score against raw GT.
     forward(batch_dict) -> (N, C) logits tensor; scene_items are
     (name, load_raw, split_dir) triples."""
@@ -1591,18 +1634,77 @@ def ptv3_make_evaluate(forward, build_feat, feat_spec, grid, chunk_xy,
     from scipy.spatial import cKDTree
 
     def evaluate(scene_items, label):
+        bs = max(1, int(os.environ.get("EVAL_BATCH", "4")))
         t_inter = np.zeros(num_classes, dtype=np.int64)
         t_union = np.zeros(num_classes, dtype=np.int64)
         t_gt    = np.zeros(num_classes, dtype=np.int64)
         correct = total = 0
         n_scenes = n_skipped_tiles = n_skipped_scenes = 0
         t_test = time.time()
+
+        def _run(group):
+            # gc stays per-tile min-subtracted (NOT the training path's global
+            # min): identical serialization codes to the unbatched call, and
+            # the offset-derived batch index keeps clouds apart in spconv.
+            lens = [len(g[2]) for g in group]
+            coord = torch.from_numpy(np.concatenate([g[2] for g in group])).cuda()
+            featt = torch.from_numpy(np.concatenate([g[3] for g in group])).cuda()
+            gc = np.ascontiguousarray(np.concatenate([g[4] for g in group]))
+            grid_coord = torch.from_numpy(gc).long().cuda()
+            offset = torch.tensor(np.cumsum(lens), dtype=torch.long).cuda()
+            lg = forward({"coord": coord, "grid_coord": grid_coord,
+                          "feat": featt, "offset": offset}
+                         ).cpu().numpy().astype(np.float32)
+            return np.split(lg, np.cumsum(lens)[:-1])
+
+        def forward_group(group):
+            # OOM on the batched forward halves bs for the rest of this pass
+            # and retries tile-by-tile; a tile that still OOMs alone is
+            # skipped. Non-OOM RuntimeErrors re-raise (abort eval), as before.
+            nonlocal bs
+            if len(group) > 1:
+                try:
+                    return _run(group)
+                except RuntimeError as e:
+                    if "out of memory" not in str(e).lower():
+                        raise
+                    torch.cuda.empty_cache()
+                    bs = max(1, bs // 2)
+            outs = []
+            for g in group:
+                try:
+                    outs.append(_run([g])[0])
+                except RuntimeError as e:
+                    if "out of memory" not in str(e).lower():
+                        raise
+                    torch.cuda.empty_cache()
+                    outs.append(None)
+            return outs
+
         with torch.no_grad():
             for name, load_raw, split_dir in scene_items:
                 tiles = sorted(glob.glob(f"{split_dir}/{name}_x*.npz"))
                 if not tiles:
                     n_skipped_scenes += 1; continue
                 keys_l, vote_l, xyz_l = [], [], []
+                group = []
+
+                def flush():
+                    nonlocal n_skipped_tiles
+                    for (xyz, inverse, *_), lg in zip(group, forward_group(group)):
+                        if lg is None:
+                            n_skipped_tiles += 1
+                            continue
+                        e = np.exp(lg - lg.max(1, keepdims=True))
+                        prob = (e / e.sum(1, keepdims=True))[inverse]  # per original pt
+                        cxy = (xyz[:, :2].min(0) + xyz[:, :2].max(0)) / 2
+                        d = np.abs(xyz[:, :2] - cxy).max(1)
+                        wgt = np.clip(1.0 - d / (chunk_xy / 2.0), 0.05, 1.0) ** 2
+                        keys_l.append(np.floor(xyz / grid).astype(np.int64))
+                        vote_l.append((prob * wgt[:, None]).astype(np.float32))
+                        xyz_l.append(xyz.astype(np.float32))
+                    group.clear()
+
                 for tile in tiles:
                     try:
                         z = np.load(tile)
@@ -1630,27 +1732,11 @@ def ptv3_make_evaluate(forward, build_feat, feat_spec, grid, chunk_xy,
                     vx = cxyz[first].astype(np.float32)
                     feat = build_feat(vx, rgb[first].astype(np.float32) / 255.0,
                                       {n: v[first] for n, v in ex.items()})
-                    coord = torch.from_numpy(vx).cuda()
-                    featt = torch.from_numpy(feat).cuda()
-                    offset = torch.tensor([len(vx)], dtype=torch.long).cuda()
                     gc = vk[first] - vk[first].min(0)        # unique, dedup-consistent
-                    grid_coord = torch.from_numpy(np.ascontiguousarray(gc)).long().cuda()
-                    try:
-                        lg = forward({"coord": coord, "grid_coord": grid_coord,
-                                      "feat": featt, "offset": offset}
-                                     ).cpu().numpy().astype(np.float32)
-                    except RuntimeError as e:
-                        if "out of memory" in str(e).lower():
-                            torch.cuda.empty_cache(); n_skipped_tiles += 1; continue
-                        raise
-                    ex = np.exp(lg - lg.max(1, keepdims=True))
-                    prob = (ex / ex.sum(1, keepdims=True))[inverse]   # per original pt
-                    cxy = (xyz[:, :2].min(0) + xyz[:, :2].max(0)) / 2
-                    d = np.abs(xyz[:, :2] - cxy).max(1)
-                    wgt = np.clip(1.0 - d / (chunk_xy / 2.0), 0.05, 1.0) ** 2
-                    keys_l.append(np.floor(xyz / grid).astype(np.int64))
-                    vote_l.append((prob * wgt[:, None]).astype(np.float32))
-                    xyz_l.append(xyz.astype(np.float32))
+                    group.append((xyz, inverse, vx, feat, gc))
+                    if len(group) >= bs:
+                        flush()
+                flush()
                 if not keys_l:
                     n_skipped_scenes += 1; continue
                 K = np.concatenate(keys_l); V = np.concatenate(vote_l); P = np.concatenate(xyz_l)
@@ -1665,7 +1751,7 @@ def ptv3_make_evaluate(forward, build_feat, feat_spec, grid, chunk_xy,
                 except Exception as ex:
                     print(f"  [{label}] skip {name}: raw reload failed: {ex}", flush=True)
                     n_skipped_scenes += 1; continue
-                _, nn = cKDTree(rep_xyz).query(raw_xyz)
+                _, nn = cKDTree(rep_xyz).query(raw_xyz, workers=-1)
                 raw_pred = pred_u[nn]
                 v = (raw_lab >= 0) & (raw_lab < num_classes)
                 rp, rl = raw_pred[v], raw_lab[v]
@@ -2125,12 +2211,20 @@ def _demo():  # ponytail: one runnable check -- `python train_common.py`
     except ValueError as e:
         assert "feat_nope" in str(e) and "feat_demo" in str(e)
 
-    fwd = lambda cxyz, feat: np.tile([5.0, 0.0, 0.0], (len(cxyz), 1)).astype(np.float32)
+    fwd = lambda tiles: [np.tile([5.0, 0.0, 0.0], (len(c), 1)).astype(np.float32)
+                         for c, _ in tiles]
     ev = kp_make_evaluate(fwd, bf, 2.0, 30.0, 3, ["a", "b", "c"])
+    os.environ["EVAL_BATCH"] = "1"
     m_kp = ev([("s0", f"{ds}/val/s0.npz", None, f"{prep}/val")], "demo")
     assert m_kp["num_scenes"] == 1 and m_kp["per_class_gt_count"]["a"] > 0
     assert abs(m_kp["per_class_iou"]["a"] - m_kp["per_class_gt_count"]["a"]
                / sum(m_kp["per_class_gt_count"].values())) < 0.02   # all-a predictions
+    # batched grouping must not change the metrics
+    os.environ["EVAL_BATCH"] = "3"
+    m_kp3 = ev([("s0", f"{ds}/val/s0.npz", None, f"{prep}/val")], "demo")
+    del os.environ["EVAL_BATCH"]
+    assert (m_kp3["per_class_iou"] == m_kp["per_class_iou"]
+            and m_kp3["overall_acc"] == m_kp["overall_acc"])
     pp = kp_make_predict_points(
         lambda cxyz, feat: np.tile([1.0, 0.0, 0.0], (len(cxyz), 1)).astype(np.float32),
         bf, 2.0, 30.0, 3, 0, save_probs=True)

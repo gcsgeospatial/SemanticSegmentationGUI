@@ -920,7 +920,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                 except Exception as ex:
                     print(f"  [{label}] skip {name}: raw reload failed: {ex}", flush=True)
                     n_skipped += 1; continue
-                _, nn = cKDTree(xyz[got]).query(raw_xyz)
+                _, nn = cKDTree(xyz[got]).query(raw_xyz, workers=-1)
                 raw_pred = pred[got][nn]
                 v = raw_lab >= 0
                 rp, rl = raw_pred[v], raw_lab[v]
