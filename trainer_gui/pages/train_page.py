@@ -799,6 +799,10 @@ class TrainPage(QWidget):
                        for c in extra]
         names = std + [n if n.startswith("feat_") else f"feat_{n}"
                        for n in extra_names if n]
+        # HAG-box (and source-dimension) datasets bake feat_hag without it ever
+        # appearing in feature_channels — offer it whenever the scenes carry it.
+        if meta.get("has_hag") and "feat_hag" not in names:
+            names.append("feat_hag")
         for n in names:
             it = QListWidgetItem(str(n))
             it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
