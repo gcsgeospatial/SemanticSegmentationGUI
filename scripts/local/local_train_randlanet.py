@@ -249,9 +249,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         intensity, ret_num = tc.scene_arrays(z, len(xyz))
         lab = z["label"].astype(np.int32) if "label" in z \
             else np.full(len(xyz), -1, np.int32)
-        extras = {k: z[k].astype(np.float32) for k in z.files
-                  if k.startswith("feat_")}
-        return xyz, intensity, ret_num, lab, extras
+        return xyz, intensity, ret_num, lab, tc.scene_feats(z)
 
     def grid_subsample(xyz, intensity, ret_num, lab, extras, grid):
         keys = np.floor(xyz / grid).astype(np.int64)

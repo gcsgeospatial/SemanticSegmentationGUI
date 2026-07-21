@@ -731,8 +731,18 @@ def kp_load_canonical(npz_path):
     intensity, ret_num = scene_arrays(z, len(xyz))
     lab = z["label"].astype(np.int32) if "label" in z.files \
         else np.full(len(xyz), -1, np.int32)
-    extras = {k: z[k].astype(np.float32) for k in z.files if k.startswith("feat_")}
-    return xyz, intensity, ret_num, lab, extras
+    return xyz, intensity, ret_num, lab, scene_feats(z)
+
+
+def scene_feats(z):
+    """Every feat_* channel a scene npz carries. Pre-2026-07-13 conversions
+    stored HAG under a bare 'hag' key — surface it as feat_hag so legacy
+    datasets keep working without a re-convert/re-upload."""
+    import numpy as np
+    out = {k: z[k].astype(np.float32) for k in z.files if k.startswith("feat_")}
+    if "feat_hag" not in out and "hag" in z.files:
+        out["feat_hag"] = z["hag"].astype(np.float32)
+    return out
 
 
 def _grid_pool_t(p, a, l, voxel, num_classes):
@@ -1438,12 +1448,9 @@ def ptv3_tile_and_save(src_paths, out_dir, chunk_xy, stride, load_canonical):
         except Exception as e:
             print(f"  skip {src}: {e}", flush=True); continue
         # Every feat_* channel the scene carries rides into the cache tiles
-        # (feat_hag included — HAG is an ordinary feature channel).
-        extras = {}
-        if src.endswith(".npz"):
-            z = np.load(src)
-            extras = {k: z[k].astype(np.float32) for k in z.files
-                      if k.startswith("feat_")}
+        # (feat_hag included — HAG is an ordinary feature channel; legacy
+        # bare-'hag' scenes surface it via scene_feats).
+        extras = scene_feats(np.load(src)) if src.endswith(".npz") else {}
         print(f"    [{fi+1}/{len(src_paths)}] {scene}: {len(xyz):,} pts "
               f"loaded in {time.time()-t0:.1f}s, tiling…", flush=True)
         # ptv3 tiles are RAW slices (no pooling), so only the tile-index math
@@ -1821,6 +1828,9 @@ def feat_extras(z, spec, where):
         if not n.startswith("feat_"):
             continue
         if n not in z.files:
+            if n == "feat_hag" and "hag" in z.files:   # pre-2026-07-13 scene key
+                out[n] = z["hag"].astype(np.float32)
+                continue
             avail = [k for k in z.files if k.startswith("feat_")]
             raise ValueError(
                 f"{where} has no '{n}' channel (available feat_*: "
