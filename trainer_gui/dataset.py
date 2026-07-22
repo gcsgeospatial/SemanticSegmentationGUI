@@ -1124,6 +1124,7 @@ def export_predictions(pred_dir, fmt: str, progress=None, class_map=None,
             "points export as 255)")
     written: list[Path] = []
     no_crs: list[str] = []
+    legend_said = False
     for src in sorted(Path(pred_dir).glob("*_pred.npz")):
         with np.load(src) as d:
             xyz = np.asarray(d["xyz"], np.float64)
@@ -1131,6 +1132,15 @@ def export_predictions(pred_dir, fmt: str, progress=None, class_map=None,
             conf = (np.asarray(d["confidence"], np.float32)
                     if "confidence" in d.files else None)
             crs_wkt = str(d["crs_wkt"]) if "crs_wkt" in d.files else None
+            member = (np.asarray(d["dominant_member"], np.uint8)
+                      if "dominant_member" in d.files else None)
+            member_names = ([str(s) for s in d["member_names"]]
+                            if "member_names" in d.files else None)
+        if member is not None and fmt in ("las", "laz") and not legend_said:
+            legend_said = True
+            say("  ens_member field (ensemble's dominant model per point): "
+                + (", ".join(f"{i}={n}" for i, n in enumerate(member_names))
+                   if member_names else "member indices in ensemble input order"))
         if crs_wkt is None and fmt in ("las", "laz"):
             no_crs.append(src.name)
         if class_map:                       # model indices -> source values
@@ -1146,7 +1156,8 @@ def export_predictions(pred_dir, fmt: str, progress=None, class_map=None,
         # ponytail: uint8 classification (LAS pf6 / uchar); >255 classes would clip.
         cls = np.clip(cls, 0, 255).astype(np.uint8)
         dst = src.with_suffix(f".{fmt}")
-        _write_pred(dst, xyz, cls, fmt, confidence=conf, crs_wkt=crs_wkt)
+        _write_pred(dst, xyz, cls, fmt, confidence=conf, crs_wkt=crs_wkt,
+                    member=member)
         written.append(dst)
         say(f"  {src.name} -> {dst.name} ({len(xyz):,} pts"
             + (f"; {low:,} below confidence {unclass_threshold:g} -> class {unclass}"
@@ -1159,17 +1170,21 @@ def export_predictions(pred_dir, fmt: str, progress=None, class_map=None,
 
 
 def _write_pred(dst: Path, xyz: np.ndarray, cls: np.ndarray, fmt: str,
-                confidence=None, crs_wkt=None):
+                confidence=None, crs_wkt=None, member=None):
     """One classified cloud -> dst. xyz float, cls uint8; confidence (float32)
     rides along in las/laz (Extra Bytes VLR — CloudCompare reads it as a scalar
-    field) and txt/csv; ply stays classification-only. crs_wkt (the source's
-    CRS, ferried scene npz -> pred npz) is restored as the las/laz WKT VLR so
-    the deliverable is georeferenced; other formats can't carry it."""
+    field) and txt/csv; ply stays classification-only. member (uint8, the
+    ensemble's per-point dominant model index) rides along in las/laz only, as
+    the "ens_member" extra dim. crs_wkt (the source's CRS, ferried scene npz ->
+    pred npz) is restored as the las/laz WKT VLR so the deliverable is
+    georeferenced; other formats can't carry it."""
     if fmt in ("las", "laz"):
         import laspy
         h = laspy.LasHeader(point_format=6, version="1.4")   # 8-bit classification
         if confidence is not None:
             h.add_extra_dim(laspy.ExtraBytesParams(name="confidence", type=np.float32))
+        if member is not None:
+            h.add_extra_dim(laspy.ExtraBytesParams(name="ens_member", type=np.uint8))
         if crs_wkt:
             try:
                 from pyproj import CRS
@@ -1183,6 +1198,8 @@ def _write_pred(dst: Path, xyz: np.ndarray, cls: np.ndarray, fmt: str,
         las.classification = cls
         if confidence is not None:
             las.confidence = confidence
+        if member is not None:
+            las.ens_member = member
         las.write(str(dst))
     elif fmt == "ply":
         # confidence is las/laz/txt/csv-only; the ply deliverable stays class-only.

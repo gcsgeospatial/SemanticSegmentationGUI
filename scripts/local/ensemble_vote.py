@@ -12,8 +12,10 @@ argmax wins (soft vote — confidence = max of the average). Otherwise it falls
 back to a confidence-weighted hard vote: each model's label weighted by its
 per-point confidence (1.0 when absent), confidence = the winning weight share.
 Every output also carries "agreement": the fraction of models whose own label
-matches the final one. Class compatibility is clamped via each folder's
-infer_run.json when present.
+matches the final one, and "dominant_member": the per-point index (input
+order, names in "member_names") of the model that most drove the final label —
+exported to las/laz as the "ens_member" scalar field. Class compatibility is
+clamped via each folder's infer_run.json when present.
 
 Scenes are matched by filename (minus extension) across the input folders.
 Points are matched by row when the clouds are identical (the normal case); if a
@@ -82,6 +84,20 @@ def agreement(labels, final):
     return (np.asarray(labels) == final).mean(0).astype(np.float32)
 
 
+def dominant_member(voted, probs=None, labels=None, weights=None):
+    """(N,) uint8 index of the member that most drove the final label: highest
+    prob mass on the voted class (soft), or highest weight among members whose
+    own label matches it (hard). Ties -> earliest member. Soft-vote points no
+    member covered land on member 0 (agreement/confidence already flag them)."""
+    voted = np.asarray(voted)
+    if probs is not None:
+        sup = np.asarray(probs, np.float32)[:, np.arange(len(voted)), voted]
+    else:
+        sup = np.where(np.asarray(labels) == voted,
+                       np.asarray(weights, np.float32), 0.0)
+    return sup.argmax(0).astype(np.uint8)
+
+
 def load_pred(path):
     """(xyz, labels, intensity|None, confidence|None, probs|None) from any
     prediction file. npz is read natively (container-safe); exported formats go
@@ -107,11 +123,16 @@ def load_pred(path):
             np.asarray(conf, np.float32) if conf is not None else None, None)
 
 
-def write_out(path, xyz, cls, intensity, confidence, agree, crs_wkt=None):
+def write_out(path, xyz, cls, intensity, confidence, agree, crs_wkt=None,
+              dominant=None, member_names=None):
     if path.endswith(".npz"):
         d = {"xyz": xyz, "classification": cls.astype(np.int32),
              "confidence": np.asarray(confidence, np.float32),
              "agreement": np.asarray(agree, np.float32)}
+        if dominant is not None:
+            d["dominant_member"] = np.asarray(dominant, np.uint8)
+            if member_names:
+                d["member_names"] = np.asarray(list(member_names))
         if intensity is not None:
             d["intensity"] = intensity
         if crs_wkt:
@@ -125,7 +146,8 @@ def write_out(path, xyz, cls, intensity, confidence, agree, crs_wkt=None):
     from pathlib import Path
     _write_pred(Path(path), np.asarray(xyz, np.float64),
                 np.clip(cls, 0, 255).astype(np.uint8), path.rsplit(".", 1)[1],
-                confidence=np.asarray(confidence, np.float32), crs_wkt=crs_wkt)
+                confidence=np.asarray(confidence, np.float32), crs_wkt=crs_wkt,
+                member=np.asarray(dominant, np.uint8) if dominant is not None else None)
 
 
 def align_idx(ref_xyz, xyz):
@@ -169,6 +191,20 @@ def _class_info(d):
     return int(n if n is not None else len(names)), list(names)
 
 
+def _member_name(d):
+    """Display name for an ensemble member dir: its infer_run.json backbone,
+    else the folder's basename."""
+    p = os.path.join(d, "infer_run.json")
+    try:
+        with open(p, encoding="utf-8") as f:
+            name = json.load(f).get("backbone")
+        if name:
+            return str(name)
+    except (OSError, json.JSONDecodeError):
+        pass
+    return os.path.basename(os.path.normpath(d))
+
+
 def check_class_clamp(input_dirs, log=print):
     """Refuse to mix models with different class sets. Dirs without an
     infer_run.json (bare exported files) skip the check with a printed note."""
@@ -192,6 +228,8 @@ def ensemble(input_dirs, out_dir, log=print):
     scans = [_scan(d) for d in input_dirs]
     if not scans[0]:
         raise FileNotFoundError(f"no *_pred.<npz|las|laz|ply|txt|csv> under {input_dirs[0]}")
+    names = [_member_name(d) for d in input_dirs]
+    log("  dominant-member field: " + ", ".join(f"{i}={n}" for i, n in enumerate(names)))
     done = 0
     for stem, ref_path in scans[0].items():
         others = [s.get(stem) for s in scans[1:]]
@@ -215,6 +253,7 @@ def ensemble(input_dirs, out_dir, log=print):
         if all(p is not None for p in probs):
             log(f"  {stem}: soft vote (all {len(probs)} members carry probs)")
             voted, conf = soft_vote(np.stack(probs), stacked)
+            dom = dominant_member(voted, probs=np.stack(probs))
         else:                                            # fallback: weighted hard vote
             noprobs = [d for d, p in zip(input_dirs, probs) if p is None]
             # the two branches genuinely disagree — say which one ran
@@ -222,13 +261,15 @@ def ensemble(input_dirs, out_dir, log=print):
             w = np.stack([c if c is not None else np.ones(len(ref_lab), np.float32)
                           for c in confs])
             voted, conf = weighted_vote(stacked, w)
+            dom = dominant_member(voted, labels=stacked, weights=w)
         agree = agreement(stacked, voted)
         crs = None
         if ref_path.endswith(".npz"):    # ferry the reference member's CRS along
             with np.load(ref_path) as zr:
                 crs = str(zr["crs_wkt"]) if "crs_wkt" in zr.files else None
         out_path = f"{out_dir}/{os.path.basename(ref_path)}"
-        write_out(out_path, ref_xyz, voted, ref_itn, conf, agree, crs_wkt=crs)
+        write_out(out_path, ref_xyz, voted, ref_itn, conf, agree, crs_wkt=crs,
+                  dominant=dom, member_names=names)
         log(f"  {os.path.basename(out_path)}: {len(voted)} pts, "
             f"mean confidence {float(conf.mean()):.3f}, "
             f"mean agreement {float(agree.mean()):.3f}")
@@ -262,6 +303,15 @@ def self_test():
     # agreement: exact per-point fraction of models matching the final label
     ag = agreement(np.array([[0, 0], [1, 0], [1, 1]]), np.array([0, 0]))
     assert np.allclose(ag, [1 / 3, 2 / 3]) and ag.dtype == np.float32
+    # dominant member — soft: highest prob mass on the voted class
+    dm = dominant_member(np.array([0, 1]),
+                         probs=np.array([[[0.2, 0.8], [0.2, 0.8]],
+                                         [[0.9, 0.1], [0.3, 0.7]]], np.float32))
+    assert dm.tolist() == [1, 0] and dm.dtype == np.uint8
+    # dominant member — hard: highest weight among label-matching members
+    dm = dominant_member(np.array([0]), labels=np.array([[1], [0], [0]]),
+                         weights=np.array([[0.9], [0.5], [0.6]], np.float32))
+    assert dm.tolist() == [2]
     # identical clouds take the row-aligned fast path; mismatched fall back to NN
     xyz = np.random.rand(100, 3).astype(np.float32)
     assert align_idx(xyz, xyz) is None
@@ -294,6 +344,9 @@ def self_test():
         assert z["confidence"].dtype == np.float32 and z["agreement"].dtype == np.float32
         assert np.allclose(z["confidence"], [0.6, 0.7, 0.7], atol=2e-3)   # f16 probs
         assert np.allclose(z["agreement"], [1 / 3, 1.0, 1.0])
+        # soft dominance: per point, member with the most mass on the voted class
+        assert z["dominant_member"].tolist() == [0, 2, 0]
+        assert z["member_names"].tolist() == ["m0", "m1", "m2"]
         # clamp: mismatched class_names refuse loudly
         with open(os.path.join(dirs[1], "infer_run.json"), "w", encoding="utf-8") as f:
             json.dump({"num_classes": 2, "class_names": ["a", "c"]}, f)
@@ -313,6 +366,8 @@ def self_test():
         # point 0: w(0)=0.9 vs w(1)=0.55+0.55=1.1 -> label 1, share 1.1/2.0
         assert z3["classification"].tolist() == [1, 0, 1]
         assert np.allclose(z3["confidence"], [0.55, 1.0, 1.0], atol=1e-6)
+        # hard dominance: pt0 tie (m1/m2 both 0.55) -> earliest matching member
+        assert z3["dominant_member"].tolist() == [1, 2, 0]
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print("self-test OK")
