@@ -34,6 +34,7 @@ Usage:
         --weights runs/<id>/final_model.pth   # label staged scenes
 """
 
+import os
 from typing import Optional
 
 # ============================================================================

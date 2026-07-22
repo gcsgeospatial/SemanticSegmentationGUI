@@ -559,7 +559,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                         np.zeros(len(xyz0), np.float32),
                         np.zeros((len(xyz0), num_classes), np.float16)
                         if SAVE_PROBS else None)
-            nn = cKDTree(sub_xyz[valid]).query(xyz0)[1]
+            nn = cKDTree(sub_xyz[valid]).query(xyz0, workers=-1)[1]
             vv = sub_votes[valid]                    # copy — safe to normalize in place
             vv /= vv.sum(1, keepdims=True)           # vote sums exceed 1 -> distribution
             vv = tc.apply_class_mask(vv, exclude_idx)

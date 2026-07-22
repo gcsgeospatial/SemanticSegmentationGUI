@@ -105,8 +105,9 @@ datasets_volume = modal.Volume.from_name(
     timeout=TIMEOUT_HOURS * 3600,
     # Auto-restart the container on failure (e.g. an intermittent CUDA device-
     # side assert from spconv, which poisons the context and cannot be caught
-    # in-process). Each retry auto-resumes from the latest checkpoint, so an
-    # intermittent crash costs only the epochs since the last checkpoint.
+    # in-process). Each retry auto-resumes from the latest checkpoint (the
+    # shared concerto trainer's AUTO_RESUME machinery), so an intermittent
+    # crash costs only the epochs since the last checkpoint.
     retries=modal.Retries(max_retries=10, backoff_coefficient=1.0, initial_delay=5.0),
 )
 def train_utonia(dataset: Optional[str] = None, grid: Optional[float] = None,
