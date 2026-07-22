@@ -1,10 +1,10 @@
 """View any trainer npz (staged inference scene or prediction) in CloudCompare.
 
-An .npz is literally a zip of .npy arrays — unzipping it gives files
+An .npz is literally a zip of .npy arrays -- unzipping it gives files
 CloudCompare can't read. This converts instead: xyz becomes the cloud, rgb the
 las color, and every other per-point channel (intensity, return_number,
 feat_hag, feat_geo_*, label, confidence, agreement, dominant_member, ...)
-becomes a float32 Extra Bytes scalar field CloudCompare lists by name — e.g.
+becomes a float32 Extra Bytes scalar field CloudCompare lists by name -- e.g.
 color the cloud by feat_hag to see where inference HAG collapsed on roofs.
 
 Usage:
@@ -12,6 +12,9 @@ Usage:
   python npz_to_las.py --self-test
 """
 import sys
+
+if sys.version_info[0] < 3:
+    sys.exit("npz_to_las.py needs python3 (plain 'python' here is 2.x)")
 
 import numpy as np
 
@@ -45,7 +48,10 @@ def npz_to_las(path):
         setattr(las, k, v)
     out = str(path)[: -len(".npz")] + ".las"
     las.write(out)
-    print(f"  {path} -> {out} ({len(xyz):,} pts; fields: {', '.join(extras) or 'none'})")
+    # ponytail: .format, not f-string -- keeps the file py2-parseable so the
+    # version guard above can fire instead of a bare SyntaxError.
+    print("  {} -> {} ({:,} pts; fields: {})".format(
+        path, out, len(xyz), ", ".join(extras) or "none"))
     return out
 
 
