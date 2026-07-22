@@ -49,6 +49,11 @@ trainer-src-ptv3 = "*"
 [feature.ptv3.activation.env]
 PTV3_SRC = "$CONDA_PREFIX/opt/ptv3"
 
+# cmd.exe activation on Windows only expands %VAR%, not $VAR (same for every
+# feature's win-64 target below); target.win-64 matches the named cuda variants.
+[feature.ptv3.target.win-64.activation.env]
+PTV3_SRC = "%CONDA_PREFIX%/opt/ptv3"
+
 [feature.ptv3.pypi-options]
 # Mirror of the modal recipe's pip call: --index-url cu118 --extra-index-url pypi
 index-url = "https://download.pytorch.org/whl/cu118"
@@ -90,6 +95,9 @@ trainer-src-randlanet = "*"
 [feature.randlanet.activation.env]
 RANDLANET_SRC = "$CONDA_PREFIX/opt/randlanet"
 
+[feature.randlanet.target.win-64.activation.env]
+RANDLANET_SRC = "%CONDA_PREFIX%/opt/randlanet"
+
 [feature.randlanet.pypi-options]
 index-url = "https://download.pytorch.org/whl/cu121"
 extra-index-urls = ["https://pypi.org/simple"]
@@ -126,6 +134,10 @@ trainer-src-kpconv = "*"
 MPLBACKEND = "Agg"   # headless matplotlib (kernel_points.py imports it)
 KPCONV_SRC = "$CONDA_PREFIX/opt/kpconv"
 
+[feature.kpconv.target.win-64.activation.env]
+MPLBACKEND = "Agg"
+KPCONV_SRC = "%CONDA_PREFIX%/opt/kpconv"
+
 [feature.kpconv.pypi-options]
 index-url = "https://download.pytorch.org/whl/cu121"
 extra-index-urls = ["https://pypi.org/simple"]
@@ -157,9 +169,14 @@ platforms = ["linux-64-cuda121", "win-64-cuda121"]
 [feature.kpconvx-cold.activation.env]
 KPCONVX_SRC = "$CONDA_PREFIX/opt/kpconvx"
 
+# Windows activation runs under cmd.exe: $VAR is passed through literally,
+# only %VAR% expands. target.win-64 matches the win-64-cudaXXX named platforms.
+[feature.kpconvx-cold.target.win-64.activation.env]
+KPCONVX_SRC = "%CONDA_PREFIX%/opt/kpconvx"
+
 [feature.kpconvx-cold.dependencies]
 python = "3.11.*"
-trainer-src-kpconvx = "*"
+trainer-src-kpconvx = ">=1.1.0"   # 1.0.x = keops sources, incompatible with this pykeops-less env
 
 [feature.kpconvx-cold.pypi-options]
 index-url = "https://download.pytorch.org/whl/cu121"
@@ -200,6 +217,9 @@ trainer-src-concerto = "*"
 [feature.concerto.activation.env]
 CONCERTO_SRC = "$CONDA_PREFIX/opt/concerto"
 
+[feature.concerto.target.win-64.activation.env]
+CONCERTO_SRC = "%CONDA_PREFIX%/opt/concerto"
+
 [feature.concerto.pypi-options]
 index-url = "https://download.pytorch.org/whl/cu124"
 extra-index-urls = ["https://pypi.org/simple"]
@@ -238,6 +258,9 @@ trainer-src-sonata = "*"
 [feature.sonata.activation.env]
 SONATA_SRC = "$CONDA_PREFIX/opt/sonata"
 
+[feature.sonata.target.win-64.activation.env]
+SONATA_SRC = "%CONDA_PREFIX%/opt/sonata"
+
 [feature.sonata.pypi-options]
 index-url = "https://download.pytorch.org/whl/cu124"
 extra-index-urls = ["https://pypi.org/simple"]
@@ -275,6 +298,9 @@ trainer-src-utonia = "*"
 
 [feature.utonia.activation.env]
 UTONIA_SRC = "$CONDA_PREFIX/opt/utonia"
+
+[feature.utonia.target.win-64.activation.env]
+UTONIA_SRC = "%CONDA_PREFIX%/opt/utonia"
 
 [feature.utonia.pypi-options]
 index-url = "https://download.pytorch.org/whl/cu124"
