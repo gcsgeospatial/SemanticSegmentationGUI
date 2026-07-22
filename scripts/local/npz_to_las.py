@@ -24,11 +24,19 @@ def npz_to_las(path):
     z = np.load(path)
     xyz = np.asarray(z["xyz"], np.float64)
     rgb = np.asarray(z["rgb"]) if "rgb" in z.files else None
-    extras = {k: np.asarray(z[k]) for k in z.files if k not in ("xyz", "rgb", "crs_wkt")}
-    extras = {k[:32]: v.astype(np.float32) for k, v in extras.items()
-              if v.ndim == 1 and len(v) == len(xyz) and np.issubdtype(v.dtype, np.number)}
 
     h = laspy.LasHeader(point_format=7 if rgb is not None else 6, version="1.4")
+    # channels that shadow a native LAS dimension (intensity, return_number, ...)
+    # get an npz_ prefix: the native slots are integer-typed and would truncate
+    # the npz's normalized floats.
+    taken = set(h.point_format.dimension_names)
+    extras = {}
+    for k in z.files:
+        if k in ("xyz", "rgb", "crs_wkt"):
+            continue
+        v = np.asarray(z[k])
+        if v.ndim == 1 and len(v) == len(xyz) and np.issubdtype(v.dtype, np.number):
+            extras[("npz_" + k if k in taken else k)[:32]] = v.astype(np.float32)
     for k in extras:
         h.add_extra_dim(laspy.ExtraBytesParams(name=k, type=np.float32))
     if "crs_wkt" in z.files:
@@ -63,12 +71,15 @@ def self_test():
         p = Path(td) / "s.npz"
         np.savez(p, xyz=np.random.rand(10, 3) * 100,
                  rgb=np.random.randint(0, 256, (10, 3)),
+                 intensity=np.linspace(0, 2, 10).astype(np.float32),
                  feat_hag=np.linspace(0, 30, 10).astype(np.float32),
                  label=np.array([-1] * 5 + [2] * 5, np.int32))
         las = laspy.read(npz_to_las(p))
         assert np.allclose(np.asarray(las.feat_hag), np.linspace(0, 30, 10), atol=1e-5)
         assert np.asarray(las.label).tolist() == [-1] * 5 + [2] * 5   # f32 keeps -1
         assert np.asarray(las.red).max() > 255                        # 16-bit color
+        # native-name collision lands under npz_ with full float precision
+        assert np.allclose(np.asarray(las.npz_intensity), np.linspace(0, 2, 10), atol=1e-6)
     print("self-test OK")
 
 
