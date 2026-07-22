@@ -50,6 +50,10 @@ VAL_EVERY     = 10           # held-out val pass every N epochs (no weight updat
 # Resume: when True, continue the most recent AdamW-recipe run in the outputs
 # dir (same run dir, appended metrics) instead of starting fresh.
 RESUME = False
+# The cloud shell sets AUTO_RESUME=1 only on Modal's OWN retries (preemption /
+# crash); locally a user can export it to continue after a Kill. Same contract
+# as the PTv3-family trainers.
+AUTO_RESUME = os.environ.get("AUTO_RESUME", "0") == "1"
 
 # Class-balanced loss + rare-class oversampling. This deliberately diverges from
 # train_LAS.py's segloss_balance='none' to stop the rare Water/Bridge classes
@@ -301,7 +305,8 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
         # exact feature spec.
         return tc.kp_find_latest_checkpoint("AdamW", {FEATURE_MODE},
                                             features=FEAT_SPEC,
-                                            legacy_features=FEAT_LEGACY)
+                                            legacy_features=FEAT_LEGACY,
+                                            skip_done=not EVAL_ONLY)
 
     print("=" * 70)
     print(f"  KPConvX-L  {dataset or 'infer'}  COLD/{FEATURE_MODE}  "
@@ -317,7 +322,8 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
         tc.clear_stop()
     train_list, val_list, test_list = ([], [], []) if INFER else ensure_prep()
 
-    resume_info = find_latest_checkpoint() if (RESUME or EVAL_ONLY) else None
+    resume_info = (find_latest_checkpoint()
+                   if (RESUME or AUTO_RESUME or EVAL_ONLY) else None)
     if INFER:
         # Inference-only: fresh *_infer run dir, weights loaded after net build.
         run_id = datetime.utcnow().strftime("%Y%m%d_%H%M%S_infer")
@@ -849,6 +855,9 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
     if not EVAL_ONLY:
         best.finalize(lambda p: torch.save(
             {"model": net.state_dict(), "epoch": ep}, p))
+        # Mark the run complete so AUTO_RESUME won't re-resume it on the next
+        # launch (a crashed/retried run has no DONE and is picked back up).
+        open(f"{run_dir}/DONE", "w").close()
     print(f"  total wall-clock: {(time.time() - t_run)/3600:.2f} h")
 
 

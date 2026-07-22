@@ -57,7 +57,6 @@ class InferPage(QWidget):
         self._ens_running = False                   # True from launch until export/failure
         self._ens_idx = -1                          # index of the member currently running
         self._ens_dirs: list[Path] = []             # completed members' prediction dirs
-        self._last_pred_dir: Path | None = None     # last finished predictions dir ('Plot this run')
         self._run_open = False                      # a begin_run header awaits its end_run
 
         root = QVBoxLayout(self)
@@ -69,10 +68,20 @@ class InferPage(QWidget):
         self.sub.setObjectName("pageSub")
         root.addWidget(self.sub)
 
-        wbox = QGroupBox("Weights")
+        wbox = QGroupBox("Inputs")
         wf = self.wf = QFormLayout(wbox)
         # Fields fill width so Browse… buttons aren't clipped.
         wf.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        self.input_edit = QLineEdit()
+        in_row = QHBoxLayout()
+        in_row.addWidget(self.input_edit, 1)   # edit absorbs slack; both buttons keep their size
+        fold_btn = QPushButton("Folder…")
+        fold_btn.clicked.connect(self._pick_input)
+        file_btn = QPushButton("File…")
+        file_btn.clicked.connect(self._pick_input_file)
+        in_row.addWidget(fold_btn)
+        in_row.addWidget(file_btn)
+        wf.addRow("Point clouds (folder or file)", ui.wrap(in_row))
         radio_row = QHBoxLayout()
         self.from_run_radio = QRadioButton("Training run")
         self.from_run_radio.setChecked(True)
@@ -188,19 +197,9 @@ class InferPage(QWidget):
         self.ens_hint_w = ui.wrap(eh_row)
         wf.addRow(self.ens_hint_w)
 
-        ibox = QGroupBox("Input")
+        ibox = QGroupBox("Inference settings")
         iform = self.iform = QFormLayout(ibox)
         iform.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
-        self.input_edit = QLineEdit()
-        in_row = QHBoxLayout()
-        in_row.addWidget(self.input_edit, 1)   # edit absorbs slack; both buttons keep their size
-        fold_btn = QPushButton("Folder…")
-        fold_btn.clicked.connect(self._pick_input)
-        file_btn = QPushButton("File…")
-        file_btn.clicked.connect(self._pick_input_file)
-        in_row.addWidget(fold_btn)
-        in_row.addWidget(file_btn)
-        iform.addRow("Point clouds (folder or file)", ui.wrap(in_row))
         self.grid_spin = QDoubleSpinBox()
         self.grid_spin.setRange(0.02, 1_000_000.0)
         self.grid_spin.setSingleStep(0.05)
@@ -296,33 +295,12 @@ class InferPage(QWidget):
         iform.addRow("Classes (mask at launch)", ui.wrap(ccol))
         self._rebuild_class_list()   # starts disabled with a 'load a run' placeholder
 
-        run_row = QHBoxLayout()
-        self.run_btn = QPushButton("Run inference")
-        self.run_btn.setObjectName("primary")
-        self.run_btn.clicked.connect(self._run)
-        run_row.addWidget(self.run_btn)
-        run_row.addStretch()
-
-        forms_col = QVBoxLayout()
-        forms_col.addWidget(wbox)
-        forms_col.addWidget(ibox)
-        forms_col.addLayout(run_row)
-        forms_col.addStretch()
-
-        self.log = LogConsole()   # \r-aware, colored console (drop-in for the old QPlainTextEdit)
-        self.log.setPlaceholderText("Conversion and run logs appear here…")
-
-        # After-the-run knobs: format + the confidence gate only shape the EXPORT
-        # step (the .npz keeps raw predictions — re-export never re-runs
-        # inference), so they live with the post-run actions, not the launch
-        # decisions above.
-        abox = QGroupBox("After the run")
-        aform = QFormLayout(abox)
-        aform.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        # Export knobs: format + the confidence gate only shape the EXPORT step
+        # (the .npz keeps raw predictions — re-export never re-runs inference).
         # Predictions always land under <workspace>/inference — the same spot
         # 'Download run…' uses, so runs + their predictions co-locate.
-        # Prediction file format — every option is xyz + classification only
-        # (no RGB colour columns: the deliverable carries classes, not colours).
+        # Every format option is xyz + classification only (no RGB colour
+        # columns: the deliverable carries classes, not colours).
         self.fmt_combo = QComboBox()
         for label, key in (("LAS (.las)", "las"), ("LAZ (.laz)", "laz"),
                            ("PLY (.ply)", "ply"), ("Text (.txt)", "txt"),
@@ -332,7 +310,7 @@ class InferPage(QWidget):
         self.fmt_combo.setCurrentIndex(i if i >= 0 else 0)
         self.fmt_combo.setToolTip("Predictions are written as xyz + classification "
                                   "(no colour columns).")
-        aform.addRow("Prediction format", self.fmt_combo)
+        iform.addRow("Prediction format", self.fmt_combo)
         # Confidence gate at export: low-confidence points become ASPRS class 1.
         self.unclass_chk = QCheckBox("Mark low-confidence points Unclassified")
         self.unclass_chk.setChecked(True)
@@ -352,28 +330,38 @@ class InferPage(QWidget):
         uc_row.addWidget(self.unclass_chk)
         uc_row.addWidget(self.unclass_spin)
         uc_row.addStretch()
-        aform.addRow("Confidence", ui.wrap(uc_row))
+        iform.addRow("Confidence", ui.wrap(uc_row))
+
+        run_row = QHBoxLayout()
+        self.run_btn = QPushButton("Run inference")
+        self.run_btn.setObjectName("primary")
+        self.run_btn.clicked.connect(self._run)
+        run_row.addWidget(self.run_btn)
+        run_row.addStretch()
+
+        forms_col = QVBoxLayout()
+        forms_col.addWidget(wbox)
+        forms_col.addWidget(ibox)
+        forms_col.addLayout(run_row)
+
+        self.log = LogConsole()   # \r-aware, colored console (drop-in for the old QPlainTextEdit)
+        self.log.setPlaceholderText("Conversion and run logs appear here…")
 
         # Action bar; comparison metrics print to the log.
         self.compare_btn = QPushButton("Compare to ground truth…")
         self.compare_btn.setToolTip("Pick a prediction + its ground truth; accuracy, "
                                     "mIoU and per-class IoU print to the log.")
         self.compare_btn.clicked.connect(self._compare_gt)
-        self.plot_btn = QPushButton("Plot this run")
-        self.plot_btn.setEnabled(False)   # enabled once a run exports / compares
-        self.plot_btn.setToolTip("Open the Plotting page for the last finished "
-                                 "inference or comparison.")
-        self.plot_btn.clicked.connect(self._plot_run)
         actions = QHBoxLayout()
         actions.addWidget(self.compare_btn)
-        actions.addWidget(self.plot_btn)
         actions.addStretch(1)
-        out_box = QVBoxLayout()
-        out_box.addWidget(abox)
-        out_box.addLayout(actions)
+        # Launch decisions, then the console — the console is the page's bottom
+        # pane, nothing lives below it.
+        forms_col.addLayout(actions)
+        forms_col.addStretch()
 
         root.addWidget(ui.vsplit(ui.wrap(forms_col), self.log,
-                                 ui.wrap(out_box), sizes=[340, 340, 84]), 1)
+                                 sizes=[440, 324]), 1)
 
         self.converter.output.connect(self._append)
         self.converter.done.connect(self._on_converted)
@@ -1495,8 +1483,6 @@ class InferPage(QWidget):
             return
         self._append(f"\n✓ Done - {len(written)} prediction file(s) in {written[0].parent}.\n"
                      f"  'Compare to ground truth…' for accuracy + mIoU.")
-        self._last_pred_dir = written[0].parent
-        self.plot_btn.setEnabled(True)
         self._end_run(f"✓ exported {len(written)} prediction file(s)")
 
     def _on_export_error(self, tb: str):
@@ -1684,16 +1670,6 @@ class InferPage(QWidget):
         except (OSError, csv.Error) as e:
             lines.append(f"  (couldn't update stats csv: {e})")
         self._append("\n".join(lines))
-        self._last_pred_dir = Path(pred).parent
-        self.plot_btn.setEnabled(True)
-
-    def _plot_run(self):
-        """Jump to the Plotting page focused on the run behind these weights —
-        training metrics live under the run id, not the predictions folder.
-        PlottingPage.receive_nav(run=...) preselects it (matches by dir or id)."""
-        rid = (self._manifest_path.parent.name if self._manifest_path
-               else self._modal_cfg_run or "")
-        ui.navigate("Plotting", **({"run": rid} if rid else {}))
 
     # ------------------------------------------------------------- helpers
     def _begin_run(self, title: str):

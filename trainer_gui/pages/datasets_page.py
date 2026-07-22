@@ -263,6 +263,33 @@ class DatasetsPage(QWidget):
         self.hag_box.toggled.connect(self.hag_opts_w.setVisible)
         self.hag_opts_w.setVisible(False)
         form.addRow(self.hag_box)
+        # RGB color: explicit mapping only, collapsed by default (design
+        # 2026-07-21) — color is rare in this domain, so it costs no space or
+        # attention until someone actually needs it. Nothing is auto-detected;
+        # the dataset carries color only when the box is on AND all three
+        # channels are mapped to source columns.
+        self.rgb_box = QGroupBox("RGB color (rare)")
+        self.rgb_box.setCheckable(True)
+        self.rgb_box.setChecked(False)
+        self.rgb_box.setToolTip(
+            "Map source columns to color channels. All three mapped = the "
+            "dataset carries color; off or any 'none' = no color. Values are "
+            "scaled to 8-bit automatically (16-bit and 0-1 sources included).")
+        self.rgb_r = QComboBox()
+        self.rgb_g = QComboBox()
+        self.rgb_b = QComboBox()
+        rgb_row = QHBoxLayout()
+        for lbl, c in (("R", self.rgb_r), ("G", self.rgb_g), ("B", self.rgb_b)):
+            c.addItem("none")
+            rgb_row.addWidget(QLabel(lbl))
+            rgb_row.addWidget(c, 1)
+        rgb_row.addStretch()
+        self.rgb_opts_w = ui.wrap(rgb_row)
+        rgb_lay = QVBoxLayout(self.rgb_box)
+        rgb_lay.addWidget(self.rgb_opts_w)
+        self.rgb_box.toggled.connect(self.rgb_opts_w.setVisible)
+        self.rgb_opts_w.setVisible(False)
+        form.addRow(self.rgb_box)
         # Optional: bake extra per-point source fields into every scene as
         # feat_<name> (p95(|v|)-normalized, like intensity). Hidden until the
         # input carries candidate fields; collapsed (unchecked) by default.
@@ -482,6 +509,12 @@ class DatasetsPage(QWidget):
         # Always offerable once an input is probed: computed geometric channels
         # need no source field, so the group no longer hides on empty feat_list.
         self.feat_group.setVisible(True)
+        # RGB mapping candidates: every probed column; explicit-only, so no
+        # preselection — the user maps color or the dataset has none.
+        for combo in (self.rgb_r, self.rgb_g, self.rgb_b):
+            combo.clear()
+            combo.addItem("none")
+            combo.addItems(fields)
 
     # ------------------------------------------------------------- config
     def _spec(self) -> LabelSpec:
@@ -770,6 +803,13 @@ class DatasetsPage(QWidget):
         geo = [self.geo_list.item(i).text() for i in range(self.geo_list.count())
                if self.geo_list.item(i).checkState() == Qt.Checked
                ] if self.feat_group.isChecked() else []
+        rgb_sel = ([c.currentText() for c in (self.rgb_r, self.rgb_g, self.rgb_b)]
+                   if self.rgb_box.isChecked() else [])
+        mapped = [s for s in rgb_sel if s and s != "none"]
+        if self.rgb_box.isChecked() and len(mapped) < 3:
+            self._append("RGB mapping needs all three channels set (or untick "
+                         "the RGB box for no color).")
+            return None
         return {
             "name": name, "in_path": in_path, "split": split,
             "val_inputs": val_inputs, "test_inputs": test_inputs,
@@ -781,6 +821,7 @@ class DatasetsPage(QWidget):
             "feature_fields": feats or None,
             "geo_features": geo or None,
             "geo_radius": float(self.geo_radius.value()),
+            "rgb_fields": rgb_sel if len(mapped) == 3 else None,
             "max_workers": 1,   # TODO(not ready): parallel UI hidden; force single-process
         }
 
@@ -810,6 +851,7 @@ class DatasetsPage(QWidget):
                 feature_fields=plan["feature_fields"],
                 geo_features=plan["geo_features"],
                 geo_radius=plan["geo_radius"],
+                rgb_fields=plan["rgb_fields"],
                 max_workers=plan["max_workers"], progress=progress)
 
         self._done_cb = self._on_converted

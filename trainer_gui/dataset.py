@@ -409,6 +409,31 @@ def _hag_from_cloud(cloud: Cloud) -> np.ndarray | None:
     return None
 
 
+def _apply_rgb_mapping(cloud: Cloud, rgb_fields) -> Cloud:
+    """Dataset builds carry color ONLY when the user mapped all three channels
+    (explicit-only, design 2026-07-21): set cloud.rgb from the named source
+    columns, or strip any reader-auto color when no mapping was made. The
+    inference conversion path never calls this — it keeps auto color so runs
+    trained with rgb still find it."""
+    if not rgb_fields:
+        cloud.rgb = None
+        return cloud
+    cols = []
+    for fld in rgb_fields:
+        key = next((k for k in cloud.fields if k.lower() == str(fld).lower()), None)
+        if key is None:
+            raise ValueError(f"RGB column '{fld}' not in the cloud "
+                             f"(have: {sorted(cloud.fields)})")
+        cols.append(np.asarray(cloud.fields[key], np.float64).reshape(-1))
+    c = np.column_stack(cols)
+    if c.max() > 255:            # 16-bit color
+        c = c / 257.0
+    elif 0 < c.max() <= 1.0:     # unit-range floats
+        c = c * 255.0
+    cloud.rgb = np.clip(c, 0, 255).astype(np.uint8)
+    return cloud
+
+
 def _convert_one(cloud: Cloud, raw: np.ndarray | None, value_to_index: dict[int, int],
                  out_path: Path, intensity_norm: str = "p95",
                  compute_hag: bool = False, ground_value: int | None = None,
@@ -595,6 +620,7 @@ def _convert_many(files: list[Path], dest_for, spec, value_to_index, intensity_n
                   *, compute_hag, ground_value, hag_filter,
                   feature_fields: list[str] | None = None,
                   geo_features: list[str] | None = None, geo_radius: float = 1.0,
+                  rgb_fields: list[str] | None = None,
                   max_workers: int | None = None) -> list[dict]:
     """Read + convert each file to its npz CONCURRENTLY; returns the stat dicts in
     INPUT order. Order matters: the caller feeds it to allocate_splits positionally,
@@ -606,7 +632,7 @@ def _convert_many(files: list[Path], dest_for, spec, value_to_index, intensity_n
     scenes. say() is a queued Qt signal (thread-safe), but we only call it from
     this thread as map yields in order — clean, ordered progress for free."""
     def work(f: Path) -> dict:
-        cloud = read_points(f)
+        cloud = _apply_rgb_mapping(read_points(f), rgb_fields)
         raw = read_labels(f, cloud, spec) if spec is not None else None
         out_path = dest_for(f)
         st = _convert_one(cloud, raw, value_to_index, out_path, intensity_norm,
@@ -638,6 +664,7 @@ def _plan_and_convert(input_files: list[Path], val_files: list[Path] | None,
                       hag_filter: str = "grid",
                       feature_fields: list[str] | None = None,
                       geo_features: list[str] | None = None, geo_radius: float = 1.0,
+                      rgb_fields: list[str] | None = None,
                       max_workers: int | None = None) -> dict:
     """Convert sources into out_root/{train,val,test}/*.npz; returns
     {"train": [stats], "val": [stats], "test": [stats]}.
@@ -665,7 +692,8 @@ def _plan_and_convert(input_files: list[Path], val_files: list[Path] | None,
                 spec, value_to_index, intensity_norm, say, compute_hag=compute_hag,
                 ground_value=ground_value, hag_filter=hag_filter,
                 feature_fields=feature_fields, geo_features=geo_features,
-                geo_radius=geo_radius, max_workers=max_workers))
+                geo_radius=geo_radius, rgb_fields=rgb_fields,
+                max_workers=max_workers))
     vfrac = 0.0 if val_files else split.val_frac
     tfrac = 0.0 if test_files else split.test_frac
 
@@ -675,14 +703,15 @@ def _plan_and_convert(input_files: list[Path], val_files: list[Path] | None,
             spec, value_to_index, intensity_norm, say, compute_hag=compute_hag,
             ground_value=ground_value, hag_filter=hag_filter,
             feature_fields=feature_fields, geo_features=geo_features,
-            geo_radius=geo_radius, max_workers=max_workers))
+            geo_radius=geo_radius, rgb_fields=rgb_fields,
+            max_workers=max_workers))
         return stats
 
     # Single cloud -> tile as a measurement, allocate tiles, reassemble per split.
     if len(input_files) == 1:
         f = input_files[0]
         say(f"  single-cloud split {f.name} (tile-measure -> holey clouds) ...")
-        cloud = read_points(f)
+        cloud = _apply_rgb_mapping(read_points(f), rgb_fields)
         raw = read_labels(f, cloud, spec) if spec is not None else None
         if compute_hag and _hag_from_cloud(cloud) is None:
             from . import pretrain                      # whole-cloud HAG, ferried via fields
@@ -722,7 +751,8 @@ def _plan_and_convert(input_files: list[Path], val_files: list[Path] | None,
                          spec, value_to_index, intensity_norm, say, compute_hag=compute_hag,
                          ground_value=ground_value, hag_filter=hag_filter,
                          feature_fields=feature_fields, geo_features=geo_features,
-                         geo_radius=geo_radius, max_workers=max_workers)
+                         geo_radius=geo_radius, rgb_fields=rgb_fields,
+                         max_workers=max_workers)
     for st in pool:                                    # map kept input order -> deterministic alloc
         st["_pool_path"] = out_root / "_pool" / st["scene"]
     pts = [st["n_points"] for st in pool]
@@ -753,6 +783,7 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
                     feature_fields: list[str] | None = None,
                     geo_features: list[str] | None = None,
                     geo_radius: float = 1.0,
+                    rgb_fields: list[str] | None = None,
                     max_workers: int | None = None,
                     progress=None) -> Path:
     """Convert `inputs` (files and/or folders) into a staged canonical dataset with
@@ -829,6 +860,7 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
                                     feature_fields=feature_fields,
                                     geo_features=geo_features,
                                     geo_radius=geo_radius,
+                                    rgb_fields=rgb_fields,
                                     max_workers=max_workers)
     for sp in _SPLITS:
         if not scene_stats[sp]:
@@ -918,6 +950,7 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
             "truth_dir": spec.truth_dir if spec else "",
             "intensity_norm": intensity_norm,
             "hag_source": hag_src,
+            "rgb_fields": rgb_fields,   # explicit-only color: the mapped columns, or None
             "hag_ground_value": (int(ground_value) if ground_value is not None else None),
             "hag_use_smrf": bool(use_smrf),
             # source_field "@geo:<jak name>" marks a COMPUTED channel (recomputed

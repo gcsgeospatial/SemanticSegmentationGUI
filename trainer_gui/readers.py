@@ -75,7 +75,9 @@ def _read_las(path) -> Cloud:
     ret = np.asarray(las.return_number, np.float32) if "return_number" in dims else None
 
     fields = {}
-    skip = {"x", "y", "z", "red", "green", "blue"}
+    # red/green/blue stay in fields: color is explicit-only at dataset build,
+    # so the channels must be offerable as mappable columns.
+    skip = {"x", "y", "z"}
     for d in las.point_format.dimensions:
         name = d.name.lower()
         if name in skip:
@@ -120,7 +122,7 @@ def _read_ply(path) -> Cloud:
             break
 
     fields = {}
-    skip = {"x", "y", "z", "red", "green", "blue", "nx", "ny", "nz", "alpha"}
+    skip = {"x", "y", "z", "nx", "ny", "nz", "alpha"}
     for name in v.dtype.names:
         if name in skip:
             continue

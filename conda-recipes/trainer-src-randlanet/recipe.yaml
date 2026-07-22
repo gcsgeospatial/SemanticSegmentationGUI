@@ -1,8 +1,9 @@
 # RandLA-Net-pytorch sources + compiled nearest_neighbors/cpp_subsampling,
-# pinned at the same SHA the modal recipe clones. linux-64: ships cp311
-# extensions (torch-free; variants key on python only). Upstream's
+# pinned at the same SHA the modal recipe clones. linux-64 + win-64: ships
+# cp311 extensions (torch-free; variants key on python only). Upstream's
 # nearest_neighbors setup.py is replaced (as in the old Dockerfile) — the
-# original hardcodes flags that break on modern toolchains.
+# original hardcodes flags that break on modern toolchains; the replacement
+# lives in nearest_neighbors/setup.py here and is copied in as a path source.
 
 context:
   sha: "75adeacdb796db07e69ba990c36409c5d3ee886b"
@@ -12,43 +13,80 @@ package:
   version: "1.0.0"   # bump when the sha moves
 
 source:
-  git: https://github.com/tsunghan-wu/RandLA-Net-pytorch.git
-  rev: ${{ sha }}
+  - git: https://github.com/tsunghan-wu/RandLA-Net-pytorch.git
+    rev: ${{ sha }}
+  - path: ./nearest_neighbors/setup.py
+    target_directory: utils/nearest_neighbors
 
 build:
-  number: 1   # rebuilt with the cython<3 knn.cpp regen — new identity so caches/locks refetch
-  script: |
-    cat > "$SRC_DIR/utils/nearest_neighbors/setup.py" <<'PY'
-    from setuptools import setup, Extension
-    import numpy
-    setup(
-        name='nearest_neighbors',
-        ext_modules=[Extension(
-            'nearest_neighbors',
-            sources=['knn.cpp', 'knn_.cxx'],
-            include_dirs=['./', numpy.get_include()],
-            language='c++',
-            extra_compile_args=['-std=c++11', '-fopenmp'],
-            extra_link_args=['-std=c++11', '-fopenmp'],
-        )],
-    )
-    PY
-    # the checked-in knn.cpp is stale Cython output (#include "longintrepr.h",
-    # removed in py3.11) — regenerate it from knn.pyx with the host cython
-    cd "$SRC_DIR/utils/nearest_neighbors"
-    "$PREFIX/bin/cython" --cplus knn.pyx -o knn.cpp
-    $PYTHON setup.py build_ext --inplace
-    mkdir -p lib/python
-    touch __init__.py lib/__init__.py lib/python/__init__.py
-    cp nearest_neighbors*.so lib/python/
-    cd "$SRC_DIR/utils/cpp_wrappers/cpp_subsampling" && $PYTHON setup.py build_ext --inplace
-    cd "$SRC_DIR"
-    touch utils/cpp_wrappers/__init__.py utils/cpp_wrappers/cpp_subsampling/__init__.py
-    mkdir -p "$PREFIX/opt/randlanet"
-    cp -r "$SRC_DIR"/. "$PREFIX/opt/randlanet/"
-    rm -rf "$PREFIX/opt/randlanet/.git"
-    mkdir -p "$PREFIX/etc/conda/activate.d"
-    printf 'export RANDLANET_SRC="${CONDA_PREFIX}/opt/randlanet"\n' > "$PREFIX/etc/conda/activate.d/trainer-src-randlanet.sh"
+  number: 2   # build 1's cython regen produced PyInit_knn (module named after knn.pyx),
+              # breaking `import nearest_neighbors`; regen now uses the right module name
+  script:
+    - if: unix
+      then: |
+        # the checked-in knn.cpp is stale Cython output (#include "longintrepr.h",
+        # removed in py3.11) — regenerate it. Cython names the module after the
+        # .pyx file, and the extension/importers expect `nearest_neighbors`, so
+        # regenerate under that name (bare knn.pyx yields a broken PyInit_knn).
+        cd "$SRC_DIR/utils/nearest_neighbors"
+        cp knn.pyx nearest_neighbors.pyx
+        "$PREFIX/bin/cython" --cplus nearest_neighbors.pyx -o knn.cpp
+        rm nearest_neighbors.pyx
+        $PYTHON setup.py build_ext --inplace
+        mkdir -p lib/python
+        touch __init__.py lib/__init__.py lib/python/__init__.py
+        cp nearest_neighbors*.so lib/python/
+        cd "$SRC_DIR/utils/cpp_wrappers/cpp_subsampling" && $PYTHON setup.py build_ext --inplace
+        cd "$SRC_DIR"
+        touch utils/cpp_wrappers/__init__.py utils/cpp_wrappers/cpp_subsampling/__init__.py
+        mkdir -p "$PREFIX/opt/randlanet"
+        cp -r "$SRC_DIR"/. "$PREFIX/opt/randlanet/"
+        rm -rf "$PREFIX/opt/randlanet/.git"
+        mkdir -p "$PREFIX/etc/conda/activate.d"
+        printf 'export RANDLANET_SRC="${CONDA_PREFIX}/opt/randlanet"\n' > "$PREFIX/etc/conda/activate.d/trainer-src-randlanet.sh"
+    - if: win
+      then: |
+        rem conda-forge's vs2022 activation only detects VS 17.x / v143; on newer
+        rem VS (e.g. Build Tools 2026) cl never lands on PATH — self-activate then.
+        rem vcvars64 APPENDS to INCLUDE/LIB, so the prefix header paths survive.
+        rem Clear the stale VS vars the failed activation left behind — a bogus
+        rem VSINSTALLDIR makes VsDevCmd.bat error out.
+        set "VSINSTALLDIR="
+        set "VCINSTALLDIR="
+        set "VisualStudioVersion="
+        where cl >nul 2>nul
+        if %ERRORLEVEL% neq 0 for /f "usebackq tokens=*" %%i in (`vswhere -products * -latest -property installationPath`) do call "%%i\VC\Auxiliary\Build\vcvars64.bat"
+        where cl >nul 2>nul
+        if %ERRORLEVEL% neq 0 exit 1
+        cd /d "%SRC_DIR%\utils\nearest_neighbors"
+        rem MSVC's OpenMP 2.0 (/openmp) rejects unsigned loop indices (C3016);
+        rem sign the four size_t for-loops. Binary-mode replace preserves CRLF.
+        %PYTHON% -c "p='knn_.cxx'; s=open(p,'rb').read(); s=s.replace(b'for(size_t i=0; i<nqueries; i++){', b'for(long long i=0; i<(long long)nqueries; i++){'); s=s.replace(b'for(size_t bid=0; bid < batch_size; bid++){', b'for(long long bid=0; bid < (long long)batch_size; bid++){'); assert s.count(b'for(long long') == 8, 'upstream knn_.cxx changed'; open(p,'wb').write(s)"
+        if %ERRORLEVEL% neq 0 exit 1
+        rem regen under the importable module name — see unix branch note
+        copy /y knn.pyx nearest_neighbors.pyx
+        "%PREFIX%\Scripts\cython.exe" --cplus nearest_neighbors.pyx -o knn.cpp
+        if %ERRORLEVEL% neq 0 exit 1
+        del nearest_neighbors.pyx
+        %PYTHON% setup.py build_ext --inplace
+        if %ERRORLEVEL% neq 0 exit 1
+        mkdir lib\python
+        type nul > __init__.py
+        type nul > lib\__init__.py
+        type nul > lib\python\__init__.py
+        copy /y nearest_neighbors*.pyd lib\python\
+        if %ERRORLEVEL% neq 0 exit 1
+        cd /d "%SRC_DIR%\utils\cpp_wrappers\cpp_subsampling"
+        %PYTHON% setup.py build_ext --inplace
+        if %ERRORLEVEL% neq 0 exit 1
+        cd /d "%SRC_DIR%"
+        type nul > utils\cpp_wrappers\__init__.py
+        type nul > utils\cpp_wrappers\cpp_subsampling\__init__.py
+        if exist .git rmdir /s /q .git
+        mkdir "%PREFIX%\opt\randlanet"
+        xcopy /e /q /y "%SRC_DIR%" "%PREFIX%\opt\randlanet\"
+        if %ERRORLEVEL% neq 0 exit 1
+        rem no activate.d .bat: RANDLANET_SRC is set by envs/pixi.toml activation.env
 
 requirements:
   build:

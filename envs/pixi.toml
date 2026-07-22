@@ -27,6 +27,9 @@ platforms = [
     { name = "linux-64-cuda118", platform = "linux-64", cuda = "11.8" },
     { name = "linux-64-cuda121", platform = "linux-64", cuda = "12.1" },
     { name = "linux-64-cuda120", platform = "linux-64", cuda = "12.0" },
+    { name = "win-64-cuda118", platform = "win-64", cuda = "11.8" },
+    { name = "win-64-cuda121", platform = "win-64", cuda = "12.1" },
+    { name = "win-64-cuda120", platform = "win-64", cuda = "12.0" },
 ]
 requires-pixi = ">=0.60"
 
@@ -35,11 +38,16 @@ requires-pixi = ">=0.60"
 # PTv3's 5x5x5 stem (see local_train_ptv3.py).
 
 [feature.ptv3]
-platforms = ["linux-64-cuda118"]
+platforms = ["linux-64-cuda118", "win-64-cuda118"]
 
 [feature.ptv3.dependencies]
 python = "3.11.*"
 trainer-src-ptv3 = "*"
+
+# _SRC set here (not only in the package's activate.d) so it's cross-platform:
+# the recipes ship .sh activation scripts, which Windows never runs.
+[feature.ptv3.activation.env]
+PTV3_SRC = "$CONDA_PREFIX/opt/ptv3"
 
 [feature.ptv3.pypi-options]
 # Mirror of the modal recipe's pip call: --index-url cu118 --extra-index-url pypi
@@ -73,11 +81,14 @@ sanity = "python -c \"import os, sys, torch, spconv, torch_scatter; sys.path.ins
 # torch 2.2.2 + cu121; compiled knn/subsampling exts ship in trainer-src-randlanet.
 
 [feature.randlanet]
-platforms = ["linux-64-cuda121"]
+platforms = ["linux-64-cuda121", "win-64-cuda121"]
 
 [feature.randlanet.dependencies]
 python = "3.11.*"
 trainer-src-randlanet = "*"
+
+[feature.randlanet.activation.env]
+RANDLANET_SRC = "$CONDA_PREFIX/opt/randlanet"
 
 [feature.randlanet.pypi-options]
 index-url = "https://download.pytorch.org/whl/cu121"
@@ -105,7 +116,7 @@ sanity = "python -c \"import os, sys, torch; sys.path.insert(0, os.environ['RAND
 # torch 2.3.0 + cu121; compiled cpp_wrappers + kernel cache ship in trainer-src-kpconv.
 
 [feature.kpconv]
-platforms = ["linux-64-cuda121"]
+platforms = ["linux-64-cuda121", "win-64-cuda121"]
 
 [feature.kpconv.dependencies]
 python = "3.11.*"
@@ -113,6 +124,7 @@ trainer-src-kpconv = "*"
 
 [feature.kpconv.activation.env]
 MPLBACKEND = "Agg"   # headless matplotlib (kernel_points.py imports it)
+KPCONV_SRC = "$CONDA_PREFIX/opt/kpconv"
 
 [feature.kpconv.pypi-options]
 index-url = "https://download.pytorch.org/whl/cu121"
@@ -135,28 +147,26 @@ pandas = "<3"
 sanity = "python -c \"import os, sys, torch; sys.path.insert(0, os.environ['KPCONV_SRC']); import cpp_wrappers.cpp_subsampling.grid_subsampling; print('kpconv env ok, torch', torch.__version__)\""
 
 # ------------------------------------------------------- kpconvx-cold ---------
-# torch 2.3.0 + cu121 + pykeops. pykeops JIT-compiles CUDA kernels at runtime,
-# so this env carries nvcc + a host C++ compiler (the GPU box needs only the
-# NVIDIA driver).
+# torch 2.3.0 + cu121 + torch-cluster (the keops-free fork's neighbor backend).
+# The pykeops runtime-JIT stack (nvcc, cudart/nvrtc headers, host compiler) is
+# gone since trainer-src-kpconvx 1.1.0, which also unlocked win-64.
 
 [feature.kpconvx-cold]
-platforms = ["linux-64-cuda121"]
+platforms = ["linux-64-cuda121", "win-64-cuda121"]
+
+[feature.kpconvx-cold.activation.env]
+KPCONVX_SRC = "$CONDA_PREFIX/opt/kpconvx"
 
 [feature.kpconvx-cold.dependencies]
 python = "3.11.*"
-cuda-nvcc = "12.1.*"
-cuda-cudart-dev = "12.1.*"
-cuda-nvrtc-dev = "12.1.*"
-cuda-version = "12.1.*"
-cxx-compiler = "*"
 trainer-src-kpconvx = "*"
 
 [feature.kpconvx-cold.pypi-options]
 index-url = "https://download.pytorch.org/whl/cu121"
 extra-index-urls = ["https://pypi.org/simple"]
 index-strategy = "unsafe-best-match"   # pip-like: +cuXXX pins only exist on the torch index
-# no-build stays OFF here: pykeops ships only an sdist (pure python; its CUDA
-# kernels JIT at runtime), so the solver must be allowed to read sdist metadata.
+find-links = [{ url = "https://data.pyg.org/whl/torch-2.3.0+cu121.html" }]
+no-build = true    # wheels only -> lockable from the Windows dev box
 
 [feature.kpconvx-cold.pypi-dependencies]
 torch = { version = "==2.3.0+cu121" }
@@ -168,24 +178,27 @@ easydict = "*"
 h5py = "*"
 matplotlib = "*"
 timm = "*"
-pykeops = "*"
+torch-cluster = "*"
 tqdm = "*"
 tensorboard = "*"
 pandas = "<3"
 
 [feature.kpconvx-cold.tasks]
-sanity = "python -c \"import os, sys, torch, pykeops; sys.path.insert(0, os.environ['KPCONVX_SRC']); import cpp_wrappers.cpp_subsampling.grid_subsampling; print('kpconvx env ok, torch', torch.__version__)\""
+sanity = "python -c \"import os, sys, torch, torch_cluster; sys.path.insert(0, os.environ['KPCONVX_SRC']); import cpp_wrappers.cpp_subsampling.cpp_subsampling, cpp_wrappers.cpp_neighbors.cpp_neighbors; print('kpconvx env ok, torch', torch.__version__)\""
 
 # --------------------------------------------- concerto / sonata / utonia -----
 # The pcssl encoder family: identical dep stacks (torch 2.5.0 + cu124 + spconv
 # + torch-scatter + huggingface_hub), differing only in the trainer-src package.
 
 [feature.concerto]
-platforms = ["linux-64-cuda120"]   # cu124 wheels: any 12.x driver (minor-version compat)
+platforms = ["linux-64-cuda120", "win-64-cuda120"]   # cu124 wheels: any 12.x driver (minor-version compat)
 
 [feature.concerto.dependencies]
 python = "3.11.*"
 trainer-src-concerto = "*"
+
+[feature.concerto.activation.env]
+CONCERTO_SRC = "$CONDA_PREFIX/opt/concerto"
 
 [feature.concerto.pypi-options]
 index-url = "https://download.pytorch.org/whl/cu124"
@@ -216,11 +229,14 @@ torch-scatter = "*"
 sanity = "python -c \"import os, sys, torch, spconv, torch_scatter, huggingface_hub; sys.path.insert(0, os.environ['CONCERTO_SRC']); import concerto; print('concerto env ok, torch', torch.__version__)\""
 
 [feature.sonata]
-platforms = ["linux-64-cuda120"]   # cu124 wheels: any 12.x driver (minor-version compat)
+platforms = ["linux-64-cuda120", "win-64-cuda120"]   # cu124 wheels: any 12.x driver (minor-version compat)
 
 [feature.sonata.dependencies]
 python = "3.11.*"
 trainer-src-sonata = "*"
+
+[feature.sonata.activation.env]
+SONATA_SRC = "$CONDA_PREFIX/opt/sonata"
 
 [feature.sonata.pypi-options]
 index-url = "https://download.pytorch.org/whl/cu124"
@@ -251,11 +267,14 @@ torch-scatter = "*"
 sanity = "python -c \"import os, sys, torch, spconv, torch_scatter, huggingface_hub; sys.path.insert(0, os.environ['SONATA_SRC']); import sonata; print('sonata env ok, torch', torch.__version__)\""
 
 [feature.utonia]
-platforms = ["linux-64-cuda120"]   # cu124 wheels: any 12.x driver (minor-version compat)
+platforms = ["linux-64-cuda120", "win-64-cuda120"]   # cu124 wheels: any 12.x driver (minor-version compat)
 
 [feature.utonia.dependencies]
 python = "3.11.*"
 trainer-src-utonia = "*"
+
+[feature.utonia.activation.env]
+UTONIA_SRC = "$CONDA_PREFIX/opt/utonia"
 
 [feature.utonia.pypi-options]
 index-url = "https://download.pytorch.org/whl/cu124"

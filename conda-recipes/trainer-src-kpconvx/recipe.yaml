@@ -1,30 +1,59 @@
-# KPConvX (apple/ml-kpconvx Standalone/KPConvX subtree) + compiled
-# cpp_wrappers, pinned at the same SHA the modal recipe clones. linux-64:
-# ships cp311 pybind extensions (torch-free; variants key on python only).
+# KPConvX (keops-free fork of apple/ml-kpconvx, Standalone/KPConvX subtree) +
+# compiled cpp_wrappers, pinned at the same SHA the modal recipe clones.
+# linux-64 + win-64: the fork's torch-cluster neighbor search removed the
+# pykeops/nvcc requirement, so the package builds and runs on both platforms.
 
 context:
-  sha: "54e644a9f3bddd4c344a58193897a44582b0fea4"
+  sha: "b2cd23ccac54342780980124b8b9e419e339672d"
 
 package:
   name: trainer-src-kpconvx
-  version: "1.0.0"   # bump when the sha moves
+  version: "1.1.0"   # 1.1.x = keops-free fork line; bump when the sha moves
 
 source:
-  git: https://github.com/apple/ml-kpconvx.git
+  git: https://github.com/orion-hoch/ml-kpconvx-windows-acessible.git
   rev: ${{ sha }}
 
 build:
   number: 0
-  script: |
-    cd "$SRC_DIR/Standalone/KPConvX/cpp_wrappers/cpp_subsampling" && $PYTHON setup.py build_ext --inplace
-    cd "$SRC_DIR/Standalone/KPConvX/cpp_wrappers/cpp_neighbors" && $PYTHON setup.py build_ext --inplace
-    cd "$SRC_DIR/Standalone/KPConvX"
-    touch cpp_wrappers/__init__.py cpp_wrappers/cpp_subsampling/__init__.py \
-          cpp_wrappers/cpp_neighbors/__init__.py
-    mkdir -p "$PREFIX/opt/kpconvx"
-    cp -r "$SRC_DIR/Standalone/KPConvX"/. "$PREFIX/opt/kpconvx/"
-    mkdir -p "$PREFIX/etc/conda/activate.d"
-    printf 'export KPCONVX_SRC="${CONDA_PREFIX}/opt/kpconvx"\n' > "$PREFIX/etc/conda/activate.d/trainer-src-kpconvx.sh"
+  script:
+    - if: unix
+      then: |
+        cd "$SRC_DIR/Standalone/KPConvX/cpp_wrappers/cpp_subsampling" && $PYTHON setup.py build_ext --inplace
+        cd "$SRC_DIR/Standalone/KPConvX/cpp_wrappers/cpp_neighbors" && $PYTHON setup.py build_ext --inplace
+        cd "$SRC_DIR/Standalone/KPConvX"
+        touch cpp_wrappers/__init__.py cpp_wrappers/cpp_subsampling/__init__.py \
+              cpp_wrappers/cpp_neighbors/__init__.py
+        mkdir -p "$PREFIX/opt/kpconvx"
+        cp -r "$SRC_DIR/Standalone/KPConvX"/. "$PREFIX/opt/kpconvx/"
+        mkdir -p "$PREFIX/etc/conda/activate.d"
+        printf 'export KPCONVX_SRC="${CONDA_PREFIX}/opt/kpconvx"\n' > "$PREFIX/etc/conda/activate.d/trainer-src-kpconvx.sh"
+    - if: win
+      then: |
+        rem conda-forge's vs2022 activation only detects VS 17.x / v143; on newer
+        rem VS (e.g. Build Tools 2026) cl never lands on PATH — self-activate then.
+        rem Clear the stale VS vars the failed activation left behind first.
+        set "VSINSTALLDIR="
+        set "VCINSTALLDIR="
+        set "VisualStudioVersion="
+        where cl >nul 2>nul
+        if %ERRORLEVEL% neq 0 for /f "usebackq tokens=*" %%i in (`vswhere -products * -latest -property installationPath`) do call "%%i\VC\Auxiliary\Build\vcvars64.bat"
+        where cl >nul 2>nul
+        if %ERRORLEVEL% neq 0 exit 1
+        cd /d "%SRC_DIR%\Standalone\KPConvX\cpp_wrappers\cpp_subsampling"
+        %PYTHON% setup.py build_ext --inplace
+        if %ERRORLEVEL% neq 0 exit 1
+        cd /d "%SRC_DIR%\Standalone\KPConvX\cpp_wrappers\cpp_neighbors"
+        %PYTHON% setup.py build_ext --inplace
+        if %ERRORLEVEL% neq 0 exit 1
+        cd /d "%SRC_DIR%\Standalone\KPConvX"
+        type nul > cpp_wrappers\__init__.py
+        type nul > cpp_wrappers\cpp_subsampling\__init__.py
+        type nul > cpp_wrappers\cpp_neighbors\__init__.py
+        mkdir "%PREFIX%\opt\kpconvx"
+        xcopy /e /q /y "%SRC_DIR%\Standalone\KPConvX" "%PREFIX%\opt\kpconvx\"
+        if %ERRORLEVEL% neq 0 exit 1
+        rem no activate.d .bat: KPCONVX_SRC is set by envs/pixi.toml activation.env
 
 requirements:
   build:
@@ -40,6 +69,6 @@ requirements:
       - numpy   # the env supplies numpy<2 via pip; don't pin a conda numpy
 
 about:
-  repository: https://github.com/apple/ml-kpconvx
-  summary: KPConvX standalone sources + compiled cpp_wrappers at ${{ sha }}
-  license: LicenseRef-Apple-Sample-Code
+  repository: https://github.com/orion-hoch/ml-kpconvx-windows-acessible
+  summary: KPConvX standalone sources (keops-free fork) + compiled cpp_wrappers at ${{ sha }}
+  license: MIT   # upstream apple/ml-kpconvx LICENSE is plain MIT; fork modifications MIT (Orion Hoch)

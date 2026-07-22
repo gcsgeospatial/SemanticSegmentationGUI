@@ -1093,7 +1093,8 @@ def kp_make_run_dir(variant):
 
 
 def kp_find_latest_checkpoint(opt_type, feature_modes, arch_hash=None,
-                              features=None, legacy_features=None):
+                              features=None, legacy_features=None,
+                              skip_done=False):
     """Most recent run (run-ids are timestamps, so they sort) with checkpoints
     AND this script's recipe: optimizer type, feature_mode (the trainer's raw
     run.json value), the ordered feature spec (run.json "features"; a run
@@ -1107,6 +1108,12 @@ def kp_find_latest_checkpoint(opt_type, feature_modes, arch_hash=None,
         return int(os.path.basename(p)[2:5])   # ep149.pth -> 149
 
     for rd in sorted(glob.glob(f"{OUTPUTS_ROOT}/runs/*"), reverse=True):
+        # skip_done: resume must not pick a COMPLETED run (find_latest_
+        # unfinished_run's rule); EVAL_ONLY passes False because it *wants*
+        # finished runs. Pre-DONE-marker runs are indistinguishable from
+        # crashed ones and stay eligible — same behavior as before.
+        if skip_done and os.path.exists(f"{rd}/DONE"):
+            continue
         ckpts = glob.glob(f"{rd}/checkpoints/ep*.pth")
         if not ckpts:
             continue

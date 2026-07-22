@@ -17,6 +17,8 @@ source:
 build:
   number: 0
   noarch: generic
+  skip:
+    - win   # bash build script; the noarch artifact installs everywhere — build on Linux only
   script: |
     mkdir -p "$PREFIX/opt/ptv3"
     cp -r "$SRC_DIR"/. "$PREFIX/opt/ptv3/"

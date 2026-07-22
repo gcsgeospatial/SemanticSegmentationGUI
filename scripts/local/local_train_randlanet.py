@@ -85,6 +85,13 @@ RARE_FREQ_THRESH = 0.02          # classes under 2% of train points count as rar
 RARE_CENTER_PROB = 0.25          # P(center the next train sphere on a rare-class point)
 VAL_EVERY        = 10            # held-out val pass every N epochs (no weight updates)
 
+# Resume: force-continue the latest matching unfinished run (see AUTO_RESUME).
+RESUME           = False
+# The cloud shell sets AUTO_RESUME=1 only on Modal's OWN retries (preemption /
+# crash); locally a user can export it to continue after a Kill. Same contract
+# as the PTv3-family trainers.
+AUTO_RESUME      = os.environ.get("AUTO_RESUME", "0") == "1"
+
 # Fixed mount inside cloud containers; the pixi local backend points
 # TT_DATASETS_ROOT at the real host dir (see train_common path contract).
 DATASETS_ROOT = os.environ.get("TT_DATASETS_ROOT", "/datasets")
@@ -715,37 +722,57 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     tc.clear_stop()
     train_list, val_list, test_list = ensure_prep()
     tag = dataset
-    run_id = datetime.utcnow().strftime(f"%Y%m%d_%H%M%S_{tag}_randlanet_cold")
-    run_dir = f"{tc.OUTPUTS_ROOT}/runs/{run_id}"
-    os.makedirs(f"{run_dir}/checkpoints", exist_ok=True)
-    with open(f"{run_dir}/run.json", "w") as f:
-        json.dump({
-            "backbone": "RandLA-Net", "warm_start": False,
-            "dataset": dataset,
-            "mode": mode, "gpu": tc.gpu_name(),
-            "n_epochs": N_EPOCHS,
-            "batch_size": BATCH_SIZE, "num_points": NUM_POINTS,
-            "sub_grid_size": SUB_GRID_SIZE, "in_dim": IN_DIM,
-            # resolved input spec (log-dk rides outside it, driven by
-            # DG_LOGDK_FEAT) — inference rebuilds this exact assembly from here.
-            "features": FEAT_SPEC,
-            "steps_per_epoch": STEPS,
-            "eval_votes": EVAL_VOTES,
-            "class_balance": {"weighting": CLASS_WEIGHTING, "beta": WEIGHT_BETA,
-                              "weight_scheme": "inv_sqrt_freq" if WEIGHT_BETA == 0.5
-                              else f"inv_freq^{WEIGHT_BETA}",
-                              "cap": WEIGHT_CAP, "rare_freq_thresh": RARE_FREQ_THRESH,
-                              "rare_center_prob": RARE_CENTER_PROB},
-            "loss": {"pointwise": "focal" if USE_FOCAL else "weighted_ce",
-                     "focal_gamma": FOCAL_GAMMA if USE_FOCAL else None,
-                     "ce_weighted": CLASS_WEIGHTING,
-                     "lovasz_softmax_weight": LOVASZ_WEIGHT},
-            "num_classes": NUM_CLASSES,
-            "class_names": CLASS_NAMES,
-            "train_scenes": [n for n, _, _ in train_list],
-            "val_scenes":   [n for n, _, _ in val_list],
-            "test_scenes":  [n for n, _, _ in test_list],
-        }, f, indent=2)
+    # Only the RESUME_RECIPE_KEYS subset this run.json actually records: a
+    # candidate that disagrees is skipped, so a resume never republishes a
+    # manifest its weights don't match.
+    # ponytail: sub_grid_size/num_points aren't in RESUME_RECIPE_KEYS so they
+    # aren't compared — a mismatched in_dim still fails loudly at
+    # load_state_dict; add them to run.json+RESUME_RECIPE_KEYS if that bites.
+    _recipe = {"features": FEAT_SPEC, "n_epochs": N_EPOCHS,
+               "num_classes": NUM_CLASSES, "class_names": CLASS_NAMES}
+    resume_info = (tc.find_latest_unfinished_run(f"{tag}_randlanet_cold", _recipe)
+                   if (RESUME or AUTO_RESUME) else None)
+    if resume_info:
+        run_dir, resume_ckpt, resume_epoch = resume_info
+        run_id = os.path.basename(run_dir)
+        os.makedirs(f"{run_dir}/checkpoints", exist_ok=True)
+        start_epoch = resume_epoch + 1
+        print(f"  RESUMING {run_id} from {os.path.basename(resume_ckpt)} "
+              f"-> epoch {start_epoch}/{N_EPOCHS}", flush=True)
+    else:
+        resume_ckpt, start_epoch = None, 0
+        run_id = datetime.utcnow().strftime(f"%Y%m%d_%H%M%S_{tag}_randlanet_cold")
+        run_dir = f"{tc.OUTPUTS_ROOT}/runs/{run_id}"
+        os.makedirs(f"{run_dir}/checkpoints", exist_ok=True)
+    if resume_ckpt is None:
+        with open(f"{run_dir}/run.json", "w") as f:
+            json.dump({
+                "backbone": "RandLA-Net", "warm_start": False,
+                "dataset": dataset,
+                "mode": mode, "gpu": tc.gpu_name(),
+                "n_epochs": N_EPOCHS,
+                "batch_size": BATCH_SIZE, "num_points": NUM_POINTS,
+                "sub_grid_size": SUB_GRID_SIZE, "in_dim": IN_DIM,
+                # resolved input spec (log-dk rides outside it, driven by
+                # DG_LOGDK_FEAT) — inference rebuilds this exact assembly from here.
+                "features": FEAT_SPEC,
+                "steps_per_epoch": STEPS,
+                "eval_votes": EVAL_VOTES,
+                "class_balance": {"weighting": CLASS_WEIGHTING, "beta": WEIGHT_BETA,
+                                  "weight_scheme": "inv_sqrt_freq" if WEIGHT_BETA == 0.5
+                                  else f"inv_freq^{WEIGHT_BETA}",
+                                  "cap": WEIGHT_CAP, "rare_freq_thresh": RARE_FREQ_THRESH,
+                                  "rare_center_prob": RARE_CENTER_PROB},
+                "loss": {"pointwise": "focal" if USE_FOCAL else "weighted_ce",
+                         "focal_gamma": FOCAL_GAMMA if USE_FOCAL else None,
+                         "ce_weighted": CLASS_WEIGHTING,
+                         "lovasz_softmax_weight": LOVASZ_WEIGHT},
+                "num_classes": NUM_CLASSES,
+                "class_names": CLASS_NAMES,
+                "train_scenes": [n for n, _, _ in train_list],
+                "val_scenes":   [n for n, _, _ in val_list],
+                "test_scenes":  [n for n, _, _ in test_list],
+            }, f, indent=2)
 
     train_files = sorted(glob.glob(f"{PREP_DIR}/train/*.npz"))
     val_files   = sorted(glob.glob(f"{PREP_DIR}/val/*.npz"))
@@ -788,15 +815,26 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     print(f"  params: {sum(p.numel() for p in net.parameters()):,}")
 
     opt = optim.Adam(net.parameters(), lr=cfg.learning_rate)
+    if resume_ckpt is not None:
+        rckpt = torch.load(resume_ckpt, map_location=device, weights_only=True)
+        net.load_state_dict(rckpt["model"])
+        if "optim" in rckpt:
+            opt.load_state_dict(rckpt["optim"])
+        print(f"  resumed weights{' + optimizer' if 'optim' in rckpt else ''} "
+              f"at epoch {start_epoch}", flush=True)
+    # Built AFTER the resume load on purpose: ExponentialLR seeds base_lr from
+    # the optimizer's CURRENT param-group lr, and the restored optimizer state
+    # carries the decayed lr — so the decay continues instead of restarting.
     sched = optim.lr_scheduler.ExponentialLR(opt, 0.95)
 
     metrics_csv = f"{run_dir}/metrics.csv"
-    with open(metrics_csv, "w", newline="") as f:
-        csv.writer(f).writerow([
-            "epoch", "train_loss", "val_loss", "train_acc", "val_acc",
-            "train_iou", "val_iou", "sec_per_iter", "sec_per_epoch",
-            "gpu_mem_mb",
-        ])
+    if not os.path.exists(metrics_csv):       # keep prior rows when resuming
+        with open(metrics_csv, "w", newline="") as f:
+            csv.writer(f).writerow([
+                "epoch", "train_loss", "val_loss", "train_acc", "val_acc",
+                "train_iou", "val_iou", "sec_per_iter", "sec_per_epoch",
+                "gpu_mem_mb",
+            ])
 
     def _to_device(batch):
         for k in ("features", "labels", "input_inds", "cloud_inds"):
@@ -816,9 +854,10 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     # NOTE: far heavier than the old quick_val — every val scene is fully covered
     # and reprojected to raw points. Raise VAL_EVERY if it costs too much. -------
     val_csv = f"{run_dir}/val_metrics.csv"
-    with open(val_csv, "w", newline="") as f:
-        csv.writer(f).writerow(["epoch", "val_acc", "val_miou"] +
-                               [f"iou_{n}" for n in CLASS_NAMES])
+    if not os.path.exists(val_csv):           # keep prior rows when resuming
+        with open(val_csv, "w", newline="") as f:
+            csv.writer(f).writerow(["epoch", "val_acc", "val_miou"] +
+                                   [f"iou_{n}" for n in CLASS_NAMES])
 
     def evaluate(ds, name2src, label):
         """Full-coverage eval scored on the ORIGINAL raw points (official
@@ -990,11 +1029,12 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     # Opt-in bf16 autocast (TT_AMP=1), matching the other trainers. Batch
     # prefetch is already covered here by the DataLoader's num_workers.
     AMP = os.environ.get("TT_AMP") == "1"
-    print(f"  starting {N_EPOCHS} epochs, {cfg.train_steps} steps/epoch"
+    print(f"  starting at epoch {start_epoch}, up to {N_EPOCHS}, "
+          f"{cfg.train_steps} steps/epoch"
           f"{' [bf16 autocast]' if AMP else ''}", flush=True)
     LOG_EVERY = 20
     ep = N_EPOCHS - 1     # final-eval label when the loop never runs
-    for ep in range(N_EPOCHS):
+    for ep in range(start_epoch, N_EPOCHS):
         net.train()
         iou_calc = IoUCalculator(cfg)
         ep_loss = 0.0; n_steps = 0; correct = total = 0
@@ -1065,6 +1105,11 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     best.finalize(lambda p: torch.save(
         {"model": net.state_dict(), "epoch": ep}, p))
     print(f"  total wall-clock {(time.time() - t_run)/3600:.2f} h")
+
+    # Mark the run complete so AUTO_RESUME won't re-resume it on the next launch
+    # (a crashed/retried run has no DONE and is picked back up automatically).
+    open(f"{run_dir}/DONE", "w").close()
+    print(f"  run complete -> {run_id}", flush=True)
 
 
 def main():

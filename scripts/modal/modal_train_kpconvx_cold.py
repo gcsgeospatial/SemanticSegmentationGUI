@@ -46,23 +46,25 @@ image = (
         "h5py",
         "matplotlib",
         "timm",
-        "pykeops",
+        "torch-cluster",
         "tqdm",
         "tensorboard",
         "pandas<3",
         index_url="https://download.pytorch.org/whl/cu121",
         extra_index_url="https://pypi.org/simple",
+        find_links="https://data.pyg.org/whl/torch-2.3.0+cu121.html",
     )
     .env({"PYTHONUNBUFFERED": "1"})
 )
 
 # Mount the KPConvX standalone repo into the image at /opt/kpconvx.
-# Model source: pinned upstream clone (the standalone KPConvX subtree) —
-# portable (no local checkout needed to build). Bump the SHA deliberately:
-# it IS the architecture version.
+# Model source: pinned clone of the keops-free fork (torch-cluster neighbor
+# search; upstream apple/ml-kpconvx at 54e644a + the backend swap) — portable
+# (no local checkout needed to build). Bump the SHA deliberately: it IS the
+# architecture version.
 image = image.run_commands(
-    "git clone https://github.com/apple/ml-kpconvx.git /tmp/ml-kpconvx"
-    " && git -C /tmp/ml-kpconvx checkout --detach 54e644a9f3bddd4c344a58193897a44582b0fea4"
+    "git clone https://github.com/orion-hoch/ml-kpconvx-windows-acessible.git /tmp/ml-kpconvx"
+    " && git -C /tmp/ml-kpconvx checkout --detach b2cd23ccac54342780980124b8b9e419e339672d"
     " && mv /tmp/ml-kpconvx/Standalone/KPConvX /opt/kpconvx"
     " && rm -rf /tmp/ml-kpconvx",
 )
@@ -94,6 +96,10 @@ datasets_volume = modal.Volume.from_name(
     cpu=8,
     memory=49152,
     timeout=TIMEOUT_HOURS * 3600,
+    # Auto-restart the container on failure (preemption / intermittent CUDA
+    # crash). Each retry auto-resumes from the latest checkpoint (marker below),
+    # so a preemption costs only the epochs since the last checkpoint.
+    retries=modal.Retries(max_retries=10, backoff_coefficient=1.0, initial_delay=5.0),
 )
 def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
                   weights: Optional[str] = None,
@@ -106,6 +112,22 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
     shells out to it, so local and cloud run byte-identical code."""
     import sys
     sys.path.insert(0, "/root")
+    # Resume only on Modal's OWN retries (preemption / crash), never on a user
+    # relaunch -- parity with local, where a fresh launch is a fresh run. The
+    # function-call id is stable across retries but new for every `modal run`,
+    # so attempt 1 just drops a marker and any later attempt of the same call
+    # resumes. No id (shouldn't happen in a container) -> resume, the safe side.
+    # ponytail: markers accumulate under /outputs/.attempts (bytes each, never
+    # cleaned) -- delete the dir if it ever bothers anyone.
+    fcid = modal.current_function_call_id()
+    marker = f"/outputs/.attempts/{fcid}" if fcid else ""
+    if not fcid or os.path.exists(marker):
+        os.environ["TT_MODAL_RETRY"] = os.environ["AUTO_RESUME"] = "1"
+    else:
+        os.makedirs("/outputs/.attempts", exist_ok=True)
+        open(marker, "w").close()
+        outputs_volume.commit()
+
     import train_common
     train_common.modal_shell_run(
         "/root/local_train_kpconvx_cold.py",
