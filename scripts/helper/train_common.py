@@ -1003,28 +1003,27 @@ def kp_ensure_prep(prep_dir, ds_root, sig, tile_fn):
 
 
 def kp_make_build_feat(logdk_feat, logdk_k,
-                       spec=("intensity", "return_number", "height")):
-    """build_feat(xyz, intensity, ret_num, drop=False, extras=None)
+                       spec=("intensity", "return_number")):
+    """build_feat(xyz, intensity, ret_num, drop=(), extras=None)
     -> [1, *spec] (+ log d_k when D3b is on). The constant-1 bias is ALWAYS
-    first and not part of the spec (default spec = the legacy
-    [intensity, return_number, height] recipe).
+    first and not part of the spec (default spec = the heightless
+    [intensity, return_number] recipe).
 
-    "height" is always tile-relative: z - min(z) over the tile. Real
-    HeightAboveGround is the ordinary feat_hag channel, fed via `extras`
-    like every feat_<name> dataset channel. With `drop`, zero the SENSOR
-    channels (intensity / return_number / rgb) wherever they sit in the
-    spec; geometry-derived channels (height, x/y/z, feat_*) always survive
-    — they come from the coords and are never missing at inference."""
+    "height" (tile-relative z - min(z)) is LEGACY-ONLY: removed from every
+    default 2026-07-22, still resolvable so pre-spec checkpoints whose
+    run.json names it can infer. Real HeightAboveGround is the ordinary
+    feat_hag channel, fed via `extras` like every feat_<name> dataset
+    channel. `drop` is a sequence of spec
+    indices to zero: EVERY spec channel is droppable — sensor and
+    geometry-derived alike — so no channel is guaranteed present and the
+    model can't grow dependent on any single one. The caller draws the
+    channels (kp_make_sample_tile: one independent coin per channel per
+    tile). Only the bias and the log d_k conditioning channel never drop."""
     import numpy as np
     import density as dg
     spec = list(spec)
-    # ponytail: sensor set is the fixed names; a sensor-derived feat_* channel
-    # (e.g. NDVI from a source dim) would need a per-channel flag in the
-    # dataset catalog to join the drop.
-    drop_idx = [i for i, n in enumerate(spec)
-                if n in ("intensity", "return_number", "rgb")]
 
-    def build_feat(xyz, intensity, ret_num, drop=False, extras=None):
+    def build_feat(xyz, intensity, ret_num, drop=(), extras=None):
         bias = np.ones((len(xyz), 1), np.float32)
         height = (xyz[:, 2] - xyz[:, 2].min()).astype(np.float32)
         src = {"x": xyz[:, 0], "y": xyz[:, 1], "z": xyz[:, 2], "height": height,
@@ -1035,8 +1034,8 @@ def kp_make_build_feat(logdk_feat, logdk_k,
             raise ValueError(f"feature channel(s) {missing} not available "
                              f"here; have {sorted(src)}")
         attrs = np.stack([src[n] for n in spec], axis=1).astype(np.float32)
-        if drop and drop_idx:
-            attrs[:, drop_idx] = 0.0   # feature-drop: sensor channels only
+        if len(drop):
+            attrs[:, list(drop)] = 0.0   # per-channel feature dropout
         cols = [bias, attrs]
         if logdk_feat:           # D3b: never dropped — the density signal to condition on
             cols.append(dg.local_density_logdk(xyz, logdk_k)[:, None])
@@ -1051,7 +1050,10 @@ def kp_make_sample_tile(build_feat, grid, max_pts, aug_color,
     """sample_tile(tile_path, max_pts=None, min_pts=32, training=True) ->
     (augmented+centered xyz, features, labels) or None. Height comes from the
     original (pre-augmentation) z so it stays a meaningful
-    height-above-tile-min feature."""
+    height-above-tile-min feature. aug_color = per-channel KEEP probability:
+    each spec channel is independently zeroed with p = 1-aug_color per
+    training tile (no channel is exempt), so the model learns every channel
+    as a bonus signal, never a dependency."""
     import numpy as np
     import density as dg
 
@@ -1074,7 +1076,8 @@ def kp_make_sample_tile(build_feat, grid, max_pts, aug_color,
                 keep = dg.voxel_first_idx(xyz, g_eff)
                 xyz, intensity, ret_num, lab = xyz[keep], intensity[keep], ret_num[keep], lab[keep]
                 extras = {n: v[keep] for n, v in extras.items()}
-        drop = (training and np.random.rand() > aug_color)
+        drop = (np.flatnonzero(np.random.rand(len(build_feat.spec)) > aug_color)
+                if training else ())
         feat = build_feat(xyz, intensity, ret_num, drop=drop, extras=extras)
         geo_xyz = kp_augment(xyz) if training else xyz
         geo_xyz = (geo_xyz - geo_xyz.mean(0)).astype(np.float32)
@@ -1795,7 +1798,9 @@ def ptv3_make_evaluate(forward, build_feat, feat_spec, grid, chunk_xy,
 # Widths: rgb = 3, everything else 1 (PTv3 additionally expands a
 # single-channel color entry to 3 — its arch rule). HAG is the ordinary
 # feat_hag dataset channel; only `logdk` stays outside the spec (driven by
-# DG_LOGDK_FEAT, appended after the spec channels).
+# DG_LOGDK_FEAT, appended after the spec channels). "height" is LEGACY-ONLY
+# (removed from every default and the GUI picker; kept in the vocab so old
+# run.json specs still parse at inference).
 FEAT_VOCAB = ("x", "y", "z", "height", "intensity", "return_number", "rgb")
 
 
@@ -2158,13 +2163,19 @@ def _demo():  # ponytail: one runnable check -- `python train_common.py`
     except ValueError as e:
         assert "bogus" in str(e) and "intensity" in str(e)   # lists the vocabulary
 
-    bf = kp_make_build_feat(False, 8)
+    bf = kp_make_build_feat(False, 8)   # heightless default [intensity, return_number]
     xyz10 = np.random.RandomState(0).rand(10, 3).astype(np.float32)
     f = bf(xyz10, np.ones(10, np.float32), np.zeros(10, np.float32))
-    assert f.shape == (10, 4) and np.all(f[:, 0] == 1.0)
-    fd = bf(xyz10, np.ones(10, np.float32), np.ones(10, np.float32), drop=True)
-    assert np.all(fd[:, 1:3] == 0.0)                    # drop zeroes intensity+ret_num
-    assert np.allclose(fd[:, 3], xyz10[:, 2] - xyz10[:, 2].min())  # geometry survives
+    assert f.shape == (10, 3) and np.all(f[:, 0] == 1.0)
+    fd = bf(xyz10, np.ones(10, np.float32), np.ones(10, np.float32), drop=[0])
+    assert np.all(fd[:, 1] == 0.0) and np.all(fd[:, 2] == 1.0)  # per-channel drop
+    assert np.all(fd[:, 0] == 1.0)                      # the bias never drops
+    # legacy "height" spec still resolves — pre-spec checkpoints must infer
+    bfl = kp_make_build_feat(False, 8, spec=["intensity", "return_number", "height"])
+    fl = bfl(xyz10, np.ones(10, np.float32), np.ones(10, np.float32))
+    assert np.allclose(fl[:, 3], xyz10[:, 2] - xyz10[:, 2].min())
+    fh = bfl(xyz10, np.ones(10, np.float32), np.ones(10, np.float32), drop=[2])
+    assert np.all(fh[:, 3] == 0.0) and np.all(fh[:, 1] == 1.0)  # every channel droppable
     # spec-ordered assembly (bias always first, not in the spec)
     bfs = kp_make_build_feat(False, 8, spec=["height", "intensity", "feat_q"])
     fq = np.arange(10, dtype=np.float32)
@@ -2211,7 +2222,7 @@ def _demo():  # ponytail: one runnable check -- `python train_common.py`
 
     st = kp_make_sample_tile(bf, 2.0, 500, 0.8, False, 2.5, 0.5)
     s = st(train_tiles[0], training=False)
-    assert s and s[0].shape == (len(s[2]), 3) and s[1].shape[1] == 4
+    assert s and s[0].shape == (len(s[2]), 3) and s[1].shape[1] == 3
     assert abs(s[0].mean()) < 1e-3                      # centered
     # feat_* channels ride the tile cache (mean-pooled) and land where the
     # spec puts them; requesting an absent one is a clear error naming it.

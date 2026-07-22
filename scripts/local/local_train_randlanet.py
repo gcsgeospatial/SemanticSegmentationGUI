@@ -37,6 +37,10 @@ SUB_GRID_SIZE = 0.30             # 30 cm — sparse aerial LiDAR (~2 pts/m²) vs
 # names; "" = the legacy [x, y, z, intensity, return_number] recipe (IN_DIM 5).
 # log d_k (DG_LOGDK_FEAT) appends after the spec, as always.
 FEAT_CHANNELS = ""
+AUG_COLOR     = 0.8      # per-channel keep prob: each NON-COORDINATE spec channel
+                         # (intensity/return_number/feat_*) independently zeroed with
+                         # p 0.2 per training sphere. x/y/z stay — they double as the
+                         # net's coordinates, zeroing them would starve the kNN graph.
 
 # --- density domain-generalization (scripts/helper/density.py; see DENSITY_DG.md) ---
 # o = rho*g^2; density-invariant for o>=1, breaks for o<1. RandLA's fixed-N absorbs a
@@ -435,8 +439,12 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                     pc[:, 0] *= -1.0
                 pc = pc * np.float32(rng.uniform(0.9, 1.1))
             src = {"intensity": intensity, "return_number": ret_num, **extras}
-            cols = ([src[n][sel] for n in NONXYZ]
-                    + ([dg.local_density_logdk(pc, DG_LOGDK_K)] if DG_LOGDK_FEAT else []))
+            cols = [src[n][sel] for n in NONXYZ]
+            if augment:      # per-channel feature dropout (see AUG_COLOR)
+                cols = [np.zeros_like(c) if rng.rand() > AUG_COLOR else c
+                        for c in cols]
+            if DG_LOGDK_FEAT:   # D3b conditioning channel — never dropped
+                cols.append(dg.local_density_logdk(pc, DG_LOGDK_K))
             feat2 = (np.stack(cols, axis=1) if cols
                      else np.zeros((len(sel), 0))).astype(np.float32)   # D3b: + log d_k on the (augmented) coords
             lb = lab[sel].astype(np.int64)

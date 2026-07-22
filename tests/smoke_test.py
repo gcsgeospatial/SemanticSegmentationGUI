@@ -916,7 +916,7 @@ def main():
 
         # inline HAG: bake it during tiling in one pass (no separate reload).
         # ground_value=2 (the "Ground" source value) -> the labels are the ONLY
-        # ground source (SMRF never runs); grid nearest-fills label gaps.
+        # ground source (CSF never runs); grid nearest-fills label gaps.
         staged_ih = dataset.convert_dataset(
             "laz_hag_inline", str(laz_root / "train"), spec, classes, [0], tmp / "staging",
             val_inputs=[str(laz_root / "val")], test_inputs=[str(laz_root / "test")],
@@ -930,7 +930,7 @@ def main():
               mih["has_hag"] is True
               and mih["source"]["hag_source"] == "grid+labels"
               and mih["source"]["hag_ground_value"] == 2
-              and mih["source"]["hag_use_smrf"] is False)
+              and mih["source"]["hag_use_csf"] is False)
         check("convert_dataset(compute_hag): feature_channels catalogs the hag entry",
               {"name": "hag", "source_field": "@hag:grid+labels", "norm": "raw"}
               in mih["source"]["feature_channels"])
@@ -946,14 +946,18 @@ def main():
         check("convert_infer_job(hag, ground_value): feat_hag baked, no label key",
               "feat_hag" in zjh.files and "label" not in zjh.files
               and zjh["feat_hag"].shape[0] == zjh["xyz"].shape[0])
-        # Ground SOURCE and interpolation are separate axes now; the old smrf_fill
-        # union is gone — a ground class means labels only, no second source.
+        # Ground SOURCE and interpolation are separate axes now; the SMRF-era
+        # fill-union knobs are gone — a ground class means labels only, no
+        # second source, and detection is CSF-only.
         import inspect
         from trainer_gui import pretrain
-        check("hag: smrf_fill union removed from the whole chain",
+        check("hag: legacy smrf knobs removed from the whole chain",
               "smrf_fill" not in inspect.signature(dataset.convert_infer_job).parameters
               and "smrf_fill" not in inspect.signature(pretrain.hag_for_cloud).parameters
-              and "use_smrf" not in inspect.signature(pretrain.hag_for_cloud).parameters)
+              and "use_smrf" not in inspect.signature(pretrain.hag_for_cloud).parameters
+              and "smrf_cell" not in inspect.signature(pretrain.hag_for_cloud).parameters
+              and not hasattr(pretrain, "smrf_ground_mask")
+              and callable(pretrain.csf_ground_mask))
         # Ground from the labels must NOT equal ground from detection — otherwise
         # ground_value silently isn't reaching hag_for_cloud's ground_mask.
         job_d = dataset.convert_infer_job("hag_detect_job", str(laz_root / "val"),

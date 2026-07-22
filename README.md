@@ -115,7 +115,7 @@ two are thin wrappers). Their HuggingFace **weights are CC-BY-NC 4.0
 
 **HeightAboveGround** is an ordinary feature channel (`feat_hag`), not a model
 variant: bake it on the Datasets page with **Compute Height-Above-Ground**
-(ground = the file's ground class when set, else PDAL SMRF detection;
+(ground = the file's ground class when set, else PDAL CSF detection;
 interpolated by grid / `hag_nn` / `hag_delaunay`), then tick `feat_hag` in the
 Train page's feature list to feed it to any model. Runs trained with `feat_hag`
 record it in `run.json "features"`; the Inference page auto-enables the HAG
@@ -147,7 +147,7 @@ top to bottom:
    Random fills by point count), and the **seed** (default 42). Already have
    split folders? Tick **Separate train/val/test folders (use as-is)**. Optional
    **Compute Height-Above-Ground (HAG)** bakes a per-point `feat_hag` channel
-   (ground = your labeled ground class when set, else SMRF detection; never a
+   (ground = your labeled ground class when set, else CSF detection; never a
    mix) — select it in the Train page's feature list to use it.
 
 Hit **Build dataset**. It writes `train/ val/ test/` `.npz` to staging; progress

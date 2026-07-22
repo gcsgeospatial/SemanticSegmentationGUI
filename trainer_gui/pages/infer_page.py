@@ -228,12 +228,12 @@ class InferPage(QWidget):
                                    "grid: fast raster approximation, no PDAL needed. "
                                    "hag_nn / hag_delaunay: accurate PDAL filters.")
         self.hag_ground = QLineEdit()
-        self.hag_ground.setPlaceholderText("blank = detect (SMRF)")
+        self.hag_ground.setPlaceholderText("blank = detect (CSF)")
         self.hag_ground.setMaximumWidth(90)
         self.hag_ground.setToolTip("Classification value in the input clouds that means "
                                    "ground (e.g. 2). When set, those points are the ONLY "
                                    "ground source — never mixed with detection. Blank = "
-                                   "SMRF detects ground instead (needs PDAL; without it "
+                                   "CSF detects ground instead (needs PDAL; without it "
                                    "the grid method's own heuristic is the fallback).")
         hag_row = QHBoxLayout()
         hag_row.addWidget(QLabel("method"))
@@ -733,7 +733,8 @@ class InferPage(QWidget):
                         if isinstance(c, dict) and c.get("name") == "hag"), "")
             method = src[len("@hag:"):].split("+", 1)[0] if src.startswith("@hag:") else ""
             if not method and legacy_hag:
-                # old runs carry the method in hag_source itself (e.g. "grid+smrf")
+                # old runs carry the method in hag_source itself (legacy tags
+                # like "grid+smrf" from the SMRF era still parse: split on "+")
                 method = str(m["hag_source"]).split("+", 1)[0]
             j = self.hag_filter.findText(method) if method else -1
             if j >= 0:
@@ -1220,10 +1221,19 @@ class InferPage(QWidget):
         # HAG comes from the checkbox — _check_hag() already reconciled it with
         # the run's feature spec and parsed the ground value.
         hag_on = self.hag_chk.isChecked()
+        if self._ens_running and not hag_on:
+            # Union semantics (see _run_features): stage feat_hag when ANY
+            # member needs it — loading a hag-less member's run.json last
+            # unticks the box, which must not starve the hag members.
+            hag_on = any("feat_hag" in ((m.get("manifest") or {}).get("features") or [])
+                         for m in self._ens_members)
+            if hag_on:
+                self._append("[hag] re-enabled for the ensemble: a member's spec "
+                             "includes feat_hag (the last-loaded run didn't).")
         hag_filter = self.hag_filter.currentText() if hag_on else "grid"
         if hag_on:
             src = (f"ground = class {self._hag_ground_value}"
-                   if self._hag_ground_value is not None else "ground detected (SMRF)")
+                   if self._hag_ground_value is not None else "ground detected (CSF)")
             self._append(f"[1/4] Computing HeightAboveGround ({hag_filter}, {src}) "
                          "for the input scenes.")
         job_root = self._infer_out_dir()

@@ -2,9 +2,9 @@
 Local training script for KPConvX-L on a canonical trainer_gui --dataset
 (3-folder train/val/test), COLD-START, native-features variant.
 
-  Features  : 4 = [1, intensity, return_number, height], where height is
-              tile-relative (z - tile_min_z). No geometric-feature
-              computation — uses the attributes the cloud carries.
+  Features  : 3 = [1, intensity, return_number] by default. No geometric-
+              feature computation — uses the attributes the cloud carries.
+              The old tile-relative "height" channel is legacy-only.
               FEAT_CHANNELS env overrides the spec (ordered csv incl. dataset
               feat_* channels, e.g. feat_hag for real HeightAboveGround);
               run.json "features" records the resolved list.
@@ -40,7 +40,7 @@ from typing import Optional
 # ============================================================================
 # Configuration
 # ============================================================================
-FEATURE_MODE  = "native"     # [1, intensity, return_number, height]
+FEATURE_MODE  = "native"     # [1, intensity, return_number] (+ selected feat_*)
 N_EPOCHS      = 100
 EPOCH_STEPS   = 300          # optimizer steps / epoch (KPConvX S3DIS: 300)
 PACK_N        = 4            # tiles packed per forward (KPConvX batch_size = 4)
@@ -87,7 +87,7 @@ RARE_FREQ_FRAC  = 0.5        # auto-rare threshold: freq < frac x median present
 RARE_TILE_PROB  = 0.25       # P(draw the next train tile from a rare-class tile)
 
 # Input-feature spec (FEAT_CHANNELS env, GUI picker): comma-separated ordered
-# names; "" = the legacy [intensity, return_number, height] recipe. The
+# names; "" = the default [intensity, return_number] recipe (no height). The
 # constant-1 bias channel is always first and not part of the spec.
 FEAT_CHANNELS = ""
 
@@ -106,7 +106,7 @@ STRIDE        = 50.0
 # Augmentation (train_LAS.py LASConfig): geometry (rotation/scale/x-flip/noise)
 # is train_common.kp_augment's defaults; only the feature-drop probability is
 # configured here.
-AUG_COLOR     = 0.8          # augment_color: P(keep features) = 0.8
+AUG_COLOR     = 0.8          # per-channel keep prob: each feature channel independently zeroed with p 0.2
 
 # --- density domain-generalization (scripts/helper/density.py; see DENSITY_DG.md) ---
 # All default to current behaviour. o = rho*g^2; the model is density-invariant for
@@ -200,11 +200,14 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
     CYC_PLATEAU    = round(globals()["CYC_PLATEAU"] * _cyc_scale)
     CYC_DECREASE10 = globals()["CYC_DECREASE10"] * _cyc_scale
     # Input-feature spec: FEAT_CHANNELS env at train (the infer branch below
-    # overrides it from run.json — env is ignored at infer). "height" is always
-    # tile-relative; real HAG is the ordinary feat_hag dataset channel.
-    FEAT_LEGACY = ["intensity", "return_number", "height"]
+    # overrides it from run.json — env is ignored at infer). "height" (the
+    # tile-relative z proxy) is DEAD for new runs (removed 2026-07-22 — real
+    # HAG is the feat_hag dataset channel); FEAT_LEGACY keeps it ONLY so
+    # pre-spec checkpoints, whose weights expect that width, still infer.
+    FEAT_LEGACY = ["intensity", "return_number", "height"]   # infer-only reconstruction
+    FEAT_DEFAULT = ["intensity", "return_number"]            # train default, no height
     FEAT_SPEC = (list(FEAT_LEGACY) if INFER    # env ignored at infer
-                 else tc.parse_feat_spec(FEAT_CHANNELS, FEAT_LEGACY))
+                 else tc.parse_feat_spec(FEAT_CHANNELS, FEAT_DEFAULT))
 
     # --dataset NAME selects a canonical trainer_gui dataset under /datasets
     # (bind-mounted); NUM_CLASSES / CLASS_NAMES / PREP_DIR are locals so the

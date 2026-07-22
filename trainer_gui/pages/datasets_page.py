@@ -235,7 +235,7 @@ class DatasetsPage(QWidget):
                                 "it's detected. Select feat_hag in the Train page's feature "
                                 "list to feed it to any model.")
         # Interpolation only — the ground SOURCE is the labeled class when set,
-        # else SMRF detection (any method; grid heuristic = the PDAL-less fallback).
+        # else CSF detection (any method; grid heuristic = the PDAL-less fallback).
         self.hag_filter = QComboBox()
         self.hag_filter.addItems(list(pretrain.HAG_METHODS))
         self.hag_filter.setToolTip("How HAG is interpolated from the ground points. "
@@ -244,11 +244,11 @@ class DatasetsPage(QWidget):
         # Which class is ground (raw Source value from the Classes table). When set,
         # the labels are the ONLY ground source — never mixed with detection.
         self.hag_ground = QLineEdit()
-        self.hag_ground.setPlaceholderText("blank = detect (SMRF)")
+        self.hag_ground.setPlaceholderText("blank = detect (CSF)")
         self.hag_ground.setMaximumWidth(90)
         self.hag_ground.setToolTip("Source value that means ground (from the Classes table, "
                                    "e.g. 2). When set, those labels are the only ground source "
-                                   "(gaps are nearest-filled). Blank = SMRF detects ground "
+                                   "(gaps are nearest-filled). Blank = CSF detects ground "
                                    "instead (needs PDAL; without it the grid method's own "
                                    "heuristic is the fallback).")
         hag_row = QHBoxLayout()

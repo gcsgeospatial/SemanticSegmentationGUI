@@ -102,6 +102,10 @@ AUG_SCALE_MAX    = 1.1
 AUG_FLIP_P       = 0.5          # per-axis (x, y) coordinate flip probability
 AUG_JITTER_SIGMA = 0.005        # gaussian per-point noise (m)
 AUG_JITTER_CLIP  = 0.02         # clip jitter to +/- this (m)
+AUG_COLOR        = 0.8          # per-channel keep prob: each spec entry (rgb = one
+                                # entry, its 3 columns drop together) independently
+                                # zeroed with p 0.2 per training tile — no channel
+                                # is exempt, so none becomes a hard dependency
 
 # D3b: explicit local-density input channel (log k-th-NN distance) -> bumps in_channels
 # 6->7 (retrain). Pair with DG_DENSITY_AUG so rho varies. FiLM form lives in the ptv3 lib.
@@ -270,7 +274,7 @@ def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
             point = parent
         return point.feat
 
-    def build_feat(cxyz, rgbf, extras=None):
+    def build_feat(cxyz, rgbf, extras=None, drop=()):
         """Spec-ordered features: x/y/z from the (augmented, centered,
         voxel-deduped) coords, rgb/intensity = the tile's 3 baked color
         channels (single-channel intensity was expanded to 3 at prep — the
@@ -278,15 +282,18 @@ def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
         normal block always follows the spec (the pretrained stem's normal
         slot; zero normals are the upstream demos' documented fallback).
         log d_k appends after that. The legacy spec thus reproduces the
-        pretraining layout [coord, color, normal] exactly."""
+        pretraining layout [coord, color, normal] exactly. `drop` = spec
+        indices to zero (per-channel feature dropout, train time only);
+        the normal slot and log d_k never drop."""
         cols = []
-        for n in FEAT_SPEC:
+        for i, n in enumerate(FEAT_SPEC):
             if n in ("rgb", "intensity"):
-                cols.append(rgbf)
+                c = rgbf
             elif n in ("x", "y", "z"):
-                cols.append(cxyz[:, "xyz".index(n):"xyz".index(n) + 1])
+                c = cxyz[:, "xyz".index(n):"xyz".index(n) + 1]
             else:
-                cols.append(extras[n][:, None])
+                c = extras[n][:, None]
+            cols.append(np.zeros_like(c, dtype=np.float32) if i in drop else c)
         cols.append(np.zeros((len(cxyz), 3), np.float32))   # normal slot
         if DG_LOGDK_FEAT:
             cols.append(dg.local_density_logdk(cxyz, DG_LOGDK_K)[:, None])
@@ -745,9 +752,12 @@ def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
             xyz = xyz[uniq]; rgb = rgb[uniq]; lab = lab[uniq]
             ex = {n: v[uniq] for n, v in ex.items()}
             # feat = spec-ordered stack (augmented/centered coords, the baked
-            # color channels, dataset feat_*) — see build_feat.
+            # color channels, dataset feat_*) — see build_feat. Per-channel
+            # feature dropout: train-time only, one independent coin per entry.
             xyz = xyz.astype(np.float32)
-            feat = build_feat(xyz, rgb.astype(np.float32) / 255.0, ex)
+            fdrop = (np.flatnonzero(np.random.rand(len(FEAT_SPEC)) > AUG_COLOR)
+                     if training else ())
+            feat = build_feat(xyz, rgb.astype(np.float32) / 255.0, ex, drop=fdrop)
             coords.append(xyz); feats.append(feat); labels.append(lab)
             grid_coords.append(keys[uniq])
             running += len(xyz)

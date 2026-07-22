@@ -624,7 +624,7 @@ def _convert_many(files: list[Path], dest_for, spec, value_to_index, intensity_n
                   max_workers: int | None = None) -> list[dict]:
     """Read + convert each file to its npz CONCURRENTLY; returns the stat dicts in
     INPUT order. Order matters: the caller feeds it to allocate_splits positionally,
-    so the split must not depend on which scene's PDAL/SMRF finishes first.
+    so the split must not depend on which scene's PDAL/CSF finishes first.
 
     Threads (not processes): read_points, hag_for_cloud's PDAL execute, and
     savez_compressed all drop the GIL, so this scales with cores. Workers are
@@ -806,7 +806,7 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
         the SAME pass as conversion. ground_value names the source label value
         that means GROUND — when set, those labels are the ONLY ground source
         (holes are nearest-filled/interpolated, never patched from a second
-        source). With no ground_value, SMRF detects ground for every method
+        source). With no ground_value, CSF detects ground for every method
         (the grid's opening heuristic is the PDAL-less fallback). hag_filter
         picks the interpolation: "grid" (fast raster approximation, no PDAL,
         default) or "hag_nn"/"hag_delaunay" (accurate PDAL path).
@@ -834,20 +834,20 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
         f"val={split.val_frac:.0%} test={split.test_frac:.0%} seed={split.seed}"
         + (" (+ explicit folders)" if strategy == "provided" else ""))
 
-    use_smrf = False    # ground source when computing HAG; recorded in meta below
+    use_csf = False     # ground source when computing HAG; recorded in meta below
     if compute_hag:
         from . import pretrain
         if hag_filter != "grid" and not pretrain.pdal_available():
             say(f"⚠ {hag_filter} needs PDAL (not installed) - using the grid method instead.")
             hag_filter = "grid"
-        # Ground source: trusted labels win outright; else SMRF (any method);
-        # the grid heuristic only when PDAL (and so SMRF) is unavailable.
-        use_smrf = ground_value is None and pretrain.pdal_available()
-        if ground_value is None and not use_smrf:
-            say("⚠ no ground class set and PDAL (SMRF) not installed - "
+        # Ground source: trusted labels win outright; else CSF (any method);
+        # the grid heuristic only when PDAL (and so CSF) is unavailable.
+        use_csf = ground_value is None and pretrain.pdal_available()
+        if ground_value is None and not use_csf:
+            say("⚠ no ground class set and PDAL (CSF) not installed - "
                 "falling back to the grid detection heuristic.")
         src = (f"ground=class {ground_value}" if ground_value is not None
-               else ("SMRF" if use_smrf else "grid detection"))
+               else ("CSF" if use_csf else "grid detection"))
         say(f"computing HeightAboveGround inline ({src} -> {hag_filter}) …")
     if geo_features:
         say(f"computing geometric feature(s) inline (jakteristics, "
@@ -932,8 +932,8 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
         hag_src = "source_dimension"          # HAG came from a dim already in the cloud
     elif ground_value is not None:
         hag_src = f"{hag_filter}+labels"
-    elif use_smrf:
-        hag_src = f"{hag_filter}+smrf"
+    elif use_csf:
+        hag_src = f"{hag_filter}+csf"
     else:
         hag_src = "grid"                      # PDAL-less fallback: grid heuristic
     meta = {
@@ -952,7 +952,7 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
             "hag_source": hag_src,
             "rgb_fields": rgb_fields,   # explicit-only color: the mapped columns, or None
             "hag_ground_value": (int(ground_value) if ground_value is not None else None),
-            "hag_use_smrf": bool(use_smrf),
+            "hag_use_csf": bool(use_csf),
             # source_field "@geo:<jak name>" marks a COMPUTED channel (recomputed
             # from xyz at inference — no raw field exists); its radius is the
             # train-time truth the infer path reproduces.
@@ -1022,7 +1022,7 @@ def convert_infer_job(job_id: str, input_dir: str, staging_root: Path, progress=
     per-point "feat_hag" channel with `hag_filter`. `ground_value` names the
     classification value that means ground —
     those points become the ONLY ground source, exactly as on the Datasets page.
-    Left None, SMRF detects ground for every method (the grid method's opening
+    Left None, CSF detects ground for every method (the grid method's opening
     heuristic is the PDAL-less fallback). A PDAL filter without PDAL installed
     falls back to grid. Never a union of sources: a scene that happens to contain
     none of `ground_value` degrades to detection rather than producing no HAG.
@@ -1035,7 +1035,7 @@ def convert_infer_job(job_id: str, input_dir: str, staging_root: Path, progress=
                 "instead (approximate HAG).")
             hag_filter = "grid"
         src = (f"ground=class {ground_value}" if ground_value is not None
-               else ("SMRF" if pretrain.pdal_available() else "grid detection"))
+               else ("CSF" if pretrain.pdal_available() else "grid detection"))
         say(f"  computing HeightAboveGround per scene ({src} -> {hag_filter}) …")
     if geo_features:
         say(f"  computing geometric feature(s) per scene (jakteristics, "

@@ -3,11 +3,11 @@ Local training script for the ORIGINAL KPConv (KPConv-PyTorch, HuguesTHOMAS)
 on a canonical trainer_gui --dataset (3-folder train/val/test), deformable
 KPFCNN, cold start.
 
-  Features  : 4 = [1, intensity, return_number, height], where height is
-              tile-relative (z - tile_min_z). FEAT_CHANNELS env overrides the
-              spec (ordered csv incl. dataset feat_* channels, e.g. feat_hag
-              for real HeightAboveGround); run.json "features" records the
-              resolved list.
+  Features  : 3 = [1, intensity, return_number] by default. FEAT_CHANNELS env
+              overrides the spec (ordered csv incl. dataset feat_* channels,
+              e.g. feat_hag for real HeightAboveGround); run.json "features"
+              records the resolved list. The old tile-relative "height"
+              channel is legacy-only (pre-spec checkpoints).
 
 Model: the deformable KPFCNN (train_S3DIS.py architecture verbatim) built from
 the KPConv-PyTorch repo at /opt/kpconv (env KPCONV_SRC overrides; the dev-box
@@ -79,7 +79,7 @@ def _cwd(path):
 # ============================================================================
 # Configuration
 # ============================================================================
-FEATURE_MODE  = "native"     # [1, intensity, return_number, height]
+FEATURE_MODE  = "native"     # [1, intensity, return_number] (+ selected feat_*)
 N_EPOCHS      = 150
 EPOCH_STEPS   = 300          # optimizer steps / epoch
 PACK_N        = 3            # tiles packed per forward (deformable KPConv is
@@ -109,7 +109,7 @@ RARE_FREQ_FRAC  = 0.5        # auto-rare threshold: freq < frac x median present
 RARE_TILE_PROB  = 0.25       # P(draw the next train tile from a rare-class tile)
 
 # Input-feature spec (FEAT_CHANNELS env, GUI picker): comma-separated ordered
-# names; "" = the legacy [intensity, return_number, height] recipe. The
+# names; "" = the default [intensity, return_number] recipe (no height). The
 # constant-1 bias channel is always first and not part of the spec.
 FEAT_CHANNELS = ""
 
@@ -138,7 +138,7 @@ CALIB_MAX_PTS   = 20000      # the probe runs UNCROPPED by construction: keep it
 # Augmentation: geometry (rotation/scale/x-flip/noise) is train_common.
 # kp_augment's defaults; only the feature-drop probability is configured here.
 # (KPConv's own augmentation_transform is never called.)
-AUG_COLOR     = 0.8          # P(keep features) = 0.8 -> feature-drop with p 0.2
+AUG_COLOR     = 0.8          # per-channel keep prob: each feature channel independently zeroed with p 0.2
 
 # --- density domain-generalization (scripts/helper/density.py; see DENSITY_DG.md) ---
 DG_DENSITY_AUG = False   # D1: per-tile coarsen the loaded tile to a jittered grid (train only)
@@ -289,11 +289,14 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
     # near-constant lr0. At N_EPOCHS=150 this reproduces the module constant.
     LR_DECAY    = 0.1 ** (1.0 / N_EPOCHS)
     # Input-feature spec: FEAT_CHANNELS env at train (the infer block below
-    # overrides it from run.json — env is ignored at infer). "height" is always
-    # tile-relative; real HAG is the ordinary feat_hag dataset channel.
-    FEAT_LEGACY = ["intensity", "return_number", "height"]
+    # overrides it from run.json — env is ignored at infer). "height" (the
+    # tile-relative z proxy) is DEAD for new runs (removed 2026-07-22 — real
+    # HAG is the feat_hag dataset channel); FEAT_LEGACY keeps it ONLY so
+    # pre-spec checkpoints, whose weights expect that width, still infer.
+    FEAT_LEGACY = ["intensity", "return_number", "height"]   # infer-only reconstruction
+    FEAT_DEFAULT = ["intensity", "return_number"]            # train default, no height
     FEAT_SPEC = (list(FEAT_LEGACY) if INFER    # env ignored at infer
-                 else tc.parse_feat_spec(FEAT_CHANNELS, FEAT_LEGACY))
+                 else tc.parse_feat_spec(FEAT_CHANNELS, FEAT_DEFAULT))
     # KPConv pyramid geometry: module constants, restored from run.json at infer
     # so the rebuilt model matches the weights exactly.
     CONV_RADIUS   = globals()["CONV_RADIUS"]
