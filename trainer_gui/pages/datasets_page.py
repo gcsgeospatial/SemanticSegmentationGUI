@@ -139,16 +139,6 @@ class DatasetsPage(QWidget):
         self.field_combo = QComboBox()
         self.field_combo.setEditable(True)
         form.addRow("Label field", self.field_combo)
-        self.copy_btn = QPushButton("Copy settings from…")
-        self.copy_btn.setToolTip("Repopulate class names, ignored values, split config and "
-                                 "feature selections from an existing dataset's "
-                                 "dataset_meta.json. Fields absent from the meta are left "
-                                 "untouched.")
-        self.copy_btn.clicked.connect(self._copy_settings_menu)
-        copy_row = QHBoxLayout()
-        copy_row.addWidget(self.copy_btn)
-        copy_row.addStretch()
-        form.addRow("", ui.wrap(copy_row))
         # Datasets always build into <workspace>/<name> — no per-build output pick.
         return box
 
@@ -299,6 +289,13 @@ class DatasetsPage(QWidget):
         self.combine_btn = QPushButton("Combine selected")
         self.combine_btn.clicked.connect(self._combine_selected)
         btn_row.addWidget(self.combine_btn)
+        self.copy_btn = QPushButton("Copy settings from…")
+        self.copy_btn.setToolTip("Repopulate class names, ignored values, split config and "
+                                 "feature selections from an existing dataset's "
+                                 "dataset_meta.json. Fields absent from the meta are left "
+                                 "untouched.")
+        self.copy_btn.clicked.connect(self._copy_settings_menu)
+        btn_row.addWidget(self.copy_btn)
         btn_row.addStretch()
         cl.addLayout(btn_row)
         self.class_table = QTableWidget(0, 4)
@@ -501,6 +498,8 @@ class DatasetsPage(QWidget):
             if f == self.field_combo.currentText():
                 continue
             if f.lower() in ("x", "y", "z"):   # geometry, never a feature channel
+                continue
+            if f.lower() in ("red", "green", "blue"):   # color lives in the RGB box, not here
                 continue
             it = QListWidgetItem(f)
             it.setFlags(it.flags() | Qt.ItemIsUserCheckable)

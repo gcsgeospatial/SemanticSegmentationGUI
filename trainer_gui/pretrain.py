@@ -351,6 +351,12 @@ def hag_for_cloud(cloud, *, ground_mask=None, ground_method: str = "labels",
 
 # ------------------------------------------------ Stage A': geometric features
 
+# KNN runs in query blocks: the full (n,k) table at k=100 is ~1.2 KB/pt of
+# transients, which OOM-killed multi-10M-point preps. Block output is identical.
+# ponytail: rebuilds the kd-tree per block — build-once KNN if that ever dominates.
+_GEO_BLOCK_PTS = 1_000_000
+
+
 def geo_features_for_cloud(xyz, names, geo_k: int = 100) -> "dict[str, np.ndarray]":
     """{name: float32 (n,)}; NaN -> 0. Raises (never soft-None): geo channels
     are always explicitly requested, so failures must be loud.
@@ -377,12 +383,15 @@ def geo_features_for_cloud(xyz, names, geo_k: int = 100) -> "dict[str, np.ndarra
     k = int(min(geo_k, n))                 # can't fetch more neighbors than points
     if k < 3:                              # degenerate cloud: no meaningful PCA
         return {nm: np.zeros(n, np.float32) for nm in names}
-    knn, _ = pgeof.knn_search(pts, pts, k)         # (n, k) neighbor indices
-    nn = np.ascontiguousarray(knn.flatten().astype("uint32"))
-    nn_ptr = np.ascontiguousarray((np.arange(n + 1) * k).astype("uint32"))
     k_min_search = min(10, k)              # >=10 advised for feature robustness
-    feats = pgeof.compute_features_optimal(pts, nn, nn_ptr, k_min=1, k_step=1,
-                                           k_min_search=k_min_search)
+    feats = np.empty((n, len(_PGEOF_OPTIMAL_COLS)), np.float32)
+    for s in range(0, n, _GEO_BLOCK_PTS):
+        q = pts[s:s + _GEO_BLOCK_PTS]
+        knn, _ = pgeof.knn_search(pts, q, k)       # (B, k) indices into pts
+        nn = np.ascontiguousarray(knn.ravel().astype("uint32"))
+        nn_ptr = np.ascontiguousarray((np.arange(len(q) + 1) * k).astype("uint32"))
+        feats[s:s + _GEO_BLOCK_PTS] = pgeof.compute_features_optimal(
+            pts, nn, nn_ptr, k_min=1, k_step=1, k_min_search=k_min_search)
     col = {nm: i for i, nm in enumerate(_PGEOF_OPTIMAL_COLS)}
     return {nm: np.nan_to_num(feats[:, col[nm]], nan=0.0, posinf=0.0,
                               neginf=0.0).astype(np.float32)
