@@ -432,12 +432,17 @@ def _convert_one(cloud: Cloud, raw: np.ndarray | None, value_to_index: dict[int,
     source_hag = _hag_from_cloud(cloud)
     if source_hag is not None:
         out["feat_hag"] = source_hag.astype(np.float32)
+    hag_warning = None
     if compute_hag and "feat_hag" not in out:
         from . import pretrain
         gmask = (raw == int(ground_value)) if (raw is not None and ground_value is not None) else None
-        h = pretrain.hag_for_cloud(cloud, ground_mask=gmask, hag_filter=hag_filter)
+        hag_notes: list = []
+        h = pretrain.hag_for_cloud(cloud, ground_mask=gmask, hag_filter=hag_filter,
+                                   notes=hag_notes)
         if h is not None and len(h) == cloud.n:
             out["feat_hag"] = h.astype(np.float32)
+        if hag_notes:
+            hag_warning = f"⚠ {out_path.stem}: {hag_notes[0]}"
 
     # feat_geo_<nm>, stored raw; a ferried whole-cloud value wins over recomputation
     if geo_features:
@@ -484,6 +489,7 @@ def _convert_one(cloud: Cloud, raw: np.ndarray | None, value_to_index: dict[int,
         "feature_scales": feature_scales,
         "crs_wkt": cloud.crs_wkt,
         "crs_warning": crs_warning,
+        "hag_warning": hag_warning,
     }
 
 
@@ -641,9 +647,13 @@ def _plan_and_convert(input_files: list[Path], val_files: list[Path] | None,
         if compute_hag and _hag_from_cloud(cloud) is None:
             from . import pretrain                      # whole-cloud HAG, ferried via fields
             gmask = (raw == int(ground_value)) if (raw is not None and ground_value is not None) else None
-            h = pretrain.hag_for_cloud(cloud, ground_mask=gmask, hag_filter=hag_filter)
+            hag_notes: list = []
+            h = pretrain.hag_for_cloud(cloud, ground_mask=gmask, hag_filter=hag_filter,
+                                       notes=hag_notes)
             if h is not None and len(h) == cloud.n:
                 cloud.fields["HeightAboveGround"] = h.astype(np.float32)
+            for hn in hag_notes:
+                say(f"  ⚠ {f.stem}: {hn}")
         if geo_features:
             # whole-cloud once (seam-consistent); after HAG so PDAL never sees the columns
             from . import pretrain
@@ -782,6 +792,8 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
 
     all_stats = [s for sp in _SPLITS for s in scene_stats[sp]]
     for w in sorted({s["crs_warning"] for s in all_stats if s.get("crs_warning")}):
+        say(w)
+    for w in sorted({s["hag_warning"] for s in all_stats if s.get("hag_warning")}):
         say(w)
     if len({s.get("crs_wkt") for s in all_stats} - {None}) > 1:
         say("⚠ scenes carry MORE THAN ONE CRS — the model would train on mixed "
@@ -956,6 +968,8 @@ def convert_infer_job(job_id: str, input_dir: str, staging_root: Path, progress=
         st["source_file"] = str(path)
         if st.get("crs_warning"):
             say("  " + st["crs_warning"])
+        if st.get("hag_warning"):
+            say("  " + st["hag_warning"])
         scenes.append(out_path.name)
         stats.append(st)
     meta = {
