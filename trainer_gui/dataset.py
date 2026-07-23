@@ -14,6 +14,7 @@ import json
 import os
 import re
 import shutil
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -21,8 +22,8 @@ from pathlib import Path
 
 import numpy as np
 
-from .readers import (SUPPORTED_EXTS, Cloud, crs_unit_factor, list_label_fields,
-                      read_points)
+from .readers import (SUPPORTED_EXTS, Cloud, list_label_fields, read_points,
+                      restore_to_source)
 
 
 @dataclass
@@ -160,6 +161,7 @@ def _subset(cloud: Cloud, raw: np.ndarray | None, mask: np.ndarray):
         return_number=cloud.return_number[mask] if cloud.return_number is not None else None,
         fields={k: v[mask] for k, v in cloud.fields.items()},
         crs_wkt=cloud.crs_wkt,
+        source_crs_wkt=cloud.source_crs_wkt,
     )
     return sub, (raw[mask] if raw is not None else None)
 
@@ -314,41 +316,46 @@ def _seam_drop(xy, keys, uniq, split_of_point, tile_m: float,
     return ~drop
 
 
+def _savez_fast(path: Path, arrays: dict) -> None:
+    """npz at zlib level 1: ~3x faster than savez_compressed's level 6 for ~10%
+    bigger files; np.load-compatible. Streams members straight into the zip so
+    GB-scale scenes never hold a second in-RAM copy."""
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
+        for name, a in arrays.items():
+            with zf.open(name + ".npy", "w", force_zip64=True) as f:
+                np.lib.format.write_array(f, np.asanyarray(a))
+
+
 # --------------------------------------------------------------------- conversion
 
-def _crs_check(crs_wkt: str | None, xyz: np.ndarray, name: str) -> str | None:
-    """The pipeline is meter-denominated: geographic CRS raises, non-meter units
-    (or degree-looking coords with no CRS) return a warning string, else None."""
+def _crs_label(wkt: str | None) -> str:
+    """Short 'AUTH:CODE' (or CRS name) for a WKT, for the reproject info line."""
+    try:
+        from pyproj import CRS
+        crs = CRS.from_wkt(wkt)
+        auth = crs.to_authority()
+        return f"{auth[0]}:{auth[1]}" if auth else crs.name
+    except Exception:
+        return "?"
+
+
+def _crs_report(crs_wkt: str | None, source_crs_wkt: str | None,
+                xyz: np.ndarray, name: str) -> str | None:
+    """Coords are meter-projected by read_points before this runs. source_crs_wkt
+    set = a reprojection happened (info line). No CRS + degree-looking coords is a
+    D1 hard block naming the declare-EPSG remedy; no CRS at metric magnitude passes."""
+    if source_crs_wkt:
+        return f"ℹ {name}: reprojected {_crs_label(source_crs_wkt)} -> {_crs_label(crs_wkt)}"
     if crs_wkt:
-        try:
-            from pyproj import CRS
-            crs = CRS.from_wkt(crs_wkt)
-        except Exception:
-            return None
-        if crs.is_geographic:
-            raise ValueError(
-                f"{name}: cloud is in a geographic CRS ({crs.name}) — coordinates "
-                "are lon/lat DEGREES, but tile sizes, radii and grids are meters. "
-                "Reproject to a projected CRS (e.g. UTM) and re-convert.")
-        try:
-            unit = crs.axis_info[0].unit_name
-            factor = float(crs.axis_info[0].unit_conversion_factor)
-        except (AttributeError, IndexError):
-            return None
-        if abs(factor - 1.0) > 1e-6:
-            # readers._read_las already scaled xyz by this factor at ingest.
-            return (f"ℹ {name}: CRS unit is '{unit}' ({factor:g} m) — coordinates "
-                    f"auto-scaled to meters for processing; exports restore the "
-                    f"source units.")
         return None
     xy = xyz[:, :2]
     lo, hi = xy.min(0), xy.max(0)
     if ((hi - lo).max() < 10.0 and abs(lo[0]) <= 360 and abs(hi[0]) <= 360
             and abs(lo[1]) <= 90 and abs(hi[1]) <= 90):
-        return (f"⚠ {name}: no CRS, and the coordinates fit lon/lat bounds with a "
-                "tiny extent — if these are degrees, reproject to a projected "
-                "(meter) CRS before converting; meter-denominated settings would "
-                "otherwise be wrong.")
+        raise ValueError(
+            f"{name}: no CRS and the coordinates look like lon/lat degrees, but the "
+            "pipeline is meter-denominated. Declare the source CRS in the EPSG field "
+            "on the prep/inference page so it can be reprojected to meters.")
     return None
 
 
@@ -390,19 +397,23 @@ def _convert_one(cloud: Cloud, raw: np.ndarray | None, value_to_index: dict[int,
                  out_path: Path, intensity_norm: str = "p95",
                  compute_hag: bool = False, ground_value: int | None = None,
                  hag_filter: str = "grid",
+                 ground_method: str = "labels",
                  feature_fields: list[str] | None = None,
                  geo_features: list[str] | None = None,
-                 geo_radius: float = 1.0) -> dict:
+                 geo_k: int = 100) -> dict:
     """Write one (already-read, already-cropped) cloud to a canonical npz.
     compute_hag stores feat_hag when an aligned result is possible; a scene
     without it blocks runs that require the channel."""
     # xyz stays float64 — UTM-scale coords quantize to 0.5 m in float32;
     # trainers origin-shift to a local frame before their own casts.
-    crs_warning = _crs_check(cloud.crs_wkt, cloud.xyz, out_path.stem)
+    crs_warning = _crs_report(cloud.crs_wkt, cloud.source_crs_wkt, cloud.xyz, out_path.stem)
     out: dict[str, np.ndarray] = {"xyz": cloud.xyz.astype(np.float64)}
+    # crs_wkt = processing CRS of the stored coords; source_crs_wkt present = a
+    # transform occurred (the round-trip signal); both ferry scene npz -> pred npz.
     if cloud.crs_wkt:
-        # 0-d unicode array, ferried scene npz -> pred npz -> export add_crs
         out["crs_wkt"] = np.asarray(cloud.crs_wkt)
+    if cloud.source_crs_wkt:
+        out["source_crs_wkt"] = np.asarray(cloud.source_crs_wkt)
 
     class_counts: dict[int, int] = {}
     # no class mapping = inference: raw only locates ground, don't write labels
@@ -437,7 +448,7 @@ def _convert_one(cloud: Cloud, raw: np.ndarray | None, value_to_index: dict[int,
         from . import pretrain
         gmask = (raw == int(ground_value)) if (raw is not None and ground_value is not None) else None
         hag_notes: list = []
-        h = pretrain.hag_for_cloud(cloud, ground_mask=gmask, hag_filter=hag_filter,
+        h = pretrain.hag_for_cloud(cloud, ground_mask=gmask, hag_filter=hag_filter, ground_method=ground_method,
                                    notes=hag_notes)
         if h is not None and len(h) == cloud.n:
             out["feat_hag"] = h.astype(np.float32)
@@ -451,7 +462,7 @@ def _convert_one(cloud: Cloud, raw: np.ndarray | None, value_to_index: dict[int,
                 for nm in geo_features if f"feat_geo_{nm.lower()}" in cloud.fields}
         todo = [nm for nm in geo_features if nm not in have]
         if todo:
-            have.update(pretrain.geo_features_for_cloud(cloud.xyz, todo, geo_radius))
+            have.update(pretrain.geo_features_for_cloud(cloud.xyz, todo, geo_k))
         for nm in geo_features:
             out[f"feat_geo_{nm.lower()}"] = have[nm]
 
@@ -472,7 +483,7 @@ def _convert_one(cloud: Cloud, raw: np.ndarray | None, value_to_index: dict[int,
         feature_scales[feat_key(fld)] = scale
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(out_path, **out)
+    _savez_fast(out_path, out)
 
     bbox = cloud.xyz[:, :2].max(0) - cloud.xyz[:, :2].min(0)
     area = max(float(bbox[0] * bbox[1]), 1.0)
@@ -488,6 +499,7 @@ def _convert_one(cloud: Cloud, raw: np.ndarray | None, value_to_index: dict[int,
         "has_hag": "feat_hag" in out,
         "feature_scales": feature_scales,
         "crs_wkt": cloud.crs_wkt,
+        "source_crs_wkt": cloud.source_crs_wkt,
         "crs_warning": crs_warning,
         "hag_warning": hag_warning,
     }
@@ -497,16 +509,18 @@ def convert_scene(path: Path, spec: LabelSpec | None, value_to_index: dict[int, 
                   out_path: Path, intensity_norm: str = "p95",
                   compute_hag: bool = False, ground_value: int | None = None,
                   hag_filter: str = "grid",
+                  ground_method: str = "labels",
                   feature_fields: list[str] | None = None,
                   geo_features: list[str] | None = None,
-                  geo_radius: float = 1.0) -> dict:
+                  geo_k: int = 100,
+                  declared_crs_epsg: int | None = None) -> dict:
     """Read one source file and convert the whole cloud (no cropping)."""
-    cloud = read_points(path)
+    cloud = read_points(path, declared_crs_epsg)
     raw = read_labels(path, cloud, spec) if spec is not None else None
     return _convert_one(cloud, raw, value_to_index, out_path, intensity_norm,
                         compute_hag=compute_hag, ground_value=ground_value,
-                        hag_filter=hag_filter, feature_fields=feature_fields,
-                        geo_features=geo_features, geo_radius=geo_radius)
+                        hag_filter=hag_filter, ground_method=ground_method, feature_fields=feature_fields,
+                        geo_features=geo_features, geo_k=geo_k)
 
 
 def _available_ram_bytes() -> int | None:
@@ -560,21 +574,22 @@ def _worker_cap_detail(files: list[Path]) -> tuple[int, str]:
 
 
 def _convert_many(files: list[Path], dest_for, spec, value_to_index, intensity_norm, say,
-                  *, compute_hag, ground_value, hag_filter,
+                  *, compute_hag, ground_value, hag_filter, ground_method,
                   feature_fields: list[str] | None = None,
-                  geo_features: list[str] | None = None, geo_radius: float = 1.0,
+                  geo_features: list[str] | None = None, geo_k: int = 100,
                   rgb_fields: list[str] | None = None,
-                  max_workers: int | None = None) -> list[dict]:
+                  max_workers: int | None = None,
+                  declared_crs_epsg: int | None = None) -> list[dict]:
     """Convert each file concurrently; stat dicts return in INPUT order (the caller
     feeds allocate_splits positionally). Threads: read/PDAL/savez drop the GIL."""
     def work(f: Path) -> dict:
-        cloud = _apply_rgb_mapping(read_points(f), rgb_fields)
+        cloud = _apply_rgb_mapping(read_points(f, declared_crs_epsg), rgb_fields)
         raw = read_labels(f, cloud, spec) if spec is not None else None
         out_path = dest_for(f)
         st = _convert_one(cloud, raw, value_to_index, out_path, intensity_norm,
                           compute_hag=compute_hag, ground_value=ground_value,
-                          hag_filter=hag_filter, feature_fields=feature_fields,
-                          geo_features=geo_features, geo_radius=geo_radius)
+                          hag_filter=hag_filter, ground_method=ground_method, feature_fields=feature_fields,
+                          geo_features=geo_features, geo_k=geo_k)
         st["scene"] = out_path.name
         return st
 
@@ -598,10 +613,12 @@ def _plan_and_convert(input_files: list[Path], val_files: list[Path] | None,
                       num_classes: int, out_root: Path, intensity_norm: str, say, *,
                       compute_hag: bool = False, ground_value: int | None = None,
                       hag_filter: str = "grid",
+                      ground_method: str = "labels",
                       feature_fields: list[str] | None = None,
-                      geo_features: list[str] | None = None, geo_radius: float = 1.0,
+                      geo_features: list[str] | None = None, geo_k: int = 100,
                       rgb_fields: list[str] | None = None,
-                      max_workers: int | None = None) -> dict:
+                      max_workers: int | None = None,
+                      declared_crs_epsg: int | None = None) -> dict:
     """Convert sources into out_root/{train,val,test}/*.npz; returns per-split
     stat lists. Explicit val/test folders are used verbatim; the rest is allocated."""
     stats = {sp: [] for sp in _SPLITS}
@@ -610,9 +627,9 @@ def _plan_and_convert(input_files: list[Path], val_files: list[Path] | None,
         out_path = out_root / split_name / f"{scene_name}.npz"
         st = _convert_one(cloud, raw, value_to_index, out_path, intensity_norm,
                           compute_hag=compute_hag and not hag_already,
-                          ground_value=ground_value, hag_filter=hag_filter,
+                          ground_value=ground_value, hag_filter=hag_filter, ground_method=ground_method,
                           feature_fields=feature_fields,
-                          geo_features=geo_features, geo_radius=geo_radius)
+                          geo_features=geo_features, geo_k=geo_k)
         st["scene"] = out_path.name
         stats[split_name].append(st)
 
@@ -621,10 +638,10 @@ def _plan_and_convert(input_files: list[Path], val_files: list[Path] | None,
             stats[split_name].extend(_convert_many(
                 files, lambda f, sn=split_name: out_root / sn / f"{f.stem}.npz",
                 spec, value_to_index, intensity_norm, say, compute_hag=compute_hag,
-                ground_value=ground_value, hag_filter=hag_filter,
+                ground_value=ground_value, hag_filter=hag_filter, ground_method=ground_method,
                 feature_fields=feature_fields, geo_features=geo_features,
-                geo_radius=geo_radius, rgb_fields=rgb_fields,
-                max_workers=max_workers))
+                geo_k=geo_k, rgb_fields=rgb_fields,
+                max_workers=max_workers, declared_crs_epsg=declared_crs_epsg))
     vfrac = 0.0 if val_files else split.val_frac
     tfrac = 0.0 if test_files else split.test_frac
 
@@ -632,9 +649,9 @@ def _plan_and_convert(input_files: list[Path], val_files: list[Path] | None,
         stats["train"].extend(_convert_many(
             input_files, lambda f: out_root / "train" / f"{f.stem}.npz",
             spec, value_to_index, intensity_norm, say, compute_hag=compute_hag,
-            ground_value=ground_value, hag_filter=hag_filter,
+            ground_value=ground_value, hag_filter=hag_filter, ground_method=ground_method,
             feature_fields=feature_fields, geo_features=geo_features,
-            geo_radius=geo_radius, rgb_fields=rgb_fields,
+            geo_k=geo_k, rgb_fields=rgb_fields,
             max_workers=max_workers))
         return stats
 
@@ -642,13 +659,13 @@ def _plan_and_convert(input_files: list[Path], val_files: list[Path] | None,
     if len(input_files) == 1:
         f = input_files[0]
         say(f"  single-cloud split {f.name} (tile-measure -> holey clouds) ...")
-        cloud = _apply_rgb_mapping(read_points(f), rgb_fields)
+        cloud = _apply_rgb_mapping(read_points(f, declared_crs_epsg), rgb_fields)
         raw = read_labels(f, cloud, spec) if spec is not None else None
         if compute_hag and _hag_from_cloud(cloud) is None:
             from . import pretrain                      # whole-cloud HAG, ferried via fields
             gmask = (raw == int(ground_value)) if (raw is not None and ground_value is not None) else None
             hag_notes: list = []
-            h = pretrain.hag_for_cloud(cloud, ground_mask=gmask, hag_filter=hag_filter,
+            h = pretrain.hag_for_cloud(cloud, ground_mask=gmask, hag_filter=hag_filter, ground_method=ground_method,
                                        notes=hag_notes)
             if h is not None and len(h) == cloud.n:
                 cloud.fields["HeightAboveGround"] = h.astype(np.float32)
@@ -658,9 +675,9 @@ def _plan_and_convert(input_files: list[Path], val_files: list[Path] | None,
             # whole-cloud once (seam-consistent); after HAG so PDAL never sees the columns
             from . import pretrain
             say(f"  computing {len(geo_features)} geometric feature(s) whole-cloud "
-                f"(r={geo_radius:g} m) ...")
+                f"(pgeof optimal, k≤{geo_k}) ...")
             for nm, v in pretrain.geo_features_for_cloud(
-                    cloud.xyz, geo_features, geo_radius).items():
+                    cloud.xyz, geo_features, geo_k).items():
                 cloud.fields[f"feat_geo_{nm.lower()}"] = v
         keys, uniq, inv = _atomize(cloud, split.tile_m)
         pts = np.bincount(inv, minlength=len(uniq))
@@ -682,10 +699,10 @@ def _plan_and_convert(input_files: list[Path], val_files: list[Path] | None,
     say(f"  converting {len(input_files)} scene(s), then allocating by point count ...")
     pool = _convert_many(input_files, lambda f: out_root / "_pool" / f"{f.stem}.npz",
                          spec, value_to_index, intensity_norm, say, compute_hag=compute_hag,
-                         ground_value=ground_value, hag_filter=hag_filter,
+                         ground_value=ground_value, hag_filter=hag_filter, ground_method=ground_method,
                          feature_fields=feature_fields, geo_features=geo_features,
-                         geo_radius=geo_radius, rgb_fields=rgb_fields,
-                         max_workers=max_workers)
+                         geo_k=geo_k, rgb_fields=rgb_fields,
+                         max_workers=max_workers, declared_crs_epsg=declared_crs_epsg)
     for st in pool:                                    # input order kept -> deterministic alloc
         st["_pool_path"] = out_root / "_pool" / st["scene"]
     pts = [st["n_points"] for st in pool]
@@ -713,17 +730,20 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
                     intensity_norm: str = "p95", compute_hag: bool = False,
                     ground_value: int | None = None,
                     hag_filter: str = "grid",
+                    ground_method: str = "labels",
                     feature_fields: list[str] | None = None,
                     geo_features: list[str] | None = None,
-                    geo_radius: float = 1.0,
+                    geo_k: int = 100,
                     rgb_fields: list[str] | None = None,
                     max_workers: int | None = None,
+                    declared_crs_epsg: int | None = None,
                     progress=None) -> Path:
     """Convert `inputs` (files/folders) into a staged canonical dataset.
 
     classes: [{"index", "source_value", "name"}].
     feature_fields: source fields baked into every scene as feat_<name>.
-    geo_features: jakteristics names, computed from xyz within geo_radius m.
+    geo_features: pgeof names, computed from xyz via Weinmann optimal
+        neighborhood (search ceiling geo_k neighbors).
     compute_hag: bake feat_hag; ground_value labels are the ONLY ground source
         when set, else CSF detects ground (grid heuristic is the PDAL-less
         fallback); hag_filter = "grid" | "hag_nn" | "hag_delaunay".
@@ -751,33 +771,35 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
         f"val={split.val_frac:.0%} test={split.test_frac:.0%} seed={split.seed}"
         + (" (+ explicit folders)" if strategy == "provided" else ""))
 
-    use_csf = False
     if compute_hag:
         from . import pretrain
         if hag_filter != "grid" and not pretrain.pdal_available():
             say(f"⚠ {hag_filter} needs PDAL (not installed) - using the grid method instead.")
             hag_filter = "grid"
-        # labels win outright; else CSF; grid heuristic only without PDAL
-        use_csf = ground_value is None and pretrain.pdal_available()
-        if ground_value is None and not use_csf:
-            say("⚠ no ground class set and PDAL (CSF) not installed - "
-                "falling back to the grid detection heuristic.")
-        src = (f"ground=class {ground_value}" if ground_value is not None
-               else ("CSF" if use_csf else "grid detection"))
+        if ground_method in ("csf", "smrf") and not pretrain.pdal_available():
+            say(f"⚠ {pretrain.GROUND_LABELS[ground_method]} needs PDAL (not installed) - "
+                "using Z-min proxy (percentile-Z raster) instead.")
+            ground_method = "zmin"
+        if ground_method == "labels" and ground_value is None:
+            raise ValueError("HAG 'Base off ground layer' needs a ground class - set one on "
+                             "the Classes table, or pick CSF / SMRF / Z-min proxy.")
+        src = pretrain.GROUND_LABELS[ground_method] + (
+            f" (class {ground_value})" if ground_method == "labels" else "")
         say(f"computing HeightAboveGround inline ({src} -> {hag_filter}) …")
     if geo_features:
-        say(f"computing geometric feature(s) inline (jakteristics, "
-            f"r={geo_radius:g} m): {', '.join(geo_features)} …")
+        say(f"computing geometric feature(s) inline (pgeof optimal, "
+            f"k≤{geo_k}): {', '.join(geo_features)} …")
     scene_stats = _plan_and_convert(input_files, val_files, test_files, split, spec,
                                     value_to_index, num_classes, out_root,
                                     intensity_norm, say, compute_hag=compute_hag,
                                     ground_value=ground_value,
-                                    hag_filter=hag_filter,
+                                    hag_filter=hag_filter, ground_method=ground_method,
                                     feature_fields=feature_fields,
                                     geo_features=geo_features,
-                                    geo_radius=geo_radius,
+                                    geo_k=geo_k,
                                     rgb_fields=rgb_fields,
-                                    max_workers=max_workers)
+                                    max_workers=max_workers,
+                                    declared_crs_epsg=declared_crs_epsg)
     for sp in _SPLITS:
         if not scene_stats[sp]:
             raise ValueError(f"Conversion produced an empty {sp} split - lower the "
@@ -796,8 +818,10 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
     for w in sorted({s["hag_warning"] for s in all_stats if s.get("hag_warning")}):
         say(w)
     if len({s.get("crs_wkt") for s in all_stats} - {None}) > 1:
-        say("⚠ scenes carry MORE THAN ONE CRS — the model would train on mixed "
-            "zones/unit systems; reproject all sources to one CRS for a clean dataset.")
+        # harmless now: coords are guaranteed meters, trainers are frame-invariant,
+        # mixed units can no longer occur (ingest reprojects every scene)
+        say("ℹ scenes span multiple processing-CRS zones — fine: coords are meters "
+            "and trainers frame-invariant.")
     total_pts = sum(s["n_points"] for s in all_stats)
     total_area = sum(s["area_m2"] for s in all_stats)
     density = total_pts / max(total_area, 1.0)
@@ -843,12 +867,10 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
         hag_src = ""
     elif not compute_hag:
         hag_src = "source_dimension"
-    elif ground_value is not None:
-        hag_src = f"{hag_filter}+labels"
-    elif use_csf:
-        hag_src = f"{hag_filter}+csf"
+    elif ground_method == "zmin":
+        hag_src = "zmin"
     else:
-        hag_src = "grid"
+        hag_src = f"{hag_filter}+{ground_method}"
     meta = {
         "schema_version": 2,
         "name": name,
@@ -865,7 +887,7 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
             "hag_source": hag_src,
             "rgb_fields": rgb_fields,
             "hag_ground_value": (int(ground_value) if ground_value is not None else None),
-            "hag_use_csf": bool(use_csf),
+            "hag_ground_method": (ground_method if compute_hag else None),
             # source_field "@geo:<name>"/"@hag:<method>" = computed channels,
             # recomputed at inference. Canonical intensity/return_number ride the
             # has_* flags, never this list.
@@ -873,10 +895,13 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
                                   for f in split_feature_fields(feature_fields)[1]]
                                  + [{"name": f"geo_{nm.lower()}",
                                      "source_field": f"@geo:{nm}", "norm": "raw",
-                                     "radius": float(geo_radius)}
+                                     "k": int(geo_k)}
                                     for nm in (geo_features or [])]
                                  + ([{"name": "hag", "source_field": f"@hag:{hag_src}",
                                       "norm": "raw"}] if hag_src else [])),
+            # per-scene CRS: proc = stored coords' CRS, source set = a reprojection ran
+            "crs": {s["scene"]: {"proc": s.get("crs_wkt"),
+                                 "source": s.get("source_crs_wkt")} for s in all_stats},
             "ignore_values": [int(v) for v in ignore_values],
         },
         "split": {
@@ -915,9 +940,11 @@ _GROUND_FIELD_CANDIDATES = ("classification", "Classification", "scalar_label",
 def convert_infer_job(job_id: str, input_dir: str, staging_root: Path, progress=None,
                       intensity_norm: str = "p95", hag: bool = False,
                       hag_filter: str = "grid", ground_value: int | None = None,
+                      ground_method: str = "labels",
                       feature_fields: list[str] | None = None,
                       geo_features: list[str] | None = None,
-                      geo_radius: float = 1.0,
+                      geo_k: int = 100,
+                      declared_crs_epsg: int | None = None,
                       out_dir: Path | None = None) -> Path:
     """Label-less conversion for inference jobs -> <staging>/_infer/<job_id>/ (or
     out_dir). The container mount stays /datasets/_infer/<job> either way.
@@ -934,12 +961,16 @@ def convert_infer_job(job_id: str, input_dir: str, staging_root: Path, progress=
             say(f"  ⚠ {hag_filter} needs PDAL (not installed) - using the grid method "
                 "instead (approximate HAG).")
             hag_filter = "grid"
-        src = (f"ground=class {ground_value}" if ground_value is not None
-               else ("CSF" if pretrain.pdal_available() else "grid detection"))
+        if ground_method in ("csf", "smrf") and not pretrain.pdal_available():
+            say(f"  ⚠ {pretrain.GROUND_LABELS[ground_method]} needs PDAL - using Z-min "
+                "proxy instead.")
+            ground_method = "zmin"
+        src = pretrain.GROUND_LABELS[ground_method] + (
+            f" (class {ground_value})" if ground_method == "labels" else "")
         say(f"  computing HeightAboveGround per scene ({src} -> {hag_filter}) …")
     if geo_features:
-        say(f"  computing geometric feature(s) per scene (jakteristics, "
-            f"r={geo_radius:g} m): {', '.join(geo_features)} …")
+        say(f"  computing geometric feature(s) per scene (pgeof optimal, "
+            f"k≤{geo_k}): {', '.join(geo_features)} …")
     out_root = Path(out_dir) if out_dir else (staging_root / "_infer" / job_id)
     files = discover_scenes(input_dir)
     if not files:
@@ -962,8 +993,9 @@ def convert_infer_job(job_id: str, input_dir: str, staging_root: Path, progress=
         say(f"  converting {path.name} ...")
         st = convert_scene(path, spec, {}, out_path, intensity_norm=intensity_norm,
                            compute_hag=hag, ground_value=ground_value,
-                           hag_filter=hag_filter, feature_fields=feature_fields,
-                           geo_features=geo_features, geo_radius=geo_radius)
+                           hag_filter=hag_filter, ground_method=ground_method, feature_fields=feature_fields,
+                           geo_features=geo_features, geo_k=geo_k,
+                           declared_crs_epsg=declared_crs_epsg)
         st["scene"] = out_path.name
         st["source_file"] = str(path)
         if st.get("crs_warning"):
@@ -1013,7 +1045,6 @@ def export_predictions(pred_dir, fmt: str, progress=None, class_map=None,
         say("  (no class map — export carries raw model indices; low-confidence "
             "points export as 255)")
     written: list[Path] = []
-    no_crs: list[str] = []
     legend_said = False
     for src in sorted(Path(pred_dir).glob("*_pred.npz")):
         with np.load(src) as d:
@@ -1022,6 +1053,7 @@ def export_predictions(pred_dir, fmt: str, progress=None, class_map=None,
             conf = (np.asarray(d["confidence"], np.float32)
                     if "confidence" in d.files else None)
             crs_wkt = str(d["crs_wkt"]) if "crs_wkt" in d.files else None
+            source_wkt = str(d["source_crs_wkt"]) if "source_crs_wkt" in d.files else None
             member = (np.asarray(d["dominant_member"], np.uint8)
                       if "dominant_member" in d.files else None)
             member_names = ([str(s) for s in d["member_names"]]
@@ -1031,14 +1063,8 @@ def export_predictions(pred_dir, fmt: str, progress=None, class_map=None,
             say("  ens_member field (ensemble's dominant model per point): "
                 + (", ".join(f"{i}={n}" for i, n in enumerate(member_names))
                    if member_names else "member indices in ensemble input order"))
-        if crs_wkt is None and fmt in ("las", "laz"):
-            no_crs.append(src.name)
-        f = crs_unit_factor(crs_wkt)
-        if f != 1.0:
-            # Scenes are meter-scaled at ingest (readers._read_las); deliverables
-            # go back to the source frame so they overlay the input clouds.
-            xyz = xyz / f
-            say(f"  {src.name}: restoring source CRS units (÷{f:g})")
+        # _write_pred restores coords to the source frame; a legacy unit-scale pred
+        # (non-meter crs_wkt, no source_crs_wkt) hard-blocks there (D2).
         if class_map:
             lut = np.arange(max(int(cls.max(initial=0)), max(class_map)) + 1)
             for i, v in class_map.items():
@@ -1053,23 +1079,23 @@ def export_predictions(pred_dir, fmt: str, progress=None, class_map=None,
         cls = np.clip(cls, 0, 255).astype(np.uint8)
         dst = src.with_suffix(f".{fmt}")
         _write_pred(dst, xyz, cls, fmt, confidence=conf, crs_wkt=crs_wkt,
-                    member=member)
+                    source_crs_wkt=source_wkt, member=member)
         written.append(dst)
         say(f"  {src.name} -> {dst.name} ({len(xyz):,} pts"
             + (f"; {low:,} below confidence {unclass_threshold:g} -> class {unclass}"
                if unclass_threshold is not None and conf is not None else "") + ")")
-    if no_crs:
-        say(f"  ⚠ no CRS recorded in {', '.join(no_crs)} — those {fmt} deliverables "
-            "carry no georeferencing (predictions from before CRS support, or "
-            "sources without one). Re-running the inference job re-stages with CRS.")
     return written
 
 
 def _write_pred(dst: Path, xyz: np.ndarray, cls: np.ndarray, fmt: str,
-                confidence=None, crs_wkt=None, member=None):
-    """One classified cloud -> dst. confidence rides in las/laz (Extra Bytes) and
-    txt/csv; member (ensemble dominant model) as las/laz "ens_member"; crs_wkt is
-    restored as the las/laz WKT VLR. ply stays classification-only."""
+                confidence=None, crs_wkt=None, source_crs_wkt=None, member=None):
+    """One classified cloud -> dst. xyz is inverse-transformed back to the source
+    frame via the shared keystone restore (raises the D2 legacy block); the embedded
+    las/laz WKT VLR is the SOURCE CRS so deliverables overlay the input clouds.
+    confidence rides in las/laz (Extra Bytes) and txt/csv; member (ensemble dominant
+    model) as las/laz "ens_member". ply stays classification-only."""
+    xyz = restore_to_source(xyz, crs_wkt, source_crs_wkt)
+    geo_wkt = source_crs_wkt or crs_wkt
     if fmt in ("las", "laz"):
         import laspy
         h = laspy.LasHeader(point_format=6, version="1.4")
@@ -1077,10 +1103,10 @@ def _write_pred(dst: Path, xyz: np.ndarray, cls: np.ndarray, fmt: str,
             h.add_extra_dim(laspy.ExtraBytesParams(name="confidence", type=np.float32))
         if member is not None:
             h.add_extra_dim(laspy.ExtraBytesParams(name="ens_member", type=np.uint8))
-        if crs_wkt:
+        if geo_wkt:
             try:
                 from pyproj import CRS
-                h.add_crs(CRS.from_wkt(crs_wkt))
+                h.add_crs(CRS.from_wkt(geo_wkt))
             except Exception:
                 pass    # a CRS-less deliverable beats no deliverable
         h.offsets = xyz.min(0)

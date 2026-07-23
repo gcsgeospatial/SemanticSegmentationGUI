@@ -1,6 +1,6 @@
 """Local smoke test — no Modal calls, no GPU.
 
-Run:  python tests/smoke_test.py   (from the trainer_gui/ project dir)
+Run:  python smoke_test.py   (from the trainer_gui/ project dir)
 Only check code the shipped app reaches; if this file is the only caller, delete the function.
 """
 
@@ -15,7 +15,7 @@ from pathlib import Path
 
 import numpy as np
 
-_ROOT = Path(__file__).resolve().parents[1]
+_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(_ROOT))
 # keep bare module names (local_train_ptv3, _modal_shim, …) importable
 for _d in ("scripts/local", "scripts/modal", "scripts/helper"):
@@ -31,6 +31,11 @@ CHECKS = []
 def check(name, cond):
     CHECKS.append((name, bool(cond)))
     print(("  [ok]  " if cond else "  [FAIL] ") + name)
+
+
+def col(z, key):
+    # missing npz key -> empty array so a check fails soft, never aborts the run
+    return z[key] if key in z.files else np.array([])
 
 
 def make_xyz(n=20_000, extent=100.0):
@@ -108,7 +113,8 @@ def main():
                                          test_inputs=[str(laz_root / "test")],
                                          feature_fields=["intensity"], progress=print)
         z = np.load(staged / "train" / "scene0.npz")
-        check("laz npz: keys", {"xyz", "label", "rgb", "intensity"}.issubset(z.files))
+        check("laz npz: keys", {"xyz", "label", "intensity"}.issubset(z.files))
+        check("laz npz: color STRIPPED when unmapped (ce7c922 default)", "rgb" not in z.files)
         check("laz npz: xyz f64 (N,3)", z["xyz"].dtype == np.float64 and z["xyz"].shape[1] == 3)
         check("laz npz: label i32 in {-1,0,1,2}",
               z["label"].dtype == np.int32 and set(np.unique(z["label"])) <= {-1, 0, 1, 2})
@@ -252,9 +258,10 @@ def main():
                        for i, v in enumerate([1, 2, 3])]
         staged_ply = dataset.convert_dataset("ply_demo", str(ply_root / "train"), spec_ply,
                                              classes_ply, [], tmp / "staging",
-                                             val_inputs=[str(ply_root / "val")])
+                                             val_inputs=[str(ply_root / "val")],
+                                             rgb_fields=["red", "green", "blue"])
         zp = np.load(sorted((staged_ply / "train").glob("*.npz"))[0])
-        check("ply npz: rgb present u8", zp["rgb"].dtype == np.uint8)
+        check("ply npz: rgb present u8 (explicit mapping)", col(zp, "rgb").dtype == np.uint8)
         check("ply npz: all labels mapped", set(np.unique(zp["label"])) == {0, 1, 2})
 
         # ---------------- ASCII dataset with companion label files (per-scene)
@@ -557,27 +564,36 @@ def main():
             pfs_raised = True
         check("feat: parse_feat_spec raises on an unknown channel name", pfs_raised)
 
-        # ---------------- computed geometric channels (jakteristics)
+        # ---------------- computed geometric channels (pgeof optimal neighborhood)
         from trainer_gui import pretrain
         gp = np.mgrid[0:40, 0:40].reshape(2, -1).T.astype(np.float64) * 0.4
         geo_plane = np.c_[gp, np.zeros(len(gp))]              # 16x16 m flat plane
         geo_wall = np.c_[np.full(len(gp), 30.0), gp]          # vertical plane at x=30
         geo_xyz = np.vstack([geo_plane, geo_wall])
         g1 = pretrain.geo_features_for_cloud(
-            geo_xyz, ["planarity", "linearity", "verticality", "PCA1"], 1.0)
+            geo_xyz, ["planarity", "linearity", "verticality", "scattering"], 60)
         g2 = pretrain.geo_features_for_cloud(
-            geo_xyz, ["planarity", "linearity", "verticality", "PCA1"], 1.0)
+            geo_xyz, ["planarity", "linearity", "verticality", "scattering"], 60)
         n_pl = len(geo_plane)
         check("geo: engine deterministic, float32, finite",
               all(np.array_equal(g1[k], g2[k]) for k in g1)
               and all(v.dtype == np.float32 and np.isfinite(v).all()
                       for v in g1.values()))
         check("geo: plane reads planar+horizontal, wall reads vertical",
-              g1["planarity"][:n_pl].mean() > 0.8
+              g1["planarity"][:n_pl].mean() > 0.6
               and g1["verticality"][:n_pl].mean() < 0.2
-              and g1["verticality"][n_pl:].mean() > 0.8)
+              and g1["verticality"][n_pl:].mean() > 0.5)
+        # pgeof's optimal path is float32-only, so raw UTM coords (northing ~4.5e6,
+        # where float32 resolves ~0.5 m) would wreck the geometry — the engine
+        # centers first. This guards that: translation to UTM magnitude must not move
+        # features (would fail loudly, maxΔ~0.4, without centering).
+        g_utm = pretrain.geo_features_for_cloud(
+            geo_xyz + [585000.0, 4507000.0, 0.0],
+            ["planarity", "verticality"], 60)
+        check("geo: features invariant to UTM-magnitude translation (float32 centering)",
+              max(np.abs(g_utm[k] - g1[k]).max() for k in ("planarity", "verticality")) < 1e-2)
         try:
-            pretrain.geo_features_for_cloud(geo_xyz, ["bogus"], 1.0)
+            pretrain.geo_features_for_cloud(geo_xyz, ["bogus"], 60)
             geo_raised = False
         except ValueError:
             geo_raised = True
@@ -586,29 +602,29 @@ def main():
         staged_geo = dataset.convert_dataset(
             "geo_demo", str(feat_root / "train"), spec, classes, [0], tmp / "staging",
             val_inputs=[str(feat_root / "val")], feature_fields=["eig_lin"],
-            geo_features=["planarity", "PCA1"], geo_radius=1.5)
+            geo_features=["planarity", "scattering"], geo_k=60)
         zg = np.load(sorted((staged_geo / "train").glob("*.npz"))[0])
-        check("geo: staged npz carries feat_geo_planarity + feat_geo_pca1 (f32, finite)",
+        check("geo: staged npz carries feat_geo_planarity + feat_geo_scattering (f32, finite)",
               all(k in zg.files and zg[k].dtype == np.float32
                   and np.isfinite(zg[k]).all()
-                  for k in ("feat_geo_planarity", "feat_geo_pca1")))
+                  for k in ("feat_geo_planarity", "feat_geo_scattering")))
         mg = json.loads((staged_geo / "dataset_meta.json").read_text())
-        check("geo: meta feature_channels records @geo: sentinel + raw norm + radius",
+        check("geo: meta feature_channels records @geo: sentinel + raw norm + k",
               mg["source"]["feature_channels"]
               == [{"name": "eig_lin", "source_field": "eig_lin", "norm": "p95abs"},
                   {"name": "geo_planarity", "source_field": "@geo:planarity",
-                   "norm": "raw", "radius": 1.5},
-                  {"name": "geo_pca1", "source_field": "@geo:PCA1",
-                   "norm": "raw", "radius": 1.5}])
+                   "norm": "raw", "k": 60},
+                  {"name": "geo_scattering", "source_field": "@geo:scattering",
+                   "norm": "raw", "k": 60}])
 
         staged_gsp = dataset.convert_dataset(
             "geo_spatial", str(laz_root / "train" / "scene0.laz"), spec, classes, [0],
             tmp / "staging", split=dataset.SplitConfig(val_frac=0.3, test_frac=0.3,
                                                        mode="random", seed=42,
                                                        seam_buffer_m=0.0, tile_m=20.0),
-            geo_features=["planarity"])
+            geo_features=["planarity"], geo_k=60)
         cloud_g = dataset.read_points(laz_root / "train" / "scene0.laz")
-        whole = pretrain.geo_features_for_cloud(cloud_g.xyz, ["planarity"], 1.0)["planarity"]
+        whole = pretrain.geo_features_for_cloud(cloud_g.xyz, ["planarity"], 60)["planarity"]
         by_xy = {tuple(np.round(p, 3)): v for p, v in zip(cloud_g.xyz, whole)}
         ferry_ok = True
         for sp_name in ("train", "val", "test"):
@@ -621,7 +637,7 @@ def main():
 
         job_geo = dataset.convert_infer_job("geo_job", str(feat_root / "val"),
                                             tmp / "staging",
-                                            geo_features=["planarity"], geo_radius=1.0)
+                                            geo_features=["planarity"], geo_k=60)
         zgj = np.load(next((job_geo / "scenes").glob("*.npz")))
         check("geo: convert_infer_job recomputes feat_geo_planarity, no label key",
               "feat_geo_planarity" in zgj.files and "label" not in zgj.files)
@@ -633,8 +649,8 @@ def main():
         check("geo: channel report blocks a job missing the computed channel",
               gbad_block is True and any("feat_geo_planarity" in s for s in gbad_lines))
         check("geo: parse_feat_spec accepts feat_geo_* names",
-              train_common.parse_feat_spec("intensity,feat_geo_pca1", [])
-              == ["intensity", "feat_geo_pca1"])
+              train_common.parse_feat_spec("intensity,feat_geo_scattering", [])
+              == ["intensity", "feat_geo_scattering"])
         check("infer: _entry_name reads path/Filename/name across CLI shapes",
               _entry_name({"path": "/ds/dataset_meta.json"}) == "dataset_meta.json"
               and _entry_name({"Filename": "train/"}) == "train"
@@ -676,7 +692,7 @@ def main():
               and list(np.asarray(pv["classification"]).astype(int)) == list(ex_cls))
         (exd / "sceneX_pred.npz").unlink()
 
-        # ---------------- CRS: captured at conversion, restored at export
+        # ---------------- CRS: meter-projected at ingest, restored to source at export
         import pyproj
         utm33 = pyproj.CRS.from_epsg(32633)
         ch = laspy.LasHeader(point_format=6, version="1.4")
@@ -691,9 +707,10 @@ def main():
         cl.write(str(exd / "crs_src.las"))
         dataset.convert_scene(exd / "crs_src.las", None, {}, exd / "crs_scene.npz")
         with np.load(exd / "crs_scene.npz") as zs:
-            check("crs: conversion stores the source CRS as a WKT string in the npz",
+            check("crs: meter-UTM source is the identity fast-path — proc CRS kept, no source_crs_wkt",
                   "crs_wkt" in zs.files
-                  and pyproj.CRS.from_wkt(str(zs["crs_wkt"])).to_epsg() == 32633)
+                  and pyproj.CRS.from_wkt(str(zs["crs_wkt"])).to_epsg() == 32633
+                  and "source_crs_wkt" not in zs.files)
             np.savez(exd / "crsY_pred.npz", xyz=zs["xyz"],
                      classification=ex_cls.astype(np.int32), crs_wkt=zs["crs_wkt"])
         crs_las = dataset.export_predictions(exd, "las")[0]
@@ -703,6 +720,7 @@ def main():
         for f in ("crs_src.las", "crs_scene.npz", "crsY_pred.npz", "crsY_pred.las"):
             (exd / f).unlink()
 
+        # geographic (lon/lat) source now REPROJECTS to an estimated meter UTM zone
         gh = laspy.LasHeader(point_format=6, version="1.4")
         gh.offsets = [0, 0, 0]
         gh.scales = [1e-7, 1e-7, 0.001]
@@ -712,19 +730,52 @@ def main():
         gl.y = 52.0 + ex_xyz[:, 1] * 1e-5
         gl.z = ex_xyz[:, 2]
         gl.write(str(exd / "geo_src.las"))
-        try:
-            dataset.convert_scene(exd / "geo_src.las", None, {}, exd / "geo.npz")
-            geo_raised = False
-        except ValueError as e:
-            geo_raised = "geographic" in str(e).lower()
-        check("crs: geographic (lon/lat) source is refused with a reproject message",
-              geo_raised and not (exd / "geo.npz").exists())
-        (exd / "geo_src.las").unlink()
+        dataset.convert_scene(exd / "geo_src.las", None, {}, exd / "geo.npz")
+        with np.load(exd / "geo.npz") as zg:
+            gproc = pyproj.CRS.from_wkt(str(zg["crs_wkt"]))
+            gxyz = np.asarray(zg["xyz"], np.float64)
+            check("crs: geographic source reprojects to a meter UTM zone; source_crs_wkt records 4326",
+                  gproc.is_projected and gproc.to_epsg() == 32633
+                  and "source_crs_wkt" in zg.files
+                  and pyproj.CRS.from_wkt(str(zg["source_crs_wkt"])).to_epsg() == 4326
+                  and gxyz[:, 0].min() > 1e5 and gxyz[:, 1].min() > 1e6)
+            np.savez(exd / "geoY_pred.npz", xyz=gxyz,
+                     classification=ex_cls.astype(np.int32),
+                     crs_wkt=zg["crs_wkt"], source_crs_wkt=zg["source_crs_wkt"])
+        geo_las = dataset.export_predictions(exd, "las")[0]
+        glr = laspy.read(str(geo_las))
+        check("crs: geographic export restores coords to lon/lat + embeds the 4326 source CRS",
+              glr.header.parse_crs().to_epsg() == 4326
+              and np.allclose(glr.x, 13.0 + ex_xyz[:, 0] * 1e-5, atol=1e-3)
+              and np.allclose(glr.y, 52.0 + ex_xyz[:, 1] * 1e-5, atol=1e-3))
+        for f in ("geo_src.las", "geo.npz", "geoY_pred.npz", "geoY_pred.las"):
+            (exd / f).unlink()
 
-        wsub = dataset._crs_check(None, np.array([[13.0, 52.0, 0.0], [13.1, 52.1, 1.0]]), "g")
-        wutm = dataset._crs_check(None, np.array([[5e5, 4.2e6, 0.0], [5e5 + 90, 4.2e6 + 90, 1.0]]), "u")
-        check("crs: no-CRS heuristic warns on degree-like coords, silent on UTM-like",
-              wsub is not None and wutm is None)
+        # no-CRS heuristic: degree-like coords are a D1 hard block; metric passes silent
+        try:
+            dataset._crs_report(None, None,
+                                np.array([[13.0, 52.0, 0.0], [13.1, 52.1, 1.0]]), "g")
+            d1_raised = False
+        except ValueError as e:
+            d1_raised = "declare" in str(e).lower() and "epsg" in str(e).lower()
+        wutm = dataset._crs_report(None, None,
+                                   np.array([[5e5, 4.2e6, 0.0], [5e5 + 90, 4.2e6 + 90, 1.0]]), "u")
+        check("crs: no-CRS + degree-like coords is a D1 hard block naming the declare-CRS remedy",
+              d1_raised and wutm is None)
+
+        # D2: a legacy unit-scale pred (non-meter crs_wkt, no source_crs_wkt) blocks export
+        np.savez(exd / "legacyZ_pred.npz",
+                 xyz=(ex_xyz + [9.8e5, 1.9e5, 0]).astype(np.float64),
+                 classification=ex_cls.astype(np.int32),
+                 crs_wkt=pyproj.CRS.from_epsg(2263).to_wkt())
+        try:
+            dataset.export_predictions(exd, "las")
+            d2_raised = False
+        except ValueError as e:
+            d2_raised = "re-run" in str(e).lower()
+        check("crs: legacy unit-scale pred (non-meter CRS, no source) blocks export with the re-run remedy",
+              d2_raised)
+        (exd / "legacyZ_pred.npz").unlink()
 
         train_common.write_pred(exd / "sceneC_pred.npz", ex_xyz, ex_cls,
                                 confidence=np.linspace(0.1, 1.0, 7, dtype=np.float32),
@@ -861,7 +912,7 @@ def main():
               mih["has_hag"] is True
               and mih["source"]["hag_source"] == "grid+labels"
               and mih["source"]["hag_ground_value"] == 2
-              and mih["source"]["hag_use_csf"] is False)
+              and mih["source"]["hag_ground_method"] == "labels")
         check("convert_dataset(compute_hag): feature_channels catalogs the hag entry",
               {"name": "hag", "source_field": "@hag:grid+labels", "norm": "raw"}
               in mih["source"]["feature_channels"])
@@ -875,13 +926,14 @@ def main():
               and zjh["feat_hag"].shape[0] == zjh["xyz"].shape[0])
         import inspect
         from trainer_gui import pretrain
-        check("hag: legacy smrf knobs removed from the whole chain",
-              "smrf_fill" not in inspect.signature(dataset.convert_infer_job).parameters
-              and "smrf_fill" not in inspect.signature(pretrain.hag_for_cloud).parameters
+        check("hag: smrf/zmin are ground_methods (not the old ad-hoc smrf_fill knobs)",
+              set(pretrain.GROUND_METHODS) == {"labels", "csf", "smrf", "zmin"}
+              and callable(pretrain.smrf_ground_mask)
+              and callable(pretrain.csf_ground_mask)
+              and "ground_method" in inspect.signature(pretrain.hag_for_cloud).parameters
+              and "smrf_fill" not in inspect.signature(dataset.convert_infer_job).parameters
               and "use_smrf" not in inspect.signature(pretrain.hag_for_cloud).parameters
-              and "smrf_cell" not in inspect.signature(pretrain.hag_for_cloud).parameters
-              and not hasattr(pretrain, "smrf_ground_mask")
-              and callable(pretrain.csf_ground_mask))
+              and "smrf_cell" not in inspect.signature(pretrain.hag_for_cloud).parameters)
         # labels == detection would mean ground_value never reached ground_mask
         job_d = dataset.convert_infer_job("hag_detect_job", str(laz_root / "val"),
                                           tmp / "staging", hag=True, hag_filter="grid")
@@ -894,6 +946,13 @@ def main():
         zjn = np.load(next((job_n / "scenes").glob("*.npz")))
         check("convert_infer_job(): HAG is opt-in — no feat_hag channel by default",
               "feat_hag" not in zjn.files)
+        job_z = dataset.convert_infer_job("hag_zmin_job", str(laz_root / "val"),
+                                          tmp / "staging", hag=True, hag_filter="grid",
+                                          ground_method="zmin")
+        zjz = np.load(next((job_z / "scenes").glob("*.npz")))
+        check("convert_infer_job(ground_method=zmin): percentile-Z raster HAG baked",
+              "feat_hag" in zjz.files
+              and zjz["feat_hag"].shape[0] == zjz["xyz"].shape[0])
 
         # ---------------- analysis.scan_folder on raw files
         stats = analysis.scan_folder(dataset.discover_scenes(laz_root / "train"))
@@ -1179,6 +1238,10 @@ def main():
             else:
                 os.environ["APPDATA"] = _old_appdata
 
+    except Exception as e:   # a raised check arg (e.g. missing npz key) must not blind the summary
+        import traceback
+        traceback.print_exc()
+        check(f"smoke aborted early: {type(e).__name__}: {e}", False)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

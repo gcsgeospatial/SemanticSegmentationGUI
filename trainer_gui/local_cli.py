@@ -8,7 +8,7 @@ TT_DATASET_DIR/TT_INFER_DIR/TT_PRED_DIR overrides. run_script returns
 from __future__ import annotations
 
 import shutil
-import sys
+import subprocess
 from pathlib import Path
 
 from . import appstate
@@ -24,13 +24,6 @@ def pixi_exe() -> str:
 
 def have_pixi() -> bool:
     return shutil.which("pixi") is not None
-
-
-def runnable() -> bool:
-    """True when this host can actually execute a local run: pixi on PATH and
-    linux (the training envs are linux-64/CUDA-only). Elsewhere the GUI prints
-    the exact command instead of running it — the dev-box dry-run flow."""
-    return have_pixi() and sys.platform.startswith("linux")
 
 
 def env_name(backbone) -> str:
@@ -65,20 +58,39 @@ def env_preflight(backbone, repo_root: str = "") -> tuple[bool, str]:
                    f"launch again.")
 
 
+def _nvidia_smi_gpus() -> "tuple[bool, str]":
+    """(has_gpu, detail). Runs `nvidia-smi -L` — the binary existing on PATH
+    doesn't mean a GPU responds (dead/mismatched driver, zero visible devices),
+    so probe the actual device list, not just shutil.which."""
+    exe = shutil.which("nvidia-smi")
+    if exe is None:
+        return False, "no 'nvidia-smi' on PATH"
+    try:
+        p = subprocess.run([exe, "-L"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return False, f"nvidia-smi -L failed to run ({e})"
+    gpus = [ln for ln in p.stdout.splitlines() if ln.strip().startswith("GPU ")]
+    if p.returncode != 0 or not gpus:
+        return False, (p.stdout.strip() or p.stderr.strip()
+                       or f"nvidia-smi -L exit {p.returncode}, no GPUs listed")
+    return True, f"{len(gpus)} GPU(s)"
+
+
 def gpu_preflight() -> tuple[bool, str]:
     """(proceed, message) for GPU availability. The trainers are CUDA-only
-    (every script calls .cuda()), so block when GPUs are disabled in
-    local_config, and warn when no NVIDIA driver is detectable. There is no
-    CPU inference path."""
+    (every script calls .cuda(), no CPU path), so hard-block when GPUs are
+    disabled in local_config OR when nvidia-smi -L reports no usable device."""
     cfg = appstate.local_config()
     if not cfg.get("gpus"):
         return False, ("[local] GPUs are disabled (local_config['gpus']=''), but these "
                        "models require CUDA. Set gpus='all' (or a device id) and run "
                        "again.")
-    if shutil.which("nvidia-smi") is None:
-        return True, ("[local] ⚠ no 'nvidia-smi' on PATH - if this host lacks an NVIDIA "
-                      "GPU + driver the run will fail. These models are CUDA-only "
-                      "(no CPU fallback).")
+    ok, detail = _nvidia_smi_gpus()
+    if not ok:
+        return False, (f"[local] no usable NVIDIA GPU detected ({detail}). These models "
+                       "are CUDA-only with no CPU fallback. Install/repair the NVIDIA "
+                       "driver so `nvidia-smi -L` lists a device, or set "
+                       "local_config['gpus'] to the intended device, then launch again.")
     return True, ""
 
 

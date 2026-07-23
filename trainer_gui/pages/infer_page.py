@@ -23,6 +23,8 @@ from .. import analysis, appstate, dataset, local_cli, modal_cli, plots, pretrai
 from ..backbones import BACKBONES
 from ..jobs import FuncWorker, JobRunner
 from ..logconsole import LogConsole
+from ..readers import read_points
+from .datasets_page import crs_probe, crs_story, parse_epsg   # one shared CRS-surface impl
 
 
 class InferPage(QWidget):
@@ -46,6 +48,7 @@ class InferPage(QWidget):
         self._run_class_names: list | None = None
         self._manifest_features: list | None = None  # run.json "features" (None = legacy run)
         self._hag_ground_value: int | None = None
+        self._hag_ground_method: str = "labels"   # training-time ground source
         self._modal_cfg_run = ""
         self._run_tag = ""
         self._pending_cfg_run = ""
@@ -54,6 +57,11 @@ class InferPage(QWidget):
         self._ens_idx = -1
         self._ens_dirs: list[Path] = []
         self._run_open = False
+        # CRS surface: (source_wkt, proc_wkt, looks_degrees) of the probed first input
+        self._crs_probe = None
+        self._crs_probe_name = ""
+        self._crs_probe_path = ""
+        self._declared_crs_epsg: int | None = None
 
         root = QVBoxLayout(self)
         title = QLabel("Inference")
@@ -77,6 +85,18 @@ class InferPage(QWidget):
         in_row.addWidget(fold_btn)
         in_row.addWidget(file_btn)
         wf.addRow("Point clouds (folder or file)", ui.wrap(in_row))
+        self.input_edit.editingFinished.connect(self._probe_crs)
+        self.crs_status = QLabel("")
+        self.crs_status.setObjectName("pageSub")
+        self.crs_status.setWordWrap(True)
+        wf.addRow("CRS", self.crs_status)
+        self.declare_epsg = QLineEdit()
+        self.declare_epsg.setPlaceholderText("blank = auto-detect from the file")
+        self.declare_epsg.setToolTip("EPSG code to assume for clouds that carry no CRS. Ignored "
+                                     "for files that declare their own CRS. Required when a "
+                                     "no-CRS cloud's coordinates look like lat/lon degrees.")
+        self.declare_epsg.textChanged.connect(self._render_crs)
+        wf.addRow("Declare CRS (EPSG)", self.declare_epsg)
         radio_row = QHBoxLayout()
         self.from_run_radio = QRadioButton("Training run")
         self.from_run_radio.setChecked(True)
@@ -691,6 +711,12 @@ class InferPage(QWidget):
                              f"using {self.hag_filter.currentText()}.")
             self._append(f"[hag] run trained with feat_hag; HAG enabled, "
                          f"method={self.hag_filter.currentText()}.")
+            meta_src = ((self._dataset_meta(m) or {}).get("source") or {})
+            gm = meta_src.get("hag_ground_method")
+            if not gm:      # legacy: parse the ground source out of hag_source
+                hs = str(m.get("hag_source") or "")
+                gm = hs.split("+", 1)[1] if "+" in hs else (hs if hs == "zmin" else "")
+            self._hag_ground_method = gm or "labels"
         if self._dg.get("logdk"):
             self._append(f"[dg] trained with the log-d_k density channel "
                          f"(k={self._dg.get('logdk_k', 8)}); recomputed at inference.")
@@ -872,6 +898,7 @@ class InferPage(QWidget):
         d = QFileDialog.getExistingDirectory(self, "Folder of point clouds to label")
         if d:
             self.input_edit.setText(d)
+            self._probe_crs()
 
     def _pick_input_file(self):
         f, _ = QFileDialog.getOpenFileName(
@@ -879,6 +906,41 @@ class InferPage(QWidget):
             "Point clouds (*.ply *.npz *.las *.laz *.txt *.csv *.pcd *.xyz *.pts);;All files (*)")
         if f:
             self.input_edit.setText(f)
+            self._probe_crs()
+
+    def _probe_crs(self):
+        """Read the first input cloud's CRS for the surface + D1 preflight (one
+        file, like the scene-channel check; reuses readers, no reprojection here)."""
+        path = self.input_edit.text().strip()
+        self._crs_probe, self._crs_probe_name, self._crs_probe_path = None, "", path
+        files = dataset.expand_inputs(path) if path and os.path.exists(path) else []
+        if not files:
+            self._render_crs()
+            return
+        try:
+            cloud = read_points(files[0])
+        except Exception as e:  # noqa: BLE001
+            self._append(f"Could not read CRS from {files[0].name}: {e}")
+            self._render_crs()
+            return
+        self._crs_probe = crs_probe(cloud)
+        self._crs_probe_name = (files[0].name if len(files) == 1
+                                else f"{files[0].name} (+{len(files) - 1} more)")
+        self._render_crs()
+
+    def _render_crs(self, *_):
+        """Show the probed input's detected CRS + auto action (or the D1 block)."""
+        if not self._crs_probe:
+            self.crs_status.setText("")
+            return
+        declared = parse_epsg(self.declare_epsg.text())
+        detected, action, block = crs_story(
+            *self._crs_probe, declared if type(declared) is int else None)
+        if block:
+            self.crs_status.setText(f"⚠ {self._crs_probe_name}: {detected}. "
+                                    f"Blocks Run — {block}.")
+        else:
+            self.crs_status.setText(f"{self._crs_probe_name}: detected {detected} · {action}.")
 
     def _backbone(self):
         # the run.json's backbone is authoritative for local inference
@@ -1047,6 +1109,22 @@ class InferPage(QWidget):
         if not os.path.exists(input_dir):
             self._append("Choose an input folder or file first.")
             return
+        declared = parse_epsg(self.declare_epsg.text())
+        if declared is False:
+            self._append("✗ Declare CRS: enter an EPSG integer (e.g. 6539), or leave "
+                         "blank to auto-detect from the file.")
+            return
+        if self._crs_probe_path != input_dir:
+            self._probe_crs()
+        if self._crs_probe:
+            _, _, block = crs_story(*self._crs_probe,
+                                    declared if type(declared) is int else None)
+            if block:
+                self._append(f"✗ '{self._crs_probe_name}' carries no CRS and its "
+                             f"coordinates look like lat/lon degrees — {block} to "
+                             f"reproject it, then Run.")
+                return
+        self._declared_crs_epsg = declared if type(declared) is int else None
         exc = self._excluded_classes()
         if exc and self.class_list.count() - len(exc) < 2:
             self._append("✗ Class mask: keep at least 2 classes enabled — a one-class "
@@ -1138,24 +1216,37 @@ class InferPage(QWidget):
                 self._append("[hag] re-enabled for the ensemble: a member's spec "
                              "includes feat_hag (the last-loaded run didn't).")
         hag_filter = self.hag_filter.currentText() if hag_on else "grid"
+        # infer data is unlabeled: 'labels' training degrades to detection here
+        if self._hag_ground_value is not None:
+            ground_method = "labels"
+        elif self._hag_ground_method in ("csf", "smrf", "zmin"):
+            ground_method = self._hag_ground_method        # reproduce training detection
+        else:
+            ground_method = "csf"
         if hag_on:
             src = (f"ground = class {self._hag_ground_value}"
-                   if self._hag_ground_value is not None else "ground detected (CSF)")
+                   if self._hag_ground_value is not None
+                   else f"{pretrain.GROUND_LABELS.get(ground_method, ground_method)} detection")
             self._append(f"[1/4] Computing HeightAboveGround ({hag_filter}, {src}) "
                          "for the input scenes.")
         job_root = self._infer_out_dir()
-        fields, geo, geo_r = self._infer_feature_fields()
+        fields, geo, geo_k = self._infer_feature_fields()
         if geo:
             self._append(f"[1/4] Recomputing geometric feature(s) "
-                         f"{', '.join(geo)} (r={geo_r:g} m) per scene.")
+                         f"{', '.join(geo)} (pgeof optimal, k≤{geo_k}) per scene.")
         self._append(f"[1/4] Converting {input_dir} to scenes (job {self._job_id}; "
                      f"intensity={norm}) -> {job_root}…")
+        # only passed when the user declared one — keeps the auto-detect call
+        # unchanged until dataset.convert_infer_job gains the param
+        crs_kw = ({"declared_crs_epsg": self._declared_crs_epsg}
+                  if self._declared_crs_epsg is not None else {})
         self.converter.start(dataset.convert_infer_job, self._job_id, input_dir,
                              appstate.workspace_dir(), intensity_norm=norm,
                              hag=hag_on, hag_filter=hag_filter,
                              ground_value=self._hag_ground_value,
+                             ground_method=ground_method,
                              feature_fields=fields, geo_features=geo,
-                             geo_radius=geo_r, out_dir=job_root)
+                             geo_k=geo_k, out_dir=job_root, **crs_kw)
 
     def _run_features(self) -> list | None:
         """The run's ordered input spec (run.json "features"), or None (loose
@@ -1171,43 +1262,47 @@ class InferPage(QWidget):
             if (self.from_run_radio.isChecked() and self._manifest) else None
 
     def _infer_feature_fields(self) -> tuple:
-        """(raw source fields, jakteristics names, radius) for the run's custom
+        """(raw source fields, pgeof geo names, geo_k) for the run's custom
         feat_* channels, resolved through the dataset meta; unresolved names
         fall back with a logged warning."""
         # feat_hag comes from the hag= conversion args, not a raw source field
         custom = [n for n in (self._run_features() or [])
                   if n.startswith("feat_") and n != "feat_hag"]
         if not custom:
-            return None, None, 1.0
-        jak_by_lower = {n.lower(): n for n in pretrain.GEO_FEATURES}
+            return None, None, 100
+        geo_by_lower = {n.lower(): n for n in pretrain.GEO_FEATURES}
         chans = ((self._dataset_meta() or {}).get("source") or {}).get("feature_channels") or []
         by_name = {c.get("name"): c for c in chans if isinstance(c, dict)}
-        fields, geo, radius = [], [], None
+        fields, geo, geo_k = [], [], None
         for n in custom:
             c = by_name.get(n[len("feat_"):]) or {}
             src = c.get("source_field") or ""
             if src.startswith("@geo:"):
-                geo.append(src[len("@geo:"):])
-                r = c.get("radius")
-                if r is not None and radius is not None and float(r) != radius:
-                    self._append(f"[feat] ⚠ mixed geo radii in meta ({radius:g} vs "
-                                 f"{float(r):g}) — using {radius:g}.")
-                elif r is not None:
-                    radius = float(r)
+                nm = src[len("@geo:"):]
+                if nm not in pretrain.GEO_FEATURES:   # legacy jakteristics channel
+                    self._append(f"[feat] ⚠ '{nm}' is no longer available after the "
+                                 f"pgeof switch — rebuild this dataset to recompute it.")
+                    continue
+                geo.append(nm)
+                k = c.get("k")
+                if k is not None and geo_k is not None and int(k) != geo_k:
+                    self._append(f"[feat] ⚠ mixed geo k in meta ({geo_k} vs "
+                                 f"{int(k)}) — using {geo_k}.")
+                elif k is not None:
+                    geo_k = int(k)
             elif src:
                 fields.append(src)
-            elif n.startswith("feat_geo_") and n[len("feat_geo_"):] in jak_by_lower:
-                jak = jak_by_lower[n[len("feat_geo_"):]]
+            elif n.startswith("feat_geo_") and n[len("feat_geo_"):] in geo_by_lower:
+                nm = geo_by_lower[n[len("feat_geo_"):]]
                 self._append(f"[feat] no dataset meta for '{n}' — recomputing "
-                             f"jakteristics '{jak}' at the DEFAULT radius 1.0 m "
-                             f"(train radius unknown).")
-                geo.append(jak)
+                             f"pgeof '{nm}' at the DEFAULT k=100 (train k unknown).")
+                geo.append(nm)
             else:
                 fields.append(n[len("feat_"):])
                 self._append(f"[feat] no dataset meta maps '{n}' to a raw field — "
                              f"assuming the inputs carry a field named "
                              f"'{n[len('feat_'):]}'.")
-        return fields or None, geo or None, (radius if radius is not None else 1.0)
+        return fields or None, geo or None, (geo_k if geo_k is not None else 100)
 
     def _infer_out_dir(self) -> Path:
         """<dataset>/infer/<job> when the run names a known on-disk dataset,
@@ -1435,13 +1530,6 @@ class InferPage(QWidget):
             infer_dir=str(self._staged), pred_dir=str(self._pred_dir), env=env)
         self._append(f"[local] Running inference in the pixi env ({b.label})…")
         self._append(f"[local] $ {local_cli.preview(prog, args, run_env)}\n")
-        if not local_cli.runnable():
-            self._append("[local] pixi not found (or not a Linux/CUDA host); printed "
-                         "the command only. On the GPU box predictions land in "
-                         f"{self._pred_dir.as_posix()}.")
-            self._ens_running = False
-            self.run_btn.setEnabled(True)
-            return
         gok, gmsg = local_cli.gpu_preflight()
         if gmsg:
             self._append(gmsg)

@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import codecs
+import os
 import re
+import signal
+import subprocess
+import sys
 import threading
 import traceback
 
@@ -104,6 +108,10 @@ class JobRunner(QObject):
         # incremental decoder: multi-byte chars split across chunks must not become U+FFFD
         self._dec = codecs.getincrementaldecoder("utf-8")("replace")
         self.proc = QProcess(self)
+        # own process group (unix) so Kill reaches grandchildren (pixi -> python),
+        # not just the launcher; windows uses taskkill /T in terminate() instead
+        if hasattr(self.proc, "setChildProcessModifier"):
+            self.proc.setChildProcessModifier(os.setsid)
         self.proc.setProcessEnvironment(env)
         self.proc.setProcessChannelMode(QProcess.MergedChannels)
         if self._cwd:
@@ -115,8 +123,22 @@ class JobRunner(QObject):
         self.proc.start(program, args)
 
     def terminate(self):
-        if self.running:
-            self.proc.kill()
+        """Kill the whole process tree — QProcess.kill() alone only hits the
+        direct child (pixi/modal), orphaning the python trainer with the GPU."""
+        if not self.running:
+            return
+        pid = int(self.proc.processId())
+        if sys.platform == "win32":
+            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                           capture_output=True)
+        else:
+            try:
+                pgid = os.getpgid(pid)
+                if pgid != os.getpgid(0):   # never group-kill the GUI itself
+                    os.killpg(pgid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        self.proc.kill()   # reaps the direct child; no-op if already dead
 
     def _on_output(self):
         # read from the emitting process, not self.proc — the next stage may already own it

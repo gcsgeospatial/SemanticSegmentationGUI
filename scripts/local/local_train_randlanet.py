@@ -55,7 +55,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                          "dataset name under /datasets. The only "
                          "dataset-free path is --mode infer.")
     import os, sys, time, json, csv, glob
-    from datetime import datetime
+    from datetime import datetime, timezone
     import numpy as np
     import torch
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "helper"))
@@ -227,7 +227,8 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                     xyz, intensity, ret_num, lab, extras = grid_subsample(
                         xyz, intensity, ret_num, lab, extras, SUB_GRID_SIZE)
                 except Exception as e:
-                    print(f"  skip {pc_path}: {e}", flush=True); continue
+                    raise RuntimeError(f"failed to load/subsample {pc_path}: {e} — "
+                                       "fix or remove the scene, then re-run") from e
                 tile = dict(xyz=xyz.astype(np.float32),
                             intensity=intensity.astype(np.float32),
                             ret_num=ret_num.astype(np.float32),
@@ -462,7 +463,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     if mode == "infer":
         if not weights or not infer_input:
             raise ValueError("--mode infer requires --weights and --infer-input")
-        wpath = weights if os.path.isabs(weights) else f"{tc.OUTPUTS_ROOT}/{weights}"
+        wpath = tc.resolve_weights_path(weights)
         if not os.path.exists(wpath):
             raise FileNotFoundError(f"weights not found: {wpath}")
         ckpt = tc.load_ckpt_safe(wpath, map_location=device)
@@ -481,11 +482,9 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                                       for r in (4, 16, 64, 256)]
         # rebuild the exact assembly from run.json; env is ignored at infer
         mf = (meta or {}).get("features") or []
-        try:
-            FEAT_SPEC = (tc.parse_feat_spec(",".join(mf), FEAT_LEGACY)
-                         if mf else list(FEAT_LEGACY))
-        except ValueError:
-            FEAT_SPEC = list(FEAT_LEGACY)
+        # present-but-malformed features must fail hard, not silently fall back
+        FEAT_SPEC = (tc.parse_feat_spec(",".join(mf), FEAT_LEGACY)
+                     if mf else list(FEAT_LEGACY))
         NONXYZ = [n for n in FEAT_SPEC if n not in ("x", "y", "z")]
         IN_DIM = len(FEAT_SPEC) + (1 if DG_LOGDK_FEAT else 0)
 
@@ -508,7 +507,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         if not scenes:
             raise FileNotFoundError(f"No scenes under {run_dir}/scenes")
 
-        run_id = datetime.utcnow().strftime("%Y%m%d_%H%M%S_infer")
+        run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_infer")
         # predictions live beside the input scenes, whatever model produced them
         pred_dir = os.environ.get("TT_PRED_DIR") or f"{run_dir}/predictions"
         os.makedirs(pred_dir, exist_ok=True)
@@ -518,7 +517,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                      "class_names": class_names, "sub_grid_size": SUB_GRID_SIZE,
                      "gpu": tc.gpu_name(),
                      "exclude_classes": [class_names[i] for i in exc_idx],
-                     "started_utc": datetime.utcnow().isoformat() + "Z"}
+                     "started_utc": datetime.now(timezone.utc).isoformat()}
 
         predict_scene = make_predict_scene(net, num_classes, exclude_idx=exc_idx)
         if DG_INFER_ADABN:
@@ -608,7 +607,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
               f"-> epoch {start_epoch}/{N_EPOCHS}", flush=True)
     else:
         resume_ckpt, start_epoch = None, 0
-        run_id = datetime.utcnow().strftime(f"%Y%m%d_%H%M%S_{tag}_randlanet_cold")
+        run_id = datetime.now(timezone.utc).strftime(f"%Y%m%d_%H%M%S_{tag}_randlanet_cold")
         run_dir = f"{tc.OUTPUTS_ROOT}/runs/{run_id}"
         os.makedirs(f"{run_dir}/checkpoints", exist_ok=True)
     if resume_ckpt is None:
@@ -783,7 +782,11 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                 name = os.path.splitext(os.path.basename(ds.files[i]))[0]
                 raw_src = name2src.get(name)
                 got = votes.sum(1) > 0
-                if raw_src is None or not got.any():
+                if raw_src is None:
+                    print(f"  [{label}] skip {name}: no raw source found", flush=True)
+                    n_skipped += 1; continue
+                if not got.any():
+                    print(f"  [{label}] skip {name}: no votes", flush=True)
                     n_skipped += 1; continue
                 try:
                     raw_xyz, _, _, raw_lab, _ = load_canonical(raw_src[0])

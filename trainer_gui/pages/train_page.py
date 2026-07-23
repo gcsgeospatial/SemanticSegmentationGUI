@@ -21,8 +21,9 @@ from ..backbones import BACKBONES, GPU_CHOICES
 from ..jobs import FuncWorker, JobRunner, LogParser
 from ..logconsole import LogConsole
 
-# Channels each arch CAN consume — a capability filter, never a default:
-# nothing is ever pre-checked. "height" is removed — don't reintroduce it.
+# Channels each arch CAN consume — a capability filter. "height" is removed —
+# don't reintroduce it. The standard channels are pre-checked as a sensible,
+# reversible default (default_feature_checks); geo/hag extras stay opt-in.
 _FEAT_STANDARD = {
     "randlanet":    ["intensity", "return_number"],
     "kpconvx_cold": ["intensity", "return_number"],
@@ -37,6 +38,19 @@ _FEAT_STANDARD = {
 _PTV3_LIKE = ("ptv3", "concerto", "sonata", "utonia")
 # these trainers' FEAT_CHANNELS spec expects x,y,z; the launcher prepends them
 _XYZ_IMPLICIT = ("randlanet",) + _PTV3_LIKE
+
+
+def default_feature_checks(base: str, std: list[str]) -> set[str]:
+    """Channels to pre-check: the arch's standard inputs the dataset offers.
+    ptv3-family has one 3-wide color slot, so collapse to intensity-first
+    (rgb only when intensity is absent). geo/feat_hag extras aren't in `std`,
+    so they stay unchecked."""
+    if base in _PTV3_LIKE:
+        for c in ("intensity", "rgb"):
+            if c in std:
+                return {c}
+        return set()
+    return set(std)
 
 _TUNING_FLAGS = ("batch", "chunk-xy", "grid", "sub-grid")
 
@@ -700,7 +714,8 @@ class TrainPage(QWidget):
         return ui.wrap(row)
 
     def _rebuild_feat_list(self):
-        """Repopulate for the selected backbone + dataset; nothing pre-checked."""
+        """Repopulate for the selected backbone + dataset; standard channels
+        pre-checked as a reversible default (default_feature_checks)."""
         if not hasattr(self, "feat_list"):
             return
         self.feat_list.clear()
@@ -724,12 +739,13 @@ class TrainPage(QWidget):
         # feat_hag never appears in feature_channels; offered via has_hag
         if meta.get("has_hag") and "feat_hag" not in names:
             names.append("feat_hag")
+        checked = default_feature_checks(base, std)
         for n in names:
             # display strips the feat_ prefix; the real channel name rides in UserRole
             it = QListWidgetItem(n[5:] if n.startswith("feat_") else str(n))
             it.setData(Qt.UserRole, str(n))
             it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
-            it.setCheckState(Qt.Unchecked)
+            it.setCheckState(Qt.Checked if n in checked else Qt.Unchecked)
             self.feat_list.addItem(it)
         self.feat_list.setToolTip(
             "Checked features are this run's input channels, left-to-right "
@@ -781,6 +797,11 @@ class TrainPage(QWidget):
             # never silently fall back to the trainers' built-in specs
             self._append("No input features checked — check at least one on "
                          "the Input features row.")
+            return
+        if b.key in _PTV3_LIKE and {"intensity", "rgb"} <= set(feat_csv.split(",")):
+            # ptv3 has one 3-wide color slot; both set = server-side ValueError
+            self._append("ptv3-family models have a single color slot — check "
+                         "intensity OR rgb, not both.")
             return
         env["FEAT_CHANNELS"] = feat_csv
         # forward only when actually set — a default would freeze the Modal
@@ -839,14 +860,6 @@ class TrainPage(QWidget):
             b.script, flags, b, repo_root=self.repo_root,
             outputs_root=out_root, dataset_dir=dataset_dir, env=p.get("env", {}))
         self._append(f"\n[local] $ {local_cli.preview(prog, args, run_env)}\n")
-        if not local_cli.runnable():
-            self._append(
-                "[local] pixi not found (or not a Linux/CUDA host) - printed the "
-                "command instead of running it. On the GPU box: install the env from "
-                "Configure model…, then launch: training writes to "
-                f"{out_root}/runs/<id>.")
-            self.launch_btn.setEnabled(True)
-            return
         ok_gpu, msg_gpu = local_cli.gpu_preflight()
         if msg_gpu:
             self._append(msg_gpu)
@@ -1084,7 +1097,7 @@ class TrainPage(QWidget):
                 self.dg_k.setValue(int(dg.get("logdk_k", 8)))
             except (TypeError, ValueError):
                 pass
-        # features deliberately not restored — chips always start unchecked
+        # features not restored from last config — chips seed a per-arch default
 
     def _append(self, text: str, newline: bool = True):
         ui.append_log(self.log, text, newline)

@@ -75,7 +75,7 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
                   chunk_xy: Optional[float] = None, epochs: Optional[int] = None,
                   batch: Optional[int] = None, steps_per_epoch: Optional[int] = None):
     import os, sys, time, json, csv, glob, traceback
-    from datetime import datetime
+    from datetime import datetime, timezone
     import numpy as np
     import torch
 
@@ -138,8 +138,7 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
         CLASS_NAMES = [f"class {i}" for i in range(NUM_CLASSES)]
         PREP_DIR = f"{tc.OUTPUTS_ROOT}/_infer_unused"
         if INFER and weights:
-            meta = tc.infer_meta(weights if os.path.isabs(weights)
-                                 else f"{tc.OUTPUTS_ROOT}/{weights}")
+            meta = tc.infer_meta(tc.resolve_weights_path(weights))
             if meta:
                 NUM_CLASSES = int(meta.get("num_classes") or NUM_CLASSES)
                 CLASS_NAMES = list(meta.get("class_names") or
@@ -149,11 +148,10 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
                 STRIDE = CHUNK_XY / 2.0
                 # rebuild the exact assembly from run.json; env ignored at infer
                 mf = meta.get("features")
-                try:
-                    FEAT_SPEC = (tc.parse_feat_spec(",".join(mf), FEAT_LEGACY)
-                                 if mf else list(FEAT_LEGACY))
-                except ValueError:
-                    FEAT_SPEC = list(FEAT_LEGACY)
+                # present-but-malformed features must fail hard, not silently
+                # fall back to legacy (surfaces later as a state_dict mismatch)
+                FEAT_SPEC = (tc.parse_feat_spec(",".join(mf), FEAT_LEGACY)
+                             if mf else list(FEAT_LEGACY))
                 if meta.get("hag_source"):
                     # ponytail: TEMPORARY shim (remove once legacy runs retire) —
                     # the deleted --hag variant's 'height' was real HAG; feed
@@ -224,7 +222,7 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
     resume_info = (find_latest_checkpoint()
                    if (RESUME or AUTO_RESUME or EVAL_ONLY) else None)
     if INFER:
-        run_id = datetime.utcnow().strftime("%Y%m%d_%H%M%S_infer")
+        run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_infer")
         # predictions live beside the input scenes, whatever model produced them
         run_dir = tc.infer_dir(infer_input)
         os.makedirs(os.environ.get("TT_PRED_DIR") or f"{run_dir}/predictions",
@@ -355,7 +353,7 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
     if EVAL_ONLY:
         # --weights, else final_model.pth, else the checkpoint loaded above;
         # start_epoch = N_EPOCHS falls straight through to the final eval
-        fm = ((weights if os.path.isabs(weights) else f"{tc.OUTPUTS_ROOT}/{weights}")
+        fm = (tc.resolve_weights_path(weights)
               if weights else f"{run_dir}/final_model.pth")
         if weights and not os.path.exists(fm):
             raise FileNotFoundError(f"--weights not found: {fm}")
@@ -365,7 +363,7 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
         start_epoch = N_EPOCHS
 
     if INFER:
-        fm = ((weights if os.path.isabs(weights) else f"{tc.OUTPUTS_ROOT}/{weights}")
+        fm = (tc.resolve_weights_path(weights)
               if weights else None)
         if not fm or not os.path.exists(fm):
             raise FileNotFoundError(f"--mode infer requires --weights; not found: {fm}")
@@ -479,7 +477,7 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
                      "class_names": CLASS_NAMES, "grid": GRID, "chunk_xy": CHUNK_XY,
                      "gpu": tc.gpu_name(),
                      "exclude_classes": [CLASS_NAMES[i] for i in EXC_IDX],
-                     "started_utc": datetime.utcnow().isoformat() + "Z"}
+                     "started_utc": datetime.now(timezone.utc).isoformat()}
         if DG_INFER_ADABN:
             # D2b: re-estimate BN running stats on the target tiles (label-free)
             print("  [infer] AdaBN: recomputing BN stats on target tiles...", flush=True)

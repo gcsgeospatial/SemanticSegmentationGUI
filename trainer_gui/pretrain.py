@@ -1,9 +1,9 @@
 """HeightAboveGround — hag_for_cloud is the one engine behind every feat_hag.
 
-Two independent axes, never mixed: ground SOURCE (caller mask wins, else CSF;
-grid's own heuristic only without PDAL) and INTERPOLATION ("grid" numpy raster,
-or PDAL hag_nn/hag_delaunay). Returns None on any failure — the scene then has
-no hag key and *_hag models refuse to run. pdal imports lazily.
+Two independent axes, never mixed: ground SOURCE (ground_method = labels / csf /
+smrf / zmin) and INTERPOLATION ("grid" numpy raster, or PDAL hag_nn/hag_delaunay;
+zmin is self-contained and ignores it). Returns None on any failure — the scene
+then has no hag key and *_hag models refuse to run. pdal imports lazily.
 """
 
 from __future__ import annotations
@@ -16,10 +16,20 @@ import numpy as np
 HAG_FILTERS = ("hag_nn", "hag_delaunay")     # PDAL filters (accurate path)
 HAG_METHODS = ("grid",) + HAG_FILTERS
 
-# jakteristics feature names, exact spellings
-GEO_FEATURES = ("eigenvalue_sum", "omnivariance", "eigenentropy", "anisotropy",
-                "planarity", "linearity", "PCA1", "PCA2",
-                "surface_variation", "sphericity", "verticality")
+# Ground SOURCE (orthogonal to interpolation): labels = caller's ground class,
+# csf/smrf = PDAL detection, zmin = percentile-Z raster HAG (no classification,
+# ignores hag_filter). GROUND_LABELS maps to the datasets-page dropdown text.
+GROUND_METHODS = ("labels", "csf", "smrf", "zmin")
+GROUND_LABELS = {"labels": "Base off ground layer", "csf": "CSF",
+                 "smrf": "SMRF", "zmin": "Z-min proxy"}
+
+# pgeof compute_features_optimal output columns, in return order (12 cols)
+_PGEOF_OPTIMAL_COLS = ("linearity", "planarity", "scattering", "verticality",
+                       "normal_x", "normal_y", "normal_z",
+                       "length", "surface", "volume", "curvature", "optimal_nn")
+# user-selectable geometric channels (raw normal components excluded)
+GEO_FEATURES = ("linearity", "planarity", "scattering", "verticality",
+                "length", "surface", "volume", "curvature", "optimal_nn")
 
 
 def pdal_available() -> bool:
@@ -30,9 +40,9 @@ def pdal_available() -> bool:
         return False
 
 
-def jakteristics_available() -> bool:
+def pgeof_available() -> bool:
     try:
-        import jakteristics  # noqa: F401
+        import pgeof  # noqa: F401
         return True
     except Exception:  # noqa: BLE001
         return False
@@ -110,6 +120,12 @@ GRID_HAG_GAP_WARN_M = 50.0
 # building with its surrounding ground, however large the footprint. Must stay
 # well under the CSF cloth resolution (~1-2 m) so the cloth has support.
 CSF_DECIM_CELL_M = 0.5
+
+# SMRF max window: a flat roof survives as ground unless the morphological window
+# reaches real ground across it, so this must exceed the widest building footprint
+# (~200 m diameter). slope buffers gentle terrain; the height guard below backstops
+# whatever any filter still misses.
+SMRF_MAX_WINDOW_M = 100.0
 
 
 def hag_grid_for_cloud(cloud, *, ground_mask=None,
@@ -201,6 +217,19 @@ def _min_z_per_cell(xyz, cell: float = CSF_DECIM_CELL_M) -> np.ndarray:
     return np.sort(keep)
 
 
+def _reject_high_ground(cloud, mask, relief_m: float = GRID_HAG_RELIEF_M):
+    """Roof-commission backstop for ANY ground filter: drop ground-classified
+    points sitting more than relief_m above the grid method's own roof-rejecting
+    low surface (hag_grid detection). A large flat roof absorbed into ground by
+    SMRF/CSF sits well above true ground, so this strips it however the filter
+    mislabeled it — the filter-independent guarantee that a building can't be
+    ground. Returns the mask unchanged only if the grid surface can't be built."""
+    hag = hag_grid_for_cloud(cloud, ground_mask=None)
+    if hag is None:
+        return np.asarray(mask, bool)
+    return np.asarray(mask, bool) & (np.asarray(hag) <= relief_m)
+
+
 def csf_ground_mask(cloud) -> "np.ndarray | None":
     """Ground mask via PDAL CSF, or None. CSF over SMRF: no window-size contract,
     so large flat roofs can't be absorbed into ground (the SMRF failure mode).
@@ -209,7 +238,9 @@ def csf_ground_mask(cloud) -> "np.ndarray | None":
     aren't their cell's low point can't be ground, so this drops nothing valid,
     runs the cloth on 10-50x fewer points, and denoises the low-vegetation
     envelope. The returned mask is full-length; non-envelope points are simply
-    False (not a ground source), which the interpolation handles natively."""
+    False (not a ground source), which the interpolation handles natively.
+    A height guard (_reject_high_ground) strips any cloth-ground point sitting
+    above true ground — a roof the cloth still rested on can't survive."""
     if not pdal_available():
         return None
     import pdal
@@ -222,7 +253,10 @@ def csf_ground_mask(cloud) -> "np.ndarray | None":
                     return_number=(cloud.return_number[keep]
                                    if cloud.return_number is not None else None))
         arr = _structured_from_cloud(sub)
-        csf = pdal.Pipeline(json.dumps([{"type": "filters.csf"}]), arrays=[arr])
+        # rigidness 3 = stiff cloth for flat/gentle terrain (buildings on gentle
+        # ground); the height guard catches any roof it still rests on
+        csf = pdal.Pipeline(json.dumps([{"type": "filters.csf", "rigidness": 3}]),
+                            arrays=[arr])
         csf.execute()
         sarr = csf.arrays[0]
         ax = np.asarray(sarr["X"], np.float64)
@@ -235,26 +269,64 @@ def csf_ground_mask(cloud) -> "np.ndarray | None":
             return None
         mask = np.zeros(cloud.n, dtype=bool)
         mask[keep[gm]] = True
-        return mask
+        mask = _reject_high_ground(cloud, mask)
+        return mask if mask.any() else None
     except Exception:  # noqa: BLE001
         return None
 
 
-def hag_for_cloud(cloud, *, ground_mask=None,
+def smrf_ground_mask(cloud) -> "np.ndarray | None":
+    """Ground mask via PDAL SMRF (Simple Morphological Filter), or None. SMRF's
+    window can absorb a flat roof wider than the window into ground (its
+    commission-error failure mode) — so window is set large (SMRF_MAX_WINDOW_M)
+    to reach across big buildings, and the height guard (_reject_high_ground)
+    strips any roof still wider than the window. CSF remains the safer default."""
+    if not pdal_available():
+        return None
+    import pdal
+    try:
+        arr = _structured_from_cloud(cloud)
+        pipe = pdal.Pipeline(
+            json.dumps([{"type": "filters.smrf", "window": SMRF_MAX_WINDOW_M}]),
+            arrays=[arr])
+        pipe.execute()
+        out = pipe.arrays[0]
+        ax = np.asarray(out["X"], np.float64)
+        if (len(out) != cloud.n
+                or not (np.isclose(ax[0], cloud.xyz[0, 0])
+                        and np.isclose(ax[-1], cloud.xyz[-1, 0]))):
+            return None   # PDAL dropped/reordered points -> can't map back
+        gm = np.asarray(out["Classification"]) == 2
+        gm = _reject_high_ground(cloud, gm)
+        return gm if gm.any() else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def hag_for_cloud(cloud, *, ground_mask=None, ground_method: str = "labels",
                   hag_filter: str = "grid",
                   notes: "list | None" = None) -> "np.ndarray | None":
     """The ONE HAG engine (dataset builds, tiles, inference — methods can't
-    diverge). Ground source: ground_mask wins, else CSF, never a union.
-    hag_filter picks interpolation. float32 (n,) or None — never fabricated.
+    diverge). Ground SOURCE picked by ground_method: 'labels' (caller's
+    ground_mask), 'csf'/'smrf' (PDAL detection), or 'zmin' (percentile-Z raster
+    HAG — no classification, ignores hag_filter). hag_filter picks interpolation
+    for the mask-based methods. float32 (n,) or None — never fabricated.
     notes collects per-scene warnings (grid path's large fill gaps)."""
     if hag_filter not in HAG_METHODS:
         raise ValueError(f"hag_filter must be one of {HAG_METHODS}, got {hag_filter!r}")
+    if ground_method not in GROUND_METHODS:
+        raise ValueError(f"ground_method must be one of {GROUND_METHODS}, "
+                         f"got {ground_method!r}")
+    if ground_method == "zmin":
+        return hag_grid_for_cloud(cloud, ground_mask=None, notes=notes)
+    if ground_method == "csf":
+        ground_mask = csf_ground_mask(cloud)          # None without PDAL
+    elif ground_method == "smrf":
+        ground_mask = smrf_ground_mask(cloud)         # None without PDAL
     if ground_mask is not None:
         ground_mask = np.asarray(ground_mask, dtype=bool).reshape(-1)
         if len(ground_mask) != cloud.n or not ground_mask.any():
-            ground_mask = None                        # unusable mask -> detection
-    if ground_mask is None:
-        ground_mask = csf_ground_mask(cloud)          # None without PDAL
+            ground_mask = None                        # unusable mask
     if hag_filter == "grid":
         return hag_grid_for_cloud(cloud, ground_mask=ground_mask, notes=notes)
     if ground_mask is None or not pdal_available():
@@ -279,25 +351,42 @@ def hag_for_cloud(cloud, *, ground_mask=None,
 
 # ------------------------------------------------ Stage A': geometric features
 
-def geo_features_for_cloud(xyz, names, radius: float = 1.0) -> "dict[str, np.ndarray]":
-    """{jak_name: float32 (n,)}; NaN -> 0. Raises (never soft-None): geo channels
-    are always explicitly requested, so failures must be loud."""
+def geo_features_for_cloud(xyz, names, geo_k: int = 100) -> "dict[str, np.ndarray]":
+    """{name: float32 (n,)}; NaN -> 0. Raises (never soft-None): geo channels
+    are always explicitly requested, so failures must be loud.
+
+    Weinmann optimal-neighborhood features via pgeof: fetch geo_k neighbors
+    once, then pick the eigenentropy-minimizing sub-neighborhood per point. The
+    chosen size is exposed as the 'optimal_nn' channel."""
     bad = [n for n in names if n not in GEO_FEATURES]
     if bad:
         raise ValueError(f"unknown geometric feature(s) {bad}; "
                          f"valid: {list(GEO_FEATURES)}")
     try:
-        from jakteristics import compute_features
+        import pgeof
     except ImportError as e:
-        raise RuntimeError("Geometric feature channels need the 'jakteristics' "
-                           "package (pip install jakteristics).") from e
-    pts = np.ascontiguousarray(np.asarray(xyz, dtype=np.float64))
-    # num_threads = all cores; fine while conversion forces max_workers=1
-    feats = compute_features(pts, search_radius=float(radius),
-                             feature_names=list(names))
-    return {nm: np.nan_to_num(feats[:, i], nan=0.0, posinf=0.0,
+        raise RuntimeError("Geometric feature channels need the 'pgeof' "
+                           "package (pip install pgeof).") from e
+    # pgeof's optimal path is float32-only; real coords sit at UTM magnitude
+    # (northing ~4.5e6), where float32 resolution is ~0.5 m and would destroy the
+    # cm-scale geometry. Center in float64 first — every geo feature is
+    # translation-invariant, so this is exact, not an approximation.
+    pts = np.asarray(xyz, dtype=np.float64)
+    pts = np.ascontiguousarray(pts - pts.mean(axis=0), dtype=np.float32)
+    n = len(pts)
+    k = int(min(geo_k, n))                 # can't fetch more neighbors than points
+    if k < 3:                              # degenerate cloud: no meaningful PCA
+        return {nm: np.zeros(n, np.float32) for nm in names}
+    knn, _ = pgeof.knn_search(pts, pts, k)         # (n, k) neighbor indices
+    nn = np.ascontiguousarray(knn.flatten().astype("uint32"))
+    nn_ptr = np.ascontiguousarray((np.arange(n + 1) * k).astype("uint32"))
+    k_min_search = min(10, k)              # >=10 advised for feature robustness
+    feats = pgeof.compute_features_optimal(pts, nn, nn_ptr, k_min=1, k_step=1,
+                                           k_min_search=k_min_search)
+    col = {nm: i for i, nm in enumerate(_PGEOF_OPTIMAL_COLS)}
+    return {nm: np.nan_to_num(feats[:, col[nm]], nan=0.0, posinf=0.0,
                               neginf=0.0).astype(np.float32)
-            for i, nm in enumerate(names)}
+            for nm in names}
 
 
 # --------------------------------------------------------------------- self-check

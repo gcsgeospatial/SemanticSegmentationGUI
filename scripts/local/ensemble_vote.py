@@ -99,7 +99,7 @@ def load_pred(path):
 
 
 def write_out(path, xyz, cls, intensity, confidence, agree, crs_wkt=None,
-              dominant=None, member_names=None):
+              dominant=None, member_names=None, source_crs_wkt=None):
     if path.endswith(".npz"):
         d = {"xyz": xyz, "classification": cls.astype(np.int32),
              "confidence": np.asarray(confidence, np.float32),
@@ -112,6 +112,8 @@ def write_out(path, xyz, cls, intensity, confidence, agree, crs_wkt=None,
             d["intensity"] = intensity
         if crs_wkt:
             d["crs_wkt"] = np.asarray(str(crs_wkt))
+        if source_crs_wkt:                       # round-trip signal rides along
+            d["source_crs_wkt"] = np.asarray(str(source_crs_wkt))
         np.savez(path, **d)
         return
     # ponytail: agreement is npz-only — dataset._write_pred has no agreement
@@ -122,6 +124,7 @@ def write_out(path, xyz, cls, intensity, confidence, agree, crs_wkt=None,
     _write_pred(Path(path), np.asarray(xyz, np.float64),
                 np.clip(cls, 0, 255).astype(np.uint8), path.rsplit(".", 1)[1],
                 confidence=np.asarray(confidence, np.float32), crs_wkt=crs_wkt,
+                source_crs_wkt=source_crs_wkt,
                 member=np.asarray(dominant, np.uint8) if dominant is not None else None)
 
 
@@ -236,13 +239,14 @@ def ensemble(input_dirs, out_dir, log=print):
             voted, conf = weighted_vote(stacked, w)
             dom = dominant_member(voted, labels=stacked, weights=w)
         agree = agreement(stacked, voted)
-        crs = None
-        if ref_path.endswith(".npz"):    # ferry the reference member's CRS along
+        crs = src_crs = None
+        if ref_path.endswith(".npz"):    # ferry the reference member's CRS pair along
             with np.load(ref_path) as zr:
                 crs = str(zr["crs_wkt"]) if "crs_wkt" in zr.files else None
+                src_crs = str(zr["source_crs_wkt"]) if "source_crs_wkt" in zr.files else None
         out_path = f"{out_dir}/{os.path.basename(ref_path)}"
         write_out(out_path, ref_xyz, voted, ref_itn, conf, agree, crs_wkt=crs,
-                  dominant=dom, member_names=names)
+                  dominant=dom, member_names=names, source_crs_wkt=src_crs)
         log(f"  {os.path.basename(out_path)}: {len(voted)} pts, "
             f"mean confidence {float(conf.mean()):.3f}, "
             f"mean agreement {float(agree.mean()):.3f}")

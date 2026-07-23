@@ -180,7 +180,7 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
                  chunk_xy: Optional[float] = None, epochs: Optional[int] = None,
                  batch: Optional[int] = None, steps_per_epoch: Optional[int] = None):
     import os, sys, time, json, csv, glob, traceback
-    from datetime import datetime
+    from datetime import datetime, timezone
     import numpy as np
     import torch
 
@@ -246,8 +246,7 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
         CLASS_NAMES = [f"class {i}" for i in range(NUM_CLASSES)]
         PREP_DIR = f"{tc.OUTPUTS_ROOT}/_infer_unused"
         if INFER and weights:
-            rj = _run_json_beside(weights if os.path.isabs(weights)
-                                  else f"{tc.OUTPUTS_ROOT}/{weights}")
+            rj = _run_json_beside(tc.resolve_weights_path(weights))
             if rj:
                 NUM_CLASSES = int(rj.get("num_classes") or NUM_CLASSES)
                 CLASS_NAMES = list(rj.get("class_names") or
@@ -345,7 +344,7 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
     resume_info = (find_latest_checkpoint()
                    if (RESUME or AUTO_RESUME or EVAL_ONLY) else None)
     if INFER:
-        run_id = datetime.utcnow().strftime("%Y%m%d_%H%M%S_infer")
+        run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_infer")
         run_dir = tc.infer_dir(infer_input)
         os.makedirs(os.environ.get("TT_PRED_DIR") or f"{run_dir}/predictions",
                     exist_ok=True)
@@ -476,8 +475,10 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
 
     if INFER:
         if NEIGHBOR_LIMITS is None:
-            print("  [infer] WARNING: no neighbor_limits in run.json — running with "
-                  "UNCROPPED neighbor matrices (exact, but slower).", flush=True)
+            # legacy weights lack neighbor_limits: exact uncropped matrices are
+            # correct (just slower) — a deliberate fallback, not a warning
+            print("  [infer] no neighbor_limits in run.json — using exact "
+                  "uncropped neighbor matrices (slower).", flush=True)
             NEIGHBOR_LIMITS = []
     elif resume_info:
         # adopt the resumed run's limits so the pyramid matches its weights
@@ -565,7 +566,7 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
               f"at epoch {start_epoch}", flush=True)
 
     if EVAL_ONLY:
-        fm = ((weights if os.path.isabs(weights) else f"{tc.OUTPUTS_ROOT}/{weights}")
+        fm = (tc.resolve_weights_path(weights)
               if weights else f"{run_dir}/final_model.pth")
         if weights and not os.path.exists(fm):
             raise FileNotFoundError(f"--weights not found: {fm}")
@@ -575,7 +576,7 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
         start_epoch = N_EPOCHS
 
     if INFER:
-        fm = ((weights if os.path.isabs(weights) else f"{tc.OUTPUTS_ROOT}/{weights}")
+        fm = (tc.resolve_weights_path(weights)
               if weights else None)
         if not fm or not os.path.exists(fm):
             raise FileNotFoundError(f"--mode infer requires --weights; not found: {fm}")
@@ -642,7 +643,7 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
                      "neighbor_limits": NEIGHBOR_LIMITS,
                      "gpu": tc.gpu_name(),
                      "exclude_classes": [CLASS_NAMES[i] for i in EXC_IDX],
-                     "started_utc": datetime.utcnow().isoformat() + "Z"}
+                     "started_utc": datetime.now(timezone.utc).isoformat()}
         if DG_INFER_ADABN:
             # D2b: re-estimate BN running stats on the target tiles (label-free).
             print("  [infer] AdaBN: recomputing BN stats on target tiles...", flush=True)

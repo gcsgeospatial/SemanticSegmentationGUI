@@ -18,7 +18,7 @@ dependencies = [
     "open3d>=0.18",
     "matplotlib>=3.8",
     "modal>=0.64",
-    "jakteristics>=0.6",
+    "pgeof>=0.3",
 ]
 
 [project.scripts]

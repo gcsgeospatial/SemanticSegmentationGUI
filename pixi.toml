@@ -23,7 +23,7 @@ modal = "*"
 open3d = ">=0.18"       # .pcd reader (trainer_gui/readers.py)
 laspy = { version = ">=2.5", extras = ["lazrs"] }
 plyfile = ">=1.0"
-jakteristics = ">=0.6"  # computed geometric feature channels (dataset.py geo_features)
+pgeof = ">=0.3"         # computed geometric feature channels, Weinmann optimal neighborhood (dataset.py geo_features)
 trainer-gui = { path = ".", editable = true }
 
 [activation.env]

@@ -82,7 +82,7 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                          "name materialized under /datasets. The only "
                          "dataset-free path is --mode infer.")
     import os, sys, time, json, csv, glob
-    from datetime import datetime
+    from datetime import datetime, timezone
     import numpy as np
     import torch
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "helper"))
@@ -243,7 +243,7 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
     if mode == "infer":
         if not weights or not infer_input:
             raise ValueError("--mode infer requires --weights and --infer-input")
-        wpath = weights if os.path.isabs(weights) else f"{tc.OUTPUTS_ROOT}/{weights}"
+        wpath = tc.resolve_weights_path(weights)
         if not os.path.exists(wpath):
             raise FileNotFoundError(f"weights not found: {wpath}")
         ckpt = tc.load_ckpt_safe(wpath, map_location="cpu")
@@ -280,7 +280,7 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
         if not scenes:
             raise FileNotFoundError(f"No scenes under {run_dir}/scenes")
 
-        run_id = datetime.utcnow().strftime("%Y%m%d_%H%M%S_infer")
+        run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_infer")
         # predictions live beside the input scenes, whatever model produced them
         pred_dir = os.environ.get("TT_PRED_DIR") or f"{run_dir}/predictions"
         os.makedirs(pred_dir, exist_ok=True)
@@ -291,7 +291,7 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                      "color_source": color_src, "features": FEAT_SPEC,
                      "chunk_xy": CHUNK_XY, "gpu": tc.gpu_name(),
                      "exclude_classes": [class_names[i] for i in exc_idx],
-                     "started_utc": datetime.utcnow().isoformat() + "Z"}
+                     "started_utc": datetime.now(timezone.utc).isoformat()}
 
         predict_scene = make_predict_scene(backbone, head, num_classes,
                                            exclude_idx=exc_idx)
@@ -325,7 +325,7 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
         print(f"  RESUMING {run_id} from {os.path.basename(resume_ckpt)} "
               f"-> epoch {start_epoch}/{N_EPOCHS}", flush=True)
     else:
-        run_id = datetime.utcnow().strftime(f"%Y%m%d_%H%M%S_{tag}_{_pt}")
+        run_id = datetime.now(timezone.utc).strftime(f"%Y%m%d_%H%M%S_{tag}_{_pt}")
         run_dir = f"{tc.OUTPUTS_ROOT}/runs/{run_id}"
         os.makedirs(f"{run_dir}/checkpoints", exist_ok=True)
         resume_ckpt, start_epoch = None, 0

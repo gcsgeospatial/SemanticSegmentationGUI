@@ -6,12 +6,15 @@ Usage:
   python npz_to_las.py scene.npz [more.npz ...]     # writes sibling .las
   python npz_to_las.py --self-test
 """
+import os
 import sys
 
 if sys.version_info[0] < 3:
     sys.exit("npz_to_las.py needs python3 (plain 'python' here is 2.x)")
 
 import numpy as np
+
+_REPO_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
 
 
 def npz_to_las(path):
@@ -26,7 +29,7 @@ def npz_to_las(path):
     taken = set(h.point_format.dimension_names)
     extras = {}
     for k in z.files:
-        if k in ("xyz", "rgb", "crs_wkt"):
+        if k in ("xyz", "rgb", "crs_wkt", "source_crs_wkt"):
             continue
         v = np.asarray(z[k])
         if v.ndim == 1 and len(v) == len(xyz) and np.issubdtype(v.dtype, np.number):
@@ -34,18 +37,14 @@ def npz_to_las(path):
     for k in extras:
         h.add_extra_dim(laspy.ExtraBytesParams(name=k, type=np.float32))
     if "crs_wkt" in z.files:
-        try:
-            from pyproj import CRS
-            crs = CRS.from_wkt(str(z["crs_wkt"]))
-            h.add_crs(crs)
-            # npz coords are meters (scaled at ingest); a non-meter CRS (ft
-            # state planes) needs them back in source units to match its WKT.
-            if not crs.is_geographic:
-                f = float(crs.axis_info[0].unit_conversion_factor)
-                if abs(f - 1.0) > 1e-6:
-                    xyz = xyz / f         # h.offsets is set below from this xyz
-        except Exception:
-            pass                          # a CRS-less viewable file beats none
+        proc_wkt = str(z["crs_wkt"])
+        src_wkt = str(z["source_crs_wkt"]) if "source_crs_wkt" in z.files else None
+        # single source of truth for the inverse (D2 legacy block raises here)
+        sys.path.insert(0, _REPO_ROOT)
+        from trainer_gui.readers import restore_to_source
+        xyz = restore_to_source(xyz, proc_wkt, src_wkt)   # -> source frame
+        from pyproj import CRS                             # required; wrong-unit coords under a stale WKT is worse than erroring
+        h.add_crs(CRS.from_wkt(src_wkt or proc_wkt))       # coords now match this frame
     h.offsets = xyz.min(0)
     h.scales = [0.001] * 3
     las = laspy.LasData(h)

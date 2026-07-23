@@ -21,8 +21,13 @@ def infer_dir(job):
     return os.environ.get("TT_INFER_DIR") or f"{DATASETS_ROOT}/_infer/{job}"
 
 
+def resolve_weights_path(weights):
+    """Absolute weights path: as given if absolute, else under OUTPUTS_ROOT."""
+    return weights if os.path.isabs(weights) else f"{OUTPUTS_ROOT}/{weights}"
+
+
 def write_pred(path, xyz, pred, intensity=None, confidence=None, probs=None,
-               crs_wkt=None):
+               crs_wkt=None, source_crs_wkt=None):
     """Inferred-scene npz: xyz + classification (+ intensity, confidence,
     probs when TT_SAVE_PROBS=1). dataset.export_predictions reads this."""
     import numpy as np
@@ -35,8 +40,10 @@ def write_pred(path, xyz, pred, intensity=None, confidence=None, probs=None,
         d["confidence"] = np.asarray(confidence, np.float32)
     if probs is not None:
         d["probs"] = np.asarray(probs, np.float16)
-    if crs_wkt:            # exporter georeferences the las/laz with this
+    if crs_wkt:            # processing-CRS WKT: exporter restores + georeferences
         d["crs_wkt"] = np.asarray(str(crs_wkt))
+    if source_crs_wkt:     # round-trip signal: presence means ingest reprojected
+        d["source_crs_wkt"] = np.asarray(str(source_crs_wkt))
     np.savez(path, **d)
 
 
@@ -599,13 +606,14 @@ def run_infer_scenes(scenes, predict, pred_dir, run_dir, infer_cfg, cls_txt=Fals
         name = os.path.splitext(os.path.basename(pc_path))[0]
         t0 = time.time()
         xyz, pred, inten, conf, probs = predict(pc_path)
-        try:                            # ferry the scene's CRS into the pred npz
+        try:                            # ferry the scene's CRS pair into the pred npz
             with np.load(pc_path) as z:
                 crs = str(z["crs_wkt"]) if "crs_wkt" in z.files else None
+                src = str(z["source_crs_wkt"]) if "source_crs_wkt" in z.files else None
         except OSError:
-            crs = None
+            crs = src = None
         write_pred(f"{pred_dir}/{name}_pred.npz", xyz, pred, inten, conf, probs,
-                   crs_wkt=crs)
+                   crs_wkt=crs, source_crs_wkt=src)
         if cls_txt:
             np.savetxt(f"{pred_dir}/{name}_pred_CLS.txt", pred, fmt="%d")
         scene_stats.append({"scene": os.path.basename(pc_path),
@@ -940,8 +948,8 @@ def kp_make_sample_tile(build_feat, grid, max_pts, aug_color,
 
 def kp_make_run_dir(variant):
     """Fresh timestamped run dir: <OUTPUTS_ROOT>/runs/<utc>_<variant>."""
-    from datetime import datetime
-    run_id = datetime.utcnow().strftime(f"%Y%m%d_%H%M%S_{variant}")
+    from datetime import datetime, timezone
+    run_id = datetime.now(timezone.utc).strftime(f"%Y%m%d_%H%M%S_{variant}")
     run_dir = f"{OUTPUTS_ROOT}/runs/{run_id}"
     os.makedirs(f"{run_dir}/checkpoints", exist_ok=True)
     return run_id, run_dir
@@ -1031,17 +1039,19 @@ def kp_make_evaluate(forward, build_feat, grid, chunk_xy, num_classes,
             if len(group) > 1:
                 try:
                     return forward([(c, f) for _, c, f in group])
-                except Exception as e:
-                    if "out of memory" in str(e).lower():
-                        torch.cuda.empty_cache()
-                        bs = max(1, bs // 2)
+                except RuntimeError as e:
+                    if "out of memory" not in str(e).lower():
+                        raise   # a real bug must abort eval, not corrupt mIoU
+                    torch.cuda.empty_cache()
+                    bs = max(1, bs // 2)
             outs = []
             for _, c, f in group:
                 try:
                     outs.append(forward([(c, f)])[0])
-                except Exception as e:
-                    if "out of memory" in str(e).lower():
-                        torch.cuda.empty_cache()
+                except RuntimeError as e:
+                    if "out of memory" not in str(e).lower():
+                        raise
+                    torch.cuda.empty_cache()
                     outs.append(None)
             return outs
 
@@ -2035,9 +2045,9 @@ def _demo():  # ponytail: one runnable check -- `python train_common.py`
     zp = np.load(f"{ij}/predictions/s0_pred.npz")
     assert (zp["confidence"].dtype == np.float32
             and zp["probs"].dtype == np.float16 and zp["probs"].shape == (4000, 3))
-    assert "crs_wkt" not in zp.files                 # scene had none -> pred has none
+    assert "crs_wkt" not in zp.files and "source_crs_wkt" not in zp.files  # neither
 
-    # crs_wkt ferry: a scene npz carrying a CRS string lands it in the pred npz
+    # CRS-pair ferry: proc-only scene lands only crs_wkt; reprojected scene lands both
     np.savez(f"{ij}/c0.npz", xyz=z0["xyz"], intensity=z0["intensity"],
              crs_wkt=np.asarray('PROJCS["demo"]'))
     run_infer_scenes([f"{ij}/c0.npz"],
@@ -2045,6 +2055,17 @@ def _demo():  # ponytail: one runnable check -- `python train_common.py`
                      f"{ij}/predictions", ij, {"backbone": "demo"})
     with np.load(f"{ij}/predictions/c0_pred.npz") as zc:
         assert str(zc["crs_wkt"]) == 'PROJCS["demo"]'
+        assert "source_crs_wkt" not in zc.files      # no transform -> no source
+
+    np.savez(f"{ij}/c1.npz", xyz=z0["xyz"], intensity=z0["intensity"],
+             crs_wkt=np.asarray('PROJCS["utm"]'),
+             source_crs_wkt=np.asarray('GEOGCS["src"]'))
+    run_infer_scenes([f"{ij}/c1.npz"],
+                     lambda p: (z0["xyz"], pr, z0["intensity"], cf, None),
+                     f"{ij}/predictions", ij, {"backbone": "demo"})
+    with np.load(f"{ij}/predictions/c1_pred.npz") as zc:
+        assert str(zc["crs_wkt"]) == 'PROJCS["utm"]'
+        assert str(zc["source_crs_wkt"]) == 'GEOGCS["src"]'   # both ferried
 
     # env_overrides: env wins over the module default, order preserved
     os.environ["LOSS_FOCAL_GAMMA"] = "3.5"
