@@ -1,9 +1,6 @@
 """Inference page: pick weights + input folder, run --mode infer.
-
-Stages (one JobRunner):
-  Modal: convert -> upload scenes -> [upload weights] -> run -> download.
-  Local: convert -> pixi run (TT_* env points scenes + predictions at host dirs).
-"""
+Modal: convert -> upload scenes -> [upload weights] -> run -> download.
+Local: convert -> pixi run (TT_* env)."""
 
 from __future__ import annotations
 
@@ -34,30 +31,29 @@ class InferPage(QWidget):
         self.repo_root = repo_root
         self.converter = FuncWorker(self)
         self.preflight = FuncWorker(self)
-        self.exporter = FuncWorker(self)   # npz -> chosen prediction format (host-side)
+        self.exporter = FuncWorker(self)
         self.runner = JobRunner(self)
         self._stage = ""
         self._job_id = ""
         self._staged: Path | None = None
         self._weights_remote = ""
         self._dl_dest: Path | None = None
-        self._pred_dir: Path | None = None   # where local predictions land (host)
-        self._manifest: dict | None = None         # the picked run.json (local runs)
+        self._pred_dir: Path | None = None
+        self._manifest: dict | None = None
         self._manifest_path: Path | None = None
-        self._local_weights: Path | None = None    # weights = the run.json's sibling
-        self._dg: dict = {}                         # DG settings baked into the weights (run.json["dg"])
-        self._run_class_names: list | None = None   # the loaded run's own classes (run.json)
+        self._local_weights: Path | None = None
+        self._dg: dict = {}
+        self._run_class_names: list | None = None
         self._manifest_features: list | None = None  # run.json "features" (None = legacy run)
-        self._hag_ground_value: int | None = None   # parsed in _check_hag, used by the converter
-        self._modal_cfg_run = ""                    # run id whose fetched config is applied
-        self._run_tag = ""                          # weights' run id — prediction parent dir
-        self._pending_cfg_run = ""                  # run id the cfg_fetcher is out for
-        # Ensemble (Phase 3): captured members + the run-time member queue state.
+        self._hag_ground_value: int | None = None
+        self._modal_cfg_run = ""
+        self._run_tag = ""
+        self._pending_cfg_run = ""
         self._ens_members: list[dict] = []
-        self._ens_running = False                   # True from launch until export/failure
-        self._ens_idx = -1                          # index of the member currently running
-        self._ens_dirs: list[Path] = []             # completed members' prediction dirs
-        self._run_open = False                      # a begin_run header awaits its end_run
+        self._ens_running = False
+        self._ens_idx = -1
+        self._ens_dirs: list[Path] = []
+        self._run_open = False
 
         root = QVBoxLayout(self)
         title = QLabel("Inference")
@@ -70,11 +66,10 @@ class InferPage(QWidget):
 
         wbox = QGroupBox("Inputs")
         wf = self.wf = QFormLayout(wbox)
-        # Fields fill width so Browse… buttons aren't clipped.
         wf.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
         self.input_edit = QLineEdit()
         in_row = QHBoxLayout()
-        in_row.addWidget(self.input_edit, 1)   # edit absorbs slack; both buttons keep their size
+        in_row.addWidget(self.input_edit, 1)
         fold_btn = QPushButton("Folder…")
         fold_btn.clicked.connect(self._pick_input)
         file_btn = QPushButton("File…")
@@ -91,20 +86,18 @@ class InferPage(QWidget):
         radio_row.addWidget(self.from_file_radio)
         radio_row.addStretch()
         wf.addRow("Source", ui.wrap(radio_row))
-        # LOCAL: pick run.json — arch, grid, tile, intensity, HAG, weights path come from it.
         self.runjson_edit = QLineEdit()
         self.runjson_edit.setPlaceholderText("…/local_runs/runs/<id>/run.json")
-        # Load on Enter/focus-out; any edit drops the stale load.
+        # load on Enter/focus-out; any edit drops the stale load
         self.runjson_edit.editingFinished.connect(self._load_run_manifest)
         self.runjson_edit.textChanged.connect(self._invalidate_manifest)
         rj_row = QHBoxLayout()
-        rj_row.addWidget(self.runjson_edit, 1)   # edit absorbs slack; button keeps its size
+        rj_row.addWidget(self.runjson_edit, 1)
         rj_btn = QPushButton("Browse…")
         rj_btn.clicked.connect(self._pick_runjson)
         rj_row.addWidget(rj_btn)
         self.runjson_row_w = ui.wrap(rj_row)
         wf.addRow("Run file (run.json)", self.runjson_row_w)
-        # Weights default to the .pth named in run.json; can point anywhere.
         self.weights_edit = QLineEdit()
         self.weights_edit.setPlaceholderText("default: the .pth named in run.json, beside it")
         w_row = QHBoxLayout()
@@ -114,13 +107,12 @@ class InferPage(QWidget):
         w_row.addWidget(w_btn)
         self.weights_row_w = ui.wrap(w_row)
         wf.addRow("Weights file", self.weights_row_w)
-        # MODAL: pick/paste a run id (weights live on the cloud outputs volume).
         self.run_combo = QComboBox()
-        self.run_combo.setEditable(True)   # run ids can also be typed/pasted
+        self.run_combo.setEditable(True)
         self.run_combo.lineEdit().setPlaceholderText(
             "run id — or paste <volume>/runs/<id> straight from the train log")
         self.run_combo.currentIndexChanged.connect(self._on_run_pick)
-        # A typed/pasted id pulls the run's config off the outputs volume.
+        # a typed/pasted id pulls the run's config off the outputs volume
         self.run_combo.lineEdit().editingFinished.connect(self._on_run_id_typed)
         run_row = QHBoxLayout()
         run_row.addWidget(self.run_combo, 1)
@@ -145,9 +137,7 @@ class InferPage(QWidget):
         pth_row.addWidget(inst_btn)
         self.pth_row_w = ui.wrap(pth_row)
         wf.addRow("File", self.pth_row_w)
-        # Folded manifest echo: while a run manifest is applied, the locked
-        # Architecture / Grid / Tile rows hide and this one muted line stands in
-        # (see _apply_manifest_lock).
+        # stands in for the folded arch/grid/tile rows (_apply_manifest_lock)
         self.manifest_summary = QLabel("")
         self.manifest_summary.setObjectName("pageSub")
         self.manifest_summary.setWordWrap(True)
@@ -156,12 +146,8 @@ class InferPage(QWidget):
         self.backbone_combo.currentIndexChanged.connect(self._sync_controls)
         # populated at the end of __init__ (reload_backbones needs grid_spin etc.)
         wf.addRow("Architecture", self.backbone_combo)
-        # Ensemble (Phase 3): vote over several runs. Members are captured from the
-        # normal weights inputs above ('Add current selection'), then run
-        # sequentially over the once-staged scenes and soft-voted.
-        # ponytail: LOCAL backend only — the per-member Modal download loop isn't
-        # wired through the stage machine; the group is disabled in modal mode
-        # (tooltip says so) rather than half-supported.
+        # ponytail: ensemble is LOCAL-only — the per-member Modal download loop
+        # isn't wired; the group is disabled in modal mode instead.
         self.ens_box = QGroupBox("Ensemble (vote over several runs)")
         self.ens_box.setCheckable(True)
         self.ens_box.setChecked(False)
@@ -181,11 +167,10 @@ class InferPage(QWidget):
         erow.addStretch()
         ecol.addLayout(erow)
         ens_hint = QLabel("3+ models recommended; runtime scales with model count.")
-        ens_hint.setObjectName("pageSub")   # muted, same style as the page subtitle
+        ens_hint.setObjectName("pageSub")
         ecol.addWidget(ens_hint)
         wf.addRow(self.ens_box)
-        # Modal: the group above stays visible-but-disabled; this row lives
-        # OUTSIDE the disabled group so its button remains clickable.
+        # lives outside the disabled group so the button stays clickable
         ens_modal_hint = QLabel("Ensembles run locally — switch to Local mode to enable")
         ens_modal_hint.setObjectName("pageSub")
         self.ens_switch_btn = QPushButton("Switch to Local")
@@ -206,15 +191,13 @@ class InferPage(QWidget):
         self.grid_spin.setDecimals(2)
         self.grid_spin.setValue(0.30)
         iform.addRow("Grid size (m) - from the run", self.grid_spin)
-        # Intensity is p95-normalized end-to-end; nothing to match here.
         self.chunk_spin = QDoubleSpinBox()
         self.chunk_spin.setRange(10.0, 1_000_000.0)
         self.chunk_spin.setSingleStep(5.0)
         self.chunk_spin.setDecimals(0)
         self.chunk_spin.setValue(50.0)
         iform.addRow("Tile size (m)", self.chunk_spin)
-        # HAG is opt-in: computing it costs a full ground-detection pass. Loading
-        # a run whose features include feat_hag ticks this for you.
+        # opt-in; loading a run trained with feat_hag ticks it automatically
         self.hag_chk = QCheckBox("Compute Height-Above-Ground (HAG)")
         self.hag_chk.setToolTip("Bakes a per-point feat_hag channel into each converted "
                                 "scene — required by runs trained with feat_hag. Ground "
@@ -245,13 +228,10 @@ class InferPage(QWidget):
         self.hag_opts_w.setVisible(False)
         iform.addRow("", self.hag_opts_w)
         if not pretrain.pdal_available():
-            # grid still works without PDAL; convert_infer_job falls back to grid
-            # if a PDAL filter is picked anyway.
+            # convert_infer_job falls back to grid if a PDAL filter is picked anyway
             self.hag_chk.setText("Compute Height-Above-Ground (HAG) - grid only, "
                                  "PDAL not installed")
-        # Label-free domain-adaptation knobs + probability export. Env-driven
-        # (DG_INFER_ADABN / DG_INFER_TTA / TT_SAVE_PROBS); backend details in
-        # scripts/DENSITY_DG.md.
+        # env-driven: DG_INFER_ADABN / DG_INFER_TTA / TT_SAVE_PROBS
         self.adabn_chk = QCheckBox("AdaBN - recalibrate BatchNorm on these scenes")
         self.adabn_chk.setToolTip(
             "Recomputes BatchNorm statistics on the target tiles (label-free) before "
@@ -278,7 +258,6 @@ class InferPage(QWidget):
         dg_row.addStretch()
         iform.addRow("Domain adaptation", ui.wrap(dg_row))
 
-        # Per-job class mask: untick classes absent from these scenes (e.g. water).
         self.class_list = QListWidget()
         self.class_list.setMaximumHeight(96)
         self.class_list.setToolTip(
@@ -293,14 +272,10 @@ class InferPage(QWidget):
         ccol.addWidget(self.class_list)
         ccol.addWidget(self.class_mask_lbl)
         iform.addRow("Classes (mask at launch)", ui.wrap(ccol))
-        self._rebuild_class_list()   # starts disabled with a 'load a run' placeholder
+        self._rebuild_class_list()
 
-        # Export knobs: format + the confidence gate only shape the EXPORT step
-        # (the .npz keeps raw predictions — re-export never re-runs inference).
-        # Predictions always land under <workspace>/inference — the same spot
-        # 'Download run…' uses, so runs + their predictions co-locate.
-        # Every format option is xyz + classification only (no RGB colour
-        # columns: the deliverable carries classes, not colours).
+        # export-only knobs — the .npz keeps raw predictions, so re-export never
+        # re-runs inference; predictions land under <workspace>/inference
         self.fmt_combo = QComboBox()
         for label, key in (("LAS (.las)", "las"), ("LAZ (.laz)", "laz"),
                            ("PLY (.ply)", "ply"), ("Text (.txt)", "txt"),
@@ -311,7 +286,6 @@ class InferPage(QWidget):
         self.fmt_combo.setToolTip("Predictions are written as xyz + classification "
                                   "(no colour columns).")
         iform.addRow("Prediction format", self.fmt_combo)
-        # Confidence gate at export: low-confidence points become ASPRS class 1.
         self.unclass_chk = QCheckBox("Mark low-confidence points Unclassified")
         self.unclass_chk.setChecked(True)
         self.unclass_spin = QDoubleSpinBox()
@@ -344,10 +318,9 @@ class InferPage(QWidget):
         forms_col.addWidget(ibox)
         forms_col.addLayout(run_row)
 
-        self.log = LogConsole()   # \r-aware, colored console (drop-in for the old QPlainTextEdit)
+        self.log = LogConsole()
         self.log.setPlaceholderText("Conversion and run logs appear here…")
 
-        # Action bar; comparison metrics print to the log.
         self.compare_btn = QPushButton("Compare to ground truth…")
         self.compare_btn.setToolTip("Pick a prediction + its ground truth; accuracy, "
                                     "mIoU and per-class IoU print to the log.")
@@ -355,8 +328,6 @@ class InferPage(QWidget):
         actions = QHBoxLayout()
         actions.addWidget(self.compare_btn)
         actions.addStretch(1)
-        # Launch decisions, then the console — the console is the page's bottom
-        # pane, nothing lives below it.
         forms_col.addLayout(actions)
         forms_col.addStretch()
 
@@ -372,11 +343,11 @@ class InferPage(QWidget):
         self.exporter.output.connect(self._append)
         self.exporter.done.connect(self._on_exported)
         self.exporter.error.connect(self._on_export_error)
-        self.voter = FuncWorker(self)   # ensemble vote over the member prediction dirs
+        self.voter = FuncWorker(self)
         self.voter.output.connect(self._append)
         self.voter.done.connect(self._on_voted)
         self.voter.error.connect(self._on_vote_error)
-        self.cfg_fetcher = FuncWorker(self)   # modal run.json fetch for a typed run id
+        self.cfg_fetcher = FuncWorker(self)
         self.cfg_fetcher.output.connect(self._append)
         self.cfg_fetcher.done.connect(self._on_cfg_fetched)
         self.cfg_fetcher.error.connect(
@@ -384,7 +355,7 @@ class InferPage(QWidget):
         self.runner.output.connect(self._on_output)
         self.runner.finished.connect(self._on_stage_done)
         self.runner.failed.connect(self._on_runner_failed)
-        self.dl_runner = JobRunner(self)   # run download, independent of the infer stages
+        self.dl_runner = JobRunner(self)
         self.dl_runner.output.connect(lambda s: self._append(s, newline=False))
         self.dl_runner.finished.connect(self._on_run_downloaded)
         self.dl_runner.failed.connect(
@@ -404,8 +375,7 @@ class InferPage(QWidget):
             + ("Pick a run.json (or a local .pth), a folder of clouds, and run locally."
                if local else
                "Pick a run (or a local .pth), a folder of clouds, and run on Modal."))
-        # ponytail: ensemble ships local-only — modal would need a per-member
-        # download loop through the stage machine; disabled with a tooltip instead.
+        # ponytail: ensemble ships local-only; disabled with a tooltip on modal
         self.ens_box.setEnabled(local)
         self.ens_box.setToolTip(
             "" if local else "Ensemble runs on the LOCAL backend only — the "
@@ -413,14 +383,12 @@ class InferPage(QWidget):
             "local on the Settings page to use it.")
         if not local:
             self.ens_box.setChecked(False)
-        self.wf.setRowVisible(self.ens_hint_w, not local)   # why it's greyed + the fix
+        self.wf.setRowVisible(self.ens_hint_w, not local)
         self._sync_source_rows()
         self.reload_backbones()
 
     def _switch_to_local(self):
-        """Flip the execution backend to local. Prefer the sidebar combo (keeps
-        it in sync and re-schemes every page via main's _on_mode_change); a
-        standalone page falls back to the appstate setter + its own refresh."""
+        """Flip the backend to local, via the sidebar combo when present."""
         combo = getattr(self.window(), "mode_combo", None)
         if isinstance(combo, QComboBox):
             i = combo.findData("local")
@@ -456,8 +424,7 @@ class InferPage(QWidget):
         self._sync_controls()
 
     def _refresh_env_marks(self):
-        """Local mode: mark models whose pixi env isn't installed yet, so the
-        block at Run time isn't a surprise. Pure directory scan per backbone."""
+        """Local mode: mark models whose pixi env isn't installed yet."""
         local = appstate.get_exec_mode() == "local"
         for i in range(self.backbone_combo.count()):
             b = BACKBONES.get(self.backbone_combo.itemData(i))
@@ -469,7 +436,7 @@ class InferPage(QWidget):
 
     def showEvent(self, ev):
         super().showEvent(ev)
-        self._refresh_env_marks()   # env may have been installed from the Train page
+        self._refresh_env_marks()
 
     # ------------------------------------------------------------- class names
     def _set_run_classes(self, names):
@@ -478,9 +445,8 @@ class InferPage(QWidget):
         self._rebuild_class_list()
 
     def _rebuild_class_list(self):
-        """All-checked list of the loaded run's classes; disabled placeholder when
-        no run manifest is loaded. Deliberately NOT persisted via appstate —
-        exclusions are per-scene-batch judgments; all-on is the safe default."""
+        """All-checked list of the run's classes. Deliberately not persisted —
+        all-on is the safe default."""
         self.class_list.blockSignals(True)
         self.class_list.clear()
         names = self._run_class_names or []
@@ -531,9 +497,7 @@ class InferPage(QWidget):
             if h["run_id"] not in seen:
                 seen.add(h["run_id"])
                 self.run_combo.addItem(f"{h['run_id']}  ({h['backbone']})", h)
-        # Local/downloaded runs: the SAME discovery source as the Plotting page
-        # (appstate.run_roots + plots.discover_runs), filtered to dirs carrying
-        # a run.json manifest — this picker needs backbone/classes, not CSVs.
+        # same discovery source as the Plotting page, filtered to dirs with run.json
         for root in appstate.run_roots(self.repo_root):
             for rdir in plots.discover_runs(root):
                 if rdir.name in seen:
@@ -543,8 +507,7 @@ class InferPage(QWidget):
                     seen.add(rdir.name)
                     self.run_combo.addItem(f"{rdir.name}  ({m.get('backbone', '?')})",
                                            {"run_id": rdir.name, "backbone": m.get("backbone")})
-        # No implicit default: an old history entry preselected here reads as "the"
-        # run and may not even exist on Modal anymore. Restore what was typed, else blank.
+        # no implicit default — restore what was typed, else blank
         self.run_combo.setCurrentIndex(-1)
         self.run_combo.setEditText(prev)
         self.run_combo.blockSignals(False)
@@ -559,7 +522,7 @@ class InferPage(QWidget):
             i = self.backbone_combo.findData(h["backbone"])
             if i >= 0:
                 self.backbone_combo.setCurrentIndex(i)
-        # Typed/pasted text has no item data — leave any fetched classes in place.
+        # typed/pasted text has no item data — leave any fetched classes in place
         if appstate.get_exec_mode() != "local" and isinstance(h, dict):
             self._set_run_classes(self._run_pick_class_names(h))
 
@@ -576,16 +539,12 @@ class InferPage(QWidget):
         return None
 
     def _combo_run_ref(self) -> tuple:
-        """(volume, run_id) from the run combo — typed text wins over currentData().
-        Accepts a pasted '<volume>/runs/<id>' (the train log's copy string), a bare
-        id, or the combo's own 'id  (backbone)' items. Volume is '' unless pasted."""
+        """(volume, run_id) from the run combo — typed text wins over
+        currentData(); volume is '' unless pasted."""
         return _parse_run_ref(self.run_combo.currentText())
 
     def _download_run(self):
-        """Modal: fetch runs/<id> (weights + run.json + metrics) from the model's
-        outputs volume to <workspace>/inference/<id> — the folder reload_runs and
-        the class-name lookup also read, and where local inference can pick the
-        run.json straight back up."""
+        """Fetch runs/<id> from the outputs volume to <workspace>/inference/<id>."""
         b = self._backbone()
         vol, run_id = self._combo_run_ref()
         if not (b and run_id):
@@ -611,7 +570,7 @@ class InferPage(QWidget):
             return
         self._append(f"\n✓ Run downloaded -> {dest} (weights: final_model.pth). "
                      "It now also appears under locally-known runs.")
-        self.reload_runs()          # adopt run.json classes + list the local copy
+        self.reload_runs()
         self._on_run_pick()
 
     def _pick_runjson(self):
@@ -628,16 +587,13 @@ class InferPage(QWidget):
         self._manifest_features = None
         self._dg = {}
         self._modal_cfg_run = ""
-        self._apply_manifest_lock(False)   # run-derived inputs editable again
-        # The class mask belongs to the dropped run — a stale list would send
-        # its EXCLUDE_CLASSES names with unrelated weights.
+        self._apply_manifest_lock(False)
+        # a stale class mask would send EXCLUDE_CLASSES with unrelated weights
         self._set_run_classes(None)
 
     def _infer_dg_env(self, dg: dict | None = None) -> dict:
-        """DG_* env for inference. logdk recovered from run.json (it changed the input
-        width, so must be recomputed or the load fails); AdaBN / TTA / save-probs come
-        from the Domain-adaptation row. `dg` overrides the loaded run's block (ensemble
-        members carry their own)."""
+        """DG_* env for inference; logdk must be recomputed (it changed the
+        input width). `dg` overrides the loaded run's block."""
         dg = self._dg if dg is None else dg
         env: dict[str, str] = {}
         if dg.get("logdk"):
@@ -651,8 +607,7 @@ class InferPage(QWidget):
             env["TT_SAVE_PROBS"] = "1"
         if env:
             self._append("[dg] inference: " + " ".join(f"{k}={v}" for k, v in sorted(env.items())))
-        # Class mask rides the same env dict (local -e / modal --env-json), so it
-        # covers single runs, modal runs, and every ensemble member unchanged.
+        # class mask rides the same env dict — covers local, modal and ensemble
         exc = self._excluded_classes()
         if exc:
             env["EXCLUDE_CLASSES"] = ",".join(exc)
@@ -681,29 +636,27 @@ class InferPage(QWidget):
             return
         self._manifest, self._manifest_path = m, p
         self._local_weights = p.parent / m.get("weights", "final_model.pth")
-        self.weights_edit.setText(str(self._local_weights))   # default
-        self._apply_manifest_lock(True)   # arch/grid/tile come from the run — grey them out
+        self.weights_edit.setText(str(self._local_weights))
+        self._apply_manifest_lock(True)
         ok = "✓" if self._local_weights.is_file() else "✗ weights missing -"
         self._append(f"Loaded {p.name}: {m.get('backbone')}, grid={m.get('grid')}, "
                      f"chunk={m.get('chunk_xy')}, intensity={m.get('intensity_norm')}. "
                      f"{ok} {self._local_weights}")
 
     def _apply_manifest_fields(self, m: dict) -> bool:
-        """Arch/grid/tile/HAG/DG/classes from a run manifest — shared by the local
-        run.json loader and the Modal fetch-by-run-id path. False (with a log
-        line) when the run's model can't be used here."""
+        """Arch/grid/tile/HAG/DG/classes from a run manifest; False when the
+        run's model can't be used here."""
         bkey = m.get("backbone")
         legacy_hag = bool(m.get("hag_source"))
         if isinstance(bkey, str) and bkey.endswith("_hag"):
-            # ponytail: TEMPORARY shim (remove with the trainers') — the deleted
-            # *_hag variants run on their base trainer, which maps the legacy
-            # 'height' channel to feat_hag when run.json carries hag_source.
+            # ponytail: TEMPORARY shim — deleted *_hag variants run on their base
+            # trainer, mapping legacy 'height' to feat_hag via hag_source
             bkey = bkey[: -len("_hag")]
             self._append(f"[legacy-hag] run from the removed --hag variant — "
                          f"using '{bkey}'; HAG conversion forced on (temporary "
                          f"support for old weights).")
         i = self.backbone_combo.findData(bkey)
-        if i < 0:   # the run's model is hidden/unknown — don't keep the wrong one
+        if i < 0:
             self._append(f"✗ Model '{bkey}' isn't available here. Enable it on the "
                          f"Train page, then reload this run.")
             return False
@@ -712,18 +665,13 @@ class InferPage(QWidget):
             self.grid_spin.setValue(float(m["grid"]))
         if m.get("chunk_xy") is not None and self.chunk_spin.isEnabled():
             self.chunk_spin.setValue(float(m["chunk_xy"]))
-        # logdk changes input width, so it MUST be re-fed at inference (DG_* env).
+        # logdk changed the input width, so it must be re-fed at inference
         self._dg = m.get("dg") or {}
-        # The run's ordered input spec (run.json "features"); None = legacy run.
-        # Legacy --hag runs listed the HAG channel as 'height' — translate it so
-        # the channel gating below requires the baked feat_hag, like the trainer.
+        # legacy --hag runs listed the HAG channel as 'height' — translate it
         feats = m.get("features")
         if legacy_hag and feats:
             feats = ["feat_hag" if n == "height" else n for n in feats]
-        # Prefill HAG from the run's feature spec: tick + preselect the method the
-        # dataset baked it with (meta "@hag:<method>[+source]"). The user can still
-        # untick. Ground class isn't prefilled — run.json doesn't carry one, and it
-        # describes the inference input, not the training set.
+        # prefill HAG method from the dataset meta ("@hag:<method>"); user can untick
         need_hag = "feat_hag" in (feats or []) or legacy_hag
         self.hag_chk.setChecked(need_hag)
         if need_hag:
@@ -733,8 +681,7 @@ class InferPage(QWidget):
                         if isinstance(c, dict) and c.get("name") == "hag"), "")
             method = src[len("@hag:"):].split("+", 1)[0] if src.startswith("@hag:") else ""
             if not method and legacy_hag:
-                # old runs carry the method in hag_source itself (legacy tags
-                # like "grid+smrf" from the SMRF era still parse: split on "+")
+                # old runs carry the method in hag_source itself ("grid+smrf" era)
                 method = str(m["hag_source"]).split("+", 1)[0]
             j = self.hag_filter.findText(method) if method else -1
             if j >= 0:
@@ -747,21 +694,18 @@ class InferPage(QWidget):
         if self._dg.get("logdk"):
             self._append(f"[dg] trained with the log-d_k density channel "
                          f"(k={self._dg.get('logdk_k', 8)}); recomputed at inference.")
-        # Custom feat_* channels must be baked into the converted scenes.
         self._manifest_features = feats
         custom = [n for n in (self._manifest_features or []) if n.startswith("feat_")]
         if custom:
             self._append(f"[feat] run trained with custom channel(s): {', '.join(custom)} "
                          f"— the input clouds must carry the matching source field(s).")
-        # Label the comparison stats with the model's own classes.
         self._set_run_classes(self._names_from_manifest(m))
         return True
 
     # ------------------------------------------- modal config-by-run-id fetch
     def _on_run_id_typed(self):
-        """Modal: a typed/pasted run id — pull its run.json (locally downloaded
-        copy first, else off the outputs volumes) so arch/grid/tile/HAG/classes
-        match the run, same as picking a run.json does for local inference."""
+        """Modal: pull a typed/pasted run id's run.json (local copy first, else
+        off the outputs volumes) so the inputs match the run."""
         if appstate.get_exec_mode() == "local" or not self.from_run_radio.isChecked():
             return
         vol, rid = self._combo_run_ref()
@@ -769,7 +713,7 @@ class InferPage(QWidget):
             return
         if self._manifest and self._manifest_path is None:
             self._invalidate_manifest()   # a different run's fetched config — drop it
-        # Already downloaded ('Download run…' / Runs page)? No network needed.
+        # already downloaded? no network needed
         rdirs = appstate.runs_dir()
         cands = [appstate.workspace_dir() / "inference" / rid]
         cands += [bdir / rid for bdir in (rdirs.iterdir() if rdirs.exists() else [])]
@@ -779,9 +723,9 @@ class InferPage(QWidget):
                 self._apply_modal_manifest(m, rid)
                 return
         if vol:
-            vols = [vol]   # pasted <volume>/runs/<id> — go straight there, no search
+            vols = [vol]
         else:
-            # Bare id: search the current model's outputs volume first, then the others.
+            # bare id: search the current model's outputs volume first
             cur = BACKBONES.get(self.backbone_combo.currentData())
             vols = [cur.outputs_volume] if cur else []
             for i in range(self.backbone_combo.count()):
@@ -797,16 +741,15 @@ class InferPage(QWidget):
         if not m:
             self._append(f"✗ No run.json for '{rid}' on any outputs volume — set "
                          f"Architecture / grid / tile to match the run manually.")
-            self._forget_run(rid)   # a stale history entry stops being offered
+            self._forget_run(rid)
             return
         if self._combo_run_ref()[1] != rid:
             return   # the user moved on to another run while we fetched
         self._apply_modal_manifest(m, rid)
 
     def _forget_run(self, rid: str):
-        """A history run that's gone from Modal: purge it so it stops being offered.
-        A pasted id that was never in history is left alone (the run may simply
-        predate run.json manifests)."""
+        """Purge a history run that's gone from Modal; a pasted id that was
+        never in history is left alone."""
         hist = appstate.get("run_history", [])
         kept = [h for h in hist if h.get("run_id") != rid]
         if len(kept) == len(hist):
@@ -818,9 +761,7 @@ class InferPage(QWidget):
         self._append(f"  (dropped '{rid}' from the run list — stale history entry.)")
 
     def _apply_modal_manifest(self, m: dict, rid: str):
-        """A run manifest resolved from a Modal run id: apply + lock the run-derived
-        inputs and keep it as self._manifest (no path — there's no local run.json)
-        so intensity_norm and dataset-nested output work as in local mode."""
+        """Apply + lock a manifest resolved from a Modal run id (no local path)."""
         if not self._apply_manifest_fields(m):
             return
         self._manifest, self._manifest_path = m, None
@@ -830,22 +771,16 @@ class InferPage(QWidget):
                      f"chunk={m.get('chunk_xy')}, intensity={m.get('intensity_norm')}.")
 
     def _on_source_toggle(self):
-        self._sync_source_rows()   # hide the rows the other source owns
-        # A loaded run.json dictates arch/grid/tile; the manual .pth source frees them.
+        self._sync_source_rows()
         use_run = self.from_run_radio.isChecked() and self._manifest is not None
         self._apply_manifest_lock(use_run)
-        # The class mask follows the active source: a bare .pth has no class set,
-        # so a stale list would send the run's EXCLUDE_CLASSES with other weights.
+        # a stale class mask would pair the run's EXCLUDE_CLASSES with other weights
         self._set_run_classes(
             self._names_from_manifest(self._manifest) if use_run else None)
 
     def _apply_manifest_lock(self, locked: bool):
-        """Grey out the inputs a run.json dictates (architecture, grid, tile size) so
-        they can't drift from the loaded run. Unlocking restores tile-size enablement
-        to whether the backbone even has a tile param (RandLA has none).
-        While a manifest is applied the three locked rows also FOLD AWAY into the
-        single muted summary line under the run selector (manifest_summary);
-        unlocking brings the editable rows back."""
+        """Grey out what a run.json dictates (arch, grid, tile); while a manifest
+        is applied the three rows fold into the manifest_summary line."""
         self.backbone_combo.setEnabled(not locked)
         self.grid_spin.setEnabled(not locked)
         if locked:
@@ -880,17 +815,13 @@ class InferPage(QWidget):
             self.weights_edit.setText(path)
 
     def _resolved_weights(self):
-        """Local weights: the explicit override if set, else the run.json's sibling.
-        The two need not be co-located."""
+        """The explicit override if set, else the run.json's sibling."""
         t = self.weights_edit.text().strip()
         return Path(t) if t else self._local_weights
 
     def _weights_run_tag(self, member: dict | None = None) -> str:
-        """Parent folder for this job's prediction dirs: the run id of the weights
-        used (the runs/<id> from run.json), so every prediction traces back to its
-        model — and lands beside a 'Download run…' copy of the same run. A loose
-        .pth has no run id; its filename stem stands in. Ensemble members resolve
-        their own run; the voted output goes under 'ensemble'."""
+        """Parent folder for prediction dirs: the weights' run id (loose .pth ->
+        filename stem; the voted ensemble output goes under 'ensemble')."""
         if member:
             mp = member.get("manifest_path")
             return Path(mp).parent.name if mp else Path(member["weights"]).stem
@@ -901,10 +832,8 @@ class InferPage(QWidget):
         if self.backbone_combo.currentData() is None:
             return
         if self._manifest is not None and self.from_run_radio.isChecked():
-            return   # the run's grid/tile are authoritative (and folded into the
-                     # summary line) — defaults here would silently undercut them.
-                     # Safe on load: _apply_manifest_fields sets the combo BEFORE
-                     # assigning self._manifest, so the defaults still get applied.
+            return   # the run's grid/tile are authoritative; safe on load — the
+                     # combo is set before self._manifest is assigned
         b = self._backbone()
         gp = next((p for p in b.params if p.recommend_key == "grid"), None)
         if gp:
@@ -952,7 +881,7 @@ class InferPage(QWidget):
             self.input_edit.setText(f)
 
     def _backbone(self):
-        # The run.json's backbone is authoritative for LOCAL inference so no deprecated backbones
+        # the run.json's backbone is authoritative for local inference
         if (self._manifest and self.from_run_radio.isChecked()
                 and appstate.get_exec_mode() == "local"
                 and self._manifest.get("backbone") in BACKBONES):
@@ -960,11 +889,8 @@ class InferPage(QWidget):
         return BACKBONES[self.backbone_combo.currentData()]
 
     def _check_hag(self) -> bool:
-        """Parse the ground class and reconcile the HAG box with the run's
-        feature spec before we convert. A run whose "features" include feat_hag
-        needs the channel baked (auto-tick); a run without it just wastes
-        conversion time when the box is on (warn, don't block). Sets
-        self._hag_ground_value."""
+        """Reconcile the HAG box with the run's feature spec and parse the
+        ground class; sets self._hag_ground_value."""
         self._hag_ground_value = None
         need = "feat_hag" in (self._run_features() or [])
         if need and not self.hag_chk.isChecked():
@@ -986,14 +912,10 @@ class InferPage(QWidget):
 
     # ------------------------------------------------------------- ensemble
     def _add_ens_member(self):
-        """Capture the currently configured model as an ensemble member — the same
-        resolution _run's local branch uses (backbone + resolved weights +
-        run.json), snapshotted so later UI edits don't drift the member."""
+        """Snapshot the currently configured model as an ensemble member so
+        later UI edits don't drift it."""
         if self.from_file_radio.isChecked():
-            # A bare .pth has no run.json: no class names to clamp on (its trainer
-            # writes placeholder class_0… names that would fail the voter's exact
-            # clamp only AFTER every member burned a full inference pass) and no
-            # dataset to resolve feature channels from. Refuse early and loudly.
+            # a bare .pth has no run.json — no classes/dataset to check against
             self._append("✗ ensemble: members must come from training runs "
                          "(run.json) — a bare .pth carries no class/dataset info "
                          "to check compatibility against.")
@@ -1007,10 +929,8 @@ class InferPage(QWidget):
             return
         bkey = self._manifest.get("backbone")
         manifest, mpath = dict(self._manifest), str(self._manifest_path)
-        # CLAMP: members must share one class set AND one dataset — feature
-        # channels and intensity_norm are resolved through the first member's
-        # dataset meta, so a different dataset would silently stage feat_*
-        # columns from the wrong source field for the other members.
+        # members must share one class set AND one dataset — feature channels and
+        # intensity_norm resolve through the first member's dataset meta
         new_n = manifest.get("num_classes")
         new_names = self._names_from_manifest(manifest)
         new_ds = manifest.get("dataset")
@@ -1048,8 +968,7 @@ class InferPage(QWidget):
         self._ens_members.pop(row)
 
     def _run_ensemble(self, input_dir: str):
-        """Ensemble launch: validate members, stage scenes ONCE, then run the
-        members sequentially through the normal local stage machine."""
+        """Validate members, stage scenes once, run members sequentially."""
         n = len(self._ens_members)
         if n < 2:
             self._append("✗ ensemble needs at least 2 members — 'Add current "
@@ -1064,8 +983,7 @@ class InferPage(QWidget):
         self._begin_run(f"ensemble inference · {n} members · job {self._job_id}")
         self.run_btn.setEnabled(False)
         self._ens_running, self._ens_idx, self._ens_dirs = True, -1, []
-        # _ens_running is set, so _check_hag sees the members' feature UNION —
-        # any member with feat_hag turns HAG conversion on for the shared stage.
+        # _ens_running is set, so _check_hag sees the members' feature union
         if not self._check_hag():
             self._ens_running = False
             self.run_btn.setEnabled(True)
@@ -1086,8 +1004,8 @@ class InferPage(QWidget):
         self._start_local_infer(member=m)
 
     def _on_member_done(self):
-        """A member's local run exited 0: keep its infer_run.json beside its
-        predictions (the vote's class clamp reads it), then next member or vote."""
+        """Keep the member's infer_run.json beside its predictions (the vote's
+        class clamp reads it), then next member or vote."""
         if not list(self._pred_dir.glob("*_pred.npz")):
             self._ens_running = False
             self.run_btn.setEnabled(True)
@@ -1095,8 +1013,7 @@ class InferPage(QWidget):
                          f"predictions in {self._pred_dir}. Check the log above.")
             self._end_run(f"✗ ensemble member {self._ens_idx + 1} wrote no predictions")
             return
-        # The trainers write infer_run.json to the job dir (= the staged mount),
-        # one level above the predictions mount — copy the member's snapshot in.
+        # trainers write infer_run.json to the job dir — copy the member's snapshot in
         src = Path(self._staged) / "infer_run.json"
         if src.is_file():
             try:
@@ -1114,8 +1031,7 @@ class InferPage(QWidget):
         self.voter.start(_vote_members, [str(d) for d in self._ens_dirs], str(ens_dir))
 
     def _on_voted(self, ens_dir):
-        # _ens_running stays True through the export so the class map comes from
-        # the members' manifest; _on_exported/_on_export_error reset it.
+        # _ens_running stays True through export; _on_exported resets it
         self._report_predictions(Path(ens_dir))
 
     def _on_vote_error(self, tb: str):
@@ -1141,16 +1057,15 @@ class InferPage(QWidget):
             self._run_ensemble(input_dir)
             return
         weights_run_id = ""
-        weights_vol = ""   # a pasted <volume>/runs/<id> names it; else the backbone's
+        weights_vol = ""
         if self.from_file_radio.isChecked():
             if not os.path.isfile(self.pth_edit.text().strip()):
                 self._append("Choose a .pth file.")
                 return
             self._weights_remote = f"uploads/{Path(self.pth_edit.text()).name}"
-            bkey = self.backbone_combo.currentData()   # a loose .pth has no manifest
-            self._run_tag = Path(self.pth_edit.text().strip()).stem  # no run id: pth stem
+            bkey = self.backbone_combo.currentData()
+            self._run_tag = Path(self.pth_edit.text().strip()).stem
         elif not modal:
-            # LOCAL: run.json is the explicit input; weights = its sibling.
             if not (self._manifest and self._manifest_path):
                 self._append("Pick a run.json first.")
                 return
@@ -1159,11 +1074,9 @@ class InferPage(QWidget):
                 self._append(f"✗ Weights not found ({w}). Set the 'Weights file' box.")
                 return
             bkey = self._manifest.get("backbone")
-            self._run_tag = self._manifest_path.parent.name   # runs/<id>/run.json
+            self._run_tag = self._manifest_path.parent.name
         else:
-            # MODAL: weights live on the cloud volume, keyed by run id. The typed
-            # text wins — currentData() keeps returning the last picked item even
-            # after the user types/pastes a different id over it.
+            # modal: typed text wins — currentData() returns the last picked item
             pasted_vol, run_id = self._combo_run_ref()
             if not run_id:
                 self._append("Pick or type a run id.")
@@ -1183,10 +1096,8 @@ class InferPage(QWidget):
         self._job_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         self._begin_run(f"inference · {bkey} · job {self._job_id}")
         self.run_btn.setEnabled(False)
-        # Runs enter history at train START, so may lack final_model.pth. Check weights
-        # exist before converting/uploading/paying for GPU. Runs in a worker.
-        # A run already fetched with 'Download run…' was pulled OFF the volume, so
-        # its weights provably exist there — no network round-trip needed.
+        # runs enter history at train start and may lack final_model.pth — check
+        # before paying; a downloaded run provably has weights, skip the check
         if modal and weights_run_id:
             if self._has_local_run_copy(weights_run_id):
                 self._append(f"[0/4] Weights verified from the local download of "
@@ -1209,7 +1120,7 @@ class InferPage(QWidget):
         return any((d / "final_model.pth").is_file() for d in dirs)
 
     def _start_conversion(self, input_dir: str):
-        # p95 end-to-end; honor a legacy norm recorded in run.json.
+        # p95 end-to-end; honor a legacy norm recorded in run.json
         if self._ens_running:
             # ponytail: the FIRST member's manifest speaks for the ensemble
             # (norm/dataset) — members are same-dataset runs in practice.
@@ -1218,13 +1129,9 @@ class InferPage(QWidget):
         else:
             norm = (self._manifest or {}).get("intensity_norm", "p95") \
                 if (self.from_run_radio.isChecked() and self._manifest) else "p95"
-        # HAG comes from the checkbox — _check_hag() already reconciled it with
-        # the run's feature spec and parsed the ground value.
         hag_on = self.hag_chk.isChecked()
         if self._ens_running and not hag_on:
-            # Union semantics (see _run_features): stage feat_hag when ANY
-            # member needs it — loading a hag-less member's run.json last
-            # unticks the box, which must not starve the hag members.
+            # union semantics: stage feat_hag when ANY member needs it
             hag_on = any("feat_hag" in ((m.get("manifest") or {}).get("features") or [])
                          for m in self._ens_members)
             if hag_on:
@@ -1251,10 +1158,8 @@ class InferPage(QWidget):
                              geo_radius=geo_r, out_dir=job_root)
 
     def _run_features(self) -> list | None:
-        """The loaded run's ordered input spec (run.json "features"), or None
-        (loose .pth / legacy run -> legacy channel handling). During an ensemble
-        run: the UNION of every member's features, so the once-staged scenes
-        carry (and the channel report checks) what any member needs."""
+        """The run's ordered input spec (run.json "features"), or None (loose
+        .pth / legacy run). Ensemble: the union of every member's features."""
         if self._ens_running:
             feats: list = []
             for m in self._ens_members:
@@ -1267,16 +1172,9 @@ class InferPage(QWidget):
 
     def _infer_feature_fields(self) -> tuple:
         """(raw source fields, jakteristics names, radius) for the run's custom
-        feat_* channels, resolved through the dataset meta's
-        source.feature_channels. Computed geo entries carry source_field
-        "@geo:<jak name>" + "radius" — the meta radius is the train-time truth.
-        A geo channel with no meta (loose .pth) is recovered from its
-        feat_geo_<nm> name at the DEFAULT radius 1.0 with a warning; other
-        unresolved names fall back to a same-named raw field (conversion fails
-        loud on a truly missing one)."""
-        # feat_hag is produced by the conversion's hag=/hag_filter= args, not a
-        # raw source field — routing its "@hag:" source_field into feature_fields
-        # would fail as a missing raw field.
+        feat_* channels, resolved through the dataset meta; unresolved names
+        fall back with a logged warning."""
+        # feat_hag comes from the hag= conversion args, not a raw source field
         custom = [n for n in (self._run_features() or [])
                   if n.startswith("feat_") and n != "feat_hag"]
         if not custom:
@@ -1312,10 +1210,8 @@ class InferPage(QWidget):
         return fields or None, geo or None, (radius if radius is not None else 1.0)
 
     def _infer_out_dir(self) -> Path:
-        """Nest this infer job under its owning dataset (<dataset>/infer/<job>) when
-        the run names a known, on-disk dataset; else a findable workspace scratch
-        spot (loose .pth has no linked dataset). The container still mounts it at
-        /datasets/_infer/<job> regardless."""
+        """<dataset>/infer/<job> when the run names a known on-disk dataset,
+        else a workspace scratch spot."""
         name = self._owning_dataset()
         staged = appstate.known_datasets().get(name or "", {}).get("staged_dir", "")
         if staged and os.path.isdir(staged):
@@ -1335,7 +1231,7 @@ class InferPage(QWidget):
         self._start_conversion(self._pending_input)
 
     def _on_preflight_error(self, tb: str):
-        # A failed check shouldn't block; fall through to the in-container backstop.
+        # a failed check shouldn't block; the in-container backstop catches it
         self._append(f"[0/4] (weights check errored, proceeding anyway)\n{tb}")
         self._start_conversion(self._pending_input)
 
@@ -1346,7 +1242,6 @@ class InferPage(QWidget):
         for line in lines:
             self._append(line)
         if blocked:
-            # Same shape as the HAG refusal: a clear log line, button back, stop.
             self._append("✗ Aborting — the input clouds lack channel(s) this run was "
                          "trained on (see above). Re-export the inputs with those "
                          "fields, or pick a run that doesn't need them.")
@@ -1365,9 +1260,7 @@ class InferPage(QWidget):
         self._stage = "upload_scenes"
         prog, args = modal_cli.volume_put(modal_cli.DATASETS_VOLUME, str(staged),
                                           f"/_infer/{self._job_id}")
-        # pre-create so inference works even on an account that has never
-        # uploaded a dataset (put errors on a missing volume; create's
-        # already-exists error is ignored by JobRunner's pre stage).
+        # pre-create so the put doesn't error on a missing volume
         self.runner.start(prog, args, cwd=self.repo_root,
                           pre=modal_cli.volume_create(modal_cli.DATASETS_VOLUME))
 
@@ -1395,9 +1288,7 @@ class InferPage(QWidget):
         elif self._stage == "upload_weights":
             self._start_modal_run()
         elif self._stage == "run":
-            # Predictions on the datasets volume at _infer/<job_id>/predictions.
-            # Download under <workspace>/inference/<run_id>: grouped per model
-            # (beside a 'Download run…' copy); job-id subfolder avoids collisions.
+            # download under <workspace>/inference/<run_tag>/predictions_<job>
             self._dl_dest = (appstate.workspace_dir() / "inference"
                              / self._weights_run_tag()
                              / f"predictions_{self._job_id}")
@@ -1409,7 +1300,6 @@ class InferPage(QWidget):
                                               str(self._dl_dest))
             self.runner.start(prog, args, cwd=self.repo_root)
         elif self._stage == "run_local":
-            # Local: predictions already on the host, no download.
             if self._ens_running:
                 self._on_member_done()
             else:
@@ -1418,9 +1308,8 @@ class InferPage(QWidget):
             self._report_predictions(self._dl_dest / "predictions")
 
     def _report_predictions(self, pred_dir):
-        """Predictions landed (a stage can exit 0 yet write nothing) -> write the
-        scripts' npz predictions as the chosen format (xyz + classification) on a
-        worker thread; _on_exported prints the final green report."""
+        """Verify predictions landed (a stage can exit 0 yet write nothing),
+        then export them as the chosen format on a worker thread."""
         pred_dir = Path(pred_dir) if pred_dir else None
         if not (pred_dir and pred_dir.is_dir()):
             self._ens_running = False
@@ -1445,19 +1334,15 @@ class InferPage(QWidget):
                             class_map=self._class_map(), unclass_threshold=thr)
 
     def _owning_dataset(self) -> str | None:
-        """Dataset name the active weights belong to: the loaded run.json's, or —
-        during an ensemble run — the first member's (members share a class set,
-        so one dataset meta speaks for all)."""
+        """Dataset the active weights belong to (ensemble: the first member's)."""
         if self._ens_running:
             return (self._ens_members[0].get("manifest") or {}).get("dataset")
         return (self._manifest or {}).get("dataset") \
             if (self.from_run_radio.isChecked() and self._manifest) else None
 
     def _dataset_meta(self, manifest: dict | None = None) -> dict | None:
-        """The run's dataset_meta.json as a dict, or None when it can't be
-        resolved (loose .pth / unknown dataset). `manifest` overrides
-        self._manifest — _apply_manifest_fields runs BEFORE the manifest is
-        adopted, so it must resolve against the one being applied."""
+        """The run's dataset_meta.json, or None. `manifest` overrides
+        self._manifest (_apply_manifest_fields runs before it's adopted)."""
         name = manifest.get("dataset") if manifest else self._owning_dataset()
         mp = appstate.known_datasets().get(name or "", {}).get("meta_path", "")
         try:
@@ -1467,12 +1352,10 @@ class InferPage(QWidget):
             return None
 
     def _class_map(self) -> dict | None:
-        """{model index: source classification value} from the run's dataset meta,
-        so exports carry the input's own codes. None (identity) when the dataset
-        can't be resolved (loose .pth / unknown dataset) — logged once."""
+        """{model index: source classification value} from the run's dataset
+        meta; None (identity) when the dataset can't be resolved."""
         try:
-            # meta collapses combined classes to "source_values" (list); the
-            # FIRST value is the primary export code. Singular = very old metas.
+            # "source_values" first value is the primary export code; singular = old metas
             cmap = {int(c["index"]): int((c.get("source_values") or
                                           [c["source_value"]])[0])
                     for c in (self._dataset_meta() or {}).get("classes", [])}
@@ -1496,7 +1379,6 @@ class InferPage(QWidget):
         self._end_run(f"✓ exported {len(written)} prediction file(s)")
 
     def _on_export_error(self, tb: str):
-        # Predictions still exist as the scripts' raw .npz; only the rewrite failed.
         self._ens_running = False
         self.run_btn.setEnabled(True)
         self._append(f"\n✗ Format conversion failed — predictions remain as raw "
@@ -1515,29 +1397,22 @@ class InferPage(QWidget):
             flags["chunk-xy"] = self.chunk_spin.value()
         self._append(f"[3/4] Running inference on Modal ({b.label})…")
         self._stage = "run"
-        # Same DG_LOGDK_* / EXCLUDE_CLASSES env the local branch passes — the
-        # shell forwards it to the trainer subprocess via --env-json.
+        # same env the local branch passes; forwarded via --env-json
         prog, args = modal_cli.run_script(b.script, flags, detach=False,
                                           env=self._infer_dg_env())
         self._append(f"$ modal {' '.join(args)}\n")
         self.runner.start(prog, args, cwd=self.repo_root)
 
     def _start_local_infer(self, member: dict | None = None):
-        """Local pixi inference: the trainer reads the staged scenes and writes
-        predictions straight to host dirs via the TT_* env contract. No
-        up/download. `member` (an ensemble member dict) overrides the UI-derived
-        backbone/weights/grid and lands predictions in its own _m<k> dir."""
+        """Local pixi inference via the TT_* env contract; `member` overrides
+        the UI-derived backbone/weights/grid (ensemble)."""
         b = BACKBONES[member["backbone"]] if member else self._backbone()
-        # Predictions: <workspace>/inference/<run_tag>/predictions_<job> (same
-        # spot as the Modal download), via TT_PRED_DIR — grouped per model so a
-        # run's outputs live together. Scenes come from self._staged
-        # (TT_INFER_DIR).
+        # TT_PRED_DIR / TT_INFER_DIR contract; same spot as the Modal download
         suffix = f"_m{self._ens_idx + 1}" if member else ""
         self._pred_dir = (appstate.workspace_dir() / "inference"
                           / self._weights_run_tag(member)
                           / f"predictions_{self._job_id}{suffix}")
         self._pred_dir.mkdir(parents=True, exist_ok=True)
-        # Weights: the picked .pth or run.json's sibling — passed absolute.
         if member:
             wpath = Path(member["weights"])
         else:
@@ -1567,7 +1442,7 @@ class InferPage(QWidget):
             self._ens_running = False
             self.run_btn.setEnabled(True)
             return
-        gok, gmsg = local_cli.gpu_preflight()   # CUDA-only — fail clearly, not cryptically
+        gok, gmsg = local_cli.gpu_preflight()
         if gmsg:
             self._append(gmsg)
         if not gok:
@@ -1584,8 +1459,7 @@ class InferPage(QWidget):
         self.runner.start(prog, args, cwd=self.repo_root, extra_env=run_env)
 
     def _on_output(self, text: str):
-        # Legacy container-style paths (/datasets/_infer/<job>/…) in trainer logs
-        # that mean nothing on the host; show the real output folder the files land in.
+        # rewrite container paths in trainer logs to the real host folders
         disp = (_localize_paths(text, self._job_id, self._pred_dir, self._staged)
                 if self._stage == "run_local" else text)
         self._append(disp, newline=False)
@@ -1597,7 +1471,7 @@ class InferPage(QWidget):
         self._end_run("✗ conversion error")
 
     def _on_runner_failed(self, err: str):
-        # FailedToStart fires `failed` not `finished`; re-enable the button.
+        # FailedToStart fires failed, not finished; re-enable here
         self._ens_running = False
         self.run_btn.setEnabled(True)
         self._append(f"\n✗ Failed to start: {err}")
@@ -1642,7 +1516,6 @@ class InferPage(QWidget):
                  f"  labeled  : {m['labeled']:,} pts",
                  "  per-class IoU:"]
         lines += [f"    {nm(c)}: {iou:.4f}" for c, iou in sorted(m["per_class_iou"].items())]
-        # Persist beside the prediction so the numbers aren't lost with the log.
         mpath = Path(pred).with_suffix(".metrics.json")
         try:
             with open(mpath, "w", encoding="utf-8") as f:
@@ -1651,10 +1524,7 @@ class InferPage(QWidget):
             lines.append(f"  saved -> {mpath}")
         except OSError as e:
             lines.append(f"  (couldn't save metrics json: {e})")
-        # Accumulate one row per comparison in <workspace>/gt_metrics.csv so
-        # one-at-a-time scoring builds the experiment table by itself. The file
-        # is rewritten with the union of all headers, so a later run with a
-        # different class set widens the table instead of losing columns.
+        # accumulate rows in gt_metrics.csv; rewritten with the union of headers
         row = {"when": datetime.now().strftime("%Y-%m-%d %H:%M"),
                "prediction": str(pred), "ground_truth": str(gt),
                "scene": m["scene"] or Path(pred).stem,
@@ -1683,8 +1553,7 @@ class InferPage(QWidget):
 
     # ------------------------------------------------------------- helpers
     def _begin_run(self, title: str):
-        """Run header instead of the old log.clear(): earlier runs stay
-        scrollable above the divider."""
+        """Run header; earlier runs stay scrollable above the divider."""
         self._run_open = True
         self.log.begin_run(title)
 
@@ -1700,9 +1569,8 @@ class InferPage(QWidget):
 
 
 def _vote_members(member_dirs: list, out_dir: str, progress=None):
-    """FuncWorker body: run scripts/local/ensemble_vote.py over the member
-    prediction dirs, then strip the big float16 'probs' payload from each member
-    npz (the classification/confidence npz is kept for re-export/compare)."""
+    """Run ensemble_vote.py over the member prediction dirs, then strip the
+    big 'probs' payload from each member npz."""
     import numpy as np
     scripts_local = str(Path(__file__).resolve().parents[2] / "scripts" / "local")
     if scripts_local not in sys.path:
@@ -1724,9 +1592,8 @@ def _vote_members(member_dirs: list, out_dir: str, progress=None):
 
 
 def _localize_paths(text: str, job_id: str, pred_dir, staged) -> str:
-    """Rewrite container bind-mount paths to the host folders they map to (see the
-    mounts in _start_local_infer), so a local run's log shows where files really go.
-    Predictions first (the more specific mount), then the staging root."""
+    """Rewrite container bind-mount paths to the host folders they map to;
+    predictions first (the more specific mount), then the staging root."""
     if pred_dir:
         for p in (f"/datasets/_infer/{job_id}/predictions", f"_infer/{job_id}/predictions"):
             text = text.replace(p, str(pred_dir))
@@ -1738,14 +1605,9 @@ def _localize_paths(text: str, job_id: str, pred_dir, staged) -> str:
 
 def _scene_channel_report(staged,
                           features: list | None = None) -> tuple[list[str], bool]:
-    """(log lines, blocking) — verifies the converted scenes carry what the
-    trainers read. The scene npz IS the model's input (fixed contract), so what's
-    in it is exactly what inference sees. `features` is the run's ordered spec
-    (run.json "features"): x/y/z/height cost nothing (xyz always present),
-    intensity / return_number missing = constant filler + a warning (the
-    trainers' own fallback), rgb / feat_* (incl. feat_hag) are HARD
-    requirements -> blocking=True names which scenes lack what. None = legacy
-    behavior (xyz + intensity), never blocking."""
+    """(log lines, blocking) — verify the converted scenes carry what the run
+    needs: rgb / feat_* are hard requirements (blocking); missing intensity /
+    return_number only warns; features None = legacy, never blocking."""
     import numpy as np
     scenes = sorted(Path(staged).glob("scenes/*.npz"))
     if not scenes:

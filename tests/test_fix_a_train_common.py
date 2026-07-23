@@ -1,7 +1,4 @@
-"""find_latest_unfinished_run recipe matching (group A fix).
-
-Run: python tests/test_fix_a_train_common.py
-"""
+"""find_latest_unfinished_run recipe matching. Run: python tests/test_fix_a_train_common.py"""
 import json
 import os
 import sys

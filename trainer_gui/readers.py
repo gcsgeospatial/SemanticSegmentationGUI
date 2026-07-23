@@ -1,10 +1,5 @@
-"""Read point clouds of every supported format into one in-memory shape.
-
-Formats: .las/.laz (laspy), .ply (plyfile), ASCII .txt/.csv/.xyz/.pts (numpy),
-.pcd (open3d), .npy/.npz (numpy). Each reader returns a Cloud; `fields` holds
-every per-point 1-D numeric array found, so the GUI can offer any of them as
-the ground-truth label source.
-"""
+"""Read every supported point-cloud format into one Cloud shape; `fields` holds
+every per-point 1-D numeric array so any can be offered as the label source."""
 
 from __future__ import annotations
 
@@ -29,6 +24,25 @@ class Cloud:
     @property
     def n(self) -> int:
         return len(self.xyz)
+
+
+def crs_unit_factor(crs_wkt: str | None) -> float:
+    """Horizontal axis unit of a projected CRS in meters (1.0 for meter,
+    geographic, absent, or unparseable CRS). THE unit contract: _read_las
+    multiplies xyz by this at ingest (source units -> meters) and exporters
+    divide by it (meters -> source units) — both sides derive it from the same
+    WKT, so nothing else needs to ferry a scale."""
+    if not crs_wkt:
+        return 1.0
+    try:
+        from pyproj import CRS
+        crs = CRS.from_wkt(crs_wkt)
+        if crs.is_geographic:
+            return 1.0
+        f = float(crs.axis_info[0].unit_conversion_factor)
+        return f if abs(f - 1.0) > 1e-6 else 1.0
+    except Exception:  # noqa: BLE001 — no pyproj / malformed WKT = no scaling
+        return 1.0
 
 
 def read_points(path: str | Path) -> Cloud:
@@ -75,8 +89,7 @@ def _read_las(path) -> Cloud:
     ret = np.asarray(las.return_number, np.float32) if "return_number" in dims else None
 
     fields = {}
-    # red/green/blue stay in fields: color is explicit-only at dataset build,
-    # so the channels must be offerable as mappable columns.
+    # red/green/blue stay in fields: color is explicit-only, columns must be mappable
     skip = {"x", "y", "z"}
     for d in las.point_format.dimensions:
         name = d.name.lower()
@@ -88,8 +101,20 @@ def _read_las(path) -> Cloud:
             continue
         if arr.ndim == 1 and np.issubdtype(arr.dtype, np.number):
             fields[d.name] = arr
+    wkt = crs.to_wkt() if crs is not None else None
+    f = crs_unit_factor(wkt)
+    if f != 1.0:
+        # Non-meter projected CRS (US survey ft state planes, etc.): scale to
+        # meters HERE so every consumer (tiling, HAG, CSF, stats) sees meters.
+        # crs_wkt stays the SOURCE WKT — exporters divide by the same factor to
+        # restore source units. z rides the horizontal unit (standard for ft
+        # clouds); a source HAG dim is height, so it scales too.
+        xyz *= f
+        for k in list(fields):
+            if k.lower().replace("_", "") in ("heightaboveground", "hag"):
+                fields[k] = np.asarray(fields[k], np.float64) * f
     return Cloud(xyz=xyz, rgb=rgb, intensity=intensity, return_number=ret, fields=fields,
-                 crs_wkt=crs.to_wkt() if crs is not None else None)
+                 crs_wkt=wkt)
 
 
 # ---------------------------------------------------------------- ply

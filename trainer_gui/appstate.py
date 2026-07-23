@@ -1,9 +1,5 @@
-"""Persisted app state (known datasets, last-used params, run history).
-
-Stored as JSON in the per-OS app dir (%APPDATA% on Windows, $XDG_CONFIG_HOME or
-~/.config on Linux, ~/Library/Application Support on macOS). Staging and
-downloaded run artifacts also live there so the repo stays clean.
-"""
+"""Persisted app state, stored as JSON in the per-OS app dir; staging and
+downloaded run artifacts live there too."""
 
 from __future__ import annotations
 
@@ -15,9 +11,7 @@ from typing import Any
 
 
 def _app_base(platform: str, environ) -> Path:
-    """Native per-OS base dir for app data. APPDATA is honored on EVERY platform
-    so it stays a single override knob (tests set it); otherwise pick the native
-    location for the OS."""
+    """Per-OS app-data base; APPDATA is honored on every platform (test override knob)."""
     if environ.get("APPDATA"):
         return Path(environ["APPDATA"])
     home = Path.home()
@@ -41,10 +35,8 @@ def staging_dir() -> Path:
 
 
 def workspace_dir() -> Path:
-    """The single root that owns every dataset and, nested inside each, its runs/
-    and infer/ output. Set once via the first-launch prompt (set_workspace);
-    until then it falls back to staging_dir() so nothing breaks. This is the host
-    dir bound to /datasets, so /datasets/<name> resolves for every dataset."""
+    """The root owning every dataset (host dir bound to /datasets); falls back to
+    staging_dir() until the first-launch prompt sets it."""
     w = get("workspace")
     d = Path(w) if w else staging_dir()
     d.mkdir(parents=True, exist_ok=True)
@@ -56,14 +48,12 @@ def set_workspace(path: str) -> None:
 
 
 def dataset_root(name: str) -> Path:
-    """A dataset's on-disk root = its registered staged_dir (may live outside the
-    workspace for pre-existing datasets — zero-move keeps them where they are)."""
+    """A dataset's on-disk root = its registered staged_dir (may be outside the workspace)."""
     return Path(known_datasets()[name]["staged_dir"])
 
 
 def dataset_run_roots() -> list[Path]:
-    """`<dataset>/runs` for every registered dataset still on disk — the roots the
-    Plotting page scans for local training runs."""
+    """<dataset>/runs for every registered dataset still on disk."""
     roots = []
     for name, info in known_datasets().items():
         staged = info.get("staged_dir", "")
@@ -73,12 +63,8 @@ def dataset_run_roots() -> list[Path]:
 
 
 def run_roots(repo_root: str | None = None) -> list[Path]:
-    """Every place local training runs live — the ONE discovery source shared by
-    the Plotting list and the Inference run picker (plots.discover_runs walks
-    each root one level deep, so runs/<id> and runs/<backbone>/<id> both fit):
-    dataset-nested runs/, downloaded runs (<workspace>/inference), the Runs-page
-    layout, the repo's runs/, plus the legacy local_train_out key (read-only —
-    the Train page no longer writes it)."""
+    """Every place local runs live — the ONE discovery source for the Plotting
+    list and Inference run picker (each root walked one level deep)."""
     roots = [*dataset_run_roots(), workspace_dir() / "inference", runs_dir()]
     if repo_root:
         roots.append(Path(repo_root) / "runs")
@@ -89,8 +75,7 @@ def run_roots(repo_root: str | None = None) -> list[Path]:
 
 
 def scratch_infer_dir() -> Path:
-    """Where inference from a loose .pth (no linked dataset) lands — a findable
-    spot in the workspace instead of forcing a dataset pick."""
+    """Where inference from a loose .pth (no linked dataset) lands."""
     return workspace_dir() / "_scratch" / "infer"
 
 
@@ -117,15 +102,11 @@ def set_exec_mode(mode: str) -> None:
     put("exec_mode", "local" if mode == "local" else "modal")
 
 
-# Defaults for the local backend. Roots default to the dirs the GUI already
-# uses (so a converted dataset / inference job is immediately reachable); every
-# value is overridable from state.json["local_config"] for I/O modularity.
-# (Older state.json files may carry retired keys — images/registry/extra_args
-# from docker, enabled_backbones from the removed model filter — all ignored.)
+# local-backend defaults; retired keys in old state.json (docker-era) are ignored
 _DEFAULT_LOCAL_CONFIG = {
     "datasets_root": "",   # -> TT_DATASETS_ROOT (default: workspace_dir())
     "outputs_root": "",    # -> TT_OUTPUTS_ROOT  (default: local_runs_dir())
-    "gpus": "all",         # GPU selection ("all" | CUDA device id | "" to disable)
+    "gpus": "all",         # "all" | CUDA device id | "" to disable
 }
 
 
@@ -185,15 +166,13 @@ def forget_dataset(name: str) -> None:
     put("datasets", ds)
 
 
-# A dataset folder's record-keeping subdirs: kept when the dataset is deleted so
-# past training runs + inference outputs survive. Everything else is "data".
+# record-keeping subdirs kept when a dataset is deleted
 _KEEP_ON_DELETE = ("runs", "infer")
 
 
 def _rmtree_force(path: Path) -> str:
-    """Remove a file or a whole dir tree, best-effort. On Windows retry once after
-    clearing the read-only bit that blocks rmtree. Returns "" on success, else the
-    error string — NEVER raises (a throw would skip the caller's list refresh)."""
+    """Best-effort remove (Windows read-only retry). Returns "" or the error —
+    never raises (a throw would skip the caller's list refresh)."""
     import shutil
     import stat
 
@@ -216,18 +195,12 @@ def _rmtree_force(path: Path) -> str:
 
 
 def delete_dataset(name: str) -> tuple[str, str]:
-    """Forget a saved dataset AND delete its DATA on disk (train/val/test, meta,
-    prep cache), plus any per-dataset overrides keyed by name. Its runs/ and infer/
-    subdirs are KEPT for record keeping (and re-registered on the Plotting page).
-    Returns (staged_dir, error): error is "" when the data is gone (or there was
-    none), else the reason it couldn't be removed (locked/in-use file — common on
-    Windows). The registry entry + overrides are dropped regardless, so the list
-    stays consistent even if files linger. Every dataset is deletable."""
+    """Forget a dataset and delete its data (runs/ and infer/ are kept). Returns
+    (staged_dir, error); the registry entry is dropped even if files linger."""
     info = known_datasets().get(name, {})
     staged = info.get("staged_dir", "")
 
-    # Forget the entry + overrides FIRST so the list always reflects the delete,
-    # even if the on-disk cleanup below fails (locked files are common on Windows).
+    # forget first so the list reflects the delete even if cleanup fails
     forget_dataset(name)
     for key in ("dg_config",):
         allc = get(key, {})
@@ -235,9 +208,6 @@ def delete_dataset(name: str) -> tuple[str, str]:
             allc.pop(name, None)
             put(key, allc)
 
-    # Best-effort disk removal — must NEVER raise. Delete only the data; if runs/
-    # or infer/ are present, keep them (and the folder) and remove data per-child;
-    # otherwise there's nothing to preserve, so drop the whole folder.
     err = ""
     if staged and os.path.isdir(staged):
         root = Path(staged)
@@ -252,9 +222,7 @@ def delete_dataset(name: str) -> tuple[str, str]:
 
 
 def _register_kept_runs(root: Path) -> None:
-    """A deleted dataset's registry entry is gone, so dataset_run_roots() no longer
-    covers its kept runs/. Add it to the Plotting page's extra roots so those runs
-    stay visible for record keeping."""
+    """Keep a deleted dataset's runs/ visible via the Plotting page's extra roots."""
     runs = root / "runs"
     try:
         has_runs = runs.is_dir() and any(runs.iterdir())

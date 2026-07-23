@@ -1,16 +1,6 @@
-"""Read run artifacts and build matplotlib figures.
-
-Two figure builders, both drawing into a Figure() directly (no pyplot, so they
-work for headless PNG export *and* embedded Qt canvases):
-
-  single_run_figure(run_dir)         -> one run's val curves + final per-class IoU
-  multi_run_figure(run_dirs, metric) -> overlay several runs + their mean ± std
-
-Data sources written by the training scripts:
-  val_metrics.csv   epoch, val_acc, val_miou, iou_<Class>...  (periodic val pass)
-  metrics.csv       epoch, train_loss/acc/iou, ...            (per-epoch training)
-  test_metrics.json final val + test overall/per-class metrics
-  run.json          backbone, dataset, class names (run_config.json on legacy runs)
+"""Run-artifact figures, drawn into Figure() directly (no pyplot — works headless
+and embedded). Sources: val_metrics.csv, metrics.csv, test_metrics.json,
+run.json (run_config.json on legacy runs).
 """
 
 from __future__ import annotations

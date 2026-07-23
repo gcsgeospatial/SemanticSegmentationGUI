@@ -1,19 +1,6 @@
-"""Density-domain-generalization primitives, shared by every local_train_* script
-(and, when bundled, the modal_train_* wrappers).
-
-The whole problem reduces to one scalar: occupancy  o = rho * g^2  (mean points per
-voxel cell of size g, for areal density rho). A voxel subsample keeps <=1 point/cell,
-so it CAPS density at 1/g^2. Consequence:
-  * o >= 1  -> every cell filled, the subsampled cloud is ~a function of the surface,
-              not of rho -> the backbone is density-invariant for free.
-  * o <  1  -> cells go empty (Poisson holes), invariance breaks. This is the whole gap.
-The valve is one-way: you can always thin a dense cloud DOWN to g0 (safe), you can
-never invent the points a sparse cloud never captured (ill-posed). So everything here
-is built around the SPARSEST density you must serve.
-
-These are pure-numpy/scipy except `adabn_recalibrate` (torch). Run `python density.py`
-for the self-checks.
-"""
+"""Density-domain-generalization primitives for the local_train_* scripts.
+Occupancy o = rho*g^2; o < 1 breaks density invariance, and coarsening is
+one-way (thin dense, never densify sparse). `python density.py` self-checks."""
 import os
 
 import numpy as np
@@ -25,15 +12,7 @@ __all__ = [
 ]
 
 
-# --------------------------------------------------------------------------- #
-# Env-var overrides. The GUI "Density generalization (advanced)" panel saves a
-# per-dataset DG config and passes it to the run as DG_* env vars; each script
-# reads them in its config block via, e.g.
-#     DG_DENSITY_AUG = dg.env_bool("DG_DENSITY_AUG", globals()["DG_DENSITY_AUG"])
-# so every flag is controllable from the GUI (or a direct `DG_*=1 python ...`)
-# without becoming a CLI argument. globals()[...] avoids the assign-before-ref
-# UnboundLocalError when the local shadows the module constant.
-# --------------------------------------------------------------------------- #
+# DG_* env overrides (set by the GUI panel or directly), never CLI args.
 def env_bool(name, default):
     v = os.environ.get(name)
     return bool(default) if v is None else v.strip().lower() in ("1", "true", "yes", "on")
@@ -54,47 +33,26 @@ def env_str(name, default):
     return v if v not in (None, "") else default
 
 
-# --------------------------------------------------------------------------- #
-# D1 — density / grid jitter: pick a per-tile effective grid g_eff >= g0.
-# Coarsening g lowers output density (~1/g_eff^2), i.e. drives occupancy o<1 so
-# the model is trained across the density range it will meet at inference.
-# --------------------------------------------------------------------------- #
+# D1 — density/grid jitter: per-tile effective grid g_eff >= g0.
 def effective_grid(g0, coarsen_max=2.5, p_native=0.5, rng=None):
-    """Per-tile effective grid. Returns g0 with prob p_native (a full-occupancy
-    anchor every batch), else log-uniform in [g0, g0*coarsen_max].
-
-    coarsen_max ties to the sparsest density you must serve: to reach output
-    density rho_min from a model grid g0, set coarsen_max = 1/(g0*sqrt(rho_min)).
-    Coarsening only — you cannot densify a subsampled tile (the one-way valve).
-    """
+    """g0 with prob p_native, else log-uniform in [g0, g0*coarsen_max]
+    (coarsen_max = 1/(g0*sqrt(rho_min)) reaches output density rho_min)."""
     rng = rng or np.random.default_rng()
     if coarsen_max <= 1.0 or rng.random() < p_native:
         return float(g0)
     return float(g0) * float(np.exp(rng.uniform(0.0, np.log(coarsen_max))))
 
 
-# --------------------------------------------------------------------------- #
-# D0 / D0b — canonicalize to a grid: first point per g-cell. Used both to
-# resample a training tile to g_eff (D1) and to thin a too-dense inference
-# cloud down to the model's trained g0 (D0b). 'first' (not barycenter) keeps a
-# real measurement and lets companion arrays / labels slice by the same index.
-# --------------------------------------------------------------------------- #
+# D0/D0b — canonicalize to a grid: first point per g-cell.
 def voxel_first_idx(xyz, g):
-    """Indices of the first point falling in each g-sized voxel. Slice xyz AND
-    every per-point companion (labels, intensity, hag, ...) by these indices to
-    get a density-canonicalized cloud at <=1 point per g-cell."""
+    """Indices of the first point per g-voxel; slice every per-point companion
+    array by them too."""
     keys = np.floor(np.asarray(xyz)[:, :3] / float(g)).astype(np.int64)
     _, idx = np.unique(keys, axis=0, return_index=True)
     return np.sort(idx)            # preserve original point order
 
 
-# --------------------------------------------------------------------------- #
-# D3b — explicit local-density feature so the net learns a density-CONDITIONAL
-# boundary instead of one entangled with density. log of the k-th NN distance is
-# the cleanest scalar: d_k ~ rho^(-1/2), so log d_k ~ -0.5 log rho (a clean,
-# bounded density coordinate). Feed it as an extra input channel (pair with D1
-# augmentation, or it sees no variation to learn from).
-# --------------------------------------------------------------------------- #
+# D3b — local-density input channel: log d_k ~ -0.5 log rho (pair with D1).
 def local_density_logdk(xyz, k=8):
     """Per-point log distance to the k-th nearest neighbour (natural log).
     Larger = sparser. Returns float32 array, shape (N,)."""
@@ -109,30 +67,11 @@ def local_density_logdk(xyz, k=8):
     return np.log(np.maximum(dk, 1e-6)).astype(np.float32)
 
 
-# --------------------------------------------------------------------------- #
-# D2b — AdaBN: re-estimate BatchNorm running stats on the (unlabeled) target so
-# the frozen source stats stop mis-normalizing at a different density. No labels,
-# no backprop. In 3D one tile = millions of points, so this is reliable even at
-# batch size 1. Single highest-ROI label-free patch.
-# --------------------------------------------------------------------------- #
+# D2b — AdaBN: re-estimate BN running stats on the unlabeled target.
 def adabn_recalibrate(model, batches, forward, momentum=None, reset=True):
-    """Refresh BN running mean/var over target `batches`.
-
-    model    : nn.Module (BatchNorm layers anywhere inside).
-    batches  : iterable of inputs to feed `forward`.
-    forward  : callable(model, batch) -> runs a forward pass (output ignored).
-    momentum : BN momentum while accumulating. None (default) -> torch's
-               momentum=None mode, a CUMULATIVE average over all batches — the
-               PreciseBN estimator (Yan et al., "Rethinking 'Batch' in
-               BatchNorm"), unbiased in ~30-50 batches. A float -> exponential
-               average with that momentum (with reset=True, (1-m)^N of the
-               zeroed init survives N batches — feed enough of them).
-    reset    : if True, zero the running stats first so the estimate is purely
-               target-driven (pure AdaBN); if False, the existing stats act as a
-               source prior that the target updates ease into (source-prior mixing).
-
-    Leaves the model in eval() with adapted stats. Returns the model.
-    """
+    """Refresh BN running mean/var over target `batches` via forward(model, b).
+    momentum None = cumulative (PreciseBN); float = exponential. reset zeroes
+    stats first (pure AdaBN). Leaves model.eval(); returns the model."""
     import torch
     import torch.nn as nn
     bns = [m for m in model.modules()
@@ -159,9 +98,6 @@ def adabn_recalibrate(model, batches, forward, momentum=None, reset=True):
     return model
 
 
-# --------------------------------------------------------------------------- #
-# Self-checks: the smallest things that fail if the math is wrong.
-# --------------------------------------------------------------------------- #
 def _demo():
     rng = np.random.default_rng(0)
 
@@ -172,8 +108,7 @@ def _demo():
     assert all(g0 <= g <= g0 * 2.5 + 1e-9 for g in gs)
     assert max(gs) > g0 * 2.0                                            # range exercised
 
-    # voxel_first_idx: canonicalizing a DENSE cloud to g0 lands output occupancy
-    # ~1 (<=1 pt/cell) and lowers density; a denser input -> same output count.
+    # voxel_first_idx: dense cloud canonicalizes to ~1 pt/cell
     side = 20.0
     dense = rng.uniform(0, side, size=(40000, 3)); dense[:, 2] = 0.0     # ~100 pts/m^2
     idx = voxel_first_idx(dense, g0)

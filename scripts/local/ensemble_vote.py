@@ -1,28 +1,9 @@
-"""Cross-model ensemble over trainer_gui prediction files.
-
-All backbones predict on the SAME raw input points and their output reaches
-your folder as {scene}_pred.<fmt> (las/laz/ply/txt/csv after the GUI export, or
-the container's raw {scene}_pred.npz), so ensembling is per-point, independent
-of architecture. Ensembling 2-3 models is the contest-era trick that survived
-into modern recipes (~+2 mIoU for 3 models on the 2024 Waymo winner).
-
-Voting: when every matched scene npz carries the saved class distribution
-("probs", written under TT_SAVE_PROBS=1), the distributions are AVERAGED and
-argmax wins (soft vote — confidence = max of the average). Otherwise it falls
-back to a confidence-weighted hard vote: each model's label weighted by its
-per-point confidence (1.0 when absent), confidence = the winning weight share.
-Every output also carries "agreement": the fraction of models whose own label
-matches the final one, and "dominant_member": the per-point index (input
-order, names in "member_names") of the model that most drove the final label —
-exported to las/laz as the "ens_member" scalar field. Class compatibility is
-clamped via each folder's infer_run.json when present.
-
-Scenes are matched by filename (minus extension) across the input folders.
-Points are matched by row when the clouds are identical (the normal case); if a
-model's cloud differs (e.g. it filtered points), its rows are carried onto the
-first model's points by nearest neighbour. Hard-vote ties go to the earliest-
-listed model — put your strongest model first. Output is written in the first
-input's format.
+"""Cross-model ensemble over trainer_gui *_pred.<fmt> files, matched by
+filename across input folders. Soft vote (averaged "probs") when every member
+carries them, else confidence-weighted hard vote; output adds "agreement" and
+"dominant_member" (las/laz field "ens_member"), class sets clamped via
+infer_run.json. Hard-vote ties go to the earliest input — put your strongest
+model first; output uses the first input's format.
 
 Usage:
   python ensemble_vote.py --inputs predsA predsB [predsC ...] --out out_dir
@@ -40,13 +21,9 @@ REPO_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
 
 
 def soft_vote(probs, labels=None):
-    """probs: (M, N, C) normalized distributions, one per model. Returns
-    ((N,) argmax labels, (N,) f32 confidence = max of the averaged distribution).
-    A model that never covered a point leaves an all-zero row there (predict_points
-    NN-fills the label only), so average over the COVERING models, not over M —
-    otherwise a lone member's 0.99 is diluted to 0.33 and the export threshold
-    rewrites the point to Unclassified. Points no model covered have no
-    distribution at all; they fall back to a plain vote over `labels`."""
+    """(M, N, C) distributions -> ((N,) argmax labels, (N,) f32 confidence).
+    Averages over the COVERING models only (all-zero row = not covered);
+    points nobody covered fall back to a plain vote over `labels`."""
     probs = np.asarray(probs, np.float32)
     cov = (probs.sum(-1) > 0).sum(0)                  # (N,) models that saw each point
     p = probs.sum(0) / np.maximum(cov, 1)[:, None]
@@ -85,10 +62,9 @@ def agreement(labels, final):
 
 
 def dominant_member(voted, probs=None, labels=None, weights=None):
-    """(N,) uint8 index of the member that most drove the final label: highest
-    prob mass on the voted class (soft), or highest weight among members whose
-    own label matches it (hard). Ties -> earliest member. Soft-vote points no
-    member covered land on member 0 (agreement/confidence already flag them)."""
+    """(N,) uint8 index of the member that most drove the final label (soft:
+    prob mass on the voted class; hard: weight among matching members).
+    Ties -> earliest; uncovered soft-vote points land on member 0."""
     voted = np.asarray(voted)
     if probs is not None:
         sup = np.asarray(probs, np.float32)[:, np.arange(len(voted)), voted]
@@ -104,8 +80,7 @@ def load_pred(path):
     through the GUI's readers (probs never survive an export — npz only)."""
     if path.endswith(".npz"):
         z = np.load(path)
-        # xyz float64: preds carry georeferenced (UTM ~1e6) coords — a float32
-        # cast quantizes the voted deliverable's northing to 0.5 m steps.
+        # float64: a float32 cast quantizes UTM northing to 0.5 m steps
         return (z["xyz"].astype(np.float64), z["classification"].astype(np.int64),
                 z["intensity"] if "intensity" in z.files else None,
                 z["confidence"].astype(np.float32) if "confidence" in z.files else None,
@@ -151,10 +126,8 @@ def write_out(path, xyz, cls, intensity, confidence, agree, crs_wkt=None,
 
 
 def align_idx(ref_xyz, xyz):
-    """Row map from xyz onto ref_xyz: None when the clouds already match row-for-
-    row (fast path); else NN indices so lab/conf/probs can all be re-rowed.
-    rtol=0 is load-bearing: on UTM coords numpy's default rtol=1e-5 would make
-    the tolerance ~50 m and any same-length cloud would take the fast path."""
+    """Row map from xyz onto ref_xyz: None when rows already match, else NN
+    indices. rtol=0 is load-bearing — the default rtol=1e-5 is ~50 m on UTM."""
     if len(xyz) == len(ref_xyz) and np.allclose(xyz, ref_xyz, rtol=0.0, atol=1e-4):
         return None
     from scipy.spatial import cKDTree      # lazy: only the mismatch path needs it

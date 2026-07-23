@@ -1,14 +1,7 @@
-"""Local smoke test for the trainer_gui pipeline — no Modal calls, no GPU.
+"""Local smoke test — no Modal calls, no GPU.
 
 Run:  python tests/smoke_test.py   (from the trainer_gui/ project dir)
-
-Covers: synthetic LAZ/PLY/ASCII scenes -> canonical conversion (field + companion
-label specs), npz contract, meta + recommendations, inference-job conversion
-(incl. opt-in HAG), density-generalization manifest round-trip, training-log
-parsing, ground-truth comparison stats, modal↔pixi env-sync, local pixi backend.
-
-Every check here guards code the shipped app reaches. If a function's only caller
-is this file, delete the function — don't add a check for it.
+Only check code the shipped app reaches; if this file is the only caller, delete the function.
 """
 
 from __future__ import annotations
@@ -24,8 +17,7 @@ import numpy as np
 
 _ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_ROOT))
-# train scripts moved under scripts/{local,modal,helper}; keep the bare module
-# names importable (import_module("local_train_ptv3"), _modal_shim, …).
+# keep bare module names (local_train_ptv3, _modal_shim, …) importable
 for _d in ("scripts/local", "scripts/modal", "scripts/helper"):
     sys.path.insert(0, str(_ROOT / _d))
 
@@ -83,8 +75,7 @@ def write_ascii(pc_path, cls_path, xyz, labels, intensity):
 
 
 def main():
-    # Windows consoles default to cp1252; any non-ASCII in test or progress
-    # output (✓, …, ²) would otherwise crash the run on the print, not the logic.
+    # cp1252 consoles crash on non-ASCII prints (✓, ²)
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except (AttributeError, ValueError):
@@ -93,8 +84,6 @@ def main():
     print(f"workdir: {tmp}")
     try:
         # ---------------- LAZ dataset with field labels (value 0 ignored)
-        # Provide explicit val + test folders so the three materialized splits are
-        # deterministic (train keeps scene0/scene1; val + test come verbatim).
         laz_root = tmp / "laz_src"
         for split, k in (("train", 2), ("val", 1), ("test", 1)):
             d = laz_root / split
@@ -116,7 +105,8 @@ def main():
         staged = dataset.convert_dataset("laz_demo", str(laz_root / "train"), spec, classes,
                                          [0], tmp / "staging",
                                          val_inputs=[str(laz_root / "val")],
-                                         test_inputs=[str(laz_root / "test")], progress=print)
+                                         test_inputs=[str(laz_root / "test")],
+                                         feature_fields=["intensity"], progress=print)
         z = np.load(staged / "train" / "scene0.npz")
         check("laz npz: keys", {"xyz", "label", "rgb", "intensity"}.issubset(z.files))
         check("laz npz: xyz f64 (N,3)", z["xyz"].dtype == np.float64 and z["xyz"].shape[1] == 3)
@@ -125,6 +115,11 @@ def main():
         check("laz npz: ignored value 0 -> -1", (z["label"] == -1).sum() > 0)
         check("laz npz: intensity p95-normalized 0..2 (default matches the GUI)",
               0.0 <= z["intensity"].min() and z["intensity"].max() <= 2.0)
+        check("laz npz: UNREQUESTED canonical channel is NOT baked (no defaults)",
+              "return_number" not in z.files)
+        check("channels: canonical spellings intercepted, rest stay feat_* fields",
+              dataset.split_feature_fields(["Intensity", "scalar_ReturnNumber", "eig_lin"])
+              == ({"intensity", "return_number"}, ["eig_lin"]))
         meta = json.loads((staged / "dataset_meta.json").read_text())
         check("meta: num_classes 3", meta["num_classes"] == 3)
         check("meta: class names ordered", meta["class_names"] == ["Ground", "Veg", "Building"])
@@ -141,17 +136,11 @@ def main():
         check("meta: recommendations for all backbones",
               "ptv3" in meta["recommendations"] and "kpconvx_cold" in meta["recommendations"])
         grid = meta["recommendations"]["ptv3"]["grid"]
-        # 20k pts over ~100x100m -> 2 pts/m² -> spacing .71m -> 1.25x = 0.88 (in band)
         check(f"meta: ptv3 grid clamped to band (got {grid})", 0.10 <= grid <= 2.0)
         check("meta: kpconvx grid clamped to its band",
               0.4 <= meta["recommendations"]["kpconvx_cold"]["grid"] <= 2.0)
 
-        # ---------------- analysis.recommend: aerial density sweep 0.5 -> 1000 pts/m2.
-        # Occupancy o = rho*g^2 must stay >= 1 (the density-invariant band, see
-        # scripts/DENSITY_DG.md), grids shrink monotonically as density grows, and
-        # every value stays inside its UI band so the Train page never clamps.
-        # The whole sweep is folded into two checks — one failing (rho, backbone)
-        # is named in the message, so per-cell checks bought nothing but noise.
+        # ---------------- analysis.recommend: density sweep (o = rho*g^2 >= 1, see scripts/DENSITY_DG.md)
         DENSITIES = (0.5, 2.0, 10.0, 50.0, 100.0, 250.0, 1000.0)
         recs = {rho: analysis.recommend({"stats": {"mean_pts_per_m2": rho,
                                                    "mean_spacing_m": rho ** -0.5}})
@@ -185,8 +174,6 @@ def main():
                                      )["ptv3"]["chunk_xy"] ** 2 * d <= 80_000
                   for d in (2.0, 10.0, 50.0)))
         dg_wide = analysis.dg_recommend(1000.0, 2.0)   # UAV-trained, QL2 inference
-        # need comes from the grid the model ACTUALLY trains at (ptv3 pinned at
-        # 0.15 by the crop), not the raw density ratio: 1/(0.15*sqrt(2)) ~ 4.7
         check("dg: dense-trained gap sized to the real (pinned) grid, not the ratio",
               4.5 <= dg_wide["coarsen_max"] <= 5.0 and dg_wide["p_native"] == 0.35
               and dg_wide["tta"] == 4 and dg_wide["logdk"]
@@ -202,8 +189,7 @@ def main():
         check("dg: no aug when the pinned training grid already covers the target",
               analysis.dg_recommend(100.0, 50.0)["density_aug"] is False)
 
-        # ---------------- scene split: a folder of clouds is split by WHOLE scenes
-        # (no tiling) into three disjoint train/val/test folders.
+        # ---------------- scene split: whole scenes into disjoint train/val/test
         sc_src = tmp / "scene_src"
         sc_src.mkdir()
         for i in range(3):
@@ -225,8 +211,6 @@ def main():
               and not (set(va_sc) & set(te_sc)))
         check("scene-split: meta records split mode + seed",
               msc["split"]["mode"] == "random" and msc["split"]["seed"] == 42)
-        # Parallel conversion must not change the split: same folder + seed -> same
-        # scene->split mapping (guards the order-preserving map in _convert_many).
         staged_sc2 = dataset.convert_dataset(
             "laz_scene2", str(sc_src), spec, classes, [0], tmp / "staging",
             split=dataset.SplitConfig(val_frac=0.34, test_frac=0.33, mode="random", seed=42))
@@ -234,13 +218,10 @@ def main():
         check("scene-split: deterministic across runs (parallel-safe)",
               all(sorted(msc["splits"][sp]["scenes"]) == sorted(msc2["splits"][sp]["scenes"])
                   for sp in ("train", "val", "test")))
-        # Worker cap stays sane: >=1, never more than the file count (3 here).
         wc = dataset._worker_cap_detail(list(sc_src.glob("*.laz")))[0]
         check(f"convert: worker cap RAM/core-clamped (got {wc})", 1 <= wc <= 3)
 
-        # ---------------- single-cloud split: one cloud is tile-measured and
-        # reassembled into three holey train/val/test clouds (seam_buffer=0 here so
-        # points are conserved; a positive buffer would drop a seam to limit leakage).
+        # ---------------- single-cloud split (seam_buffer=0 conserves points)
         staged_sp = dataset.convert_dataset(
             "laz_spatial", str(laz_root / "train" / "scene0.laz"), spec, classes, [0],
             tmp / "staging", split=dataset.SplitConfig(val_frac=0.3, test_frac=0.3,
@@ -296,7 +277,8 @@ def main():
                        {"index": 1, "source_value": 6, "name": "Building"}]
         staged_txt = dataset.convert_dataset("txt_demo", str(txt_root / "train"), spec_txt,
                                              classes_txt, [0], tmp / "staging",
-                                             val_inputs=[str(txt_root / "val")])
+                                             val_inputs=[str(txt_root / "val")],
+                                             feature_fields=["intensity", "return_number"])
         zt = np.load(sorted((staged_txt / "train").glob("*.npz"))[0])
         check("ascii npz: intensity + return_number captured",
               "intensity" in zt.files and "return_number" in zt.files)
@@ -309,14 +291,15 @@ def main():
         check("infer npz: p95 intensity clipped to [0,2]",
               0.0 <= zi["intensity"].min() and zi["intensity"].max() <= 2.0)
 
-        # ---------------- backbones + appstate (imports used below)
+        # ---------------- backbones + appstate
         from trainer_gui import appstate
         from trainer_gui.backbones import BACKBONES
 
-        # intensity normalization modes differ: p95 scales hotter than max
         one = dataset.discover_scenes(txt_root / "val")[0]
-        dataset.convert_scene(one, None, {}, tmp / "imax.npz", intensity_norm="max")
-        dataset.convert_scene(one, None, {}, tmp / "ip95.npz", intensity_norm="p95")
+        dataset.convert_scene(one, None, {}, tmp / "imax.npz", intensity_norm="max",
+                              feature_fields=["intensity"])
+        dataset.convert_scene(one, None, {}, tmp / "ip95.npz", intensity_norm="p95",
+                              feature_fields=["intensity"])
         imax, ip95 = np.load(tmp / "imax.npz")["intensity"], np.load(tmp / "ip95.npz")["intensity"]
         check("convert: max-norm intensity in [0,1]", imax.max() <= 1.0 + 1e-6)
         check("convert: p95-norm intensity >= max-norm and <= 2",
@@ -326,9 +309,6 @@ def main():
         check("backbones: registry = the 4 cold scripts + 3 pcssl encoders",
               set(BACKBONES) == {"ptv3", "randlanet", "kpconvx_cold", "kpconv",
                                  "concerto", "sonata", "utonia"})
-        # pcssl family: one shared trainer; the sonata/utonia wrappers must
-        # override the core's PKG/HF/BB_KEY constants per CALL, never at
-        # import (several entry points share one process here).
         import local_train_concerto as _pc
         import local_train_sonata as _ps
         import local_train_utonia as _pu
@@ -356,9 +336,6 @@ def main():
         # ---------------- density generalization: env mapping + run.json round-trip
         import train_common
 
-        # dg_config_to_env emits TRAIN-time vars only (density aug + the logdk channel,
-        # which changes the input width). AdaBN/TTA are inference-time (set on the Infer
-        # page), so they must NOT leak into the train launch env.
         dg_cfg = {"density_aug": True, "coarsen_max": 2.5, "p_native": 0.5,
                   "logdk": True, "logdk_k": 12, "adabn": True, "tta": 3}
         dg_env = analysis.dg_config_to_env(dg_cfg)
@@ -369,7 +346,6 @@ def main():
               "DG_INFER_ADABN" not in dg_env and "DG_INFER_TTA" not in dg_env)
         check("dg: empty config -> baseline (no vars)", analysis.dg_config_to_env({}) == {})
 
-        # loss/class-balance: only non-default knobs become LOSS_*/RARE_* env
         base = {"focal": False, "focal_gamma": 2.0, "class_weighting": True,
                 "weight_beta": 0.5, "rare_oversample": True}
         check("loss: all-default config emits nothing", analysis.loss_config_to_env(base) == {})
@@ -381,8 +357,6 @@ def main():
         check("loss: gamma is ignored unless focal is on",
               "LOSS_FOCAL_GAMMA" not in analysis.loss_config_to_env({**base, "focal_gamma": 3.0}))
 
-        # write_run_manifest bakes the DG block (read from the training env) into run.json
-        # so a logdk model is self-describing; infer_meta reads it back at inference.
         dg_run = tmp / "dg_run"
         dg_run.mkdir()
         (dg_run / "run_config.json").write_text(json.dumps(
@@ -402,8 +376,6 @@ def main():
               train_common.write_run_manifest(str(dg_run), "ptv3")["dg"]["logdk"] is False)
 
         # ---------------- graceful stop: the /outputs/STOP sentinel contract
-        # (GUI touches it, trainer consumes it at epoch end and breaks into the
-        # normal final-eval + finalize path).
         _orig_sentinel = train_common.STOP_SENTINEL
         stop_f = tmp / "STOP"
         train_common.STOP_SENTINEL = str(stop_f)
@@ -418,9 +390,7 @@ def main():
         finally:
             train_common.STOP_SENTINEL = _orig_sentinel
 
-        # ---------------- path contract: TT_* env roots (pixi local backend).
-        # Unset vars = the container mounts, byte-for-byte (Modal unaffected);
-        # the pixi backend repoints them at real host dirs.
+        # ---------------- path contract: TT_* env roots (unset = container mounts)
         import importlib
         _tt_saved = {k: os.environ.pop(k, None)
                      for k in ("TT_DATASETS_ROOT", "TT_OUTPUTS_ROOT",
@@ -493,11 +463,7 @@ def main():
         check("mask: kp_make_predict_points accepts exclude_idx",
               "exclude_idx" in inspect.signature(train_common.kp_make_predict_points).parameters)
 
-        # Train page's Modal-presence check parses `modal volume ls --json` entries
-        # whose basename key varies by CLI version — lock the parser.
         from trainer_gui.pages.infer_page import _entry_name, _localize_paths, _parse_run_ref
-        # The Inference run box accepts the train log's copy string verbatim
-        # (<volume>/runs/<id>), plus every older shape that already worked.
         check("infer: _parse_run_ref handles pasted volume paths and bare ids",
               _parse_run_ref("ptv3-hag-outputs/runs/20260709_195750_ieee-test_ptv3_hag")
               == ("ptv3-hag-outputs", "20260709_195750_ieee-test_ptv3_hag")
@@ -505,7 +471,6 @@ def main():
               and _parse_run_ref("20260709_1957  (ptv3_hag)") == ("", "20260709_1957")
               and _parse_run_ref("/vol/runs/id/") == ("vol", "id")
               and _parse_run_ref("") == ("", ""))
-        # Modal CLI removed `volume get -f` (only --force remains); `put` keeps -f.
         from trainer_gui import modal_cli
         check("modal_cli: volume get spells out --force (short -f was removed)",
               "--force" in modal_cli.volume_get("v", "runs/x", "d")[1]
@@ -517,9 +482,6 @@ def main():
         check("infer: _manifest_in reads run.json from a downloaded run folder",
               _manifest_in(mdir)["backbone"] == "ptv3"
               and _manifest_in(tmp / "no_such_run") is None)
-        # Post-conversion channel report: flags scenes missing intensity, BLOCKS
-        # on a missing feat_hag (an ordinary hard feat_* requirement) with the
-        # HAG-box hint — the scene npz is the model's literal input.
         from trainer_gui.pages.infer_page import _scene_channel_report
         cdir = tmp / "chan_job" / "scenes"
         cdir.mkdir(parents=True)
@@ -540,9 +502,7 @@ def main():
               hag_ok_block is False
               and not any("feat_hag" in s for s in hag_ok_lines))
 
-        # ---------------- feature channels (Phase 2): user-picked extra dims ride
-        # as feat_<name> npz keys, meta records the raw-field mapping, inference
-        # bakes them, and the channel report BLOCKS scenes missing a required one.
+        # ---------------- feature channels: user-picked extra dims as feat_<name>
         feat_root = tmp / "feat_src"
         for split, k in (("train", 2), ("val", 1)):
             d = feat_root / split
@@ -597,8 +557,7 @@ def main():
             pfs_raised = True
         check("feat: parse_feat_spec raises on an unknown channel name", pfs_raised)
 
-        # ---------------- computed geometric channels (jakteristics): engine
-        # numerics, meta record, single-cloud ferry, infer recompute + gating.
+        # ---------------- computed geometric channels (jakteristics)
         from trainer_gui import pretrain
         gp = np.mgrid[0:40, 0:40].reshape(2, -1).T.astype(np.float64) * 0.4
         geo_plane = np.c_[gp, np.zeros(len(gp))]              # 16x16 m flat plane
@@ -642,8 +601,6 @@ def main():
                   {"name": "geo_pca1", "source_field": "@geo:PCA1",
                    "norm": "raw", "radius": 1.5}])
 
-        # Single-cloud split: values must be the WHOLE-cloud computation ferried
-        # into the tiles (exact float match), not per-split recomputes.
         staged_gsp = dataset.convert_dataset(
             "geo_spatial", str(laz_root / "train" / "scene0.laz"), spec, classes, [0],
             tmp / "staging", split=dataset.SplitConfig(val_frac=0.3, test_frac=0.3,
@@ -683,8 +640,6 @@ def main():
               and _entry_name({"Filename": "train/"}) == "train"
               and _entry_name({"name": "a.npz"}) == "a.npz"
               and _entry_name({}) == "")
-        # Local runs must show the host output folder, not the container's /datasets
-        # bind-mount path — both the leading-slash and bare forms the scripts print.
         check("infer: _localize_paths maps container paths to the host output folder",
               _localize_paths("labeling -> /datasets/_infer/J/predictions/s_pred.ply",
                               "J", r"C:\out", r"C:\stage") == r"labeling -> C:\out/s_pred.ply"
@@ -692,18 +647,12 @@ def main():
                                   "J", r"C:\out", r"C:\stage") == r"done — predictions in C:\out")
 
         # ---------------- prediction export (Inference page format picker)
-        # The scripts' *_pred.npz (xyz + class, straight from inference) -> chosen
-        # format carrying xyz + classification; the inferred data is transformed
-        # directly into the target type (no coloured PLY); the source npz is KEPT
-        # (raw indices + confidence) so a new threshold re-exports without inference.
         exd = tmp / "pred_export"
         exd.mkdir()
         ex_cls = np.array([0, 1, 2, 3, 4, 2, 0], np.int64)
         ex_xyz = make_xyz(7)
 
         def _mk_pred():
-            # scripts now write inferred data as a compact npz (xyz + class); export
-            # writes the chosen type straight from it — no intermediate coloured PLY.
             np.savez(exd / "sceneX_pred.npz", xyz=ex_xyz.astype(np.float32),
                      classification=ex_cls.astype(np.int32))
 
@@ -754,8 +703,6 @@ def main():
         for f in ("crs_src.las", "crs_scene.npz", "crsY_pred.npz", "crsY_pred.las"):
             (exd / f).unlink()
 
-        # geographic (lon/lat) input fails loud at conversion — every meter-
-        # denominated knob (tile_m, chunk_xy, radii, grids) would mean degrees.
         gh = laspy.LasHeader(point_format=6, version="1.4")
         gh.offsets = [0, 0, 0]
         gh.scales = [1e-7, 1e-7, 0.001]
@@ -774,15 +721,11 @@ def main():
               geo_raised and not (exd / "geo.npz").exists())
         (exd / "geo_src.las").unlink()
 
-        # no CRS at all: degree-looking coords only WARN (returned in stats),
-        # and a projected-magnitude cloud stays silent.
         wsub = dataset._crs_check(None, np.array([[13.0, 52.0, 0.0], [13.1, 52.1, 1.0]]), "g")
         wutm = dataset._crs_check(None, np.array([[5e5, 4.2e6, 0.0], [5e5 + 90, 4.2e6 + 90, 1.0]]), "u")
         check("crs: no-CRS heuristic warns on degree-like coords, silent on UTM-like",
               wsub is not None and wutm is None)
 
-        # write_pred (Phase 0): confidence + probs ride in the npz with the
-        # dtype/shape contract the export threshold below depends on.
         train_common.write_pred(exd / "sceneC_pred.npz", ex_xyz, ex_cls,
                                 confidence=np.linspace(0.1, 1.0, 7, dtype=np.float32),
                                 probs=RNG.random((7, 5)).astype(np.float16))
@@ -792,9 +735,6 @@ def main():
                   and zc["probs"].dtype == np.float16 and zc["probs"].shape == (7, 5))
         (exd / "sceneC_pred.npz").unlink()
 
-        # confidence threshold + class remap at export: model indices map to the
-        # dataset's source values; points under the cut become ASPRS class 1
-        # (Unclassified); confidence rides into the LAS as an Extra Bytes dim.
         from trainer_gui import readers
         np.savez(exd / "sceneT_pred.npz", xyz=make_xyz(3).astype(np.float32),
                  classification=np.array([0, 1, 2], np.int32),
@@ -812,14 +752,10 @@ def main():
         check("export: re-export of the kept npz at threshold 0.0 marks nothing",
               list(c0) == [10, 11, 12])
 
-        # ---------------- ensemble vote (Phase 3): soft vote over saved probs,
-        # class clamp, confidence-weighted fallback, agreement. Drives the
-        # functions the GUI's ensemble mode calls; the Qt member loop itself is
-        # GUI-side and not smoke-testable.
+        # ---------------- ensemble vote (the Qt member loop is GUI-side, untestable here)
         import ensemble_vote as evote
-        _q = lambda s: None   # quiet log for the ensemble() calls
+        _q = lambda s: None   # quiet log
 
-        # soft vote overturns a 2-1 hard majority when the majority is unsure
         sv_lab, sv_conf = evote.soft_vote(np.array(
             [[[0.9, 0.1]], [[0.45, 0.55]], [[0.45, 0.55]]], np.float32))
         hv_lab, _ = evote.weighted_vote(np.array([[0], [1], [1]]),
@@ -834,7 +770,6 @@ def main():
               wv_lab.tolist() == [0, 0] and abs(float(wv_conf[0]) - 0.9 / 1.3) < 1e-6
               and float(wv_conf[1]) == 1.0)
 
-        # synthetic 3-model trio end-to-end: infer_run.json clamp + npz payload
         ens = tmp / "ens"
         ex3 = make_xyz(3).astype(np.float32)
         EP = [np.array([[0.9, 0.1], [0.6, 0.4], [0.2, 0.8]], np.float32),
@@ -859,7 +794,6 @@ def main():
                   ez["classification"].tolist() == [0, 0, 1]
                   and np.allclose(ez["confidence"], [0.6, 0.7, 0.7], atol=2e-3)
                   and np.allclose(ez["agreement"], [1 / 3, 1.0, 1.0]))
-        # clamp: mismatched class_names across infer_run.json refuse loudly
         (ens / "m1" / "infer_run.json").write_text(json.dumps(
             {"num_classes": 2, "class_names": ["a", "c"]}), encoding="utf-8")
         try:
@@ -870,7 +804,6 @@ def main():
         check("ensemble: class clamp refuses mismatched class_names", clamp_raised)
         (ens / "m1" / "infer_run.json").write_text(json.dumps(
             {"num_classes": 2, "class_names": ["a", "b"]}), encoding="utf-8")
-        # one member without probs -> confidence-weighted hard vote for the scene
         with np.load(ens / "m2" / "s_pred.npz") as zslim:
             slim = {k: zslim[k] for k in zslim.files if k != "probs"}
         np.savez(ens / "m2" / "s_pred.npz", **slim)
@@ -914,9 +847,7 @@ def main():
         check("plots: multi_run_figure overlays runs + an average line",
               len(line_labels) == 3 and any("average" in s for s in line_labels))
 
-        # inline HAG: bake it during tiling in one pass (no separate reload).
-        # ground_value=2 (the "Ground" source value) -> the labels are the ONLY
-        # ground source (CSF never runs); grid nearest-fills label gaps.
+        # ---------------- inline HAG during tiling (ground_value=2 -> labels only, no CSF)
         staged_ih = dataset.convert_dataset(
             "laz_hag_inline", str(laz_root / "train"), spec, classes, [0], tmp / "staging",
             val_inputs=[str(laz_root / "val")], test_inputs=[str(laz_root / "test")],
@@ -935,10 +866,6 @@ def main():
               {"name": "hag", "source_field": "@hag:grid+labels", "norm": "raw"}
               in mih["source"]["feature_channels"])
 
-        # convert_infer_job with the HAG box ticked + a ground class: resolves the
-        # 'classification' field off files[0], masks ground by value, bakes a
-        # feat_hag channel — and STILL writes no label key (empty value_to_index).
-        # Guards the whole opt-in HAG path; grid needs no PDAL.
         job_h = dataset.convert_infer_job("hag_job", str(laz_root / "val"),
                                           tmp / "staging", hag=True, hag_filter="grid",
                                           ground_value=2, progress=print)
@@ -946,9 +873,6 @@ def main():
         check("convert_infer_job(hag, ground_value): feat_hag baked, no label key",
               "feat_hag" in zjh.files and "label" not in zjh.files
               and zjh["feat_hag"].shape[0] == zjh["xyz"].shape[0])
-        # Ground SOURCE and interpolation are separate axes now; the SMRF-era
-        # fill-union knobs are gone — a ground class means labels only, no
-        # second source, and detection is CSF-only.
         import inspect
         from trainer_gui import pretrain
         check("hag: legacy smrf knobs removed from the whole chain",
@@ -958,15 +882,13 @@ def main():
               and "smrf_cell" not in inspect.signature(pretrain.hag_for_cloud).parameters
               and not hasattr(pretrain, "smrf_ground_mask")
               and callable(pretrain.csf_ground_mask))
-        # Ground from the labels must NOT equal ground from detection — otherwise
-        # ground_value silently isn't reaching hag_for_cloud's ground_mask.
+        # labels == detection would mean ground_value never reached ground_mask
         job_d = dataset.convert_infer_job("hag_detect_job", str(laz_root / "val"),
                                           tmp / "staging", hag=True, hag_filter="grid")
         zjd = np.load(next((job_d / "scenes").glob("*.npz")))
         check("convert_infer_job(ground_value): labeled ground != detected ground",
               "feat_hag" in zjd.files
               and not np.allclose(zjh["feat_hag"], zjd["feat_hag"]))
-        # HAG off = the default: not one wasted ground pass, no feat_hag channel.
         job_n = dataset.convert_infer_job("nohag_job", str(laz_root / "val"),
                                           tmp / "staging")
         zjn = np.load(next((job_n / "scenes").glob("*.npz")))
@@ -993,9 +915,6 @@ def main():
         check("parser: run id extracted", seen["run"] == "20260611_010101_demo_ptv3")
 
         # ---------------- ground-truth comparison stats (Inference page)
-        # analysis.prediction_metrics scores explicit per-point classifications
-        # only (a prediction npz 'classification'/'pred' vs a GT npz 'label' /
-        # LAS classification) — RGB-palette decoding is gone with the viewer.
         gtc = tmp / "gtcmp"
         gtc.mkdir()
         np.savez(gtc / "sceneY_pred.npz", xyz=make_xyz(5).astype(np.float32),
@@ -1009,16 +928,13 @@ def main():
               and gm["per_class_iou"] == {0: 1.0, 1: 0.5, 2: 0.5}
               and abs(gm["miou"] - 2 / 3) < 1e-9)
 
-        # ================= LOCAL (Docker) backend =================
+        # ================= LOCAL backend =================
         import importlib
 
         import _modal_shim
         from trainer_gui import local_cli
         BB = BACKBONES
 
-        # the modal shim must import every training script (no torch / no cloud)
-        # and expose its @app.local_entrypoint main + the recorded Image recipe.
-        # Derived from the registry so a new backbone is covered automatically.
         SCRIPTS = [Path(b.script).stem for b in BB.values()]
         shim_ok, recipe_ok = True, True
         for nm in SCRIPTS:
@@ -1039,15 +955,11 @@ def main():
                 recipe_ok = False
         check(f"local: modal shim imports all {len(SCRIPTS)} train scripts + finds main", shim_ok)
         check("local: every script records an Image recipe (env-sync source of truth)", recipe_ok)
-        # the shim's catch-all __getattr__ must RAISE on dunders, else inspect.getmodule
-        # reads modal.__file__ as a function and torch's import blows up (endswith bug).
         _modal_shim.install()
         check("local: shim raises on dunder lookups (inspect.getmodule-safe)",
               not hasattr(sys.modules["modal"], "__file__")
               and sys.modules["modal"].Volume is not None)
 
-        # decoupling: every local_train_X.py imports with NO modal (torch lives in
-        # the body) and exposes its train fn with no-op Volume stand-ins.
         LOCAL = [s.replace("modal_train_", "local_train_") for s in SCRIPTS]
         local_ok = True
         for nm in LOCAL:
@@ -1057,30 +969,21 @@ def main():
                 local_ok = False
                 continue
             fn = next((getattr(lm, n) for n in dir(lm) if n.startswith("train_")), None)
-            # Volumes are a Modal concept; the local scripts must carry NO stand-ins.
             if fn is None or hasattr(lm, "outputs_volume") or hasattr(lm, "datasets_volume"):
                 local_ok = False
         check(f"local: all {len(LOCAL)} local_train_*.py import + expose train fn + no volume stubs", local_ok)
-        # --mode infer labels arbitrary clouds from weights, so it must NOT demand a
-        # --dataset (the class count/names come from the checkpoint + its run.json).
-        # Calling with dataset=None must fault PAST the dataset gate (missing weights /
-        # Docker-only deps), never with the old "--dataset is required" error.
         infer_gate_ok = True
         for nm in LOCAL:
             lm = importlib.import_module(nm)
             fn = next((getattr(lm, n) for n in dir(lm) if n.startswith("train_")), None)
             try:
                 fn(dataset=None, mode="infer")   # no weights -> should fault in the infer branch
-                infer_gate_ok = False            # must raise (never silently proceed)
+                infer_gate_ok = False
             except Exception as e:               # noqa: BLE001
                 if "dataset is required" in str(e).lower():
                     infer_gate_ok = False
         check(f"local: --mode infer runs dataset-free (all {len(LOCAL)} backbones)", infer_gate_ok)
-        # Phase 0 contract: every backbone's infer path funnels through
-        # train_common.run_infer_scenes, so each produced *_pred.npz must carry a
-        # per-point max-softmax confidence in (0, 1] (the export threshold reads it).
-        # The trainers above fault at missing weights before predicting, so drive
-        # the shared loop with a stub predict instead of a GPU run.
+        # stub predict — the real trainers fault at missing weights before predicting
         il_dir = tmp / "infer_loop"
         il_dir.mkdir()
         _il_conf = np.array([0.4, 1.0, 0.7], np.float32)
@@ -1100,7 +1003,6 @@ def main():
         check("local: local_train_ptv3.py has no 'import modal' (source is decoupled)",
               "import modal" not in _lt_src and "_NoVol" not in _lt_src
               and "modal" not in _lt_src.lower())
-        # inversion: the modal wrapper bakes its local script in + shells out to it.
         _modal_shim.install()
         for m in list(sys.modules):
             if m.startswith("modal_train_"):
@@ -1110,8 +1012,7 @@ def main():
         check("local: modal wrapper bakes its local_train script into the image",
               any(k == "copy_file" and "local_train_ptv3.py" in p["src"] for k, p in _steps))
 
-        # check_env_sync: pixi features + conda recipes mirror the modal recipes
-        # (the modal.Image recipes stay the source of truth; drift fails here).
+        # ---------------- env sync (modal.Image recipes are the source of truth)
         import tools.check_env_sync as sync
         check("sync: all 7 pixi features + recipe SHAs match their modal recipes",
               sync.check_all() == [])
@@ -1120,7 +1021,6 @@ def main():
               _ms["pins"].get("torch") == "==2.1.0"
               and _ms["index_url"] == "https://download.pytorch.org/whl/cu118"
               and _ms["sha"] and len(_ms["sha"]) >= 7)
-        # the checker actually catches drift (not vacuously green)
         _bad = {**_ms, "pins": {**_ms["pins"], "torch": "==9.9.9"}}
         import tomllib as _toml
         with open(Path(sync.REPO) / "envs" / "pixi.toml", "rb") as _f:
@@ -1130,7 +1030,6 @@ def main():
         check("sync: a pin mismatch is reported as drift",
               any("torch" in e and "drift" in e for e in _errs))
 
-        # cross-platform app dir: APPDATA overrides everywhere; else native per-OS
         check("appstate: _app_base honors APPDATA on every platform",
               appstate._app_base("linux", {"APPDATA": "/x"}) == Path("/x")
               and appstate._app_base("win32", {"APPDATA": "/x"}) == Path("/x"))
@@ -1140,7 +1039,7 @@ def main():
               and appstate._app_base("darwin", {}) == Path.home() / "Library" / "Application Support"
               and appstate._app_base("win32", {"LOCALAPPDATA": "/la"}) == Path("/la"))
 
-        # local_cli + appstate exec mode/config, isolated to a throwaway APPDATA
+        # ---------------- local_cli + appstate (throwaway APPDATA)
         _old_appdata = os.environ.get("APPDATA")
         os.environ["APPDATA"] = str(tmp / "appdata_local")
         try:
@@ -1148,7 +1047,6 @@ def main():
             appstate.set_exec_mode("local")
             check("appstate: exec mode persists to local", appstate.get_exec_mode() == "local")
 
-            # delete_dataset: forget a saved entry AND remove its staged copy on disk
             del_dir = tmp / "to_delete_ds"
             del_dir.mkdir()
             (del_dir / "dataset_meta.json").write_text("{}", encoding="utf-8")
@@ -1160,8 +1058,6 @@ def main():
             check("appstate: delete_dataset forgets the entry + deletes its staged dir",
                   "to_delete" not in appstate.known_datasets() and not del_dir.exists())
 
-            # Even when on-disk removal fails (locked files on Windows), the entry
-            # MUST still be forgotten so the GUI list refreshes — forget happens first.
             import shutil as _sh
             stuck = tmp / "stuck_ds"
             stuck.mkdir()
@@ -1175,7 +1071,6 @@ def main():
             check("appstate: delete_dataset forgets the entry even when rmtree fails",
                   "stuck" not in appstate.known_datasets() and err)
 
-            # delete removes only the data; runs/ + infer/ are kept for record keeping
             keep_ds = tmp / "keep_ds"
             (keep_ds / "train").mkdir(parents=True)
             (keep_ds / "dataset_meta.json").write_text("{}", encoding="utf-8")
@@ -1223,18 +1118,14 @@ def main():
                   local_cli.env_name(BB["kpconvx_cold"]) == "kpconvx-cold"
                   and local_cli.env_name(BB["ptv3"]) == "ptv3")
 
-            # ---- workspace re-root: one root owns every dataset; runs + infer nest
-            # under it, host-side only (container paths /datasets, /outputs unchanged).
+            # ---- workspace re-root (host-side only; container paths unchanged)
             ws = tmp / "ws"
             appstate.set_workspace(str(ws))
-            # A prior check pinned datasets_root to a resolved path; clear it so we
-            # exercise the real default (blank -> derives from the workspace).
+            # clear the datasets_root a prior check pinned, so blank derives from the workspace
             appstate.set_local_config({**appstate.local_config(), "datasets_root": ""})
             check("appstate: workspace_dir + datasets_root default to the set workspace",
                   appstate.workspace_dir() == ws
                   and appstate.local_config()["datasets_root"] == str(ws))
-            # base /datasets = workspace (so /datasets/<name> resolves with no extra
-            # mount); the dataset's own folder bound to /outputs => runs at <ds>/runs/<id>.
             ds_root = ws / "myds"
             _, _, wenv = local_cli.run_script(
                 "modal_train_ptv3.py", {"dataset": "myds"}, BB["ptv3"],
@@ -1244,7 +1135,6 @@ def main():
                   and wenv["TT_OUTPUTS_ROOT"] == str(ds_root))
             check("appstate: scratch_infer_dir sits under the workspace",
                   appstate.scratch_infer_dir() == ws / "_scratch" / "infer")
-            # infer job nested under its owning dataset via out_dir (container path fixed)
             job2 = dataset.convert_infer_job("ijob", str(txt_root / "val"),
                                              ws, out_dir=ds_root / "infer" / "ijob")
             check("dataset: convert_infer_job(out_dir=) nests scenes under <ds>/infer/<job>",
@@ -1259,9 +1149,6 @@ def main():
                   and (ds_root / "runs") in appstate.dataset_run_roots())
             appstate.forget_dataset("myds")
 
-            # GUI env manager: install() targets the same env run_script uses, and
-            # all_statuses reports one row per backbone with the manager's contract
-            # (works whether or not pixi is installed on this box).
             pprog, pargs = local_cli.install(BB["randlanet"])
             check("local_cli: install() = `pixi install --frozen -e <env>`",
                   pargs[0] == "install" and "--frozen" in pargs
@@ -1272,8 +1159,6 @@ def main():
                   and all({"key", "label", "env", "installed", "pixi"} <= set(s)
                           for s in st)
                   and {s["key"] for s in st} == set(BB))
-            # env preflight: a missing env blocks with an install hint (fake repo
-            # root = nothing installed); a conda-meta dir flips it to installed.
             ok_env, msg_env = local_cli.env_preflight(BB["randlanet"], str(tmp / "norepo"))
             check("local_cli: missing pixi env blocks with an install hint",
                   ok_env is False and "pixi install" in msg_env)
@@ -1281,7 +1166,6 @@ def main():
             (_envroot / "conda-meta").mkdir(parents=True)
             check("local_cli: an installed env (conda-meta present) passes preflight",
                   local_cli.env_preflight(BB["randlanet"], str(tmp / "fakerepo"))[0])
-            # installed weight packages: share/trainer-weights/<name>/final_model.pth
             _w = _envroot / "share" / "trainer-weights" / "trainer-weights-myds-ptv3"
             _w.mkdir(parents=True)
             (_w / "final_model.pth").write_bytes(b"x")

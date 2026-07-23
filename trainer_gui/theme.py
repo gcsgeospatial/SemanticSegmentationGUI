@@ -1,16 +1,6 @@
-"""App theming — accessible Light / Dark / System with adaptive text colors.
-
-One source of truth for colors. `apply(app, mode)` sets the Fusion style (it fully
-honors the palette, unlike the native Windows style), a QPalette (so EVERY widget's
-text/background adapts — not just the ones we style), and a parameterized QSS. The
-status labels scattered through the pages use semantic *roles* (`muted`/`ok`/`warn`/
-`error`) via `set_accent`, so their text colour adapts with the theme instead of
-being a hardcoded light-mode hex.
-
-Accessibility: every text/background pair below meets WCAG AA (>=4.5:1 normal text,
->=3:1 for large/disabled), there are visible keyboard-focus outlines, and `system`
-mode follows the OS light/dark setting (and live-updates when it changes).
-"""
+"""App theming — Light/Dark/System. apply() sets Fusion + QPalette + QSS; status
+labels use semantic roles via set_accent. Every pair meets WCAG AA (see
+_check_contrast)."""
 
 from __future__ import annotations
 
@@ -18,8 +8,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import QApplication, QStyleFactory
 
-# ---- palettes (every value here is contrast-checked in tests/smoke_test) -------
-# Keys are shared by both themes so the QSS/QPalette builders stay DRY.
+# ---- palettes (contrast-checked in tests/smoke_test) ----
 LIGHT = {
     "bg": "#ffffff", "panel": "#ffffff", "text": "#1b1f27", "muted": "#5b6273",
     "border": "#d4d8e0", "disabled_text": "#767d8b",
@@ -47,7 +36,7 @@ DARK = {
 
 
 def resolve(mode: str) -> str:
-    """'light'/'dark'/'system' -> the concrete theme name. 'system' follows the OS."""
+    """'light'/'dark'/'system' -> concrete theme name."""
     if mode in ("light", "dark"):
         return mode
     try:
@@ -63,8 +52,7 @@ def colors(mode: str) -> dict:
 
 
 def _palette(c: dict) -> QPalette:
-    """A full QPalette so widgets we DON'T style (inputs, tooltips, menus, default
-    QLabels) still get correct, high-contrast text/background for the theme."""
+    """Full QPalette so unstyled widgets still adapt to the theme."""
     g = QColor
     p = QPalette()
     p.setColor(QPalette.Window, g(c["bg"]))
@@ -110,8 +98,7 @@ QWidget {{ font-size: 14px; }}
 #log {{ font-family: "Cascadia Code", "JetBrains Mono", Consolas, "Courier New", monospace;
         font-size: 12px;
         background: {c['log_bg']}; color: {c['log_text']}; border: 1px solid {c['border']}; }}
-/* console header strip (logconsole.LogConsole toolbar) — sits on the always-dark
-   terminal core, so its text colors are console constants, not theme tokens */
+/* console toolbar sits on the always-dark terminal core: console constants, not theme tokens */
 #logToolbar {{ background: {c['log_bg']}; border: 1px solid {c['border']}; border-bottom: none; }}
 #logToolbar QToolButton, #logToolbar QPushButton {{
     background: transparent; color: #8b93a4; border: none; border-radius: 3px;
@@ -121,12 +108,9 @@ QWidget {{ font-size: 14px; }}
 #logToolbar QToolButton:checked, #logToolbar QPushButton:checked {{
     color: #d6dae3; background: #2c3445; }}
 
-/* Plain line edits get breathing room (Fusion renders them crunched). Combos and
-   spin boxes stay native: QSS padding flips them to styled mode, whose arrow
-   subcontrols overlap and clip the text. */
+/* combos/spinboxes must stay native: QSS padding flips them to styled mode, which clips text */
 QLineEdit {{ padding: 5px 8px; border: 1px solid {c['border']}; border-radius: 4px;
              background: {c['panel']}; color: {c['text']}; }}
-/* the QLineEdit inside a native-rendered combo/spinbox: no inner box */
 QComboBox QLineEdit, QAbstractSpinBox QLineEdit {{
     padding: 0 2px; border: none; background: transparent; }}
 
@@ -144,13 +128,12 @@ QGroupBox {{ font-weight: 600; margin-top: 12px; border: 1px solid {c['border']}
              border-radius: 6px; padding: 18px 14px 14px 14px; color: {c['text']}; }}
 QGroupBox::title {{ subcontrol-origin: margin; left: 10px; padding: 0 4px; color: {c['text']}; }}
 
-/* keyboard-focus visibility (accessibility) */
 QPushButton:focus, QLineEdit:focus, QComboBox:focus, QPlainTextEdit:focus,
 QTextEdit:focus, QAbstractSpinBox:focus, QListWidget:focus {{
     border: 2px solid {c['focus']};
 }}
 
-/* semantic status text — adapts with the theme (set via theme.set_accent) */
+/* semantic status text (theme.set_accent) */
 QLabel[accent="muted"] {{ color: {c['muted']}; }}
 QLabel[accent="ok"]    {{ color: {c['ok']}; }}
 QLabel[accent="warn"]  {{ color: {c['warn']}; }}
@@ -159,8 +142,7 @@ QLabel[accent="error"] {{ color: {c['error']}; }}
 
 
 def apply(app: QApplication, mode: str) -> None:
-    """Apply the resolved theme to the running app (style + palette + stylesheet).
-    Safe to call repeatedly — re-applying live-switches the theme."""
+    """Apply the resolved theme; safe to call repeatedly (live-switches)."""
     c = colors(mode)
     if "Fusion" in QStyleFactory.keys():
         app.setStyle("Fusion")            # honors the palette on every platform
@@ -169,8 +151,7 @@ def apply(app: QApplication, mode: str) -> None:
 
 
 def set_accent(widget, role: str = "") -> None:
-    """Tag a label with a semantic colour role ('muted'|'ok'|'warn'|'error', or ''
-    to clear) so its text colour comes from the theme QSS and adapts on switch."""
+    """Tag a label with a semantic colour role ('muted'|'ok'|'warn'|'error', '' clears)."""
     widget.setProperty("accent", role or None)
     st = widget.style()
     st.unpolish(widget)

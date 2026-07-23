@@ -1,12 +1,5 @@
-"""Small shared UI helpers — stacked sections and a page-level vertical scroll.
-
-`vsplit`/`hsplit` used to return draggable QSplitters with fixed pixel sizes that
-cropped content. They now return plain stacked layouts: for `vsplit` the `sizes`
-become each section's *minimum* height plus a growth weight (so nothing is
-clipped and sections grow proportionally when there's room); for `hsplit` they're
-width weights. Pages are wrapped in `scroll_v`, so anything taller than the
-window scrolls instead of being squeezed.
-"""
+"""Shared UI helpers: vsplit/hsplit stacked layouts (sizes = minimum heights /
+width weights, not splitters) and the page-level scroll_v wrapper."""
 
 from __future__ import annotations
 
@@ -16,10 +9,7 @@ from PySide6.QtWidgets import QHBoxLayout, QPlainTextEdit, QScrollArea, QVBoxLay
 
 
 def append_log(log: QPlainTextEdit, text: str, newline: bool = True):
-    """Append to a log console without yanking a scrolled-up user back to the
-    bottom. Autoscrolls only if the view was already at (or within a line of)
-    the bottom before this append — the standard `tail -f` behavior — so
-    reading earlier output stays put while new lines keep arriving below."""
+    """Append with tail-f autoscroll: only follows if already at the bottom."""
     if hasattr(log, "begin_run"):   # logconsole.LogConsole: it owns scroll/color
         log.append(text, newline)
         return
@@ -31,8 +21,7 @@ def append_log(log: QPlainTextEdit, text: str, newline: bool = True):
         bar.setValue(bar.maximum())
 
 
-# Cross-page navigation: MainWindow registers its page switcher; pages call
-# navigate("Train", run=...) without importing (or even knowing about) main.
+# cross-page navigation: MainWindow registers its switcher; pages call navigate()
 _navigator = None
 
 
@@ -64,10 +53,8 @@ def _stack(layout_cls, widgets, sizes, vertical: bool) -> QWidget:
     sizes = sizes or [1] * len(widgets)
     for child, size in zip(widgets, sizes):
         if vertical:
-            # Floor: never crop a section. An explicit setMinimumHeight REPLACES
-            # the content-derived minimum, so clamp to whichever is larger — a
-            # bare `size` let dense forms be squashed until their rows overlapped.
-            # Spacing must be final before measuring, hence polish_forms here.
+            # clamp to the content-derived minimum: setMinimumHeight replaces it,
+            # and a bare `size` let dense forms squash until rows overlapped
             polish_forms(child)
             child.setMinimumHeight(max(int(size), child.minimumSizeHint().height()))
         else:

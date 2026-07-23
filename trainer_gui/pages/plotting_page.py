@@ -36,7 +36,6 @@ class PlottingPage(QWidget):
         sub.setObjectName("pageSub")
         root.addWidget(sub)
 
-        # ---- left: run list + controls
         left = QVBoxLayout()
         btn_row = QHBoxLayout()
         add_btn = QPushButton("Add runs folder…")
@@ -68,14 +67,12 @@ class PlottingPage(QWidget):
         left.addWidget(self.show_runs_chk)
         left.addWidget(self.show_avg_chk)
 
-        # Final test metrics (test_metrics.json) for a single selected run.
         self.test_label = QLabel("")
         self.test_label.setWordWrap(True)
         self.test_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.test_label.setVisible(False)
         left.addWidget(self.test_label)
 
-        # ---- right: embedded chart
         self.fig = plots.Figure(figsize=(9, 5.5))
         self.canvas = FigureCanvas(self.fig)
         self.canvas.setMinimumHeight(480)
@@ -89,9 +86,7 @@ class PlottingPage(QWidget):
 
     # ------------------------------------------------------------- run discovery
     def _default_roots(self) -> list[Path]:
-        """The ONE run-discovery source shared with the Inference picker:
-        appstate.run_roots (dataset-nested runs/, downloaded runs, Runs-page
-        layout, repo runs/, legacy local_train_out)."""
+        """The one run-discovery source shared with the Inference picker."""
         return appstate.run_roots(self.repo_root)
 
     def _rescan(self):

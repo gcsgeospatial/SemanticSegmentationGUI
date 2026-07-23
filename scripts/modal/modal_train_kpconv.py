@@ -1,36 +1,16 @@
-"""
-Modal shell for the ORIGINAL KPConv (deformable KPFCNN), COLD-START — thin
-subprocess wrapper.
-
-Random init (no warm-start). Provisions a GPU container + the outputs /
-terminal-datasets volumes, then shells out to the local trainer
-(scripts/local/local_train_kpconv.py) so local and cloud run byte-identical
-code. Trains on a canonical trainer_gui dataset passed via --dataset (staged on
-the terminal-datasets volume).
-
-  --dataset NAME                          canonical trainer_gui dataset
-  --grid / --chunk-xy / --epochs / --batch / --steps-per-epoch
-  --mode eval --weights runs/<id>/final_model.pth     # voted re-score, no train
-  --mode infer --weights runs/<id>/final_model.pth --infer-input <job_id>
-
-GPU type / timeout come from TT_GPU / TT_TIMEOUT_HOURS env vars.
-"""
+"""Modal shell for the original KPConv (cold-start) — shells out to
+local_train_kpconv.py so local and cloud run identical code. Flags: --dataset
+--grid --chunk-xy --epochs --batch --steps-per-epoch; --mode eval|infer
+--weights --infer-input. GPU/timeout from TT_GPU / TT_TIMEOUT_HOURS."""
 
 import os
 from typing import Optional
 
 import modal
 
-# ============================================================================
-# Configuration
-# ============================================================================
 APP_NAME      = "kpconv"
 GPU_TYPE      = os.environ.get("TT_GPU", "A100")
 TIMEOUT_HOURS = int(os.environ.get("TT_TIMEOUT_HOURS", "24"))
-
-# ============================================================================
-# Modal image
-# ============================================================================
 
 app = modal.App(APP_NAME)
 
@@ -50,14 +30,11 @@ image = (
         index_url="https://download.pytorch.org/whl/cu121",
         extra_index_url="https://pypi.org/simple",
     )
-    # MPLBACKEND=Agg: kernel_points.py imports pyplot at module top — never
-    # probe a GUI backend in the container.
+    # MPLBACKEND=Agg: kernel_points.py imports pyplot at module top
     .env({"PYTHONUNBUFFERED": "1", "MPLBACKEND": "Agg"})
 )
 
-# Model source: pinned upstream clone (HuguesTHOMAS/KPConv-PyTorch) — portable
-# (no local checkout needed to build). Bump the SHA deliberately: it IS the
-# architecture version.
+# pinned upstream clone — the SHA IS the architecture version
 image = image.run_commands(
     "git clone https://github.com/HuguesTHOMAS/KPConv-PyTorch.git /opt/kpconv"
     " && git -C /opt/kpconv checkout --detach d19c575d3fa9fcfd5a74845b5b27aac7e50472c7",
@@ -68,10 +45,7 @@ image = image.run_commands(
     "touch /opt/kpconv/cpp_wrappers/__init__.py "
     "      /opt/kpconv/cpp_wrappers/cpp_subsampling/__init__.py "
     "      /opt/kpconv/cpp_wrappers/cpp_neighbors/__init__.py",
-    # Pre-solve the one kernel disposition our config uses (K=15, 3D, 'center').
-    # load_kernels caches it at UNIT scale (radius-independent), so this single
-    # file serves every KPConv block; the trainer builds the net under
-    # _cwd(/opt/kpconv), which is where this relative cache path is found.
+    # pre-solve the K=15 'center' kernel disposition (unit scale, cached)
     "cd /opt/kpconv && MPLBACKEND=Agg python -c "
     "\"from kernels.kernel_points import load_kernels; "
     "load_kernels(1.0, 15, dimension=3, fixed='center')\"",
@@ -79,17 +53,12 @@ image = image.run_commands(
 
 image = image.add_local_file("scripts/local/local_train_kpconv.py", "/root/local_train_kpconv.py")
 image = image.add_local_file("scripts/helper/train_common.py", "/root/train_common.py")
-# density.py: the DG/env-knob helper every local trainer imports (`import density
-# as dg`) — without it cloud runs die on ModuleNotFoundError at startup.
 image = image.add_local_file("scripts/helper/density.py", "/root/density.py")
 
 outputs_volume  = modal.Volume.from_name(f"{APP_NAME}-outputs",  create_if_missing=True)
 datasets_volume = modal.Volume.from_name(
     os.environ.get("TT_DATASET_VOLUME", "terminal-datasets"), create_if_missing=True)
 
-# ============================================================================
-# Training function
-# ============================================================================
 @app.function(
     image=image,
     gpu=GPU_TYPE,
@@ -97,9 +66,7 @@ datasets_volume = modal.Volume.from_name(
     cpu=8,
     memory=49152,
     timeout=TIMEOUT_HOURS * 3600,
-    # Auto-restart the container on failure (preemption / intermittent CUDA
-    # crash). Each retry auto-resumes from the latest checkpoint (marker below),
-    # so a preemption costs only the epochs since the last checkpoint.
+    # auto-restart on failure; each retry auto-resumes from the last checkpoint
     retries=modal.Retries(max_retries=10, backoff_coefficient=1.0, initial_delay=5.0),
 )
 def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
@@ -108,18 +75,11 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
                  chunk_xy: Optional[float] = None, epochs: Optional[int] = None,
                  batch: Optional[int] = None, steps_per_epoch: Optional[int] = None,
                  env_json: Optional[str] = None):
-    """Modal shell: provision the GPU container + volumes, then run the LOCAL
-    trainer. All training/inference logic lives in local_train_kpconv.py — this
-    only shells out to it, so local and cloud run byte-identical code."""
+    """Shell out to the local trainer — local and cloud run identical code."""
     import sys
     sys.path.insert(0, "/root")
-    # Resume only on Modal's OWN retries (preemption / crash), never on a user
-    # relaunch -- parity with local, where a fresh launch is a fresh run. The
-    # function-call id is stable across retries but new for every `modal run`,
-    # so attempt 1 just drops a marker and any later attempt of the same call
-    # resumes. No id (shouldn't happen in a container) -> resume, the safe side.
-    # ponytail: markers accumulate under /outputs/.attempts (bytes each, never
-    # cleaned) -- delete the dir if it ever bothers anyone.
+    # resume only on Modal's OWN retries (call id stable across retries, new
+    # per `modal run`). ponytail: /outputs/.attempts markers never cleaned.
     fcid = modal.current_function_call_id()
     marker = f"/outputs/.attempts/{fcid}" if fcid else ""
     if not fcid or os.path.exists(marker):

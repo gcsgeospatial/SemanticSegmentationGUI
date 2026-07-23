@@ -1,99 +1,40 @@
-"""
-Local FINE-TUNING script for the Pointcept self-supervised pretrained encoders
-(Concerto / Sonata / Utonia) on a canonical trainer_gui dataset.
-
-This is the shared core for the three pretrained-PTv3-family backbones: it
-fine-tunes an encoder-only PointTransformerV3 loaded from a HuggingFace
-checkpoint (concerto_base by default), recovers per-point features with the
-upstream "upcast" walk (concatenate each pooling level's features back onto
-the input points -> sum(enc_channels) dims) and trains a linear seg head on
-top — exactly the upstream demo/2_sem_seg.py protocol. local_train_sonata.py
-and local_train_utonia.py are thin wrappers that only swap the PKG constants.
-
-Everything else (dataset contract, tiling cache, augmentation, loss recipe,
-overlap-voted eval on raw points, STOP sentinel, --mode infer) is the
-local_train_ptv3.py pipeline, unchanged.
-
-Pretrained-stem rule: the checkpoints were pretrained on a 9-channel input
-stem = [coord(3), color(3), normal(3)]. The legacy spec [x, y, z, <color>]
-plus the always-appended zero-filled normal block reproduces that layout
-exactly, so the pretrained stem weights load as-is. ANY custom FEAT_CHANNELS
-spec (or DG_LOGDK_FEAT) changes the layout -> the input embedding is
-re-initialized at the right width and trains from scratch while the rest of
-the encoder keeps its pretrained weights (run.json records "stem").
-
---freeze-encoder 1 freezes the pretrained encoder (and the embedding, when it
-is the pretrained one) and trains only the seg head — the upstream linear-
-probe protocol; cheap smoke runs and small datasets. Default 0 = full
-fine-tune.
-
-Checkpoints saved here embed the model config, so --mode infer rebuilds the
-architecture offline — no HuggingFace access at inference. The pretrained
-download itself is cached under /outputs/hf_cache/<pkg> (persists on the
-outputs volume / host mount).
-
-NOTE: the pretrained WEIGHTS are CC-BY-NC 4.0 (non-commercial); the upstream
-code is Apache 2.0.
-
-Usage:
-    python local_train_concerto.py --dataset NAME [--grid G] [--chunk-xy C]
-        [--epochs N] [--batch B] [--steps-per-epoch S] [--freeze-encoder 0|1]
-    python local_train_concerto.py --mode infer
-        --weights runs/<id>/final_model.pth --infer-input <job_id>
+"""Shared fine-tuner for the Pointcept-SSL encoders (Concerto/Sonata/Utonia):
+pretrained PTv3 encoder + upcast walk + linear seg head, on the ptv3 pipeline.
+sonata/utonia wrappers only swap the PKG constants. Custom FEAT_CHANNELS
+re-initializes the input stem (pretrained stem needs the legacy layout).
+Weights are CC-BY-NC 4.0; checkpoints embed the model config so --mode infer
+works offline. Flags: --dataset --grid --chunk-xy --epochs --batch
+--steps-per-epoch --freeze-encoder | --mode infer --weights ... --infer-input.
 """
 
 import os
 from typing import Optional
 
-# ============================================================================
-# Configuration
-# ============================================================================
-# Which pretrained encoder this entry point fine-tunes. The sonata/utonia
-# wrappers overwrite these four module globals and delegate everything else —
-# train_pcssl() reads them via globals() at call time.
+# sonata/utonia wrappers overwrite these four globals; read via globals() at call time
 PKG      = "concerto"            # package dir inside the /opt/<PKG> clone
 HF_NAME  = "concerto_base"       # checkpoint name in the package's MODELS list
 HF_REPO  = "Pointcept/Concerto"  # HuggingFace repo id
 BB_KEY   = "concerto"            # trainer_gui registry key == run.json backbone
 
-N_EPOCHS      = 100             # fine-tuning converges far faster than scratch
+N_EPOCHS      = 100
 BATCH_SIZE    = 4
 
-GRID_SIZE     = 0.5            # voxel grid (m). PTv3's 0.05 m outdoor default is
-                               # for dense near-sensor LiDAR; airborne ALS is
-                               # ~2 pts/m² (~0.7 m spacing), so a 5 cm grid is a
-                               # no-op downsample AND leaves PTv3's sparse
-                               # positional-encoding conv with empty kernels (no
-                               # point falls within a few voxels of another).
-                               # 0.5 m ≈ the actual point spacing. Override --grid.
-USE_FLASH_ATTN = False   # standard attention, like the ptv3 trainer (the images
-                         # ship no flash-attn; the upstream demos run this exact
-                         # enable_flash=False + patch 1024 fallback)
+GRID_SIZE     = 0.5      # voxel grid (m); ~ALS point spacing, not PTv3's 0.05
+USE_FLASH_ATTN = False   # upstream no-flash fallback (enable_flash=False + patch 1024)
 FREEZE_ENCODER = False   # --freeze-encoder 1: linear probe (head only)
 
-# Input-feature spec (FEAT_CHANNELS env, GUI picker): comma-separated ordered
-# names; "" = the legacy [x, y, z, <color>] layout where <color> is "rgb" or
-# "intensity" per color_src. PTv3's color slot is 3-wide: a single-channel
-# "intensity" entry is expanded to 3 via the tile's baked rgb array (the arch
-# rule) — run.json records the true single name plus "color_source" as always.
-# log d_k (DG_LOGDK_FEAT) appends after the spec.
+# FEAT_CHANNELS env: ordered csv; "" = legacy [x,y,z,<color>]. The color slot
+# is 3-wide (single-channel intensity expands to 3 via the baked rgb array).
 FEAT_CHANNELS = ""
 
-# ----------------------------------------------------------------------------
-# Regularization / optimizer — PTv3's published outdoor-LiDAR recipe
-# (Wu et al., CVPR 2024, supplementary Tab. 13).
-# ----------------------------------------------------------------------------
-DROP_PATH     = 0.3      # stochastic depth (overrides the ckpt config's value;
-                         # DropPath has no weights, so the state_dict still loads)
-BASE_LR       = 6e-4     # fine-tune lr: ~1/3 of the scratch 2e-3 — the encoder
-                         # starts pretrained, a full-size lr walks it away from
-                         # the representations we paid for
+# optimizer — PTv3's published outdoor-LiDAR recipe
+DROP_PATH     = 0.3      # overrides ckpt config; DropPath has no weights
+BASE_LR       = 6e-4     # ~1/3 of scratch 2e-3
 WEIGHT_DECAY  = 5e-3     # PTv3 outdoor AdamW wd (NOT 0.05)
-WARMUP_PCT    = 0.04     # 4% of the run (PTv3's 2-epoch warmup at its 50-epoch recipe)
+WARMUP_PCT    = 0.04
 GRAD_CLIP     = 1.0
 
-# Augmentation — PTv3 outdoor suite. A transformer on a handful of large
-# scenes overfits badly without it — don't disable casually.
+# augmentation — PTv3 outdoor suite; don't disable casually
 AUG_ENABLE       = True
 AUG_ROT_Z        = 1.0          # z angle ~ U(-pi, pi) * AUG_ROT_Z (full yaw)
 AUG_ROT_XY       = 1.0 / 64.0   # x,y tilt ~ U(-pi, pi) * this (gentle ±~2.8 deg)
@@ -102,60 +43,41 @@ AUG_SCALE_MAX    = 1.1
 AUG_FLIP_P       = 0.5          # per-axis (x, y) coordinate flip probability
 AUG_JITTER_SIGMA = 0.005        # gaussian per-point noise (m)
 AUG_JITTER_CLIP  = 0.02         # clip jitter to +/- this (m)
-AUG_COLOR        = 0.8          # per-channel keep prob: each spec entry (rgb = one
-                                # entry, its 3 columns drop together) independently
-                                # zeroed with p 0.2 per training tile — no channel
-                                # is exempt, so none becomes a hard dependency
+AUG_COLOR        = 0.8          # per-entry keep prob (rgb's 3 columns drop together)
 
-# D3b: explicit local-density input channel (log k-th-NN distance) -> bumps in_channels
-# 6->7 (retrain). Pair with DG_DENSITY_AUG so rho varies. FiLM form lives in the ptv3 lib.
+# D3b: log k-th-NN-distance input channel; bumps in_channels (retrain)
 DG_LOGDK_FEAT  = False
 DG_LOGDK_K     = 8
 
-# --- density domain-generalization (scripts/helper/density.py; see DENSITY_DG.md) ---
-# o = rho*g^2; density-invariant for o>=1, breaks for o<1. D1 jitters the voxel grid
-# in training so the model spans the inference density range; D5 averages density
-# (scale) views at inference. NOTE: D2b AdaBN is intentionally omitted for PTv3 — its
-# BN is only in pooling/stem (LayerNorm elsewhere), so BN-recalibration barely helps.
+# density domain-generalization (scripts/helper/density.py; DENSITY_DG.md)
+# D2b AdaBN deliberately omitted: PTv3 is LayerNorm almost everywhere
 DG_DENSITY_AUG = False   # D1: jitter GRID_SIZE per tile during training
 DG_COARSEN_MAX = 2.5     # = 1/(GRID_SIZE*sqrt(rho_min)); density sweep-down factor
 DG_P_NATIVE    = 0.5     # P(tile kept at native GRID_SIZE)
 DG_INFER_TTA   = 0       # D5: # extra density(scale) views to average at inference (0=off)
 
-# Loss = weighted CE (+ optional focal / label smoothing) + Lovász-Softmax,
-# mirroring the kpconvx_cold trainer. PTv3's own outdoor loss is CE + Lovász.
+# loss = weighted CE (+ optional focal / label smoothing) + Lovász
 CLASS_WEIGHTING  = True
-WEIGHT_BETA      = 0.5     # 0.5 = inverse-SQRT-frequency (sub-linear, stable)
+WEIGHT_BETA      = 0.5     # 0.5 = inverse-sqrt frequency
 WEIGHT_CAP       = 5.0     # clamp each weight to [1/CAP, CAP] after mean-norm
-LABEL_SMOOTH     = 0.0     # PTv3 leans on Lovász, not smoothing (KPConvX used 0.2)
+LABEL_SMOOTH     = 0.0
 LOVASZ_WEIGHT    = 1.0     # total = <pointwise> + LOVASZ_WEIGHT * lovasz_softmax
-USE_FOCAL        = False   # True -> alpha-balanced focal instead of weighted CE
+USE_FOCAL        = False
 FOCAL_GAMMA      = 2.0
 
-# Rare-class tile oversampling. RARE_CLASSES=None auto-detects rare classes from
-# the train-set frequency histogram (classes below RARE_FREQ_FRAC x median freq).
+# rare-class tile oversampling; RARE_CLASSES=None auto-detects from train freq
 RARE_OVERSAMPLE  = True
 RARE_CLASSES     = None
 RARE_FREQ_FRAC   = 0.5
 RARE_TILE_PROB   = 0.25    # P(draw the next train tile from a rare-class tile)
-RARE_CENTER_PROB = 0.25    # P(center the train crop on a rare-class point): the
-                           # sample-level half of oversampling — a rare TILE is
-                           # still mostly ground, so a uniform crop center would
-                           # usually miss the rare points the tile was picked for
-                           # (same idea as RandLA's rare-centered spheres)
+RARE_CENTER_PROB = 0.25    # P(center the train crop on a rare-class point)
 
-# Periodic held-out validation + checkpoint/resume cadence.
-VAL_EVERY        = 10      # held-out val pass every N epochs (no weight updates)
-CHECKPOINT_GAP   = 3       # checkpoint (model + optimizer) frequency, epochs
-RESUME           = False   # force-resume the latest matching run (see AUTO_RESUME)
-# Auto-continue an unfinished run (no DONE marker) on relaunch/auto-retry, so an
-# intermittent crash never loses the run — only epochs since last checkpoint.
-# The cloud shells set AUTO_RESUME=1 (their retries=10 depends on it); local
-# runs default off — a fresh local launch is a fresh run.
+VAL_EVERY        = 10      # held-out val pass every N epochs
+CHECKPOINT_GAP   = 3
+RESUME           = False   # force-resume the latest matching run
+# AUTO_RESUME=1: set by the cloud shells on retries; local default off
 AUTO_RESUME      = os.environ.get("AUTO_RESUME", "0") == "1"
 
-# Fixed mount inside cloud containers; the pixi local backend points
-# TT_DATASETS_ROOT at the real host dir (see train_common path contract).
 DATASETS_ROOT = os.environ.get("TT_DATASETS_ROOT", "/datasets")
 
 def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
@@ -175,9 +97,7 @@ def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "helper"))
     import density as dg
     import train_common as tc
-    # Env-overridable knobs (GUI "Density generalization" + "Loss & class
-    # balance" panels; see train_common._ENV_KNOBS). Local shadows: the nested
-    # closures capture these, defaulting to the module constants.
+    # GUI env-overridable knobs (train_common._ENV_KNOBS); closures capture these
     (DG_DENSITY_AUG, DG_COARSEN_MAX, DG_P_NATIVE, DG_LOGDK_FEAT, DG_LOGDK_K,
      DG_INFER_TTA, USE_FOCAL, FOCAL_GAMMA, CLASS_WEIGHTING, WEIGHT_BETA,
      RARE_OVERSAMPLE, RARE_CENTER_PROB, VAL_EVERY,
@@ -187,12 +107,8 @@ def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
         "CLASS_WEIGHTING", "WEIGHT_BETA", "RARE_OVERSAMPLE", "RARE_CENTER_PROB",
         "VAL_EVERY", "FEAT_CHANNELS"])
 
-    # The sonata/utonia wrappers overwrite these module globals before calling.
     PKG, HF_NAME, HF_REPO, BB_KEY = (globals()["PKG"], globals()["HF_NAME"],
                                      globals()["HF_REPO"], globals()["BB_KEY"])
-    # upstream repo root holds the <PKG>/ package dir, so `import <PKG>.model`
-    # resolves from there. <PKG>_SRC (conda trainer-src-<pkg> package activation)
-    # points at the clone; the container images bake it at /opt/<PKG>.
     sys.path.insert(0, os.environ.get(f"{PKG.upper()}_SRC", f"/opt/{PKG}"))
 
     # --- resolve config: CLI args override the module defaults ---------------
@@ -204,22 +120,15 @@ def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
     STRIDE      = CHUNK_XY / 2.0
     FREEZE = bool(freeze_encoder if freeze_encoder is not None
                   else globals()["FREEZE_ENCODER"])
-    color_src = "intensity"   # what fills the 3 color channels; see module docstring
+    color_src = "intensity"   # what fills the 3 color channels
     FEAT_LEGACY = ["x", "y", "z", "intensity"]   # re-derived once color_src is known
     FEAT_SPEC = list(FEAT_LEGACY)                # --mode infer resolves from run.json
 
-    # NUM_CLASSES / CLASS_NAMES come ONLY from the dataset's dataset_meta.json.
-    # --mode infer is dataset-free: the inference branch below reads the class
-    # count/names straight from the checkpoint (+ its run.json), so skip the meta.
     if dataset:
         ds_root = tc.dataset_dir(dataset)
         ds_meta, NUM_CLASSES, CLASS_NAMES = tc.load_dataset_meta(dataset)
         if not ds_meta.get("has_intensity"):
             color_src = "rgb" if ds_meta.get("has_rgb") else "gray"
-        # Input-feature spec: FEAT_CHANNELS env; "" = the legacy layout for this
-        # dataset's color_src. An explicit "rgb" spec forces real RGB into the
-        # color slot even when the dataset also has intensity. Env is ignored
-        # at infer (the inference branch resolves the spec from run.json).
         FEAT_LEGACY = ["x", "y", "z", "rgb" if color_src == "rgb" else "intensity"]
         FEAT_SPEC = (list(FEAT_LEGACY) if mode == "infer"
                      else tc.parse_feat_spec(FEAT_CHANNELS, FEAT_LEGACY))
@@ -228,27 +137,15 @@ def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
             color_src = "rgb"
         elif "intensity" in FEAT_SPEC and ds_meta.get("has_intensity"):
             color_src = "intensity"
-        # Keyed by color_src: tiles bake the color channels in, so RGB-era
-        # caches ("ptv3_cold") are abandoned, not silently reused. A custom
-        # feature spec gets its own family too (legacy spec = "" tag).
-        # "pcssl" family, shared by concerto/sonata/utonia (identical tile
-        # builder in this one file). Deliberately NOT the ptv3_ family: that
-        # trainer has its own copy of the tile code, and silent cross-reuse
-        # would break the day either copy drifts.
-        # "_loc" = tiles in the scene-local frame (ptv3_load_canonical's
-        # origin shift). Pre-shift caches stored global-UTM float32 tiles
-        # (0.5m y quantization + the float32-mean centering bug) — a new dir
-        # name abandons them instead of silently mixing frames.
+        # cache keyed by color_src + spec; "pcssl" family is deliberately NOT
+        # shared with the ptv3_ trainer's copy of the tile code; "_loc" =
+        # scene-local frame (pre-shift global-UTM caches are abandoned)
         PREP_DIR = (f"{ds_root}/prep/pcssl_{color_src}"
                     f"{tc.feat_spec_tag(FEAT_SPEC, FEAT_LEGACY)}_chunk{int(CHUNK_XY)}_loc"
                     f"{tc.train_stride_tag()}")
 
     def _in_ch(spec):
-        # spec widths: the color slot (rgb OR intensity) is 3 wide — the color
-        # slot expands single-channel color to 3 (see build_feat) — the rest 1;
-        # + the always-appended 3-wide zero normal block (the pretrained stem
-        # was trained on [coord, color, normal] and datasets carry no normals);
-        # + log d_k (D3b) appended after that.
+        # color slot is 3 wide, rest 1; +3 zero normal block, +1 log d_k
         return (sum(3 if n in ("rgb", "intensity") else 1 for n in spec) + 3
                 + (1 if DG_LOGDK_FEAT else 0))
     IN_CH = _in_ch(FEAT_SPEC)
@@ -262,11 +159,8 @@ def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
     _mdl = importlib.import_module(f"{PKG}.model")   # /opt/<PKG>/<PKG>/model.py
 
     def _upcast_feat(point):
-        """Upstream upcast walk (demo/2_sem_seg.py): the encoder-only forward
-        returns the COARSEST level; walk the traceable GridPooling chain back
-        up, concatenating each level's features onto its parent's points ->
-        per-input-point features of dim sum(enc_channels). Autograd flows
-        through the whole walk, so it works for training, not just eval."""
+        """Upstream upcast walk: concat each pooling level's features back onto
+        its parent -> per-input-point features of dim sum(enc_channels)."""
         while "pooling_parent" in point.keys():
             parent = point.pop("pooling_parent")
             inverse = point.pop("pooling_inverse")
@@ -275,16 +169,9 @@ def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
         return point.feat
 
     def build_feat(cxyz, rgbf, extras=None, drop=()):
-        """Spec-ordered features: x/y/z from the (augmented, centered,
-        voxel-deduped) coords, rgb/intensity = the tile's 3 baked color
-        channels (single-channel intensity was expanded to 3 at prep — the
-        arch rule), feat_* from `extras` (feat_hag included). A 3-wide ZERO
-        normal block always follows the spec (the pretrained stem's normal
-        slot; zero normals are the upstream demos' documented fallback).
-        log d_k appends after that. The legacy spec thus reproduces the
-        pretraining layout [coord, color, normal] exactly. `drop` = spec
-        indices to zero (per-channel feature dropout, train time only);
-        the normal slot and log d_k never drop."""
+        """Spec-ordered features + 3-wide zero normal block + optional log d_k.
+        `drop` = spec indices to zero (train-time feature dropout); the normal
+        slot and log d_k never drop."""
         cols = []
         for i, n in enumerate(FEAT_SPEC):
             if n in ("rgb", "intensity"):
@@ -300,23 +187,12 @@ def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
         return np.concatenate(cols, axis=1).astype(np.float32)
 
     def _stem_is_pretrained():
-        # Only the exact pretraining layout maps channel-for-channel onto the
-        # pretrained stem: legacy spec + zero normals, nothing appended. Any
-        # custom spec (feat_hag included) / log-dk gets a fresh stem (right
-        # width, random init).
+        # only the exact pretraining layout maps onto the pretrained stem
         return (FEAT_SPEC == FEAT_LEGACY and not DG_LOGDK_FEAT)
 
     def build_model(num_classes, from_config=None):
-        """Build encoder + linear seg head.
-
-        Training: download the pretrained checkpoint (cached under
-        /outputs/hf_cache/<PKG>), rebuild its architecture with our overrides
-        (flash off, our in_channels, our drop_path) and load every weight
-        whose module survived — all of them for the legacy layout, everything
-        but the input embedding for a custom stem.
-
-        Inference/resume: `from_config` (embedded in our checkpoints) rebuilds
-        the exact architecture offline; the caller loads our weights on top.
+        """Encoder + linear seg head. Training downloads the pretrained ckpt;
+        from_config (embedded in our checkpoints) rebuilds offline.
         Returns (backbone, head, config, stem_pretrained)."""
         stem_pre = _stem_is_pretrained()
         if from_config is not None:
@@ -328,12 +204,9 @@ def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
                              ckpt_only=True)
             config = dict(ckpt["config"])
             sd = ckpt["state_dict"]
-        # a ckpt config may omit keys left at ctor defaults — mirror those
-        # defaults (upstream model.py) wherever we read or rewrite them
+        # ckpt config may omit keys left at ctor defaults — mirror those defaults
         n_stages = len(config.get("enc_depths", (3, 3, 3, 12, 3)))
         if not USE_FLASH_ATTN:
-            # the upstream no-flash fallback (demo pattern): standard attention
-            # + patch size clamped to 1024
             config["enable_flash"] = False
             config["upcast_attention"] = True
             config["upcast_softmax"] = True
@@ -342,9 +215,7 @@ def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
                                                    [1024] * n_stages)]
         config["in_channels"] = IN_CH
         config["drop_path"] = DROP_PATH
-        config["freeze_encoder"] = False     # freezing is handled below, not by
-                                             # the ctor (it would freeze a fresh
-                                             # custom stem too)
+        config["freeze_encoder"] = False     # handled below; ctor would freeze a fresh stem
         backbone = _mdl.PointTransformerV3(**config).cuda()
         if sd is not None:
             if not stem_pre:
@@ -361,15 +232,13 @@ def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
                   f"({'pretrained' if stem_pre else 'custom (re-initialized)'} "
                   f"input stem, {IN_CH} channels)", flush=True)
         if FREEZE:
-            # linear probe: freeze the encoder; the embedding only when it IS
-            # the pretrained one — a frozen random stem would be garbage in.
+            # freeze the embedding only when pretrained — a frozen random stem is garbage in
             for p in backbone.enc.parameters():
                 p.requires_grad = False
             if stem_pre:
                 for p in backbone.embedding.parameters():
                     p.requires_grad = False
-        # per-point feature dim after the upcast walk (encoder-only ckpts);
-        # a decoder-bearing config ends the walk at dec_channels[0] instead.
+        # encoder-only ckpts end the upcast at sum(enc_channels); decoder-bearing at dec_channels[0]
         head_in = (int(sum(config.get("enc_channels", (48, 96, 192, 384, 512))))
                    if config.get("enc_mode")
                    else int(config.get("dec_channels", (96, 96, 192, 384))[0]))
@@ -382,12 +251,9 @@ def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
         SAVE_PROBS = os.environ.get("TT_SAVE_PROBS") == "1"
 
         def _predict_scene(scene_path):
-            # Tile into CHUNK_XY windows, voxel-downsample tracking the inverse
-            # map, scatter per-voxel predictions back, NN-fill stragglers.
+            # window, voxel-downsample, scatter voxel preds back, NN-fill stragglers
             xyz, rgb, _ = load_canonical(scene_path)   # scene-local frame
             z0 = np.load(scene_path)
-            # the feat_* channels the spec needs (a miss is a clear error;
-            # feat_hag is written by convert_infer_job like any other channel)
             ex0 = tc.feat_extras(z0, FEAT_SPEC, os.path.basename(scene_path))
             pred = np.full(len(xyz), -1, np.int64)
             conf = np.zeros(len(xyz), np.float32)
@@ -398,9 +264,7 @@ def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
                     w0 = (xyz[idx] - xyz[idx].mean(0)).astype(np.float32)
                     rgbf = rgb[idx].astype(np.float32) / 255.0
                     exw = {n: v[idx] for n, v in ex0.items()}
-                    # D5 density-TTA: isotropic scale s is a density change (o->o/s^2);
-                    # re-voxelize per view, average per-point softmax. views=[1.0] when
-                    # off -> identical to the old single-view argmax.
+                    # D5 density-TTA: average softmax over scaled views; off -> [1.0]
                     views = [1.0] + (list(np.linspace(0.85, 1.2, DG_INFER_TTA))
                                      if DG_INFER_TTA else [])
                     pprob = None
@@ -434,19 +298,13 @@ def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
                 _, nn = cKDTree(xyz[~miss]).query(xyz[miss])
                 pred[miss] = pred[~miss][nn]           # conf/probs stay 0: no votes
             elif miss.any():
-                # nothing predicted (tiny scene) — lowest NON-excluded class so
-                # EXCLUDE_CLASSES holds even here; conf stays 0.
+                # tiny scene, nothing predicted: lowest non-excluded class, conf 0
                 pred[:] = min(set(range(num_classes)) - set(exclude_idx or ()))
-            # rgb carries the p95-normalized intensity grayscale the model saw.
-            # Return the scene's ORIGINAL coords, not the origin-shifted ones
-            # load_canonical computed on — the _pred.npz is the georeferenced
-            # deliverable.
+            # original coords out — the _pred.npz is the georeferenced deliverable
             return z0["xyz"], pred, rgb[:, 0] / 255.0, conf, probs
         return _predict_scene
 
-    # ==========================================================================
-    # INFERENCE-ONLY MODE
-    # ==========================================================================
+    # --- inference-only mode -------------------------------------------------
     if mode == "infer":
         if not weights or not infer_input:
             raise ValueError("--mode infer requires --weights and --infer-input")
@@ -457,19 +315,14 @@ def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
         bsd, hsd = ckpt["backbone"], ckpt["head"]
         num_classes = int(hsd["weight"].shape[0])
         class_names = [f"class_{i}" for i in range(num_classes)]
-        # read the run's run.json (single manifest) beside the weights
-        meta = tc.infer_meta(wpath)
-        # Feed the checkpoint the color signal it was trained on. Manifests from
-        # before intensity-first carry no color_source -> those runs saw RGB.
+        meta = tc.infer_meta(wpath)     # run.json beside the weights
+        # pre-intensity-first manifests carry no color_source -> those runs saw RGB
         color_src = (meta or {}).get("color_source") or "rgb"
         if meta:
             class_names = meta.get("class_names") or class_names
             if meta.get("grid") is not None:
                 GRID_SIZE = float(meta["grid"])
-        # rebuild the EXACT assembly recorded with the weights (env is ignored
-        # at infer). Old manifests wrote no "features", or wrote the color slot
-        # as 3 duplicate entries — those fall back to the legacy layout, which
-        # is exactly what they trained on (color_src drives it).
+        # rebuild the exact assembly from run.json; legacy manifests fall back
         FEAT_LEGACY = ["x", "y", "z", "rgb" if color_src == "rgb" else "intensity"]
         mf = (meta or {}).get("features")
         try:
@@ -480,8 +333,6 @@ def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
             FEAT_SPEC = list(FEAT_LEGACY)
         IN_CH = _in_ch(FEAT_SPEC)
 
-        # pcssl checkpoints embed the model config -> rebuild the exact
-        # architecture offline (no HuggingFace access at inference)
         if "config" not in ckpt:
             raise ValueError(f"{weights} has no embedded model config — not a "
                              f"local_train_{BB_KEY}.py checkpoint?")
@@ -499,9 +350,7 @@ def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
             raise FileNotFoundError(f"No scenes under {run_dir}/scenes")
 
         run_id = datetime.utcnow().strftime("%Y%m%d_%H%M%S_infer")
-        # Predictions live next to the input scenes under the shared datasets
-        # tree (not the per-model runs dir), so inference output lands in
-        # one consistent place no matter which model produced it.
+        # predictions live beside the input scenes, whatever model produced them
         pred_dir = os.environ.get("TT_PRED_DIR") or f"{run_dir}/predictions"
         os.makedirs(pred_dir, exist_ok=True)
         exc_idx = tc.exclude_class_idx(class_names)
@@ -520,26 +369,21 @@ def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
         tc.run_infer_scenes(scenes, predict_scene, pred_dir, run_dir, infer_cfg)
         return
 
-    # ==========================================================================
-    # TRAINING MODE
-    # ==========================================================================
+    # --- training mode -------------------------------------------------------
     print("=" * 70)
     print(f"  {BB_KEY} [{HF_NAME}{', frozen encoder' if FREEZE else ''}]  "
           f"{dataset}  ({tc.gpu_name()}, {N_EPOCHS} ep, batch {BATCH_SIZE})")
     print("=" * 70)
     print(f"  CUDA: {torch.cuda.is_available()}  "
           f"{torch.cuda.get_device_name(0) if torch.cuda.is_available() else ''}")
-    # Clear a stale STOP from an old run BEFORE the slow prep (tiling, HF
-    # download): a stop clicked during startup must survive to the loop.
+    # clear stale STOP before the slow prep; a stop clicked during startup survives
     tc.clear_stop()
     tc.ptv3_ensure_prep(PREP_DIR, ds_root, CHUNK_XY, STRIDE, load_canonical)
 
     tag = dataset
     _pt = BB_KEY
 
-    # Only the RESUME_RECIPE_KEYS subset of cfg: a candidate run.json that
-    # disagrees is skipped, so a resume never republishes a manifest its
-    # weights don't match. cfg itself is built below, in the fresh-run branch.
+    # resume only when RESUME_RECIPE_KEYS agree — never republish a mismatched manifest
     _recipe = {"grid_size": GRID_SIZE, "chunk_xy": CHUNK_XY, "features": FEAT_SPEC,
                "n_epochs": N_EPOCHS, "num_classes": NUM_CLASSES,
                "class_names": CLASS_NAMES}
@@ -568,11 +412,7 @@ def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
                 "num_classes": NUM_CLASSES, "grid_size": GRID_SIZE,
                 "class_names": CLASS_NAMES,
                 "color_source": color_src,
-                # resolved input spec: one rgb/intensity name = the 3-wide
-                # color slot (PTv3 expands single-channel color to 3 — see
-                # build_feat); log-dk rides outside it, driven by
-                # DG_LOGDK_FEAT. Inference rebuilds this exact assembly.
-                "features": FEAT_SPEC,
+                "features": FEAT_SPEC,   # inference rebuilds this exact assembly
                 "in_channels": IN_CH,
                 "chunk_xy": CHUNK_XY, "stride": STRIDE,
                 "steps_per_epoch": STEPS,
@@ -607,9 +447,8 @@ def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
     print(f"  Params: {n_all:,} ({n_train:,} trainable)")
 
     def _set_backbone_mode():
-        """Train-mode switch that honours --freeze-encoder. requires_grad=False
-        alone still lets BN re-estimate running stats and DropPath fire inside
-        the 'frozen' extractor; eval() is what actually stops both."""
+        # requires_grad=False alone still lets BN stats update and DropPath
+        # fire; eval() is what actually stops both
         backbone.train(not FREEZE)
         if FREEZE and not stem_pre:
             backbone.embedding.train()   # random stem is still being trained
@@ -626,15 +465,12 @@ def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
         if "optim" in rckpt:
             optim.load_state_dict(rckpt["optim"])
         print(f"  resumed weights{' + optimizer' if 'optim' in rckpt else ''}", flush=True)
-    # loss / class weights are built after the train-tile class scan below.
 
     # --- Data ---------------------------------------------------------------
     def _scene_of(p):
         b = os.path.basename(p)
         return b.rsplit("_x", 1)[0]
-    # CANONICAL: the dataset stage decided the 3-way split and materialized
-    # train/val/test; read the three PREP folders verbatim and NEVER re-carve.
-    # val = in-distribution selection holdout, test = final-report set.
+    # the dataset stage decided the 3-way split — read verbatim, never re-carve
     train_tiles = sorted(glob.glob(f"{PREP_DIR}/train/*.npz"))
     val_tiles   = sorted(glob.glob(f"{PREP_DIR}/val/*.npz"))
     test_tiles  = sorted(glob.glob(f"{PREP_DIR}/test/*.npz"))
@@ -642,8 +478,7 @@ def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
     print(f"  train: {len(train_tiles)}   val(holdout {len(hold)} scenes): "
           f"{len(val_tiles)}   test: {len(test_tiles)}", flush=True)
 
-    # --- class balance: one (parallel, PREP_DIR-cached) scan of the training
-    # tiles -> inverse-frequency weights + rare-class tile flags. -------------
+    # --- class balance ------------------------------------------------------
     class_counts, present_mask = tc.scan_class_balance(
         train_tiles, NUM_CLASSES, cache_path=f"{PREP_DIR}/class_balance_cache.npz")
 
@@ -652,8 +487,6 @@ def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
     names = [_name(c) for c in range(NUM_CLASSES)]
     print(f"  class counts: {dict(zip(names, class_counts.tolist()))}", flush=True)
 
-    # Rare classes: explicit RARE_CLASSES, else auto — present classes whose
-    # frequency is below RARE_FREQ_FRAC x the median present-class frequency.
     if RARE_CLASSES is not None:
         rare_set = set(RARE_CLASSES)
     elif RARE_OVERSAMPLE:
@@ -669,8 +502,7 @@ def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
           f"({len(rare_tiles)}/{len(train_tiles)} tiles)", flush=True)
 
     if CLASS_WEIGHTING:
-        # Inverse-sqrt-frequency, absent classes pinned at 1.0 (never up-weight
-        # a class with no train points), mean-normalized over present classes.
+        # absent classes pinned at 1.0 — never up-weight a class with no train points
         w = tc.class_weights_np(class_counts, WEIGHT_BETA, WEIGHT_CAP,
                                 absent_to_one=True)
         class_weights = torch.tensor(w, dtype=torch.float32).cuda()
@@ -679,14 +511,11 @@ def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
     else:
         class_weights = None
 
-    # Shared loss recipe: weighted (label-smoothed) CE or focal, + Lovász —
-    # PTv3's outdoor loss is literally CE + Lovász (train_common.make_seg_loss).
     seg_loss = tc.make_seg_loss(class_weights, LABEL_SMOOTH, USE_FOCAL,
                                 FOCAL_GAMMA, LOVASZ_WEIGHT)
     pick_train_tile = tc.make_tile_picker(train_tiles, rare_tiles,
                                           RARE_TILE_PROB)
 
-    # --- PTv3 outdoor augmentation suite --------------------------------------
     def augment_xyz(xyz):
         return tc.ptv3_augment_xyz(xyz, AUG_ROT_Z, AUG_ROT_XY, AUG_SCALE_MIN,
                                    AUG_SCALE_MAX, AUG_FLIP_P,
@@ -700,9 +529,7 @@ def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
             z = np.load(tile)
             xyz, rgb, lab = z["xyz"], z["rgb"], z["lab"]
             ex = tc.feat_extras(z, FEAT_SPEC, os.path.basename(tile))
-            # random crop ~30m for memory (train only — eval keeps full tiles).
-            # With prob RARE_CENTER_PROB the crop centers on a rare-class point,
-            # so the rare points a rare tile was drawn for actually land in-crop.
+            # random ~30m crop for memory (train only); may center on a rare point
             if training and len(xyz) > 80000:
                 c = None
                 if (RARE_OVERSAMPLE and rare_cols
@@ -721,14 +548,10 @@ def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
             xyz = xyz.astype(np.float32)
             if training and AUG_ENABLE:
                 xyz = augment_xyz(xyz)
-            # float64 mean: at global-UTM magnitudes a float32 mean is off by
-            # hundreds of meters, which fails the |xy|<=CHUNK_XY cut below for
-            # EVERY point and empties the whole batch (np.concatenate crash).
+            # float64 mean: a float32 mean at UTM magnitudes empties the window cut
             xyz = (xyz - xyz.mean(0, keepdims=True, dtype=np.float64)
                    ).astype(np.float32)
-            # Drop non-finite + far-outlier points: a single bad coordinate (NaN/
-            # Inf or a stray faraway return) blows up the voxel grid and spconv's
-            # indices, triggering a CUDA index device-assert that kills the run.
+            # drop non-finite/outlier points — they corrupt spconv indices (CUDA assert)
             ok = (np.isfinite(xyz).all(1)
                   & (np.abs(xyz[:, :2]).max(1) <= CHUNK_XY)
                   & (np.abs(xyz[:, 2]) <= 200.0))
@@ -736,24 +559,15 @@ def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
                 continue
             xyz = xyz[ok]; rgb = rgb[ok]; lab = lab[ok]
             ex = {n: v[ok] for n, v in ex.items()}
-            # voxel-grid downsample to GRID_SIZE. Take grid_coord from the SAME
-            # integer keys used to dedup, so it is unique per cloud and phase-
-            # consistent with the kept points. Recomputing it as
-            # floor((coord-min)/GRID) uses a different phase and can collapse two
-            # distinct voxels onto one grid_coord — which corrupts spconv's
-            # submanifold rulebook (out-of-bounds gather -> CUDA device assert).
-            # D1 density jitter: coarsen the voxel grid per tile (train only) so the
-            # model spans the inference density range. grid_coord still comes from the
-            # dedup keys below, so the spconv submanifold invariant is preserved.
+            # grid_coord MUST come from the same keys used to dedup — a different
+            # phase can collapse two voxels onto one grid_coord (CUDA assert).
+            # D1: coarsen the voxel grid per tile (train only).
             g_eff = (dg.effective_grid(GRID_SIZE, DG_COARSEN_MAX, DG_P_NATIVE)
                      if (training and DG_DENSITY_AUG) else GRID_SIZE)
             keys = np.floor(xyz / g_eff).astype(np.int64)
             uniq = tc.voxel_unique(keys)
             xyz = xyz[uniq]; rgb = rgb[uniq]; lab = lab[uniq]
             ex = {n: v[uniq] for n, v in ex.items()}
-            # feat = spec-ordered stack (augmented/centered coords, the baked
-            # color channels, dataset feat_*) — see build_feat. Per-channel
-            # feature dropout: train-time only, one independent coin per entry.
             xyz = xyz.astype(np.float32)
             fdrop = (np.flatnonzero(np.random.rand(len(FEAT_SPEC)) > AUG_COLOR)
                      if training else ())
@@ -782,18 +596,9 @@ def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
                 "gpu_mem_mb",
             ])
 
-    # --- Periodic + final evaluation: the REAL voted eval (not a cheap proxy).
-    # The periodic pass scores the held-out VAL scenes every VAL_EVERY epochs and
-    # selects the best checkpoint on val present-class mIoU (NO test peeking); the
-    # final pass also scores the TEST set, written separately to test_metrics.json.
-    # NOTE: far heavier than the old quick_val — it forwards every overlapping
-    # tile of every eval scene. Raise VAL_EVERY if it costs too much. -----------
+    # voted eval on raw points every VAL_EVERY epochs; heavy — raise VAL_EVERY if slow
     def _raw_loader(split, name):
-        """Closure -> (xyz, rgb, lab) for the ORIGINAL raw scene, so the voted
-        voxel predictions can be reprojected onto raw points + raw GT. `name` is a
-        parameter, so each closure binds its own scene (no loop late-binding bug).
-        split is 'val'|'test' -> the matching materialized dataset folder.
-        Features aren't needed here — raw scoring only uses raw xyz + raw GT."""
+        # name is a parameter so each closure binds its own scene
         return lambda: load_canonical(f"{ds_root}/{split}/{name}.npz")
 
     val_items = [(n, _raw_loader("val", n), f"{PREP_DIR}/val") for n in sorted(hold)]
@@ -817,12 +622,8 @@ def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
     tc.write_run_manifest(run_dir, _pt, dataset)
 
     def run_eval(ep, write_json=False):
-        # Periodic pass scores the held-out VAL scenes only (no test peeking) and
-        # selects the best checkpoint on val present-class mIoU. The final pass
-        # (write_json) scores TEST on the BEST-TRACKED checkpoint, not whatever
-        # epoch training happened to end on, so test_metrics.json reports the
-        # model actually kept as final_model.pth. VAL stays on the current
-        # (most-recent) weights, matching the periodic curve.
+        # val scores current weights; the final call scores TEST on the
+        # best-tracked checkpoint (what final_model.pth actually is)
         backbone.eval(); head.eval()
         m = evaluate(val_items, f"val@ep{ep}")
         tc.append_val_row(val_csv, ep, m, names)
@@ -849,10 +650,7 @@ def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
         return m
 
     LOG_EVERY = 20  # intra-epoch heartbeat
-    # Same loop speedups as the KP trainers: opt-in bf16 autocast, background
-    # batch building (tile load + batch assembly overlap the GPU), and a
-    # GPU-accumulated confusion matrix (one bincount/step, one sync/epoch).
-    AMP = os.environ.get("TT_AMP") == "1"
+    AMP = os.environ.get("TT_AMP") == "1"   # opt-in bf16 autocast
     prefetch = (tc.make_prefetcher(
         lambda: to_ptv3_batch([pick_train_tile() for _ in range(BATCH_SIZE)],
                               training=True),
@@ -945,8 +743,7 @@ def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
     if prefetch:
         prefetch.shutdown()      # stop background batch builds during the eval
 
-    # --- Final evaluation: the real voted eval over the combined eval set,
-    # written to test_metrics.json (the same number run_eval logs periodically). -
+    # final voted eval -> test_metrics.json
     print("  final evaluation over the combined eval set…", flush=True)
     run_eval(ep, write_json=True)
     best.finalize(lambda p: torch.save(
@@ -954,8 +751,7 @@ def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
          "epoch": ep, "config": model_cfg}, p))
     print(f"  total wall-clock {(time.time() - t_run)/3600:.2f} h")
 
-    # Mark the run complete so AUTO_RESUME won't re-resume it on the next launch
-    # (a crashed/retried run has no DONE and is picked back up automatically).
+    # DONE marker: AUTO_RESUME skips completed runs
     open(f"{run_dir}/DONE", "w").close()
     print(f"  run complete -> {run_id}", flush=True)
 
@@ -964,7 +760,7 @@ def main():
     import argparse
     ap = argparse.ArgumentParser(
         description='Local Pointcept-SSL (concerto/sonata/utonia) fine-tuner/inferencer.')
-    ap.add_argument('--dataset', default=None)   # required to train; omitted for --mode infer
+    ap.add_argument('--dataset', default=None)
     ap.add_argument('--grid', type=float, default=None)
     ap.add_argument('--epochs', type=int, default=None)
     ap.add_argument('--batch', type=int, default=None)

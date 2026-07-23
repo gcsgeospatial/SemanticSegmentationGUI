@@ -1,36 +1,18 @@
-"""
-Modal shell for RandLA-Net (PyTorch), COLD-START — thin subprocess wrapper.
-
-Random initialization (no pretrained weights). Provisions a GPU container + the
-outputs / terminal-datasets volumes, then shells out to the local trainer
-(scripts/local/local_train_randlanet.py) so local and cloud run byte-identical
-code. Trains on a canonical trainer_gui dataset passed via --dataset (staged on
-the terminal-datasets volume).
-
-  --dataset NAME                          canonical trainer_gui dataset
-  --sub-grid / --num-points / --epochs / --batch / --steps-per-epoch
-  --mode infer --weights runs/<id>/final_model.pth --infer-input <job_id>
-
-GPU type / timeout come from TT_GPU / TT_TIMEOUT_HOURS env vars.
-"""
+"""Modal shell for RandLA-Net (cold-start) — shells out to
+local_train_randlanet.py so local and cloud run identical code. Flags:
+--dataset --sub-grid --num-points --epochs --batch --steps-per-epoch;
+--mode infer --weights --infer-input. GPU/timeout from TT_GPU / TT_TIMEOUT_HOURS."""
 
 import os
 from typing import Optional
 
 import modal
 
-# ============================================================================
-# Configuration
-# ============================================================================
 APP_NAME      = "randlanet-cold"
 GPU_TYPE      = os.environ.get("TT_GPU", "A10G")   # RandLA is light, A10G handles it
 TIMEOUT_HOURS = int(os.environ.get("TT_TIMEOUT_HOURS", "24"))
 
-DATASETS_ROOT = "/datasets"   # terminal-datasets volume (trainer_gui canonical datasets)
-
-# ============================================================================
-# Image
-# ============================================================================
+DATASETS_ROOT = "/datasets"   # terminal-datasets volume
 
 app = modal.App(APP_NAME)
 
@@ -55,17 +37,15 @@ image = (
     .env({"PYTHONUNBUFFERED": "1"})
 )
 
-# Model source: pinned upstream clone — portable (no local checkout needed to
-# build). Bump the SHA deliberately: it IS the architecture version.
+# pinned upstream clone — the SHA IS the architecture version
 image = image.run_commands(
     "git clone https://github.com/tsunghan-wu/RandLA-Net-pytorch.git /opt/randlanet"
     " && git -C /opt/randlanet checkout --detach 75adeacdb796db07e69ba990c36409c5d3ee886b"
     " && rm -rf /opt/randlanet/.git",
 )
 
-# Compile cpp wrappers and nearest_neighbors at image-build time. The upstream
-# setup.py lists knn.pyx, which newer Cython/distutils mangle; the repo ships a
-# pre-cythonized knn.cpp, so we rewrite setup.py to build from it directly.
+# upstream setup.py lists knn.pyx (newer Cython mangles it); build from the
+# shipped pre-cythonized knn.cpp instead
 _NN_SETUP = r"""
 from setuptools import setup, Extension
 import numpy
@@ -98,8 +78,6 @@ image = image.run_commands(
 
 image = image.add_local_file("scripts/local/local_train_randlanet.py", "/root/local_train_randlanet.py")
 image = image.add_local_file("scripts/helper/train_common.py", "/root/train_common.py")
-# density.py: the DG/env-knob helper every local trainer imports (`import density
-# as dg`) — without it cloud runs die on ModuleNotFoundError at startup.
 image = image.add_local_file("scripts/helper/density.py", "/root/density.py")
 
 outputs_volume  = modal.Volume.from_name(f"{APP_NAME}-outputs",  create_if_missing=True)
@@ -107,9 +85,6 @@ datasets_volume = modal.Volume.from_name(
     os.environ.get("TT_DATASET_VOLUME", "terminal-datasets"), create_if_missing=True)
 
 
-# ============================================================================
-# Training function
-# ============================================================================
 @app.function(
     image=image,
     gpu=GPU_TYPE,
@@ -117,9 +92,7 @@ datasets_volume = modal.Volume.from_name(
     cpu=8,
     memory=32768,
     timeout=TIMEOUT_HOURS * 3600,
-    # Auto-restart the container on failure (preemption / intermittent CUDA
-    # crash). Each retry auto-resumes from the latest checkpoint (marker below),
-    # so a preemption costs only the epochs since the last checkpoint.
+    # auto-restart on failure; each retry auto-resumes from the last checkpoint
     retries=modal.Retries(max_retries=10, backoff_coefficient=1.0, initial_delay=5.0),
 )
 def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = None,
@@ -128,18 +101,11 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                     mode: str = "train", weights: Optional[str] = None,
                     infer_input: Optional[str] = None,
                env_json: Optional[str] = None):
-    """Modal shell: provision the GPU container + volumes, then run the LOCAL
-    trainer. All training/inference logic lives in local_train_randlanet.py — this only
-    shells out to it, so local and cloud run byte-identical code."""
+    """Shell out to the local trainer — local and cloud run identical code."""
     import sys
     sys.path.insert(0, "/root")
-    # Resume only on Modal's OWN retries (preemption / crash), never on a user
-    # relaunch -- parity with local, where a fresh launch is a fresh run. The
-    # function-call id is stable across retries but new for every `modal run`,
-    # so attempt 1 just drops a marker and any later attempt of the same call
-    # resumes. No id (shouldn't happen in a container) -> resume, the safe side.
-    # ponytail: markers accumulate under /outputs/.attempts (bytes each, never
-    # cleaned) -- delete the dir if it ever bothers anyone.
+    # resume only on Modal's OWN retries (call id stable across retries, new
+    # per `modal run`). ponytail: /outputs/.attempts markers never cleaned.
     fcid = modal.current_function_call_id()
     marker = f"/outputs/.attempts/{fcid}" if fcid else ""
     if not fcid or os.path.exists(marker):
@@ -175,10 +141,7 @@ def main(dataset: Optional[str] = None, sub_grid: Optional[float] = None,
          mode: str = "train", weights: Optional[str] = None,
          infer_input: Optional[str] = None,
                env_json: Optional[str] = None):
-    # .remote() keeps the local CLI attached so logs stream in real time.
-    # Pair with `modal run --detach ...` if you want to close the terminal
-    # mid-run; you can then reattach with `modal app logs {APP_NAME} -f`
-    # while the app is still active.
+    # .remote() streams logs; `modal run --detach` + `modal app logs` to detach
     what = f"infer({weights})" if mode == "infer" else f"train({dataset})"
     print(f"Launching {APP_NAME} [{what}] on {GPU_TYPE} for up to {TIMEOUT_HOURS}h.")
     train_randlanet.remote(dataset=dataset, sub_grid=sub_grid, num_points=num_points,

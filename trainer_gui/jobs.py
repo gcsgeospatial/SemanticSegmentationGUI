@@ -9,16 +9,12 @@ import traceback
 
 from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, Signal
 
-# Every training script prints per-epoch summaries in this exact shape:
-#   ep  12: loss=0.4321 acc=0.9123 miou=0.7012 s/iter=0.123 s/ep=61.4
+# trainer log shape: ep  12: loss=0.4321 acc=0.9123 miou=0.7012 s/iter=0.123 s/ep=61.4
 EPOCH_RE = re.compile(
     r"ep\s+(\d+):\s+loss=([\d.]+)\s+acc=([\d.]+)\s+miou=([\d.]+)"
-    r"(?:\s+lr=[\d.eE+-]+)?"   # PTv3 cold recipe prints lr= here; skip it
+    r"(?:\s+lr=[\d.eE+-]+)?"   # PTv3 prints lr= here
     r"(?:\s+s/iter=([\d.]+))?(?:\s+s/ep=([\d.]+))?")
-# Held-out val passes print (tc.eval_metrics in scripts/helper/train_common.py):
-#   [val@ep9] acc=0.8123  mIoU(5-way)=0.4012  mIoU(present 4)=0.4550  absent=[...]  raw_pts=1,234
-# RandLA-Net labels its val pass eval@epN; the final test pass is test@epN and
-# deliberately does NOT match.
+# [val@ep9] acc=... mIoU(5-way)=... mIoU(present 4)=...; test@epN deliberately doesn't match
 VAL_RE = re.compile(
     r"\[(?:val|eval)@ep(\d+)\]\s+acc=([\d.]+)\s+"
     r"mIoU\(\d+-way\)=([\d.]+)\s+mIoU\(present \d+\)=([\d.]+)")
@@ -83,10 +79,8 @@ class JobRunner(QObject):
 
     def start(self, program: str, args: list[str], cwd: str = "",
               extra_env: dict | None = None, pre: tuple | None = None):
-        """Run `program args`. If `pre=(program, args)` is given it runs first and
-        its exit code is IGNORED (used for idempotent `modal volume create`, which
-        errors when the volume already exists), then the main command runs and its
-        code is the one `finished` reports."""
+        """Run `program args`. An optional pre=(program, args) runs first with its
+        exit code ignored (idempotent `modal volume create`)."""
         if self.running:
             raise RuntimeError("JobRunner already has a live process")
         self._cwd = cwd
@@ -101,18 +95,13 @@ class JobRunner(QObject):
 
     def _launch(self, program: str, args: list[str]):
         env = QProcessEnvironment.systemEnvironment()
-        # Modal prints ✓ and box-drawing chars; on Windows the child's stdout
-        # defaults to cp1252 and crashes encoding them (silently aborting e.g. a
-        # `volume put`). Force UTF-8 two ways — PYTHONUTF8 enables UTF-8 mode,
-        # PYTHONIOENCODING pins the stream encoding even for libs (rich/click)
-        # that read it directly.
+        # force UTF-8 both ways: Windows cp1252 stdout crashes on Modal's ✓/box chars
         env.insert("PYTHONUTF8", "1")
         env.insert("PYTHONIOENCODING", "utf-8")
-        env.insert("PYTHONUNBUFFERED", "1")  # line-by-line streaming
+        env.insert("PYTHONUNBUFFERED", "1")
         for k, v in (self._extra_env or {}).items():
             env.insert(k, str(v))
-        # incremental: a multi-byte char ('—', '✓') split across read chunks
-        # must not decode to U+FFFD — the GUI pattern-matches these lines
+        # incremental decoder: multi-byte chars split across chunks must not become U+FFFD
         self._dec = codecs.getincrementaldecoder("utf-8")("replace")
         self.proc = QProcess(self)
         self.proc.setProcessEnvironment(env)
@@ -130,9 +119,7 @@ class JobRunner(QObject):
             self.proc.kill()
 
     def _on_output(self):
-        # Read from the emitting process, not self.proc: a finished-slot may have
-        # already started the NEXT stage (or nulled the handle) by the time a
-        # queued readyRead from the old process fires.
+        # read from the emitting process, not self.proc — the next stage may already own it
         proc = self.sender()
         if proc is not None:
             text = self._dec.decode(bytes(proc.readAllStandardOutput()))
@@ -140,12 +127,11 @@ class JobRunner(QObject):
                 self.output.emit(text)
 
     def _on_finished(self, code, _status):
-        if self._stage == "pre":      # ignore create's exit; run the real command
+        if self._stage == "pre":
             self._stage = "main"
             self._launch(*self._main)
             return
-        # Null BEFORE emitting: the finished slot often calls start() for the next
-        # stage, and nulling after would discard that new live process's handle.
+        # null BEFORE emitting: the finished slot may start() the next stage
         self.proc = None
         self.finished.emit(int(code))
 
@@ -155,12 +141,8 @@ class Stopped(Exception):
 
 
 class FuncWorker(QObject):
-    """Run a Python callable on a background thread; signals are queued to the
-    GUI thread. The callable receives a `progress(str)` callback.
-
-    Cancellation is cooperative: cancel() sets a flag and the next progress()
-    call raises Stopped, so a job only stops at its own checkpoints (scenes call
-    progress() one-per-scene, so a build stops between scenes)."""
+    """Run a callable on a background thread with a progress(str) callback.
+    Cancellation is cooperative: the next progress() call raises Stopped."""
 
     output = Signal(str)
     done = Signal(object)    # return value

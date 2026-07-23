@@ -1,13 +1,6 @@
-"""Datasets page workflow, top to bottom:
-
-  1. New dataset   point at a file/folder, name it, pick the label field
-  2. Classes       scan label values, name them, mark ignored, check density
-  3. Split         train/val/test split (whole scenes; scripts tile per model) +
-                   optional per-scene Height-Above-Ground channel (grid raster or PDAL)
-
-Labels come from a field in the cloud. Intensity is p95-normalized (i/p95
-clipped to 0..2); the single norm used across build + train + inference.
-"""
+"""Datasets page: point at clouds, name classes, split train/val/test, Build.
+Intensity is p95-normalized (i/p95 clipped to 0..2) — the single norm across
+build + train + inference."""
 
 from __future__ import annotations
 
@@ -36,12 +29,12 @@ class DatasetsPage(QWidget):
         self.worker = FuncWorker(self)
         self.uploader = JobRunner(self)
         self._staged_dir: Path | None = None
-        self._uploading: Path | None = None   # dir being uploaded
+        self._uploading: Path | None = None
         self._label_values: dict[int, int] = {}
         self._done_cb = None
-        self._scanned_for: str | None = None   # input path the last label scan covered
-        self._copied_classes: dict[int, tuple[str, bool]] = {}  # value -> (name, train) from "Copy settings"
-        self._run_open = False                  # a begin_run header awaits its end_run
+        self._scanned_for: str | None = None
+        self._copied_classes: dict[int, tuple[str, bool]] = {}
+        self._run_open = False
 
         root = QVBoxLayout(self)
         title = QLabel("Datasets")
@@ -52,11 +45,12 @@ class DatasetsPage(QWidget):
         self.sub.setObjectName("pageSub")
         root.addWidget(self.sub)
 
-        # Page scrolls, so each section keeps its natural height.
-        root.addWidget(self._new_dataset_box())   # 1
+        root.addWidget(self._new_dataset_box())    # 1
         root.addWidget(self._classes_box())        # 2
-        root.addWidget(self._tiling_box())         # 3  (incl. optional HAG)
-        root.addLayout(self._status_block())       # shared console
+        root.addWidget(self._features_box())       # 3  input features
+        root.addWidget(self._calculated_box())     # 4  computed channels: HAG + geometric
+        root.addWidget(self._tiling_box())         # 5  split + build
+        root.addLayout(self._status_block())
 
         # ---- saved datasets: bottom layer ----
         root.addWidget(QLabel("Saved Datasets"))
@@ -67,17 +61,12 @@ class DatasetsPage(QWidget):
         self.known_list.setMaximumWidth(360)
         self.known_list.itemSelectionChanged.connect(self._show_known)
         sd_col.addWidget(self.known_list)
-        # Register an already-converted folder (moved from another box, restored
-        # backup, …) without re-converting; must hold a valid dataset_meta.json.
         self.add_existing_btn = QPushButton("Add existing dataset…")
         self.add_existing_btn.clicked.connect(self._add_existing)
         sd_col.addWidget(self.add_existing_btn)
-        # Re-upload a converted dataset without re-converting; survives restart
-        # (staged_dir is remembered in state.json).
         self.upload_saved_btn = QPushButton("Upload selected to Modal")
         self.upload_saved_btn.clicked.connect(self._upload_saved)
         sd_col.addWidget(self.upload_saved_btn)
-        # Forget the dataset + delete its staged copy on disk.
         self.delete_saved_btn = QPushButton("Delete selected")
         self.delete_saved_btn.clicked.connect(self._delete_saved)
         sd_col.addWidget(self.delete_saved_btn)
@@ -91,8 +80,7 @@ class DatasetsPage(QWidget):
         self._reload_known()
 
         self._on_split_changed()
-        # Spine order Input -> Scan -> Classes -> Build: the classes/build widgets
-        # stay greyed until a label scan has run for the picked input.
+        # classes/build stay greyed until a label scan has run for the picked input
         self.input_edit.textChanged.connect(self._update_scan_gate)
         self._update_scan_gate()
 
@@ -115,7 +103,7 @@ class DatasetsPage(QWidget):
                if local else
                " Then upload to a per-dataset Modal volume."))
         self._reload_known()
-        self._refresh_next_btn()   # next-step wording follows the backend
+        self._refresh_next_btn()
 
     # ============================================================= 1. New dataset
     def _new_dataset_box(self) -> QWidget:
@@ -136,7 +124,6 @@ class DatasetsPage(QWidget):
         self.field_combo = QComboBox()
         self.field_combo.setEditable(True)
         form.addRow("Label field", self.field_combo)
-        # Reuse a previous dataset's setup: class names/ignores, split, features.
         self.copy_btn = QPushButton("Copy settings from…")
         self.copy_btn.setToolTip("Repopulate class names, ignored values, split config and "
                                  "feature selections from an existing dataset's "
@@ -150,13 +137,124 @@ class DatasetsPage(QWidget):
         # Datasets always build into <workspace>/<name> — no per-build output pick.
         return box
 
-    # ============================================================= 2. Classes
+    # ============================================================= 2. Input features
+    def _features_box(self) -> QWidget:
+        """Only checked fields are baked into scenes — no implicit channels.
+        intensity starts checked as a default, not a requirement."""
+        box = QGroupBox("3 · Feature channels — input fields the model trains on")
+        self.feat_group = box
+        box.setToolTip("Per-point fields baked into every scene. ONLY what's "
+                       "checked here ends up in the dataset — nothing is "
+                       "implicit. intensity starts checked as a default; "
+                       "uncheck it and the dataset carries none. Every scene "
+                       "must have a checked field - a missing one fails the "
+                       "build.")
+        lay = QVBoxLayout(box)
+        self.feat_hint = QLabel("Pick an input above — its per-point fields appear here.")
+        theme.set_accent(self.feat_hint, "muted")
+        lay.addWidget(self.feat_hint)
+        self.feat_list = QListWidget()
+        self.feat_list.setMaximumHeight(110)
+        lay.addWidget(self.feat_list)
+        # explicit mapping only — color is never auto-detected
+        self.rgb_box = QGroupBox("RGB color (rare)")
+        self.rgb_box.setCheckable(True)
+        self.rgb_box.setChecked(False)
+        self.rgb_box.setToolTip(
+            "Map source columns to color channels. All three mapped = the "
+            "dataset carries color; off or any 'none' = no color. Values are "
+            "scaled to 8-bit automatically (16-bit and 0-1 sources included).")
+        self.rgb_r = QComboBox()
+        self.rgb_g = QComboBox()
+        self.rgb_b = QComboBox()
+        rgb_row = QHBoxLayout()
+        for lbl, c in (("R", self.rgb_r), ("G", self.rgb_g), ("B", self.rgb_b)):
+            c.addItem("none")
+            rgb_row.addWidget(QLabel(lbl))
+            rgb_row.addWidget(c, 1)
+        rgb_row.addStretch()
+        self.rgb_opts_w = ui.wrap(rgb_row)
+        rgb_lay = QVBoxLayout(self.rgb_box)
+        rgb_lay.addWidget(self.rgb_opts_w)
+        self.rgb_box.toggled.connect(self.rgb_opts_w.setVisible)
+        self.rgb_opts_w.setVisible(False)
+        lay.addWidget(self.rgb_box)
+        return box
+
+    # ============================================================= 3. Calculated features
+    def _calculated_box(self) -> QWidget:
+        """Channels computed from xyz at build time — not fields of the input."""
+        box = QGroupBox("4 · Calculated features — computed at build time")
+        lay = QVBoxLayout(box)
+        self.hag_box = QGroupBox("Compute Height-Above-Ground (HAG)"
+                                 + ("" if pretrain.pdal_available()
+                                    else " - grid only, PDAL not installed"))
+        self.hag_box.setCheckable(True)
+        self.hag_box.setChecked(False)
+        self.hag_box.setToolTip("Bakes a per-point feat_hag channel into every scene. Ground "
+                                "comes from the labeled ground class when one is set, else "
+                                "it's detected. Select feat_hag in the Train page's feature "
+                                "list to feed it to any model.")
+        # interpolation only — ground source is the labeled class when set, else CSF
+        self.hag_filter = QComboBox()
+        self.hag_filter.addItems(list(pretrain.HAG_METHODS))
+        self.hag_filter.setToolTip("How HAG is interpolated from the ground points. "
+                                   "grid: fast raster approximation, no PDAL needed. "
+                                   "hag_nn / hag_delaunay: accurate PDAL filters.")
+        self.hag_ground = QLineEdit()
+        self.hag_ground.setPlaceholderText("blank = detect (CSF)")
+        self.hag_ground.setMaximumWidth(90)
+        self.hag_ground.setToolTip("Source value that means ground (from the Classes table, "
+                                   "e.g. 2). When set, those labels are the only ground source "
+                                   "(gaps are nearest-filled). Blank = CSF detects ground "
+                                   "instead (needs PDAL; without it the grid method's own "
+                                   "heuristic is the fallback).")
+        hag_row = QHBoxLayout()
+        hag_row.addWidget(QLabel("method"))
+        hag_row.addWidget(self.hag_filter)
+        hag_row.addWidget(QLabel("ground class"))
+        hag_row.addWidget(self.hag_ground)
+        hag_row.addStretch()
+        self.hag_opts_w = ui.wrap(hag_row)
+        hag_lay = QVBoxLayout(self.hag_box)
+        hag_lay.addWidget(self.hag_opts_w)
+        self.hag_box.toggled.connect(self.hag_opts_w.setVisible)
+        self.hag_opts_w.setVisible(False)
+        lay.addWidget(self.hag_box)
+        # stored raw as feat_geo_<name>
+        geo_lbl = QLabel("Geometric features (jakteristics) — search radius"
+                         + ("" if pretrain.jakteristics_available()
+                            else "  (jakteristics not installed — the build will fail)"))
+        self.geo_radius = QDoubleSpinBox()
+        self.geo_radius.setRange(0.1, 50.0)
+        self.geo_radius.setSingleStep(0.1)
+        self.geo_radius.setValue(1.0)
+        self.geo_radius.setSuffix(" m")
+        self.geo_radius.setToolTip("Neighborhood radius for the local PCA. Most features "
+                                   "are dimensionless ratios; eigenvalue_sum and "
+                                   "omnivariance scale with radius² — keep it small.")
+        geo_row = QHBoxLayout()
+        geo_row.addWidget(geo_lbl)
+        geo_row.addWidget(self.geo_radius)
+        geo_row.addStretch()
+        self.geo_row_w = ui.wrap(geo_row)
+        self.geo_list = QListWidget()
+        self.geo_list.setMaximumHeight(110)
+        for nm in pretrain.GEO_FEATURES:
+            it = QListWidgetItem(nm)
+            it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
+            it.setCheckState(Qt.Unchecked)
+            self.geo_list.addItem(it)
+        lay.addWidget(self.geo_row_w)
+        lay.addWidget(self.geo_list)
+        return box
+
+    # ============================================================= 4. Classes
     def _classes_box(self) -> QWidget:
         box = QGroupBox("2 · Classes - uncheck 'Train' to ignore a value; select rows + "
                         "Combine to merge into one class")
         cl = QVBoxLayout(box)
         btn_row = QHBoxLayout()
-        # Spine hint: classes + build stay greyed until the scan has run.
         self.scan_hint = QLabel("Scan labels first →")
         theme.set_accent(self.scan_hint, "muted")
         btn_row.addWidget(self.scan_hint)
@@ -186,13 +284,12 @@ class DatasetsPage(QWidget):
         cl.addWidget(self.analyze_label)
         return box
 
-    # ============================================================= 3. Split
+    # ============================================================= 5. Split
     def _tiling_box(self) -> QWidget:
-        box = QGroupBox("3 · Train / val / test split")
-        self.tile_box = box   # greyed by _update_scan_gate until labels are scanned
+        box = QGroupBox("5 · Train / val / test split")
+        self.tile_box = box
         self.split_form = form = QFormLayout(box)
-        # Two point-count fractions (train = remainder); carve three whole-scene
-        # folders once, scripts read them verbatim. No tiling here.
+        # whole-scene split only; scripts tile per model
         self.val_spin = QDoubleSpinBox()
         self.val_spin.setRange(0.05, 0.90)
         self.val_spin.setSingleStep(0.05)
@@ -207,14 +304,10 @@ class DatasetsPage(QWidget):
         form.addRow("Test fraction", self.test_spin)
         self.train_label = QLabel("Train: 70%")
         form.addRow("", self.train_label)
-        # balanced mirrors the global class mix in every split; random fills by
-        # point count alone.
         self.mode_combo = QComboBox()
         self.mode_combo.addItems(["Balanced (mirror class mix)", "Random"])
         form.addRow("Split mode", self.mode_combo)
-        # TODO(not ready): split-seed UI hidden until reviewed; seed is fixed at 42
-        # in _split_config for now.
-        # Explicit val + test folders bypass allocation (train = inputs).
+        # TODO(not ready): split-seed UI hidden; seed fixed at 42 in _split_config
         self.split_provided_chk = QCheckBox("Separate train/val/test folders (use as-is)")
         self.split_provided_chk.toggled.connect(self._on_split_changed)
         form.addRow("", self.split_provided_chk)
@@ -222,133 +315,13 @@ class DatasetsPage(QWidget):
         form.addRow("Validation folder", self.val_row_w)
         self.test_edit, self.test_row_w = self._dir_row(self._pick_test)
         form.addRow("Test folder", self.test_row_w)
-        # Optional: compute HeightAboveGround per scene in the same pass. Checkable
-        # group box, collapsed by default — same fold as the Train page's Loss box —
-        # so the landing view is just the split spinners, not the expert knobs.
-        self.hag_box = QGroupBox("Compute Height-Above-Ground (HAG)"
-                                 + ("" if pretrain.pdal_available()
-                                    else " - grid only, PDAL not installed"))
-        self.hag_box.setCheckable(True)
-        self.hag_box.setChecked(False)
-        self.hag_box.setToolTip("Bakes a per-point feat_hag channel into every scene. Ground "
-                                "comes from the labeled ground class when one is set, else "
-                                "it's detected. Select feat_hag in the Train page's feature "
-                                "list to feed it to any model.")
-        # Interpolation only — the ground SOURCE is the labeled class when set,
-        # else CSF detection (any method; grid heuristic = the PDAL-less fallback).
-        self.hag_filter = QComboBox()
-        self.hag_filter.addItems(list(pretrain.HAG_METHODS))
-        self.hag_filter.setToolTip("How HAG is interpolated from the ground points. "
-                                   "grid: fast raster approximation, no PDAL needed. "
-                                   "hag_nn / hag_delaunay: accurate PDAL filters.")
-        # Which class is ground (raw Source value from the Classes table). When set,
-        # the labels are the ONLY ground source — never mixed with detection.
-        self.hag_ground = QLineEdit()
-        self.hag_ground.setPlaceholderText("blank = detect (CSF)")
-        self.hag_ground.setMaximumWidth(90)
-        self.hag_ground.setToolTip("Source value that means ground (from the Classes table, "
-                                   "e.g. 2). When set, those labels are the only ground source "
-                                   "(gaps are nearest-filled). Blank = CSF detects ground "
-                                   "instead (needs PDAL; without it the grid method's own "
-                                   "heuristic is the fallback).")
-        hag_row = QHBoxLayout()
-        hag_row.addWidget(QLabel("method"))
-        hag_row.addWidget(self.hag_filter)
-        hag_row.addWidget(QLabel("ground class"))
-        hag_row.addWidget(self.hag_ground)
-        hag_row.addStretch()
-        self.hag_opts_w = ui.wrap(hag_row)
-        hag_lay = QVBoxLayout(self.hag_box)
-        hag_lay.addWidget(self.hag_opts_w)
-        self.hag_box.toggled.connect(self.hag_opts_w.setVisible)
-        self.hag_opts_w.setVisible(False)
-        form.addRow(self.hag_box)
-        # RGB color: explicit mapping only, collapsed by default (design
-        # 2026-07-21) — color is rare in this domain, so it costs no space or
-        # attention until someone actually needs it. Nothing is auto-detected;
-        # the dataset carries color only when the box is on AND all three
-        # channels are mapped to source columns.
-        self.rgb_box = QGroupBox("RGB color (rare)")
-        self.rgb_box.setCheckable(True)
-        self.rgb_box.setChecked(False)
-        self.rgb_box.setToolTip(
-            "Map source columns to color channels. All three mapped = the "
-            "dataset carries color; off or any 'none' = no color. Values are "
-            "scaled to 8-bit automatically (16-bit and 0-1 sources included).")
-        self.rgb_r = QComboBox()
-        self.rgb_g = QComboBox()
-        self.rgb_b = QComboBox()
-        rgb_row = QHBoxLayout()
-        for lbl, c in (("R", self.rgb_r), ("G", self.rgb_g), ("B", self.rgb_b)):
-            c.addItem("none")
-            rgb_row.addWidget(QLabel(lbl))
-            rgb_row.addWidget(c, 1)
-        rgb_row.addStretch()
-        self.rgb_opts_w = ui.wrap(rgb_row)
-        rgb_lay = QVBoxLayout(self.rgb_box)
-        rgb_lay.addWidget(self.rgb_opts_w)
-        self.rgb_box.toggled.connect(self.rgb_opts_w.setVisible)
-        self.rgb_opts_w.setVisible(False)
-        form.addRow(self.rgb_box)
-        # Optional: bake extra per-point source fields into every scene as
-        # feat_<name> (p95(|v|)-normalized, like intensity). Hidden until the
-        # input carries candidate fields; collapsed (unchecked) by default.
-        self.feat_group = QGroupBox("Extra feature channels")
-        self.feat_group.setCheckable(True)
-        self.feat_group.setChecked(False)
-        self.feat_group.setToolTip("Carry extra per-point fields (e.g. eigenvalue features) "
-                                   "into every scene as feat_<name>. Every scene must have "
-                                   "the field - a missing one fails the build. Computed "
-                                   "geometric features (jakteristics) need no source field: "
-                                   "they come from xyz within the search radius and are "
-                                   "stored raw as feat_geo_<name>.")
-        self.feat_list = QListWidget()
-        self.feat_list.setMaximumHeight(110)
-        feat_lay = QVBoxLayout(self.feat_group)
-        feat_lay.addWidget(self.feat_list)
-        # Computed geometric channels (jakteristics, from xyz — no source field).
-        geo_lbl = QLabel("Computed geometric features (jakteristics) — search radius"
-                         + ("" if pretrain.jakteristics_available()
-                            else "  (jakteristics not installed — the build will fail)"))
-        self.geo_radius = QDoubleSpinBox()
-        self.geo_radius.setRange(0.1, 50.0)
-        self.geo_radius.setSingleStep(0.1)
-        self.geo_radius.setValue(1.0)
-        self.geo_radius.setSuffix(" m")
-        self.geo_radius.setToolTip("Neighborhood radius for the local PCA. Most features "
-                                   "are dimensionless ratios; eigenvalue_sum and "
-                                   "omnivariance scale with radius² — keep it small.")
-        geo_row = QHBoxLayout()
-        geo_row.addWidget(geo_lbl)
-        geo_row.addWidget(self.geo_radius)
-        geo_row.addStretch()
-        self.geo_row_w = ui.wrap(geo_row)
-        self.geo_list = QListWidget()
-        self.geo_list.setMaximumHeight(110)
-        for nm in pretrain.GEO_FEATURES:
-            it = QListWidgetItem(nm)
-            it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
-            it.setCheckState(Qt.Unchecked)
-            self.geo_list.addItem(it)
-        feat_lay.addWidget(self.geo_row_w)
-        feat_lay.addWidget(self.geo_list)
-        for w in (self.feat_list, self.geo_row_w, self.geo_list):
-            self.feat_group.toggled.connect(w.setVisible)  # collapse w/ the checkbox
-            w.setVisible(False)
-        self.feat_group.setVisible(False)
-        form.addRow(self.feat_group)   # spanning row (like the HAG box), no label gap
-        # TODO(not ready): parallel-worker UI hidden until reviewed; conversion runs
-        # single-process (max_workers=1 forced in _conversion_plan).
+        # TODO(not ready): parallel-worker UI hidden; max_workers=1 forced in _conversion_plan
         self.tile_btn = QPushButton("Build dataset")
         self.tile_btn.setObjectName("primary")
         self.tile_btn.clicked.connect(self._start_tiling)
-        # One Stop for the shared worker: cancels whichever of scan/analyze/build
-        # is running (a build stops between scenes).
         self.stop_btn = QPushButton("Stop")
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self._stop)
-        # Context-aware next step; hidden until a build succeeds this session
-        # (modal: upload the fresh build; local: jump to the Train page).
         self.next_btn = QPushButton()
         self.next_btn.setVisible(False)
         self.next_btn.clicked.connect(self._next_step)
@@ -362,8 +335,7 @@ class DatasetsPage(QWidget):
 
     # ============================================================= shared console
     def _status_block(self) -> QVBoxLayout:
-        # Scrolling console log; errors also pop a dialog (_on_worker_error).
-        self.log = LogConsole()   # \r-aware, colored console (drop-in for the old QPlainTextEdit)
+        self.log = LogConsole()
         self.log.setMinimumHeight(140)
         self.log.setPlaceholderText("Progress and messages appear here…")
         lay = QVBoxLayout()
@@ -372,22 +344,18 @@ class DatasetsPage(QWidget):
 
     # ------------------------------------------------------------- widgets
     def _set_busy(self, on: bool):
-        """One worker at a time: disable every action that would start a second
-        job while one runs (this is the guard that stops scan+analyze colliding),
-        and light up Stop only while there's something to stop."""
+        """One worker at a time; Stop lights up only while something runs."""
         for b in (self.scan_btn, self.analyze_btn, self.tile_btn):
             b.setEnabled(not on)
         self.stop_btn.setEnabled(on)
         if on:
-            # Stop lives in the (possibly scan-gated) split box: a running scan
-            # must stay stoppable, so lift the gate while busy.
+            # a running scan must stay stoppable, so lift the scan gate while busy
             self.tile_box.setEnabled(True)
         else:
             self._update_scan_gate()
 
     def _update_scan_gate(self, *_):
-        """Spine order: classes + build stay greyed until 'Scan label values' has
-        run for the CURRENTLY picked input (changing the input re-locks them)."""
+        """Classes + build stay greyed until the current input has been scanned."""
         if self.worker.running:
             return   # _set_busy owns the buttons while a job runs
         ready = bool(self._label_values) and self._scanned_for == self.input_edit.text().strip()
@@ -400,7 +368,7 @@ class DatasetsPage(QWidget):
         if self.worker.running:
             self._append("Stopping after the current step…")
             self.worker.cancel()
-            self.stop_btn.setEnabled(False)   # buttons reset when the job unwinds
+            self.stop_btn.setEnabled(False)
 
     def _on_stopped(self):
         self._done_cb = None
@@ -408,8 +376,7 @@ class DatasetsPage(QWidget):
         self._append("⏹ Stopped.")
         self._end_run("stopped")
 
-    # LogConsole run headers: one begin_run per long operation (build, upload),
-    # closed exactly once on success/failure/stop via the _run_open latch.
+    # one begin_run per long op, closed exactly once via the _run_open latch
     def _begin_run(self, title: str):
         self.log.begin_run(title)
         self._run_open = True
@@ -434,8 +401,6 @@ class DatasetsPage(QWidget):
         return edit, ui.wrap(row)
 
     def _on_split_changed(self):
-        # Provided mode reveals the val + test folder rows; else fractions drive
-        # allocation. Keep val% + test% <= 0.90 (train keeps >= 10%).
         provided = self.split_provided_chk.isChecked()
         self.split_form.setRowVisible(self.val_row_w, provided)
         self.split_form.setRowVisible(self.test_row_w, provided)
@@ -494,23 +459,19 @@ class DatasetsPage(QWidget):
             if i >= 0:
                 self.field_combo.setCurrentIndex(i)
                 break
-        # Extra-channel candidates: every field except the label field (a late
-        # label-field change is re-filtered at build time in _conversion_plan).
+        # intensity starts checked — a default, not a requirement; nothing else is
         self.feat_list.clear()
         for f in fields:
             if f == self.field_combo.currentText():
                 continue
-            if f.lower() in ("x", "y", "z"):   # geometry, never an extra channel
+            if f.lower() in ("x", "y", "z"):   # geometry, never a feature channel
                 continue
             it = QListWidgetItem(f)
             it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
-            it.setCheckState(Qt.Unchecked)
+            it.setCheckState(Qt.Checked if dataset.canonical_channel(f) == "intensity"
+                             else Qt.Unchecked)
             self.feat_list.addItem(it)
-        # Always offerable once an input is probed: computed geometric channels
-        # need no source field, so the group no longer hides on empty feat_list.
-        self.feat_group.setVisible(True)
-        # RGB mapping candidates: every probed column; explicit-only, so no
-        # preselection — the user maps color or the dataset has none.
+        self.feat_hint.setVisible(self.feat_list.count() == 0)
         for combo in (self.rgb_r, self.rgb_g, self.rgb_b):
             combo.clear()
             combo.addItem("none")
@@ -540,9 +501,8 @@ class DatasetsPage(QWidget):
         menu.exec(self.copy_btn.mapToGlobal(self.copy_btn.rect().bottomLeft()))
 
     def _copy_settings_from(self, name: str):
-        """Repopulate class names/ignores, split config and feature selections from
-        an existing dataset's dataset_meta.json. Fields missing from the meta are
-        skipped silently; the scan gate still applies to the new input."""
+        """Repopulate classes, split and feature selections from a dataset's
+        meta; fields missing from the meta are skipped silently."""
         meta_path = appstate.known_datasets().get(name, {}).get("meta_path", "")
         try:
             with open(meta_path, "r", encoding="utf-8") as f:
@@ -552,14 +512,11 @@ class DatasetsPage(QWidget):
             return
         src = meta.get("source", {})
         copied = []
-        # -- classes: one row per class index (shared names merge to "5,6"), plus
-        #    the ignored values as unchecked rows. Also stashed so a later scan of
-        #    the new input re-applies the names instead of wiping them.
+        # -- classes: stashed so a later scan re-applies names instead of wiping them
         if meta.get("classes"):
             groups: dict[int, tuple[str, list[int]]] = {}
             for cl in meta["classes"]:
-                # written metas collapse to "source_values" (list); pre-persist
-                # in-memory rows carry singular "source_value" (see dataset.py)
+                # written metas carry "source_values" (list); in-memory rows singular
                 vals = cl.get("source_values") or [cl.get("source_value", cl["index"])]
                 groups.setdefault(int(cl["index"]), (str(cl["name"]), []))[1].extend(
                     int(v) for v in vals)
@@ -595,7 +552,7 @@ class DatasetsPage(QWidget):
             self.mode_combo.setCurrentIndex(0 if sp["mode"] == "balanced" else 1)
         if req or sp.get("mode"):
             copied.append("split")
-        # -- feature selections (raw source fields + computed geometric channels)
+        # -- features: canonical intensity/return_number ride the has_* flags
         fields, geo, radius = set(), set(), None
         for fc in src.get("feature_channels") or []:
             sf = fc.get("source_field", "")
@@ -604,11 +561,15 @@ class DatasetsPage(QWidget):
                 radius = fc.get("radius", radius)
             elif sf and not sf.startswith("@"):
                 fields.add(sf)
-        if fields or geo:
-            self.feat_group.setChecked(True)
+        canon = {c for c, k in (("intensity", "has_intensity"),
+                                ("return_number", "has_return_number"))
+                 if meta.get(k)}
+        if fields or geo or canon:
             for i in range(self.feat_list.count()):
                 it = self.feat_list.item(i)
-                it.setCheckState(Qt.Checked if it.text() in fields else Qt.Unchecked)
+                on = (it.text() in fields
+                      or dataset.canonical_channel(it.text()) in canon)
+                it.setCheckState(Qt.Checked if on else Qt.Unchecked)
             for i in range(self.geo_list.count()):
                 it = self.geo_list.item(i)
                 it.setCheckState(Qt.Checked if it.text() in geo else Qt.Unchecked)
@@ -639,7 +600,7 @@ class DatasetsPage(QWidget):
             self._append("Pick an input file or folder first.")
             return
         spec = self._spec()
-        self._scan_in_path = in_path   # what _on_scanned marks as scanned
+        self._scan_in_path = in_path
         self._append("Scanning label values…")
         self._set_busy(True)
         def job(progress):
@@ -653,8 +614,7 @@ class DatasetsPage(QWidget):
     def _on_scanned(self, counts):
         self._set_busy(False)
         self._label_values = counts
-        # Default-ignore value 0 only for ASPRS-style classification fields; else
-        # class 0 may be real.
+        # default-ignore 0 only for ASPRS-style classification fields
         ignore_zero = "class" in self._spec().field.lower()
         self.class_table.setRowCount(len(counts))
         for r, (val, cnt) in enumerate(counts.items()):
@@ -671,8 +631,7 @@ class DatasetsPage(QWidget):
                 item.setFlags(item.flags() & ~Qt.ItemIsEditable)
                 self.class_table.setItem(r, col, item)
             self.class_table.setItem(r, 3, QTableWidgetItem(f"class_{val}"))
-        # Re-apply names/train flags taken from "Copy settings from…" to the
-        # freshly scanned values (the scan rebuild would otherwise wipe them).
+        # re-apply "Copy settings from…" names to the fresh scan
         if self._copied_classes:
             for r in range(self.class_table.rowCount()):
                 for v in _parse_values(self.class_table.item(r, 1).text()):
@@ -730,8 +689,6 @@ class DatasetsPage(QWidget):
         name = name.strip()
         if not ok or not name:
             return
-        # Gather every source value across the rows (may already be a "5,6"),
-        # dedupe + sort, sum point counts.
         vals: list[int] = []
         for r in rows:
             vals += _parse_values(self.class_table.item(r, 1).text())
@@ -742,7 +699,7 @@ class DatasetsPage(QWidget):
         self.class_table.item(keep, 2).setText(f"{total:,}")
         self.class_table.setItem(keep, 3, QTableWidgetItem(name))
         self.class_table.cellWidget(keep, 0).findChild(QCheckBox).setChecked(True)
-        for r in reversed(rows[1:]):        # drop the rows now folded into `keep`
+        for r in reversed(rows[1:]):
             self.class_table.removeRow(r)
         self._append(f"Combined source values [{', '.join(map(str, vals))}] into class '{name}'.")
 
@@ -798,11 +755,9 @@ class DatasetsPage(QWidget):
         label_field = self.field_combo.currentText().strip()
         feats = [self.feat_list.item(i).text() for i in range(self.feat_list.count())
                  if self.feat_list.item(i).checkState() == Qt.Checked
-                 and self.feat_list.item(i).text() != label_field
-                 ] if self.feat_group.isChecked() else []
+                 and self.feat_list.item(i).text() != label_field]
         geo = [self.geo_list.item(i).text() for i in range(self.geo_list.count())
-               if self.geo_list.item(i).checkState() == Qt.Checked
-               ] if self.feat_group.isChecked() else []
+               if self.geo_list.item(i).checkState() == Qt.Checked]
         rgb_sel = ([c.currentText() for c in (self.rgb_r, self.rgb_g, self.rgb_b)]
                    if self.rgb_box.isChecked() else [])
         mapped = [s for s in rgb_sel if s and s != "none"]
@@ -891,9 +846,7 @@ class DatasetsPage(QWidget):
         if self._staged_dir is None:
             return
         if appstate.get_exec_mode() == "local":
-            # main.py's switcher only forwards kwargs to pages with receive_nav;
-            # the Train page has none, so a plain page switch is the whole hop
-            # (it reloads its dataset list on entry).
+            # plain page switch; the Train page reloads its dataset list on entry
             ui.navigate("Train")
         else:
             self._start_upload(self._staged_dir)
@@ -980,10 +933,7 @@ class DatasetsPage(QWidget):
                          f"runs/ + infer/ under {staged or 'nothing on disk'} for records.")
 
     def _start_upload(self, staged: Path):
-        # All datasets live on the ONE datasets volume the modal shells mount at
-        # /datasets (TT_DATASET_VOLUME, default 'terminal-datasets'), each under
-        # /<name> — the same layout the local path bind-mounts. (Was: one volume
-        # per dataset, which the trainers never mounted — invisible in the cloud.)
+        # one shared datasets volume (TT_DATASET_VOLUME), each dataset under /<name>
         self._uploading = staged
         name = staged.name
         self.upload_saved_btn.setEnabled(False)
@@ -1031,9 +981,7 @@ class DatasetsPage(QWidget):
 
     # ------------------------------------------------------------- known list
     def _reload_known(self):
-        """Each row is '<name>   <badge>' (the bare name rides in UserRole):
-        ✓ uploaded / ● staged / ⚠ missing (staged dir gone), colored with the
-        theme's ok/warn tokens."""
+        """Rows are '<name>   <badge>'; the bare name rides in UserRole."""
         c = theme.colors(appstate.get("ui_theme", "system"))
         self.known_list.clear()
         for name, info in sorted(appstate.known_datasets().items()):
@@ -1093,8 +1041,6 @@ class DatasetsPage(QWidget):
 
     # ------------------------------------------------------------- helpers
     def _append(self, text: str, newline: bool = True):
-        # Stream into the console. newline=False for chunked subprocess output
-        # (uploader); True for one-shot status messages.
         ui.append_log(self.log, text, newline)
 
 

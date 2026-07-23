@@ -1,11 +1,5 @@
 """Train page: dataset + model + params -> a training run, with live logs and
-epoch metrics. Two backends, chosen by the sidebar's Execution backend switch:
-local (pixi run on your GPU; output folder on the host via TT_* env) and Modal
-(modal run on a cloud GPU; dataset read from / run written to Modal volumes).
-Dataset check verifies the train/val/test standard; per-model pixi-env
-status/install live in a popup. Loss / class-balance knobs reach the trainer
-as env either way (extra_env locally, --env-json through the modal shell).
-"""
+epoch metrics. Backends: local (pixi run) or Modal (cloud GPU)."""
 
 from __future__ import annotations
 
@@ -22,39 +16,28 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog,
                                QProgressBar, QPushButton, QSpinBox,
                                QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
-from .. import analysis, appstate, local_cli, modal_cli, theme, ui
+from .. import analysis, appstate, dataset, local_cli, modal_cli, theme, ui
 from ..backbones import BACKBONES, GPU_CHOICES
 from ..jobs import FuncWorker, JobRunner, LogParser
 from ..logconsole import LogConsole
 
-# Input-feature picker: channels each architecture CAN take. NOTHING is ever
-# pre-checked (design 2026-07-21): point coords are the model's only given;
-# every other channel is an option the user checks deliberately. Offered chips
-# are filtered to what the selected dataset actually carries. "height" (the
-# tile-relative z proxy) was dismantled 2026-07-21 — real HAG is feat_hag; the
-# trainers still resolve "height" from old run.json specs at inference, but
-# nothing offers it for new runs.
+# Channels each arch CAN consume — a capability filter, never a default:
+# nothing is ever pre-checked. "height" is removed — don't reintroduce it.
 _FEAT_STANDARD = {
     "randlanet":    ["intensity", "return_number"],
     "kpconvx_cold": ["intensity", "return_number"],
     "kpconv":       ["intensity", "return_number"],
-    # PTv3 family: one 3-wide color slot (rgb OR intensity), no return_number
-    # (ptv3_check_spec); the pretrained-stem legacy lives in the trainers only.
+    # ptv3 family: one 3-wide color slot (rgb OR intensity), no return_number
     "ptv3":         ["intensity", "rgb"],
     "concerto":     ["intensity", "rgb"],
     "sonata":       ["intensity", "rgb"],
     "utonia":       ["intensity", "rgb"],
 }
 
-# backbones sharing the ptv3 trainer's intensity-first color-slot logic
 _PTV3_LIKE = ("ptv3", "concerto", "sonata", "utonia")
-# Point coords are always model input — never a user choice. These trainers'
-# FEAT_CHANNELS contract still expects x,y,z in the spec string, so the
-# launcher prepends them invisibly (_feat_collect).
+# these trainers' FEAT_CHANNELS spec expects x,y,z; the launcher prepends them
 _XYZ_IMPLICIT = ("randlanet",) + _PTV3_LIKE
 
-# param flags that live in the collapsed Tuning fold, not the Job box
-# ("grid"/"sub-grid" covers every backbone's grid_flag)
 _TUNING_FLAGS = ("batch", "chunk-xy", "grid", "sub-grid")
 
 
@@ -62,24 +45,24 @@ class TrainPage(QWidget):
     def __init__(self, repo_root: str):
         super().__init__()
         self.repo_root = repo_root
-        self.runner = JobRunner(self)          # training process (pixi or modal run)
-        self.pull_runner = JobRunner(self)     # pixi install, streamed to log
-        self.status_worker = FuncWorker(self)  # off-thread image-presence check
-        self.modal_worker = FuncWorker(self)   # off-thread modal volume preflight
+        self.runner = JobRunner(self)
+        self.pull_runner = JobRunner(self)
+        self.status_worker = FuncWorker(self)
+        self.modal_worker = FuncWorker(self)
         self.parser = LogParser(self)
         self._param_widgets: dict[str, QWidget] = {}
         self._meta: dict | None = None
         self._last_run_id: str | None = None
-        self._out_root: str | None = None      # host /outputs root of the live local run
+        self._out_root: str | None = None
         self._pending: dict | None = None
-        self._last_statuses: dict = {}         # key -> status dict from all_statuses
-        self._cfg_dialog: QDialog | None = None  # per-model popup when open
-        self._ds_ready = False                 # train/val/test standard met
-        self._built_sig: tuple | None = None   # (backbone, dataset) the params were built for
-        self._key_rows: list[QWidget] = []     # dynamic param rows living in the Job form
+        self._last_statuses: dict = {}
+        self._cfg_dialog: QDialog | None = None
+        self._ds_ready = False
+        self._built_sig: tuple | None = None
+        self._key_rows: list[QWidget] = []
         self._run_live = False
         self._run_t0: float | None = None
-        self._run_epochs = 0                   # launched epochs, for the progress strip
+        self._run_epochs = 0
 
         root = QVBoxLayout(self)
         title = QLabel("Train")
@@ -99,7 +82,7 @@ class TrainPage(QWidget):
         self.ds_status.setWordWrap(True)
         theme.set_accent(self.ds_status, "muted")
         form.addRow("", self.ds_status)
-        self.backbone_combo = QComboBox()      # populated in _reload_backbones
+        self.backbone_combo = QComboBox()
         self.backbone_combo.currentIndexChanged.connect(self._rebuild_params)
         model_row = QHBoxLayout()
         model_row.addWidget(self.backbone_combo, 1)
@@ -108,7 +91,6 @@ class TrainPage(QWidget):
         self.cfg_btn.clicked.connect(self._open_model_config)
         model_row.addWidget(self.cfg_btn)
         form.addRow("Model", ui.wrap(model_row))
-        # key params (epochs, steps/epoch, …) are inserted here by _rebuild_params
         self.star_hint = QLabel("★ = dataset recommendation")
         theme.set_accent(self.star_hint, "muted")
         form.addRow("", self.star_hint)
@@ -123,15 +105,11 @@ class TrainPage(QWidget):
         self.val_every.valueChanged.connect(self._refresh_summaries)
         form.addRow("Validate every N epochs", self.val_every)
         form.addRow("Input features", self._features_row())
-        # Modal-only: detach = `modal run --detach`, returns as soon as the cloud
-        # app starts, freeing this page to launch the next model — the way to
-        # train several models on one dataset in parallel.
         self.detach_chk = QCheckBox("Detach (return immediately — launch several models in parallel)")
         self.detach_chk.setToolTip("Runs in the cloud without streaming logs here. Reattach with "
                                    "`modal app logs <app>`; the run id appears under runs/ on the "
                                    "model's outputs volume (the Inference page Run field is editable).")
         form.addRow("", self.detach_chk)
-        # Modal-only: cloud GPU type (TT_GPU env, read by the modal shell at launch).
         self.gpu_combo = QComboBox()
         for g in GPU_CHOICES:
             self.gpu_combo.addItem(g)
@@ -165,7 +143,6 @@ class TrainPage(QWidget):
         run_row.addWidget(self.stop_btn)
         run_row.addStretch()
 
-        # resolved-job summary, refreshed on any contributing input change
         self.summary_lbl = QLabel("")
         self.summary_lbl.setWordWrap(True)
         theme.set_accent(self.summary_lbl, "muted")
@@ -181,9 +158,8 @@ class TrainPage(QWidget):
         config_col.addLayout(run_row)
         config_col.addStretch()
 
-        self.log = LogConsole()   # \r-aware, colored console (drop-in for the old QPlainTextEdit)
+        self.log = LogConsole()
         self.log.setPlaceholderText("Training logs…")
-        # slim live-progress strip under the console; visible only while a run is live
         self.progress_lbl = QLabel("")
         theme.set_accent(self.progress_lbl, "muted")
         self.progress_bar = QProgressBar()
@@ -239,12 +215,11 @@ class TrainPage(QWidget):
                if local else
                "Runs on a Modal cloud GPU — upload the dataset from the Datasets page "
                "first; the finished run lands on the model's outputs volume."))
-        self.cfg_btn.setVisible(local)                      # pixi env mgmt
-        # stop/kill only while live; graceful stop stays local-only (the sentinel
-        # rides the /outputs bind mount; Modal volumes can't take it mid-run)
+        self.cfg_btn.setVisible(local)
+        # graceful stop is local-only: the sentinel rides the /outputs bind mount
         self._set_run_live(self._run_live)
-        self.form.setRowVisible(self.gpu_combo, not local)  # cloud GPU pick
-        self.form.setRowVisible(self.detach_chk, not local) # parallel cloud launches
+        self.form.setRowVisible(self.gpu_combo, not local)
+        self.form.setRowVisible(self.detach_chk, not local)
         self.reload_datasets()
 
     def _sync_gpu_default(self):
@@ -287,8 +262,8 @@ class TrainPage(QWidget):
         self._cfg_dialog = dlg
         dlg.finished.connect(lambda *_: setattr(self, "_cfg_dialog", None))
         self._update_cfg_dialog()
-        self.refresh_images()        # async; _apply_statuses refreshes the dialog
-        dlg.show()                   # non-modal: install progress shows in the main log
+        self.refresh_images()
+        dlg.show()   # non-modal: install progress shows in the main log
 
     @staticmethod
     def _status_text(s: dict | None):
@@ -298,7 +273,7 @@ class TrainPage(QWidget):
         if not s["pixi"]:
             return "pixi not found", "muted", False
         if s["installed"]:
-            return "✓ installed", "ok", True     # update stays available
+            return "✓ installed", "ok", True
         return "✗ not installed", "warn", True
 
     def _update_cfg_dialog(self):
@@ -423,8 +398,7 @@ class TrainPage(QWidget):
         b = self._backbone()
         sig = (b.key if b else None, self.dataset_combo.currentText())
         if sig == self._built_sig and self._param_widgets:
-            # same backbone + dataset (re-select / programmatic refresh):
-            # never clobber user-edited values
+            # same backbone + dataset: never clobber user-edited values
             self._update_cfg_dialog()
             self._refresh_summaries()
             return
@@ -449,15 +423,14 @@ class TrainPage(QWidget):
         for spec in b.params:
             rec = recs.get(spec.recommend_key) if spec.recommend_key and \
                 spec.recommend_key in recs else None
-            # survive rebuilds: keep the user's value unless a fresh dataset
-            # recommendation supersedes it (epochs survives even a model switch)
+            # keep the user's value unless a fresh dataset rec supersedes it
             if spec.flag in prev and ((same_bb and rec is None) or spec.flag == "epochs"):
                 value = prev[spec.flag]
             elif rec is not None:
                 value = rec
             else:
                 value = spec.default
-            if spec.flag == "freeze-encoder":   # 0/1 int param -> checkbox
+            if spec.flag == "freeze-encoder":
                 w = QCheckBox("Freeze encoder (linear probe)")
                 w.setChecked(bool(int(value)))
                 w.toggled.connect(self._refresh_summaries)
@@ -493,8 +466,8 @@ class TrainPage(QWidget):
             self.warn_label.setText("\n".join("⚠ " + w for w in warns))
         else:
             self.warn_label.setText("")
-        self._rebuild_feat_list()    # feature picker follows model + dataset
-        self._update_cfg_dialog()    # sync popup with model
+        self._rebuild_feat_list()
+        self._update_cfg_dialog()
         self._refresh_summaries()
 
     @staticmethod
@@ -523,8 +496,8 @@ class TrainPage(QWidget):
         outer.addWidget(inner)
         box.toggled.connect(inner.setVisible)
         inner.setVisible(False)
-        self.tuning_box = box    # title echoes current values (_refresh_summaries)
-        self.tuning_form = QFormLayout()   # batch/grid/tile rows, per backbone
+        self.tuning_box = box
+        self.tuning_form = QFormLayout()
         lay.addLayout(self.tuning_form)
         return box
 
@@ -570,7 +543,7 @@ class TrainPage(QWidget):
         outer.addWidget(inner)
         box.toggled.connect(inner.setVisible)
         inner.setVisible(False)
-        self.adv_box = box       # unchecked = off, script defaults for everything
+        self.adv_box = box
 
         hint = QLabel("Loss & class balance — defaults already handle imbalance "
                       "(rare classes weighted up + oversampled). Everything set "
@@ -703,7 +676,7 @@ class TrainPage(QWidget):
         lay.addLayout(r2)
 
     def _dg_collect(self) -> dict:
-        if not self.adv_box.isChecked():        # off -> baseline (no DG env)
+        if not self.adv_box.isChecked():
             return {}
         return {"density_aug": self.dg_aug.isChecked(),
                 "coarsen_max": round(self.dg_coarsen.value(), 2),
@@ -713,9 +686,7 @@ class TrainPage(QWidget):
 
     # -------------------------------------------- input features (per run)
     def _features_row(self) -> QWidget:
-        """Compact picker for the Job form: a wrapping chip list. The checked
-        chips ARE the run's feature spec (left-to-right, drag to reorder) —
-        there is no hidden legacy default behind it."""
+        """Wrapping chip list: the checked chips are the run's feature spec."""
         self.feat_list = QListWidget()
         self.feat_list.setFlow(QListWidget.LeftToRight)
         self.feat_list.setWrapping(True)
@@ -729,9 +700,7 @@ class TrainPage(QWidget):
         return ui.wrap(row)
 
     def _rebuild_feat_list(self):
-        """Repopulate the checklist for the selected backbone + dataset. Offered
-        = what the arch can take AND the dataset carries. Nothing is ever
-        pre-checked — the user picks every channel deliberately."""
+        """Repopulate for the selected backbone + dataset; nothing pre-checked."""
         if not hasattr(self, "feat_list"):
             return
         self.feat_list.clear()
@@ -740,28 +709,23 @@ class TrainPage(QWidget):
             return
         base = b.key
         meta = self._meta or {}
-        std = list(_FEAT_STANDARD.get(base, []))
-        if not meta.get("has_rgb"):
-            std = [n for n in std if n != "rgb"]
-        if not meta.get("has_intensity", True):
-            std = [n for n in std if n != "intensity"]
-        if not meta.get("has_return_number", True):
-            std = [n for n in std if n != "return_number"]
+        # offered = arch capability ∩ channels the dataset was built with
+        std = [n for n in _FEAT_STANDARD.get(base, []) if meta.get(f"has_{n}")]
         extra = ((meta.get("source") or {}).get("feature_channels")
                  if isinstance(meta.get("source"), dict) else None) or []
-        # feature_channels entries are dicts ({"name", "source_field", "norm"});
-        # the channel key is the "name" field, never the dict repr.
         extra_names = [c.get("name") if isinstance(c, dict) else str(c)
                        for c in extra]
+        # older datasets may carry feat_ duplicates of canonical channels — drop them
+        extra_names = [n for n in extra_names if n
+                       and (dataset.canonical_channel(
+                            n[5:] if n.startswith("feat_") else n) or n) not in std]
         names = std + [n if n.startswith("feat_") else f"feat_{n}"
-                       for n in extra_names if n]
-        # HAG-box (and source-dimension) datasets bake feat_hag without it ever
-        # appearing in feature_channels — offer it whenever the scenes carry it.
+                       for n in extra_names]
+        # feat_hag never appears in feature_channels; offered via has_hag
         if meta.get("has_hag") and "feat_hag" not in names:
             names.append("feat_hag")
         for n in names:
-            # display without the internal feat_ prefix; the real channel name
-            # rides in UserRole so the FEAT_CHANNELS contract is untouched
+            # display strips the feat_ prefix; the real channel name rides in UserRole
             it = QListWidgetItem(n[5:] if n.startswith("feat_") else str(n))
             it.setData(Qt.UserRole, str(n))
             it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
@@ -773,9 +737,8 @@ class TrainPage(QWidget):
             "and aren't listed. Recorded in run.json.")
 
     def _feat_collect(self) -> str:
-        """Checked names in list order -> FEAT_CHANNELS csv. Always explicit:
-        the spec IS what's checked (never a hidden trainer legacy default);
-        coords ride implicitly for the trainers whose contract lists them."""
+        """Checked names in list order -> FEAT_CHANNELS csv (xyz prepended
+        where the trainer's contract expects it)."""
         names = [self.feat_list.item(i).data(Qt.UserRole)
                  for i in range(self.feat_list.count())
                  if self.feat_list.item(i).checkState() == Qt.Checked]
@@ -783,26 +746,6 @@ class TrainPage(QWidget):
         if b is not None and b.key in _XYZ_IMPLICIT:
             names = ["x", "y", "z"] + names   # coords: always in, never a chip
         return ",".join(names)
-
-    def _apply_feat_csv(self, csv: str):
-        """Restore a saved FEAT_CHANNELS csv: check the listed names (moved to
-        the top in csv order), uncheck the rest. '' (an old legacy-default
-        config) keeps the current data-driven defaults. x/y/z in old saved
-        specs are dropped — coords are implicit now."""
-        if not csv:
-            return
-        row = 0
-        for n in csv.split(","):
-            if n in ("x", "y", "z"):
-                continue
-            for i in range(row, self.feat_list.count()):
-                if self.feat_list.item(i).data(Qt.UserRole) == n:
-                    self.feat_list.insertItem(row, self.feat_list.takeItem(i))
-                    row += 1
-                    break
-        for i in range(self.feat_list.count()):
-            self.feat_list.item(i).setCheckState(
-                Qt.Checked if i < row else Qt.Unchecked)
 
     # ------------------------------------------------------------- launch
     def _launch(self):
@@ -835,17 +778,13 @@ class TrainPage(QWidget):
             env["VAL_EVERY"] = str(self.val_every.value())
         feat_csv = self._feat_collect()
         if not feat_csv:
-            # Never fall back to the trainers' old built-in specs silently.
+            # never silently fall back to the trainers' built-in specs
             self._append("No input features checked — check at least one on "
                          "the Input features row.")
             return
         env["FEAT_CHANNELS"] = feat_csv
-        # A local trainer inherits these from the GUI's process env; the Modal
-        # container only ever sees --env-json, so forward them when actually set
-        # (never a default — that would freeze the container's own defaults).
-        # AUTO_RESUME rides along so a user who *wants* to continue a run the
-        # Modal shells no longer auto-resume (TT_MODAL_RETRY is preemption-only)
-        # can still ask for it, rather than losing hours of GPU time silently.
+        # forward only when actually set — a default would freeze the Modal
+        # container's own defaults; AUTO_RESUME rides along for deliberate resumes
         for k in ("TT_TRAIN_STRIDE", "TT_AMP", "TT_PREFETCH", "AUTO_RESUME",
                   "EVAL_BATCH"):
             if os.environ.get(k):
@@ -885,9 +824,7 @@ class TrainPage(QWidget):
     def _start_local_run(self, p):
         b, flags, name, info = p["backbone"], p["flags"], p["dataset"], p["info"]
         staged = info.get("staged_dir", "")
-        # Runs nest per dataset in the workspace: TT_OUTPUTS_ROOT =
-        # <workspace>/<dataset>, so the trainer's runs/<id> lands right beside
-        # the dataset's data.
+        # runs nest per dataset: TT_OUTPUTS_ROOT = <workspace>/<dataset>
         base = str(appstate.workspace_dir())
         out_root = str(Path(base) / name)
         os.makedirs(out_root, exist_ok=True)
@@ -896,9 +833,7 @@ class TrainPage(QWidget):
             self._append(f"[local] ⚠ No staged copy of '{name}' - "
                          f"the trainer won't find the dataset.")
         elif Path(staged).parent != Path(appstate.local_config()["datasets_root"]):
-            # Dataset lives outside the workspace (pre-existing/relocated); the
-            # TT_DATASETS_ROOT base won't expose it, so point TT_DATASET_DIR
-            # straight at it. A nested dataset needs no override.
+            # dataset outside the workspace: point TT_DATASET_DIR straight at it
             dataset_dir = staged
         prog, args, run_env = local_cli.run_script(
             b.script, flags, b, repo_root=self.repo_root,
@@ -930,9 +865,8 @@ class TrainPage(QWidget):
 
     # ------------------------------------------------------------- modal path
     def _preflight_modal_run(self, p):
-        """Check the dataset is on the datasets volume before paying for a GPU
-        container that would just print 'No training tiles'. Off-thread — the
-        `modal volume ls` call can take seconds."""
+        """Verify the dataset is on the volume (off-thread) before paying for
+        a GPU container."""
         import shutil as _sh
         if _sh.which("modal") is None:
             self._append("[modal] 'modal' CLI not found on PATH — `pip install modal`, "
@@ -960,8 +894,6 @@ class TrainPage(QWidget):
         self._start_modal_run(p)
 
     def _on_modal_preflight_error(self, tb: str):
-        # Can't list (auth hiccup, flaky network) — warn but let the run proceed;
-        # the trainer itself fails fast and clearly if the dataset is missing.
         p, self._pending = self._pending, None
         if p is None:
             return
@@ -1001,7 +933,7 @@ class TrainPage(QWidget):
         return f"{dur // 60}m{dur % 60:02d}s"
 
     def _on_runner_failed(self, err: str):
-        # FailedToStart fires failed not finished; re-enable here.
+        # FailedToStart fires failed, not finished; re-enable here
         self.launch_btn.setEnabled(True)
         self._clear_stop_sentinel()
         if self._run_live:
@@ -1152,7 +1084,7 @@ class TrainPage(QWidget):
                 self.dg_k.setValue(int(dg.get("logdk_k", 8)))
             except (TypeError, ValueError):
                 pass
-        self._apply_feat_csv(str(cfg.get("features", "") or ""))
+        # features deliberately not restored — chips always start unchecked
 
     def _append(self, text: str, newline: bool = True):
         ui.append_log(self.log, text, newline)

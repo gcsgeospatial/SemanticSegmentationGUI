@@ -1,11 +1,6 @@
-"""View any trainer npz (staged inference scene or prediction) in CloudCompare.
-
-An .npz is literally a zip of .npy arrays -- unzipping it gives files
-CloudCompare can't read. This converts instead: xyz becomes the cloud, rgb the
-las color, and every other per-point channel (intensity, return_number,
-feat_hag, feat_geo_*, label, confidence, agreement, dominant_member, ...)
-becomes a float32 Extra Bytes scalar field CloudCompare lists by name -- e.g.
-color the cloud by feat_hag to see where inference HAG collapsed on roofs.
+"""Convert a trainer npz (scene or prediction) to .las for CloudCompare:
+xyz -> cloud, rgb -> color, every other per-point channel -> a float32
+Extra Bytes field listed by name.
 
 Usage:
   python npz_to_las.py scene.npz [more.npz ...]     # writes sibling .las
@@ -26,9 +21,8 @@ def npz_to_las(path):
     rgb = np.asarray(z["rgb"]) if "rgb" in z.files else None
 
     h = laspy.LasHeader(point_format=7 if rgb is not None else 6, version="1.4")
-    # channels that shadow a native LAS dimension (intensity, return_number, ...)
-    # get an npz_ prefix: the native slots are integer-typed and would truncate
-    # the npz's normalized floats.
+    # npz_ prefix when shadowing a native LAS dim: the integer native slots
+    # would truncate the normalized floats
     taken = set(h.point_format.dimension_names)
     extras = {}
     for k in z.files:
@@ -42,7 +36,14 @@ def npz_to_las(path):
     if "crs_wkt" in z.files:
         try:
             from pyproj import CRS
-            h.add_crs(CRS.from_wkt(str(z["crs_wkt"])))
+            crs = CRS.from_wkt(str(z["crs_wkt"]))
+            h.add_crs(crs)
+            # npz coords are meters (scaled at ingest); a non-meter CRS (ft
+            # state planes) needs them back in source units to match its WKT.
+            if not crs.is_geographic:
+                f = float(crs.axis_info[0].unit_conversion_factor)
+                if abs(f - 1.0) > 1e-6:
+                    xyz = xyz / f         # h.offsets is set below from this xyz
         except Exception:
             pass                          # a CRS-less viewable file beats none
     h.offsets = xyz.min(0)

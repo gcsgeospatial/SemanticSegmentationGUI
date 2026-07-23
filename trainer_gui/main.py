@@ -12,24 +12,15 @@ from PySide6.QtWidgets import (QAbstractSpinBox, QApplication, QComboBox, QFileD
                                QLabel, QListWidget, QListWidgetItem, QMessageBox, QStackedWidget,
                                QVBoxLayout, QWidget)
 
-# Repo root = the project dir holding scripts/ (one level up from this trainer_gui/
-# package). modal runs are launched with cwd=REPO_ROOT, so this must be where
-# `modal run scripts/modal/modal_train_*.py` can find the script.
-#   .../<repo>/trainer_gui/main.py  -> parents[0]=trainer_gui pkg, parents[1]=<repo>
+# modal runs launch with cwd=REPO_ROOT so `modal run scripts/...` resolves
 REPO_ROOT = str(Path(__file__).resolve().parents[1])
 
 PAGES = ["Datasets", "Train", "Inference", "Plotting"]
 
 
 class _NoWheelEdit(QObject):
-    """App-wide guard: a mouse wheel must never change a spin box / combo value.
-    Scrolling a page used to silently bump whatever number/dropdown the cursor
-    passed over (fractions, local↔modal, appearance, …). We eat wheel events on
-    spin boxes and combos *unless* they have keyboard focus, so deliberate
-    scroll-to-adjust still works once you click in, but casual page scrolling
-    never mutates a value. Open combo popups (a separate list view) are untouched.
-    ponytail: covers QAbstractSpinBox + QComboBox; add QSlider here if any slider
-    becomes a scroll victim too."""
+    """Eat wheel events on unfocused spin boxes/combos so page scrolling never
+    mutates a value. ponytail: add QSlider if one becomes a scroll victim."""
 
     def eventFilter(self, obj, event):
         if (event.type() == QEvent.Wheel
@@ -64,9 +55,7 @@ class MainWindow(QWidget):
         self.tag.setWordWrap(True)
         sl.addWidget(self.tag)
 
-        # Execution backend toggle — the seamless Modal <-> Local switch. Pages
-        # read appstate.get_exec_mode() when they launch, so flipping this just
-        # changes where the next Train / Inference run goes.
+        # Modal <-> Local switch; pages read appstate.get_exec_mode() at launch
         from . import appstate
         mode_label = QLabel("Execution backend")
         mode_label.setObjectName("modeLabel")
@@ -79,7 +68,6 @@ class MainWindow(QWidget):
         sl.addWidget(self.mode_combo)
         self._apply_mode_tag(appstate.get_exec_mode())
 
-        # Appearance: System (follows the OS), Light or Dark — persisted.
         theme_label = QLabel("Appearance")
         theme_label.setObjectName("modeLabel")
         sl.addWidget(theme_label)
@@ -116,8 +104,6 @@ class MainWindow(QWidget):
         self.train_page = TrainPage(REPO_ROOT)
         self.plotting_page = PlottingPage(REPO_ROOT)
         self.infer_page = InferPage(REPO_ROOT)
-        # Each page scrolls vertically instead of being crammed into the window,
-        # and gets HIG form spacing (Fusion's 6px default clumps the text).
         for page in (self.datasets_page, self.train_page,
                      self.infer_page, self.plotting_page):
             ui.polish_forms(page)
@@ -131,8 +117,6 @@ class MainWindow(QWidget):
         mode = self.mode_combo.currentData()
         appstate.set_exec_mode(mode)
         self._apply_mode_tag(mode)
-        # Re-scheme every page for the chosen backend (hide Modal-only controls,
-        # drop built-ins, reword copy).
         local = mode == "local"
         for page in (self.datasets_page, self.train_page, self.infer_page):
             page.apply_exec_mode(local)
@@ -148,8 +132,7 @@ class MainWindow(QWidget):
         theme.apply(QApplication.instance(), mode)
 
     def _navigate(self, page_name: str, **kwargs):
-        """ui.navigate target: switch pages (setCurrentRow fires _go's reload
-        hooks), then hand any payload to the page's receive_nav if it has one."""
+        """ui.navigate target: switch pages, then hand the payload to receive_nav."""
         self.nav.setCurrentRow(PAGES.index(page_name))
         page = {"Datasets": self.datasets_page, "Train": self.train_page,
                 "Inference": self.infer_page, "Plotting": self.plotting_page}[page_name]
@@ -166,7 +149,6 @@ class MainWindow(QWidget):
             self.plotting_page._rescan()
         self.stack.setCurrentIndex(row)
 
-    # Window size/position persists across sessions (stored in appstate JSON).
     def _restore_geometry(self):
         from . import appstate
         geo = appstate.get("window_geometry")
@@ -184,7 +166,7 @@ class MainWindow(QWidget):
 
 
 def _app_icon() -> QIcon:
-    """Window/taskbar icon — icon.png shipped at the repo root (or the package)."""
+    """icon.png from the repo root or package."""
     here = Path(__file__).resolve()
     for base in (here.parent, here.parents[1], here.parents[2]):
         p = base / "icon.png"
@@ -194,10 +176,7 @@ def _app_icon() -> QIcon:
 
 
 def _ensure_workspace(parent=None) -> None:
-    """First launch only: ask where the workspace root should live — datasets and,
-    nested inside each, their runs/ and infer/ output. Seeded with the current
-    staging dir so accepting it moves nothing; cancel falls back to staging too.
-    Once stored, never prompts again."""
+    """First launch only: ask for the workspace root; cancel falls back to staging."""
     from . import appstate
     if appstate.get("workspace"):
         return
@@ -222,15 +201,14 @@ def _check_modal_cli(parent=None) -> bool:
 def main() -> int:
     from . import appstate, theme
     if sys.platform == "win32":
-        # Give the app its OWN taskbar identity so Windows shows icon.png there
-        # instead of the generic python.exe icon.
+        # own taskbar identity so Windows shows icon.png, not python.exe's
         try:
             import ctypes
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("trainer_gui")
         except Exception:  # noqa: BLE001
             pass
     app = QApplication(sys.argv)
-    app.installEventFilter(_NoWheelEdit(app))  # wheel never changes a value (see class)
+    app.installEventFilter(_NoWheelEdit(app))
     app.setApplicationName("trainer_gui")
     app.setWindowIcon(_app_icon())
     theme.apply(app, appstate.get("ui_theme", "system"))

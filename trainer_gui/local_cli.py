@@ -1,19 +1,8 @@
-"""Builders for the LOCAL (pixi) execution path — the mirror of modal_cli.
-
-Each backbone's local_train_*.py runs DIRECTLY on the host inside its pixi
-environment (envs/pixi.toml — one env per backbone, env name = backbone key
-with '_' -> '-'; heavy deps + the trainer-src-<key> model-source package live
-there). No container and no bind mounts: the trainers read real host paths
-from the TT_* env vars (the train_common path contract):
-
-    TT_DATASETS_ROOT  <- staging root (canonical datasets + _infer/<job>)
-    TT_OUTPUTS_ROOT   <- the chosen output folder (runs/<id> lands here)
-    TT_DATASET_DIR / TT_INFER_DIR / TT_PRED_DIR <- out-of-workspace overrides
-
-run_script returns (program, args, env) for JobRunner (args like modal_cli,
-env passed as extra_env) so the GUI dispatch stays backend-agnostic. The
-modal_train_*.py scripts still subprocess these same local_train_*.py inside
-a Modal container, so local and cloud run one codebase.
+"""LOCAL (pixi) execution builders — the mirror of modal_cli. local_train_*.py
+runs on the host in its pixi env (name = backbone key, '_' -> '-'), reading
+paths from the TT_* contract: TT_DATASETS_ROOT, TT_OUTPUTS_ROOT, and
+TT_DATASET_DIR/TT_INFER_DIR/TT_PRED_DIR overrides. run_script returns
+(program, args, env); the modal shells subprocess the same scripts.
 """
 
 from __future__ import annotations

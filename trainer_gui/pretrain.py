@@ -1,21 +1,9 @@
-"""HeightAboveGround for one cloud, by two interchangeable methods.
+"""HeightAboveGround — hag_for_cloud is the one engine behind every feat_hag.
 
-`hag_for_cloud` is the single engine behind every feat_hag channel in the app:
-the Datasets page bakes it into a dataset during conversion, and the Inference
-page bakes it into the scenes for runs whose feature spec includes feat_hag.
-
-Two independent axes, never mixed:
-  - ground SOURCE: a caller-supplied ground_mask (the file's own ground class,
-    trusted labels) wins outright; with no mask, CSF (cloth simulation filter)
-    detects ground — for every interpolation method. Never a union of the two.
-  - HAG INTERPOLATION: "grid" (pure numpy/scipy raster — fast, no PDAL) or
-    hag_nn / hag_delaunay (PDAL filters — accurate, needs python-pdal).
-
-Without PDAL there is no CSF; the grid method then falls back to its own
-percentile+opening detection heuristic. Returns None on any failure — callers
-then write no "hag" key, and the *_hag models refuse to run.
-
-`pdal` is imported lazily, so this module (and the GUI) load fine without it.
+Two independent axes, never mixed: ground SOURCE (caller mask wins, else CSF;
+grid's own heuristic only without PDAL) and INTERPOLATION ("grid" numpy raster,
+or PDAL hag_nn/hag_delaunay). Returns None on any failure — the scene then has
+no hag key and *_hag models refuse to run. pdal imports lazily.
 """
 
 from __future__ import annotations
@@ -25,17 +13,16 @@ import re
 
 import numpy as np
 
-HAG_FILTERS = ("hag_nn", "hag_delaunay")     # PDAL filters (the accurate path)
-HAG_METHODS = ("grid",) + HAG_FILTERS        # hag_for_cloud methods; "grid" = fast default
+HAG_FILTERS = ("hag_nn", "hag_delaunay")     # PDAL filters (accurate path)
+HAG_METHODS = ("grid",) + HAG_FILTERS
 
-# jakteristics geometric features the app offers (their exact spellings).
+# jakteristics feature names, exact spellings
 GEO_FEATURES = ("eigenvalue_sum", "omnivariance", "eigenentropy", "anisotropy",
                 "planarity", "linearity", "PCA1", "PCA2",
                 "surface_variation", "sphericity", "verticality")
 
 
 def pdal_available() -> bool:
-    """Whether python-pdal can be imported (Stage A is disabled without it)."""
     try:
         import pdal  # noqa: F401
         return True
@@ -44,7 +31,6 @@ def pdal_available() -> bool:
 
 
 def jakteristics_available() -> bool:
-    """Whether jakteristics can be imported (geo feature channels need it)."""
     try:
         import jakteristics  # noqa: F401
         return True
@@ -55,9 +41,7 @@ def jakteristics_available() -> bool:
 # ---------------------------------------------------------------- Stage A: HAG
 
 def _structured_from_cloud(cloud) -> np.ndarray:
-    """Pack a readers.py Cloud into a PDAL-dimension-named structured array, so
-    non-LAS inputs (txt/csv/ply/…) can be fed straight into a PDAL pipeline and
-    written out as LAS/LAZ."""
+    """Pack a Cloud into a PDAL-dimension-named structured array."""
     n = cloud.n
     dt = [("X", "f8"), ("Y", "f8"), ("Z", "f8")]
     cols = {"X": cloud.xyz[:, 0], "Y": cloud.xyz[:, 1], "Z": cloud.xyz[:, 2]}
@@ -65,7 +49,7 @@ def _structured_from_cloud(cloud) -> np.ndarray:
         dt.append(("Intensity", "u2"))
         cols["Intensity"] = np.clip(cloud.intensity, 0, 65535).astype(np.uint16)
     if cloud.return_number is not None:
-        # ground filters reject ReturnNumber/NumberOfReturns of 0; keep them consistent (>=1).
+        # ground filters reject ReturnNumber/NumberOfReturns of 0
         rn = np.clip(cloud.return_number, 1, 255).astype(np.uint8)
         dt.append(("ReturnNumber", "u1"))
         cols["ReturnNumber"] = rn
@@ -97,8 +81,7 @@ def _structured_from_cloud(cloud) -> np.ndarray:
             dt.append((dim, "f8"))
             cols[dim] = arr0.astype(np.float64)
         used.add(dim.lower())
-    # Always carry a Classification dim so CSF / ground-assignment have somewhere
-    # to write (0 = unclassified when the source had no classification field).
+    # always carry a Classification dim so CSF/ground-assignment can write
     if "classification" not in used:
         dt.append(("Classification", "u1"))
         cols["Classification"] = np.zeros(n, dtype=np.uint8)
@@ -108,34 +91,20 @@ def _structured_from_cloud(cloud) -> np.ndarray:
     return arr
 
 
-# Grid-HAG knobs. cell = ground-raster resolution (error ~ cell x slope);
-# open window = largest structure whose roof-only cells get rejected; relief =
-# terrain rise the opening may flatten before a cell counts as non-ground.
-# ponytail: fixed heuristics sized for buildings on gentle terrain — promote to
-# parameters if a dataset's terrain/structures fight them.
+# ponytail: fixed grid-HAG heuristics sized for buildings on gentle terrain —
+# promote to parameters if a dataset's terrain/structures fight them
 GRID_HAG_CELL_M = 2.0
 GRID_HAG_OPEN_M = 35.0
 GRID_HAG_RELIEF_M = 2.5
-_GRID_HAG_MAX_DIM = 4096          # grow the cell instead of allocating a huge raster
+_GRID_HAG_MAX_DIM = 4096          # grow the cell instead of a huge raster
 
 
 def hag_grid_for_cloud(cloud, *, ground_mask=None,
                        cell: float = GRID_HAG_CELL_M) -> "np.ndarray | None":
-    """Approximate per-point HeightAboveGround from a rasterized ground surface.
-    Pure numpy/scipy, no PDAL, a few O(n) passes — the fast default method.
-
-    ground_mask given (trusted labels or CSF-detected ground): the raster is
-    the per-cell mean Z of the masked points; mask-less cells (e.g. under
-    buildings) are filled from the NEAREST masked cell — interpolation fills
-    the gaps, never a second ground source.
-    No mask (the no-PDAL fallback): per-cell low-percentile Z, then a grey opening rejects
-    cells whose lowest return sits on a structure (roofs); rejected + empty
-    cells are nearest-filled the same way.
-
-    HAG = z - bilinear(raster). Error is ~cell x slope: a feature channel, not
-    survey ground. Returns float32 aligned 1:1 to cloud.xyz, or None when it
-    can't produce one — the scene then carries no "hag" key and the *_hag models
-    refuse it (there is no fallback height)."""
+    """HAG from a rasterized ground surface (numpy/scipy, no PDAL). With a mask:
+    per-cell mean Z, holes nearest-filled (never a second ground source). Without:
+    low-percentile Z + grey opening rejects roof cells. Error ~ cell x slope —
+    a feature channel, not survey ground. float32 (n,) or None."""
     try:
         from scipy import ndimage
     except Exception:  # noqa: BLE001
@@ -167,9 +136,7 @@ def hag_grid_for_cloud(cloud, *, ground_mask=None,
         grid[valid] = zsum[valid] / cnt[valid]
         g2, v2 = grid.reshape(dims), valid.reshape(dims)
     else:                                          # detect: low-percentile Z + opening
-        # One int64 argsort instead of a two-key lexsort (~2.5x faster): pack
-        # cell id with 20-bit-quantized Z (<= mm resolution), so sorting the key
-        # orders by cell, Z ascending within.
+        # packed cell-id|quantized-Z argsort: ~2.5x faster than lexsort
         zq = ((z - z.min()) * ((1 << 20) - 1) / max(float(z.max() - z.min()), 1e-9))
         order = np.argsort((flat << 20) | zq.astype(np.int64))
         counts = np.bincount(flat, minlength=ncell)
@@ -178,9 +145,8 @@ def hag_grid_for_cloud(cloud, *, ground_mask=None,
         pick = starts[valid] + (0.05 * (counts[valid] - 1)).astype(np.int64)
         grid[valid] = z[order][pick]               # 5th-pctile resists low noise
         g2, v2 = grid.reshape(dims), valid.reshape(dims)
-        # Nearest-fill empties FIRST so the opening sees a full surface, then
-        # reject cells the opening lowered by more than the relief tolerance:
-        # their lowest return sits on a structure, not the ground.
+        # nearest-fill first so the opening sees a full surface, then reject
+        # cells the opening lowered past the relief tolerance (roofs)
         if (~v2).any():
             near = ndimage.distance_transform_edt(~v2, return_distances=False,
                                                   return_indices=True)
@@ -201,13 +167,8 @@ def hag_grid_for_cloud(cloud, *, ground_mask=None,
 
 
 def csf_ground_mask(cloud) -> "np.ndarray | None":
-    """Detect ground with PDAL's CSF (cloth simulation) filter -> boolean mask
-    aligned 1:1 to cloud.xyz, or None (no PDAL, pipeline failure, or reordered
-    output). The only ground-detection path when the input carries no ground
-    class. CSF over SMRF: its cloth-from-below mechanism has no window-size
-    contract, so large flat roofs can't be absorbed into ground (the SMRF
-    failure that poisoned HAG on big buildings), and its errors skew toward
-    omission — the harmless direction for HAG, which interpolates over gaps."""
+    """Ground mask via PDAL CSF, or None. CSF over SMRF: no window-size contract,
+    so large flat roofs can't be absorbed into ground (the SMRF failure mode)."""
     if not pdal_available():
         return None
     import pdal
@@ -226,23 +187,9 @@ def csf_ground_mask(cloud) -> "np.ndarray | None":
 
 def hag_for_cloud(cloud, *, ground_mask=None,
                   hag_filter: str = "grid") -> "np.ndarray | None":
-    """Per-point HeightAboveGround aligned 1:1 to cloud.xyz — the ONE engine
-    behind dataset builds, per-tile HAG and inference (so train and infer can't
-    diverge in method).
-
-    Ground SOURCE (one, never a union): ground_mask — the file's own ground
-    class, trusted outright — else CSF detection, for every method. No PDAL
-    means no CSF: the grid method then falls back to its own detection
-    heuristic, the PDAL filters return None.
-    hag_filter picks the INTERPOLATION: "grid" (default, hag_grid_for_cloud —
-    fast raster approximation, no PDAL) or a PDAL filter ("hag_nn" /
-    "hag_delaunay", the accurate path).
-
-    Returns float32 length cloud.n, or None when no method can produce an
-    aligned result — callers then write no "hag" key, and the *_hag models fail
-    loudly rather than train or predict on a fabricated height. csf+hag preserve
-    input order; the length + first/last-X guard rejects the pathological case
-    where they don't."""
+    """The ONE HAG engine (dataset builds, tiles, inference — methods can't
+    diverge). Ground source: ground_mask wins, else CSF, never a union.
+    hag_filter picks interpolation. float32 (n,) or None — never fabricated."""
     if hag_filter not in HAG_METHODS:
         raise ValueError(f"hag_filter must be one of {HAG_METHODS}, got {hag_filter!r}")
     if ground_mask is not None:
@@ -252,13 +199,12 @@ def hag_for_cloud(cloud, *, ground_mask=None,
     if ground_mask is None:
         ground_mask = csf_ground_mask(cloud)          # None without PDAL
     if hag_filter == "grid":
-        # mask=None here means no labels AND no CSF -> the grid heuristic.
         return hag_grid_for_cloud(cloud, ground_mask=ground_mask)
     if ground_mask is None or not pdal_available():
         return None                                   # nothing to anchor HAG to
     import pdal
     try:
-        arr = _structured_from_cloud(cloud)           # always has a Classification dim
+        arr = _structured_from_cloud(cloud)
         arr["Classification"] = np.where(ground_mask, 2, 1).astype(
             arr["Classification"].dtype)
         pipe = pdal.Pipeline(json.dumps([{"type": f"filters.{hag_filter}"}]), arrays=[arr])
@@ -277,15 +223,8 @@ def hag_for_cloud(cloud, *, ground_mask=None,
 # ------------------------------------------------ Stage A': geometric features
 
 def geo_features_for_cloud(xyz, names, radius: float = 1.0) -> "dict[str, np.ndarray]":
-    """Per-point jakteristics geometric features aligned 1:1 to xyz.
-
-    Returns {jak_name: float32 (n,)}. NaN (too few neighbors within `radius`)
-    becomes 0.0 — the natural "no local structure" value for these ratio
-    features (verticality 0 = horizontal is the one debatable fill; kept for
-    consistency). eigenvalue_sum and omnivariance scale with radius^2 (O(1) at
-    the 1.0 m default); the rest are dimensionless ratios. Raises instead of
-    returning None: geo channels are always explicitly requested, so a missing
-    dependency or bad name must fail the build loud, unlike HAG's soft None."""
+    """{jak_name: float32 (n,)}; NaN -> 0. Raises (never soft-None): geo channels
+    are always explicitly requested, so failures must be loud."""
     bad = [n for n in names if n not in GEO_FEATURES]
     if bad:
         raise ValueError(f"unknown geometric feature(s) {bad}; "
@@ -296,8 +235,7 @@ def geo_features_for_cloud(xyz, names, radius: float = 1.0) -> "dict[str, np.nda
         raise RuntimeError("Geometric feature channels need the 'jakteristics' "
                            "package (pip install jakteristics).") from e
     pts = np.ascontiguousarray(np.asarray(xyz, dtype=np.float64))
-    # num_threads defaults to all cores — fine while conversion forces
-    # max_workers=1; pass it down if the parallel-worker UI is ever un-hidden.
+    # num_threads = all cores; fine while conversion forces max_workers=1
     feats = compute_features(pts, search_radius=float(radius),
                              feature_names=list(names))
     return {nm: np.nan_to_num(feats[:, i], nan=0.0, posinf=0.0,
@@ -308,10 +246,7 @@ def geo_features_for_cloud(xyz, names, radius: float = 1.0) -> "dict[str, np.nda
 # --------------------------------------------------------------------- self-check
 
 def _selfcheck():
-    """Grid HAG numerics (no PDAL needed): flat ground at z=0 with a 10x10 m
-    "roof" at z=10 and no ground returns beneath it. Detection must reject the
-    roof cells (opening) and nearest-fill them; the labeled path must get the
-    same answer from the mask alone."""
+    """Grid HAG: detection and labeled paths agree on a flat scene with a roof."""
     from .readers import Cloud
     g = np.mgrid[0:60, 0:60].reshape(2, -1).T.astype(np.float64)
     on_roof = (g[:, 0] >= 25) & (g[:, 0] < 35) & (g[:, 1] >= 25) & (g[:, 1] < 35)

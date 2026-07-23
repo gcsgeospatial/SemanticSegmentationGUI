@@ -1,16 +1,8 @@
-"""LogConsole — drop-in console widget for streaming process output.
-
-Wraps a read-only QPlainTextEdit (objectName "log", so the theme QSS still
-applies) behind a chunk-safe line pipeline: QProcess delivers arbitrary
-fragments, so text is buffered until a full line lands; `\\r` progress frames
-(tqdm) REPLACE the previous line instead of piling up hundreds of fragments;
-ANSI SGR colors map to real text colors and every other escape (cursor
-movement, erase) is stripped; committed lines get a muted HH:MM:SS prefix and
-content-based severity coloring. A slim toolbar (objectName "logToolbar") adds
-Clear / Copy all / Wrap / autoscroll-pin / errors-only. The console core is
-deliberately theme-INVARIANT — a terminal stays dark in both app themes —
-hence the module color constants below instead of theme.py tokens. Foreground
-colors go through QTextCharFormat, never QSS.
+"""LogConsole — console widget for streaming process output: chunk-safe line
+assembly, \\r frames replace the previous line, ANSI SGR -> colors (other
+escapes stripped), timestamp + severity coloring, toolbar. The core is
+deliberately theme-invariant (always dark), hence module color constants;
+foreground colors go through QTextCharFormat, never QSS.
 """
 
 from __future__ import annotations
@@ -22,7 +14,7 @@ from collections import deque
 from PySide6.QtGui import QColor, QGuiApplication, QTextCharFormat, QTextCursor
 from PySide6.QtWidgets import QHBoxLayout, QPlainTextEdit, QToolButton, QVBoxLayout, QWidget
 
-# ---- theme-invariant console colors (see module docstring) ----------------------
+# ---- theme-invariant console colors ----
 CONSOLE_BG = "#0e1116"
 CONSOLE_TEXT = "#d6dae3"
 CONSOLE_MUTED = "#6b7383"
@@ -44,12 +36,8 @@ _MAX_LINES = 10000
 
 
 class LineAssembler:
-    """Raw chunk stream -> committed-line events, testable without Qt.
-
-    feed() returns [("append"|"replace", line), ...]: "replace" means the line
-    rewrites the previously committed one (a `\\r` progress frame). `\\r\\n` is a
-    plain newline — the trailing `\\r` of a chunk is carried over so a split
-    `\\r\\n` never fakes a rewrite."""
+    """Chunk stream -> [("append"|"replace", line), ...]; "replace" = a \\r frame
+    rewrites the previous line. A chunk-split \\r\\n never fakes a rewrite."""
 
     def __init__(self):
         self._buf = ""
@@ -89,8 +77,7 @@ class LineAssembler:
 
 
 def _ansi_segments(raw: str) -> list[tuple[str, str | None]]:
-    """Line -> [(text, fg hex | None)]: SGR 30-37/90-97 become colors, SGR 0
-    resets, extended colors (38/48;5;n) and all non-SGR escapes are stripped."""
+    """Line -> [(text, fg hex | None)]; extended colors and non-SGR escapes stripped."""
     segs, color, pos = [], None, 0
     for m in _SGR_RE.finditer(raw):
         if m.start() > pos:
@@ -127,8 +114,7 @@ class LogConsole(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._asm = LineAssembler()
-        # (ts, segments, severity, is_header) — kept so the errors-only filter
-        # can re-render; bounded to match setMaximumBlockCount below.
+        # (ts, segments, severity, is_header); kept so errors-only can re-render
         self._entries: deque = deque(maxlen=_MAX_LINES)
         self._fmt_cache: dict[str, QTextCharFormat] = {}
         self._doc_has_content = False
@@ -157,8 +143,7 @@ class LogConsole(QWidget):
         self._edit.setReadOnly(True)
         self._edit.setObjectName("log")
         self._edit.setMaximumBlockCount(_MAX_LINES)
-        # declaration-only sheet = this widget alone; theme #log rule (font,
-        # border) still applies, but the core stays dark in both themes.
+        # declaration-only sheet: theme #log rule still applies, core stays dark
         self._edit.setStyleSheet(f"background: {CONSOLE_BG}; color: {CONSOLE_TEXT};")
 
         clear_btn.clicked.connect(self.clear)

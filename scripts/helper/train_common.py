@@ -1,49 +1,32 @@
-"""Shared best-checkpoint selection for the local_train_* trainers.
-
-Studies pick the checkpoint with the highest validation mIoU, not the last
-epoch (Pointcept -> model_best.pth; the DFC aerial-LiDAR eval paper
-arXiv:2603.22420 selects "the checkpoint with highest validation mIoU"). This
-makes final_model.pth = best-by-val-mIoU while keeping the inference contract
-(final_model.pth) unchanged.
-"""
+"""Shared helpers for the local_train_* trainers.
+final_model.pth = best-by-val-mIoU checkpoint (arXiv:2603.22420 protocol)."""
 import contextlib
 import csv
 import json
 import os
 import time
 
-# Path contract: inside containers (Modal) these stay the fixed /datasets +
-# /outputs mounts; the pixi local backend has no container, so the GUI points
-# them at the real host dirs via TT_* env vars. Unset vars = container layout,
-# byte-for-byte.
+# Container defaults; TT_* env vars repoint them for the pixi local backend.
 DATASETS_ROOT = os.environ.get("TT_DATASETS_ROOT", "/datasets")
 OUTPUTS_ROOT = os.environ.get("TT_OUTPUTS_ROOT", "/outputs")
 
 
 def dataset_dir(name):
-    """Root of a canonical dataset. TT_DATASET_DIR overrides for a staged
-    dataset living outside the workspace (was an extra bind mount)."""
+    """Canonical dataset root; TT_DATASET_DIR overrides."""
     return os.environ.get("TT_DATASET_DIR") or f"{DATASETS_ROOT}/{name}"
 
 
 def infer_dir(job):
-    """Inference job dir (scenes/ + predictions live here). TT_INFER_DIR
-    overrides (was an extra bind mount)."""
+    """Inference job dir (scenes/ + predictions); TT_INFER_DIR overrides."""
     return os.environ.get("TT_INFER_DIR") or f"{DATASETS_ROOT}/_infer/{job}"
 
 
 def write_pred(path, xyz, pred, intensity=None, confidence=None, probs=None,
                crs_wkt=None):
-    """Write one inferred scene as a compact npz — xyz + per-point class index
-    (+ optional intensity, per-point confidence = max of the normalized class
-    distribution, and the full float16 distribution when TT_SAVE_PROBS=1). The
-    host exporter (dataset.export_predictions) writes the user's chosen file
-    type straight from this, so there's no intermediate coloured PLY to render
-    and then reparse. Class is stored losslessly (the raw prediction), not
-    encoded as palette colour."""
+    """Inferred-scene npz: xyz + classification (+ intensity, confidence,
+    probs when TT_SAVE_PROBS=1). dataset.export_predictions reads this."""
     import numpy as np
-    # xyz stays float64: predictions carry georeferenced (UTM ~1e6) coords,
-    # where a float32 cast quantizes northing to 0.5m steps in the deliverable.
+    # float64: a float32 cast quantizes UTM northing to 0.5m steps
     d = {"xyz": np.asarray(xyz, np.float64),
          "classification": np.asarray(pred, np.int32)}
     if intensity is not None:
@@ -52,8 +35,8 @@ def write_pred(path, xyz, pred, intensity=None, confidence=None, probs=None,
         d["confidence"] = np.asarray(confidence, np.float32)
     if probs is not None:
         d["probs"] = np.asarray(probs, np.float16)
-    if crs_wkt:            # source CRS (WKT string) — the exporter georeferences
-        d["crs_wkt"] = np.asarray(str(crs_wkt))     # the las/laz deliverable with it
+    if crs_wkt:            # exporter georeferences the las/laz with this
+        d["crs_wkt"] = np.asarray(str(crs_wkt))
     np.savez(path, **d)
 
 
@@ -72,14 +55,8 @@ def best_val_miou(val_csv):
 
 
 class BestCheckpoint:
-    """Track best val mIoU; write final_model.pth on a new best.
-
-        best = BestCheckpoint(run_dir)            # seeds from val_metrics.csv
-        if best.update(miou):                     # True on a new best
-            torch.save(payload, best.final)       # model-specific payload
-        ...
-        best.finalize(lambda p: torch.save(last_payload, p))  # fallback if no val
-    """
+    """Track best val mIoU (seeded from val_metrics.csv); update() is True on
+    a new best; finalize(save_last) saves last epoch only if val never ran."""
 
     def __init__(self, run_dir):
         self.final = os.path.join(run_dir, "final_model.pth")
@@ -92,8 +69,6 @@ class BestCheckpoint:
         return False
 
     def finalize(self, save_last):
-        # final_model.pth already holds the best (written on improvement); only
-        # save the last epoch if validation never ran (subset empty).
         if not os.path.exists(self.final):
             save_last(self.final)
 
@@ -102,9 +77,8 @@ STOP_SENTINEL = f"{OUTPUTS_ROOT}/STOP"   # module attr, not a default arg: smoke
 
 
 def clear_stop():
-    """Delete a stale STOP sentinel at trainer startup so an old graceful-stop
-    request can't kill a fresh run. ponytail: concurrent runs sharing one
-    /outputs share the sentinel — accepted; press stop once per run."""
+    """Delete a stale STOP sentinel at startup. ponytail: concurrent runs
+    sharing one /outputs share the sentinel — press stop once per run."""
     try:
         os.remove(STOP_SENTINEL)
         print("  [stop] removed stale STOP sentinel", flush=True)
@@ -113,9 +87,8 @@ def clear_stop():
 
 
 def stop_requested(ep):
-    """True when the GUI dropped /outputs/STOP: consume it and log. Called once
-    per epoch at the loop tail; the trainer breaks and the NORMAL post-loop
-    final-eval + finalize path runs (test_metrics.json, final_model.pth)."""
+    """Consume /outputs/STOP if present; the trainer breaks into the normal
+    post-loop final-eval + finalize path."""
     if not os.path.exists(STOP_SENTINEL):
         return False
     try:
@@ -128,14 +101,10 @@ def stop_requested(ep):
 
 
 def _dg_block() -> dict | None:
-    """DG settings that must travel WITH the weights, read from the same env the
-    training process ran under. `logdk` changes the model's input width, so
-    inference has to rebuild at that width and recompute the channel (with the same
-    k) — record both so run.json is self-describing. AdaBN/TTA are inference-time
-    choices made on the Infer page, NOT a property of the weights, so not here —
-    write_infer_run records them per inference job instead."""
+    """DG settings that travel WITH the weights (logdk changes model input
+    width — inference rebuilds with the same k). AdaBN/TTA are per-job."""
     try:
-        import density as dg   # sibling helper; always importable when a trainer runs
+        import density as dg
     except ImportError:
         return None
     return {
@@ -148,26 +117,16 @@ def _dg_block() -> dict | None:
 
 
 def _intensity_norm_from_meta(meta: dict) -> str:
-    """Where convert_dataset records the intensity normalization: under
-    meta['source']['intensity_norm'] (a top-level copy is tolerated for other
-    writers). Default 'max'. Getting this wrong feeds inference a different
-    intensity scale than training saw."""
+    """intensity_norm from meta['source'] (top-level tolerated); default 'max'.
+    Wrong value = inference sees a different intensity scale than training."""
     src = meta.get("source") if isinstance(meta.get("source"), dict) else {}
     return src.get("intensity_norm") or meta.get("intensity_norm") or "max"
 
 
 def write_run_manifest(run_dir, backbone, dataset=None, weights="final_model.pth"):
-    """Finalize run.json — THE single record of a training run, next to the
-    weights. Local inference reads ONLY this file (the user picks it explicitly):
-    every input it needs is here, and the weights are its sibling `weights`. No
-    searching, no path conventions.
-
-    The trainer writes its raw config to run.json at train START; this call (at
-    train end) MERGES the normalized manifest fields over it (so grid/chunk stay
-    in sync across backbones, which name them differently) plus the dataset's
-    intensity normalization — one file, raw config + manifest. A legacy
-    run_config.json is read as the raw source when run.json doesn't exist yet.
-    `backbone` is the backbone KEY (e.g. 'ptv3')."""
+    """Finalize run.json — the single record inference reads, beside the
+    weights. Merges normalized manifest fields over the trainer's raw config
+    (legacy run_config.json accepted as raw source). `backbone` = key."""
     rc = {}
     for fn in ("run.json", "run_config.json"):        # run_config.json = legacy runs
         p = os.path.join(run_dir, fn)
@@ -178,7 +137,7 @@ def write_run_manifest(run_dir, backbone, dataset=None, weights="final_model.pth
             except (OSError, ValueError):
                 rc = {}
             break
-    inorm = "p95"   # default; overridden below by the dataset's recorded intensity_norm
+    inorm = "p95"
     if dataset:
         mp = f"{dataset_dir(dataset)}/dataset_meta.json"
         try:
@@ -196,12 +155,8 @@ def write_run_manifest(run_dir, backbone, dataset=None, weights="final_model.pth
         "grid": rc.get("grid_size", rc.get("grid_m", rc.get("sub_grid_size", rc.get("grid")))),
         "chunk_xy": rc.get("chunk_xy", rc.get("chunk_xy_m")),
         "intensity_norm": inorm,
-        # model-specific extras (absent/None when a backbone doesn't use them):
         "num_points": rc.get("num_points"),                              # RandLA sample size
-        # density-generalization settings baked into the weights. `logdk` changes the
-        # model input width, so inference MUST re-set DG_LOGDK_FEAT/_K to rebuild and
-        # recompute the channel — that's why it travels with the weights here. AdaBN/TTA
-        # are inference-time choices (Infer page), deliberately NOT recorded.
+        # logdk changes input width — travels with the weights; AdaBN/TTA don't
         "dg": dg,
     }
     doc = {**rc, **manifest}                          # manifest keys are authoritative
@@ -211,12 +166,8 @@ def write_run_manifest(run_dir, backbone, dataset=None, weights="final_model.pth
 
 
 def infer_meta(weights_path):
-    """Inference metadata for a run, read from run.json beside the weights — the
-    single self-contained manifest — so `run.json` + weights is enough on any host
-    (no dependence on run_config.json). Falls back to a legacy run_config.json
-    (normalizing its per-backbone key names) for older runs. Returns a normalized
-    dict, or None when neither file is beside the weights (a bare .pth) so callers
-    sniff/default. Missing individual fields are None."""
+    """Normalized inference metadata from run.json (legacy run_config.json
+    fallback) beside the weights. None for a bare .pth; missing fields None."""
     d = os.path.dirname(weights_path)
     if os.path.basename(d) == "checkpoints":   # weights in runs/<id>/checkpoints/
         d = os.path.dirname(d)
@@ -249,9 +200,8 @@ def infer_meta(weights_path):
 # ------------------------------------------------------------ inference utils
 
 def xy_chunk_groups(xyz, chunk_m, min_pts=1):
-    """Index arrays grouping points into chunk_m x chunk_m XY windows (groups
-    smaller than min_pts skipped) — one sort over packed window codes instead
-    of a full-cloud boolean mask per window (O(n log n) vs O(n * windows))."""
+    """Index groups over chunk_m XY windows via one packed-code sort
+    (O(n log n)); groups smaller than min_pts skipped."""
     import numpy as np
     xy = np.asarray(xyz)[:, :2]
     if len(xy) == 0:
@@ -265,12 +215,8 @@ def xy_chunk_groups(xyz, chunk_m, min_pts=1):
 
 
 def voxel_unique(keys, return_inverse=False):
-    """First-occurrence indices (and optionally the inverse map) of the unique
-    integer ROWS of `keys` — identical output to np.unique(keys, axis=0,
-    return_index=True[, return_inverse=True]) but ~10x faster: rows are packed
-    into one int64 code (lexicographic order preserved, so even the ordering
-    matches), and a 1-D unique does the work. The unique rows themselves are
-    keys[first]. Falls back to axis=0 if the packed code would overflow."""
+    """np.unique(keys, axis=0, return_index[, return_inverse]) equivalent,
+    ~10x faster via packed int64 codes (order matches); axis=0 on overflow."""
     import numpy as np
     keys = np.asarray(keys, dtype=np.int64)
     k = keys - keys.min(0)
@@ -286,13 +232,10 @@ def voxel_unique(keys, return_inverse=False):
 
 
 def write_infer_run(run_dir, config, scene_stats):
-    """infer_run.json — the single record of an inference job: the exact config
-    used plus per-scene metrics ({scene, points, seconds}). Callers rewrite it
-    after every scene, so a crash still leaves the completed scenes' numbers."""
+    """infer_run.json: exact config + per-scene {scene, points, seconds};
+    rewritten after every scene so a crash keeps completed numbers."""
     doc = dict(config)
-    # Inference-time DG toggles: not a property of the weights (run.json keeps
-    # those), but they ARE the record of this job — without them, sweep runs
-    # differing only in AdaBN/TTA leave indistinguishable predictions.
+    # AdaBN/TTA/save_probs are per-job — recorded here, not in run.json
     doc["adabn"] = os.environ.get("DG_INFER_ADABN") == "1"
     doc["tta_views"] = int(os.environ.get("DG_INFER_TTA", "0") or 0)
     doc["save_probs"] = os.environ.get("TT_SAVE_PROBS") == "1"
@@ -305,11 +248,8 @@ def write_infer_run(run_dir, config, scene_stats):
 
 
 def exclude_class_idx(class_names):
-    """EXCLUDE_CLASSES env (csv of class NAMES, e.g. "water,vehicle") -> sorted
-    index list into this run's class_names. [] when unset. Unknown names fail
-    loudly — a typo silently masking nothing is worse. At least one class must
-    survive. (Legacy runs without class_names synthesize per-backbone fallback
-    names; the error lists the accepted spellings.)"""
+    """EXCLUDE_CLASSES env (csv of class names) -> sorted index list; [] when
+    unset. Unknown names raise; at least one class must survive."""
     names = [s.strip() for s in os.environ.get("EXCLUDE_CLASSES", "").split(",")
              if s.strip()]
     if not names:
@@ -328,10 +268,7 @@ def exclude_class_idx(class_names):
 
 
 def apply_class_mask(prob, exclude_idx):
-    """Zero the excluded columns of a normalized (N, C) prob matrix and
-    renormalize (in place), so argmax/confidence fall to the next-best class.
-    No-op on an empty list. Softmax probs are strictly positive, so the
-    remaining mass can't be exactly zero."""
+    """Zero excluded prob columns and renormalize in place; no-op on []."""
     if not exclude_idx:
         return prob
     import numpy as np
@@ -341,11 +278,7 @@ def apply_class_mask(prob, exclude_idx):
 
 
 # ============================================================================
-# Shared trainer pieces — the copy-paste core of the four local_train_* scripts,
-# extracted verbatim. Everything a helper needs arrives as an argument (the
-# scripts used to close over train_*() locals, which is why they copy-pasted);
-# per-run config binds via the make_* factories. torch/numpy import inside the
-# functions so this module stays importable on a GPU-less host (smoke test).
+# Shared trainer pieces (torch/numpy import lazily: GPU-less import must work)
 # ============================================================================
 
 def gpu_name():
@@ -357,9 +290,7 @@ def gpu_name():
 # ------------------------------------------------------------------- losses
 
 def lovasz_softmax_flat(probas, labels):
-    """Lovász-Softmax (Berman et al. 2018): differentiable mIoU/Jaccard
-    surrogate on (N, C) softmax probs / (N,) labels in [0, C), averaged over
-    classes present in the batch."""
+    """Lovász-Softmax (Berman et al. 2018) on (N, C) probs / (N,) labels."""
     import torch
 
     def _grad(gt_sorted):
@@ -384,8 +315,7 @@ def lovasz_softmax_flat(probas, labels):
 
 
 def focal_loss(logits, labels, gamma, class_weights=None):
-    """alpha-balanced multiclass focal loss; masks ignore_index=-1 internally.
-    alpha = class_weights (inverse-sqrt) when set. No label smoothing here."""
+    """Alpha-balanced multiclass focal loss; masks ignore_index=-1."""
     import torch
     valid = labels >= 0
     if not valid.any():
@@ -401,10 +331,8 @@ def focal_loss(logits, labels, gamma, class_weights=None):
 
 
 def make_seg_loss(class_weights, label_smooth, use_focal, focal_gamma, lovasz_weight):
-    """The shared total loss: weighted (label-smoothed) CE or focal, + Lovász.
-    Guards all-ignored batches: CrossEntropyLoss(ignore_index=-1) returns NaN
-    when every label is ignored (0/0 reduction); return a finite zero-grad
-    value instead so backward() can never poison the weights."""
+    """Weighted (label-smoothed) CE or focal, + Lovász. All-ignored batches
+    return a finite zero-grad value (CE ignore_index=-1 would give NaN)."""
     import torch
     ce = torch.nn.CrossEntropyLoss(weight=class_weights, ignore_index=-1,
                                    label_smoothing=label_smooth)
@@ -426,12 +354,8 @@ def make_seg_loss(class_weights, label_smooth, use_focal, focal_gamma, lovasz_we
 # ------------------------------------------------- class balance / sampling
 
 def drop_corrupt_tile(path):
-    """Remove a truncated cached tile AND its scene's .done marker so the next
-    prep re-tiles that scene. Interrupted runs can leave these behind: the
-    modal shells commit volumes every 120s WHILE tiles are being written, so a
-    preemption mid-commit can persist a half-uploaded npz behind a .done that
-    made the same commit — and validate_cache checks the signature, not file
-    integrity, so the poisoned cache is trusted forever without this."""
+    """Remove a truncated cached tile and its scene's .done so the next prep
+    re-tiles it (Modal preemption mid-commit can persist half-written npz)."""
     import re
     print(f"  corrupt cached tile dropped: {path}", flush=True)
     try:
@@ -447,10 +371,8 @@ def drop_corrupt_tile(path):
 
 
 def scan_class_balance(tile_paths, num_classes, cache_path=None):
-    """One pass over cached tiles' 'lab' arrays -> (class_counts, present_mask
-    (n_tiles, C)). The per-tile np.load is the bottleneck (~45k tiles ->
-    minutes), so read in parallel and optionally cache the raw scan (keyed on
-    the tile set) — instant on every later launch."""
+    """Parallel scan of cached tiles' 'lab' -> (class_counts, present_mask);
+    optionally cached, keyed on the tile set."""
     import numpy as np
     names = np.array([os.path.basename(p) for p in tile_paths])
     if cache_path and os.path.exists(cache_path):
@@ -502,10 +424,8 @@ def scan_class_balance(tile_paths, num_classes, cache_path=None):
 
 
 def class_weights_np(class_counts, beta, cap, absent_to_one=False):
-    """Inverse-frequency^beta weights (0.5 = inverse-sqrt, the RandLA standard),
-    mean-normalized then clamped to [1/cap, cap]. absent_to_one pins classes
-    with zero train points at 1.0 and mean-norms over present classes only
-    (the PTv3 variant); off reproduces the KP scripts byte-for-byte."""
+    """Inverse-frequency^beta weights, mean-normalized, clamped to [1/cap, cap].
+    absent_to_one pins zero-count classes at 1.0 (PTv3 variant)."""
     import numpy as np
     freq = class_counts / max(int(class_counts.sum()), 1)
     w = (1.0 / np.maximum(freq, 1e-6)) ** beta
@@ -519,8 +439,7 @@ def class_weights_np(class_counts, beta, cap, absent_to_one=False):
 
 
 def auto_rare_classes(class_counts, freq_frac):
-    """Auto-rare rule shared by the tile trainers: present classes whose count
-    is below freq_frac x the median present-class count."""
+    """Present classes below freq_frac x the median present-class count."""
     import numpy as np
     present = class_counts[class_counts > 0]
     thresh = freq_frac * float(np.median(present)) if present.size else 0.0
@@ -542,10 +461,8 @@ def make_tile_picker(train_tiles, rare_tiles, rare_prob):
 # ------------------------------------------------- canonical dataset + cache
 
 def split_scenes(ds_root):
-    """The dataset stage already materialized three whole-scene folders; read
-    them verbatim and never re-carve a split. Returns three (name, pc_path,
-    None) lists (the third slot is a legacy cls_path, always None: labels are
-    embedded in the canonical .npz)."""
+    """Read the dataset's three split folders verbatim (never re-carve).
+    Returns (name, pc_path, None) lists — third slot is a legacy cls_path."""
     import glob
     stem = lambda p: os.path.splitext(os.path.basename(p))[0]
 
@@ -560,11 +477,8 @@ def split_scenes(ds_root):
 
 
 def validate_cache(prep_dir, sig, lists, legacy_pair):
-    """Refuse to reuse a prep cache built with different settings instead of
-    silently mixing incompatible data. Migrate a pre-validation cache by
-    stamping .done markers for already-tiled scenes — legacy_pair(split_dir,
-    name) returns that script's (output_glob, done_path). Returns True if the
-    signature file was newly written."""
+    """Refuse a prep cache built with different settings; stamps .done markers
+    to migrate pre-validation caches. True if the signature was newly written."""
     import glob
     meta_path = f"{prep_dir}/cache_meta.json"
     if os.path.exists(meta_path):
@@ -612,9 +526,8 @@ def score_ious(pred, lab, num_classes):
 
 def eval_metrics(t_inter, t_union, t_gt, correct, total, class_names, t_start,
                  n_scenes, label, extra=None):
-    """The metrics dict every evaluate() builds (acc, all-class + present-class
-    mIoU, per-class IoU/GT counts), plus the one-line summary print. `extra`
-    carries script-specific tail keys (skipped counts, protocol descriptors)."""
+    """Shared metrics dict (acc, mIoU variants, per-class IoU/GT) + summary
+    print; `extra` carries script-specific tail keys."""
     import numpy as np
     num_classes = len(class_names)
     with np.errstate(invalid="ignore"):
@@ -660,10 +573,8 @@ def append_val_row(val_csv, ep, m, class_names):
 # ---------------------------------------------------------- inference scenes
 
 def scene_arrays(z, n):
-    """(intensity, ret_num) from a canonical scene npz — THE one place the
-    missing-channel fallbacks are decided, so train tiling and inference feed
-    the same distribution (intensity -> RGB grayscale -> zeros;
-    return_number/ret_num -> zeros)."""
+    """(intensity, ret_num) from a scene npz — the ONE place missing-channel
+    fallbacks are decided (intensity -> rgb gray -> zeros; ret_num -> zeros)."""
     import numpy as np
     if "intensity" in z:
         intensity = z["intensity"].astype(np.float32)
@@ -678,12 +589,9 @@ def scene_arrays(z, n):
 
 
 def run_infer_scenes(scenes, predict, pred_dir, run_dir, infer_cfg, cls_txt=False):
-    """The --mode infer scene loop: predict(pc_path) ->
-    (xyz, pred, intensity, confidence, probs) — confidence is the float32
-    per-point max of the normalized class distribution (0.0 where nothing was
-    predicted), probs the float16 distribution or None — written as
-    <name>_pred.npz (+ optional _pred_CLS.txt), with the crash-safe per-scene
-    infer_run.json rewrite."""
+    """--mode infer loop: predict(pc_path) -> (xyz, pred, intensity, conf,
+    probs), written as <name>_pred.npz (+ _pred_CLS.txt) with the crash-safe
+    per-scene infer_run.json rewrite."""
     import numpy as np
     print(f"  [infer] labeling {len(scenes)} scene(s) -> {pred_dir}", flush=True)
     scene_stats = []
@@ -694,8 +602,8 @@ def run_infer_scenes(scenes, predict, pred_dir, run_dir, infer_cfg, cls_txt=Fals
         try:                            # ferry the scene's CRS into the pred npz
             with np.load(pc_path) as z:
                 crs = str(z["crs_wkt"]) if "crs_wkt" in z.files else None
-        except OSError:                 # predict() is the scene's real reader —
-            crs = None                  # a missing/odd file is its problem, not ours
+        except OSError:
+            crs = None
         write_pred(f"{pred_dir}/{name}_pred.npz", xyz, pred, inten, conf, probs,
                    crs_wkt=crs)
         if cls_txt:
@@ -712,19 +620,12 @@ def run_infer_scenes(scenes, predict, pred_dir, run_dir, infer_cfg, cls_txt=Fals
 
 
 # ============================================================================
-# KPConv-family shared pipeline — the prep/feature/eval core the kpconv and
-# kpconvx_cold twins used to duplicate. Dataset feat_* channels are automatic:
-# kp_tile_and_save caches every feat_* the canonical scene carries, and
-# kp_make_build_feat feeds whichever ones the FEAT_CHANNELS spec names.
+# KPConv-family shared pipeline (kpconv + kpconvx_cold)
 # ============================================================================
 
 def kp_load_canonical(npz_path):
-    """Canonical trainer_gui scene (.npz) -> (xyz, intensity, ret_num, lab,
-    extras), extras = every feat_* channel the scene carries (Phase 2a writes
-    them). Missing intensity/return_number fall back via scene_arrays — the
-    single definition inference also uses, so train and infer see the same
-    distribution. xyz is origin-offset (per-scene floor-min) before the
-    float32 cast so projected (UTM) coords keep sub-meter precision."""
+    """Scene npz -> (xyz, intensity, ret_num, lab, feat_* extras). xyz is
+    origin-offset before the float32 cast (UTM sub-meter precision)."""
     import numpy as np
     z = np.load(npz_path)
     xyz = (z["xyz"] - np.floor(z["xyz"].min(0))).astype(np.float32)
@@ -735,9 +636,8 @@ def kp_load_canonical(npz_path):
 
 
 def scene_feats(z):
-    """Every feat_* channel a scene npz carries. Pre-2026-07-13 conversions
-    stored HAG under a bare 'hag' key — surface it as feat_hag so legacy
-    datasets keep working without a re-convert/re-upload."""
+    """Every feat_* channel a scene npz carries; legacy bare 'hag' surfaces
+    as feat_hag."""
     import numpy as np
     out = {k: z[k].astype(np.float32) for k in z.files if k.startswith("feat_")}
     if "feat_hag" not in out and "hag" in z.files:
@@ -746,11 +646,8 @@ def scene_feats(z):
 
 
 def _grid_pool_t(p, a, l, voxel, num_classes):
-    """Torch core of kp_grid_subsample: (points, attrs-or-None,
-    labels-or-None) tensors on any device -> pooled tensors on that device.
-    Voxel keys are raveled to one int64 so unique is a sort, not a row
-    compare; sorted-flat order == np.unique(axis=0) lexicographic order, and
-    float64 accumulators keep the old numpy numerics."""
+    """Torch core of kp_grid_subsample; raveled int64 keys keep
+    np.unique(axis=0) order, float64 accumulators keep the numpy numerics."""
     import torch
     k = torch.floor(p / voxel).long()
     k -= k.min(0).values
@@ -777,11 +674,8 @@ def _grid_pool_t(p, a, l, voxel, num_classes):
 
 
 def kp_grid_subsample(xyz, attrs, lab, voxel, num_classes):
-    """Voxel-grid subsample to `voxel` m: barycenter points, mean attrs,
-    majority labels. Mirrors KPConv's grid_subsampling (the C++ op that
-    produces the layer-0 cloud). Numpy wrapper over _grid_pool_t — pooled on
-    CUDA when available, CPU torch otherwise (every trainer image ships
-    torch)."""
+    """Voxel-grid subsample: barycenter points, mean attrs, majority labels
+    (KPConv's grid_subsampling); CUDA when available."""
     import numpy as np
     import torch
     dev = "cuda" if torch.cuda.is_available() else "cpu"
@@ -810,11 +704,8 @@ def kp_augment(xyz, scale_min=0.9, scale_max=1.1, sym_x=True, noise=0.05):
 
 
 def make_prefetcher(make_batch, depth=2):
-    """next() -> a ready training batch; `depth` background threads keep
-    building the following ones, so tile loading + CPU pyramid assembly
-    overlaps GPU compute (the same overlap upstream KPConvX gets from its
-    DataLoader workers). Build errors re-raise at next(); call .shutdown()
-    when the loop ends."""
+    """next() -> ready batch; `depth` threads prefetch. Errors re-raise at
+    next(); call .shutdown() when the loop ends."""
     from collections import deque
     from concurrent.futures import ThreadPoolExecutor
     ex = ThreadPoolExecutor(depth)
@@ -829,24 +720,20 @@ def make_prefetcher(make_batch, depth=2):
 
 
 def train_stride(chunk_xy):
-    """Train-split tile stride: chunk_xy * TT_TRAIN_STRIDE (default 0.75 ->
-    ~1.8x point duplication instead of the legacy 0.5's 4x; 1.0 = no overlap).
-    Val/test always keep chunk_xy/2 — the eval's per-voxel voting needs the
-    up-to-4 cover."""
+    """Train tile stride = chunk_xy * TT_TRAIN_STRIDE (default 0.75).
+    Val/test keep chunk_xy/2 — per-voxel voting needs the overlap."""
     return chunk_xy * float(os.environ.get("TT_TRAIN_STRIDE", "0.75"))
 
 
 def train_stride_tag():
-    """Prep-dir suffix carrying the train-stride factor, so a factor change
-    lands in a fresh cache instead of mixing grids. Empty for the legacy 0.5
-    — those existing caches stay valid untagged."""
+    """Prep-dir suffix for the stride factor; "" for the legacy 0.5 so
+    existing caches stay valid untagged."""
     f = float(os.environ.get("TT_TRAIN_STRIDE", "0.75"))
     return "" if f == 0.5 else f"_ts{f:g}"
 
 
 def _savez_fast(path, **arrays):
-    """np.savez_compressed but zlib level 1: ~2.4x faster writes for ~6%
-    bigger tiles (measured on real tiles); np.load reads it unchanged."""
+    """np.savez_compressed at zlib level 1 (~2.4x faster, ~6% bigger)."""
     import io
     import zipfile
     import numpy as np
@@ -859,12 +746,8 @@ def _savez_fast(path, **arrays):
 
 @contextlib.contextmanager
 def npz_save_pool():
-    """`with npz_save_pool() as save:` -> save(path, **arrays) queues a
-    _savez_fast on a thread pool — zlib releases the GIL, so tile
-    writes scale with cores instead of serializing behind the tiling loop.
-    Queue is bounded at 2x workers (backpressure: raw ptv3 tiles are ~10MB
-    each and would otherwise pile up in RAM); worker exceptions surface on a
-    later save() or at exit."""
+    """save(path, **arrays) queues _savez_fast on a thread pool (zlib drops
+    the GIL). Bounded queue for RAM backpressure; errors surface on save()/exit."""
     from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
     workers = os.cpu_count() or 4
     ex = ThreadPoolExecutor(workers)
@@ -887,13 +770,8 @@ def npz_save_pool():
 
 
 def tile_xy_indices(xyz_t, chunk_xy, stride):
-    """Yield (x0, y0, idx) for every non-empty overlapping chunk_xy tile of a
-    torch (N,3+) tensor; idx stays on xyz_t's device so callers gather with no
-    round-trips (put the scene on CUDA once and the whole loop runs there).
-    Points are sorted by x once so each column strip is a searchsorted slice,
-    then each strip is sorted by y so tiles are slices too — replaces the old
-    per-tile full-cloud boolean mask (O(tiles*N) -> O(N log N)). Tile origins
-    come from np.arange exactly as before, so cached-tile filenames match."""
+    """Yield (x0, y0, idx) per non-empty chunk_xy tile; idx stays on device.
+    np.arange origins keep cached-tile filenames stable."""
     import numpy as np
     import torch
     x, y = xyz_t[:, 0], xyz_t[:, 1]
@@ -919,14 +797,12 @@ def tile_xy_indices(xyz_t, chunk_xy, stride):
 
 
 def kp_tile_and_save(name, pc_path, out_dir, chunk_xy, stride, grid, num_classes):
-    """One scene -> overlapping chunk_xy tiles, grid-subsampled and cached as
-    .npz (xyz + intensity + ret_num [+ every feat_* the scene carries,
-    mean-pooled like the other attrs] + lab). Returns the tile count, or None
-    when the scene failed to load (left unmarked so it retries)."""
+    """Scene -> overlapping grid-subsampled tiles cached as .npz (xyz,
+    intensity, ret_num, feat_*, lab). None when the load failed (retries)."""
     import numpy as np
     os.makedirs(out_dir, exist_ok=True)
     t0 = time.time()
-    try:                              # canonical .npz (label + feat_* embedded)
+    try:
         xyz, intensity, ret_num, lab, extras = kp_load_canonical(pc_path)
     except Exception as e:
         print(f"  skip {pc_path}: {e}", flush=True)
@@ -934,9 +810,6 @@ def kp_tile_and_save(name, pc_path, out_dir, chunk_xy, stride, grid, num_classes
     intensity_n = np.clip(intensity, 0.0, 2.0).astype(np.float32)
     print(f"    {name}: {len(xyz):,} pts loaded in {time.time()-t0:.1f}s, tiling…",
           flush=True)
-    # GPU-resident tiling: the scene's arrays move to the device ONCE; strip
-    # slicing, per-tile gathers and voxel pooling all run there, and only the
-    # small pooled tiles come back for the (thread-pooled) compressed writes.
     import torch
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     fnames = sorted(extras)              # deterministic cache column order
@@ -948,8 +821,7 @@ def kp_tile_and_save(name, pc_path, out_dir, chunk_xy, stride, grid, num_classes
     n_tiles = 0
     with npz_save_pool() as save:
         for x0, y0, idx in tile_xy_indices(P, chunk_xy, stride):
-            # Low thresholds on purpose: water absorbs LiDAR, so pure-water
-            # tiles are sparse — a higher cut would delete them from training.
+            # low thresholds: pure-water tiles are sparse, keep them
             if len(idx) < 64:
                 continue
             sx, sa, sl = _grid_pool_t(P[idx], A[idx], L[idx], grid, num_classes)
@@ -971,11 +843,8 @@ def kp_tile_and_save(name, pc_path, out_dir, chunk_xy, stride, grid, num_classes
 
 
 def kp_ensure_prep(prep_dir, ds_root, sig, tile_fn):
-    """Idempotent prep for the KP twins: split folders read verbatim, cache
-    signature validated (validate_cache), each un-.done scene tiled via
-    tile_fn(name, pc_path, out_dir, split) — split so the caller can widen
-    the train stride (train_stride) while val/test keep the voting overlap.
-    Returns (train, val, test) scene lists."""
+    """Idempotent KP prep: validate cache signature, tile each un-.done scene
+    via tile_fn(name, pc_path, out_dir, split). Returns (train, val, test)."""
     print(f"  ensuring preprocessed cache -> {prep_dir}", flush=True)
     for split in ("train", "val", "test"):
         os.makedirs(f"{prep_dir}/{split}", exist_ok=True)
@@ -1004,21 +873,9 @@ def kp_ensure_prep(prep_dir, ds_root, sig, tile_fn):
 
 def kp_make_build_feat(logdk_feat, logdk_k,
                        spec=("intensity", "return_number")):
-    """build_feat(xyz, intensity, ret_num, drop=(), extras=None)
-    -> [1, *spec] (+ log d_k when D3b is on). The constant-1 bias is ALWAYS
-    first and not part of the spec (default spec = the heightless
-    [intensity, return_number] recipe).
-
-    "height" (tile-relative z - min(z)) is LEGACY-ONLY: removed from every
-    default 2026-07-22, still resolvable so pre-spec checkpoints whose
-    run.json names it can infer. Real HeightAboveGround is the ordinary
-    feat_hag channel, fed via `extras` like every feat_<name> dataset
-    channel. `drop` is a sequence of spec
-    indices to zero: EVERY spec channel is droppable — sensor and
-    geometry-derived alike — so no channel is guaranteed present and the
-    model can't grow dependent on any single one. The caller draws the
-    channels (kp_make_sample_tile: one independent coin per channel per
-    tile). Only the bias and the log d_k conditioning channel never drop."""
+    """build_feat(xyz, intensity, ret_num, drop=(), extras=None) -> [1, *spec]
+    (+ log d_k). Bias always first, never dropped; every spec channel IS
+    droppable. "height" is legacy-only (old run.json specs); real HAG = feat_hag."""
     import numpy as np
     import density as dg
     spec = list(spec)
@@ -1037,7 +894,7 @@ def kp_make_build_feat(logdk_feat, logdk_k,
         if len(drop):
             attrs[:, list(drop)] = 0.0   # per-channel feature dropout
         cols = [bias, attrs]
-        if logdk_feat:           # D3b: never dropped — the density signal to condition on
+        if logdk_feat:           # never dropped
             cols.append(dg.local_density_logdk(xyz, logdk_k)[:, None])
         return np.concatenate(cols, axis=1).astype(np.float32)
 
@@ -1047,13 +904,9 @@ def kp_make_build_feat(logdk_feat, logdk_k,
 
 def kp_make_sample_tile(build_feat, grid, max_pts, aug_color,
                         density_aug, coarsen_max, p_native):
-    """sample_tile(tile_path, max_pts=None, min_pts=32, training=True) ->
-    (augmented+centered xyz, features, labels) or None. Height comes from the
-    original (pre-augmentation) z so it stays a meaningful
-    height-above-tile-min feature. aug_color = per-channel KEEP probability:
-    each spec channel is independently zeroed with p = 1-aug_color per
-    training tile (no channel is exempt), so the model learns every channel
-    as a bonus signal, never a dependency."""
+    """sample_tile(tile_path, ...) -> (augmented+centered xyz, feat, lab) or
+    None. aug_color = per-channel KEEP probability, one independent coin per
+    channel per training tile."""
     import numpy as np
     import density as dg
 
@@ -1068,8 +921,7 @@ def kp_make_sample_tile(build_feat, grid, max_pts, aug_color,
             idx = np.random.choice(idx, max_pts, replace=False)
         xyz, intensity, ret_num, lab = xyz[idx], intensity[idx], ret_num[idx], lab[idx]
         extras = {n: v[idx] for n, v in extras.items()}
-        # D1 density jitter: coarsen-only re-subsample; index-consistent across
-        # all per-point arrays.
+        # D1 density jitter: coarsen-only, index-consistent
         if training and density_aug:
             g_eff = dg.effective_grid(grid, coarsen_max, p_native)
             if g_eff > grid:
@@ -1098,12 +950,8 @@ def kp_make_run_dir(variant):
 def kp_find_latest_checkpoint(opt_type, feature_modes, arch_hash=None,
                               features=None, legacy_features=None,
                               skip_done=False):
-    """Most recent run (run-ids are timestamps, so they sort) with checkpoints
-    AND this script's recipe: optimizer type, feature_mode (the trainer's raw
-    run.json value), the ordered feature spec (run.json "features"; a run
-    without one is a legacy run = `legacy_features`) and, when given, the
-    architecture hash. Same-width specs can differ in channel SEMANTICS
-    (feat_hag vs tile height), so the names must match, not just the count.
+    """Most recent run with checkpoints AND this script's recipe (optimizer,
+    feature_mode, ordered feature spec — names, not width — and arch hash).
     Returns (run_dir, ckpt_path, epoch) or None."""
     import glob
 
@@ -1111,10 +959,7 @@ def kp_find_latest_checkpoint(opt_type, feature_modes, arch_hash=None,
         return int(os.path.basename(p)[2:5])   # ep149.pth -> 149
 
     for rd in sorted(glob.glob(f"{OUTPUTS_ROOT}/runs/*"), reverse=True):
-        # skip_done: resume must not pick a COMPLETED run (find_latest_
-        # unfinished_run's rule); EVAL_ONLY passes False because it *wants*
-        # finished runs. Pre-DONE-marker runs are indistinguishable from
-        # crashed ones and stay eligible — same behavior as before.
+        # skip_done: resume skips COMPLETED runs; EVAL_ONLY wants them
         if skip_done and os.path.exists(f"{rd}/DONE"):
             continue
         ckpts = glob.glob(f"{rd}/checkpoints/ep*.pth")
@@ -1142,8 +987,7 @@ def kp_find_latest_checkpoint(opt_type, feature_modes, arch_hash=None,
                   f"(variant mismatch: feature_mode={fmode})", flush=True)
             continue
         if rc.get("hag_source"):
-            # Deleted *_hag variant: its 'height' channel was real HAG, which the
-            # native spec can't reproduce — same width, different semantics.
+            # legacy --hag runs: same width, different semantics
             print(f"  resume: skipping {os.path.basename(rd)} "
                   f"(legacy --hag run: hag_source={rc['hag_source']})", flush=True)
             continue
@@ -1164,12 +1008,9 @@ def kp_find_latest_checkpoint(opt_type, feature_modes, arch_hash=None,
 
 def kp_make_evaluate(forward, build_feat, grid, chunk_xy, num_classes,
                      class_names):
-    """The KP twins' voted eval, scored on the ORIGINAL raw points: per scene,
-    run the model over its overlapping cached tiles (EVAL_BATCH tiles per
-    forward), sum center-weighted softmax votes per voxel, argmax, then
-    propagate to every raw point by nearest neighbour and score against the
-    raw GT. forward(tiles) takes [(cxyz, feat)] and returns the per-tile
-    (N, C) logits list; a failed tile is skipped."""
+    """KP voted eval scored on the ORIGINAL raw points: center-weighted
+    softmax votes per voxel, argmax, NN-propagate to raw, score vs raw GT.
+    forward([(cxyz, feat)]) -> per-tile (N, C) logits list."""
     import glob
     import numpy as np
     import torch
@@ -1185,9 +1026,7 @@ def kp_make_evaluate(forward, build_feat, grid, chunk_xy, num_classes,
         t_test = time.time()
 
         def forward_group(group):
-            # A failed batched forward falls back to tile-by-tile (an OOM also
-            # halves bs for the rest of this pass); a tile that still fails
-            # alone is skipped (None), the pre-batching per-tile semantics.
+            # failed batched forward falls back tile-by-tile; OOM halves bs
             nonlocal bs
             if len(group) > 1:
                 try:
@@ -1221,8 +1060,7 @@ def kp_make_evaluate(forward, build_feat, grid, chunk_xy, num_classes,
                         if lg is None:
                             n_skipped_tiles += 1
                             continue
-                        # Soft votes tapered toward the tile border (truncated
-                        # context).
+                        # votes tapered toward the tile border
                         e = np.exp(lg - lg.max(1, keepdims=True))
                         prob = e / e.sum(1, keepdims=True)
                         cxy = (xyz[:, :2].min(0) + xyz[:, :2].max(0)) / 2
@@ -1290,14 +1128,9 @@ def kp_make_evaluate(forward, build_feat, grid, chunk_xy, num_classes,
 
 def kp_make_predict_points(forward_prob, build_feat, grid, chunk_xy,
                            num_classes, tta, save_probs=False, exclude_idx=None):
-    """Sliding-window inference over already-normalized features (--mode infer);
-    returns (pred, confidence, probs) per raw point — confidence is the max of
-    the view-summed softmax normalized to sum 1 (0.0 where nothing was
-    predicted), probs the float16 normalized distribution when save_probs else
-    None. forward_prob(cxyz, feat) -> (N, C) softmax ndarray; an exception
-    skips the window. D5 density-TTA: average softmax over `tta` extra
-    density(scale) views. exclude_idx (EXCLUDE_CLASSES): classes masked out of
-    the distribution before argmax — conf/probs are post-mask."""
+    """Sliding-window inference -> (pred, confidence, probs) per raw point.
+    forward_prob(cxyz, feat) -> (N, C) softmax; exceptions skip the window.
+    exclude_idx masks classes pre-argmax; conf/probs are post-mask."""
     import numpy as np
     import torch
     from scipy.spatial import cKDTree
@@ -1313,7 +1146,7 @@ def kp_make_predict_points(forward_prob, build_feat, grid, chunk_xy,
         with torch.no_grad():
             for idx in xy_chunk_groups(xyz, chunk_xy, min_pts=64):
                 cols = [intensity_n[idx], ret_num[idx]]
-                cols += [extras[n][idx] for n in feat_names]   # feat_* ride along too
+                cols += [extras[n][idx] for n in feat_names]
                 attrs = np.stack(cols, axis=1).astype(np.float32)
                 sx, sa, _ = kp_grid_subsample(xyz[idx], attrs, None, grid, num_classes)
                 if len(sx) < 32:
@@ -1345,8 +1178,7 @@ def kp_make_predict_points(forward_prob, build_feat, grid, chunk_xy,
             print(f"  [infer] WARNING: {n_skipped} window(s) failed "
                   f"(last error: {last_err})", flush=True)
         if n_skipped and not n_done:
-            # every window the scene HAD errored — filling would ship a
-            # uniform, confidence-0 label map as if it were a prediction.
+            # every window errored — don't ship a fake uniform prediction
             raise RuntimeError(
                 f"inference produced nothing: all {n_skipped} window(s) "
                 f"failed (last error: {last_err})")
@@ -1355,9 +1187,7 @@ def kp_make_predict_points(forward_prob, build_feat, grid, chunk_xy,
             _, nn = cKDTree(xyz[~miss]).query(xyz[miss])
             pred[miss] = pred[~miss][nn]           # conf/probs stay 0: no votes
         elif miss.any():
-            # nothing predicted anywhere (tiny scene: every window skipped) —
-            # fall back to the lowest NON-excluded class so EXCLUDE_CLASSES
-            # holds even here; conf stays 0 so the export threshold flags it.
+            # nothing predicted: lowest non-excluded class, conf stays 0
             pred[:] = min(set(range(num_classes)) - set(exclude_idx or ()))
         return pred, conf, probs
 
@@ -1366,9 +1196,8 @@ def kp_make_predict_points(forward_prob, build_feat, grid, chunk_xy,
 
 def kp_make_target_batches(scenes, make_batch, build_feat, grid,
                            chunk_xy, num_classes, cap=30):
-    """AdaBN (D2b) target-batch generator over inference scenes: same windows,
-    subsample and features predict_points will see. make_batch(cxyz, feat) ->
-    model batch; an exception skips the window."""
+    """AdaBN target batches over inference scenes — same windows/features
+    predict_points will see. make_batch(cxyz, feat) -> model batch."""
     import numpy as np
 
     feat_names = [n for n in getattr(build_feat, "spec", []) if n.startswith("feat_")]
@@ -1392,7 +1221,6 @@ def kp_make_target_batches(scenes, make_batch, build_feat, grid,
                 sx, sa, _ = kp_grid_subsample(txyz[idx], attrs, None, grid, num_classes)
                 if len(sx) < 32:
                     continue
-                # BN stats must see the same feature predict will be fed.
                 sub_ex = {n: sa[:, 2 + i] for i, n in enumerate(feat_names)}
                 feat = build_feat(sx, sa[:, 0], sa[:, 1], extras=sub_ex)
                 cxyz = (sx - sx.mean(0)).astype(np.float32)
@@ -1407,23 +1235,13 @@ def kp_make_target_batches(scenes, make_batch, build_feat, grid,
 
 
 # ============================================================================
-# PTv3-family shared pipeline — the prep/augment/eval core the ptv3 and
-# pcssl (concerto/sonata/utonia) trainers used to duplicate. Same pattern as
-# the kp_* family above: trainers pass small closures for the model-specific
-# parts (color_src-aware load_canonical, build_feat, forward).
+# PTv3-family shared pipeline (ptv3 + concerto/sonata/utonia)
 # ============================================================================
 
 def ptv3_load_canonical(npz_path, color_src):
-    """Canonical trainer_gui scene -> an (xyz, rgb, lab) tuple.
-    color_src picks what fills the 3 color channels: intensity-first for new
-    runs, rgb for old RGB-trained checkpoints at inference. Missing signals
-    fall through (intensity -> rgb -> mid-gray). Intensity is npz-normalized
-    (0..1 max / 0..2 p95); x255 puts it on the rgb scale the /255 sites expect.
-    xyz is origin-offset (per-scene floor-min, kp_load_canonical's pattern)
-    before the float32 cast: projected (UTM) coords are ~1e6 in magnitude,
-    where float32 spacing is 0.5m AND a float32 mean is off by hundreds of
-    meters — enough to blow the |xy|<=CHUNK_XY batch filter and empty every
-    training batch."""
+    """Scene npz -> (xyz, rgb, lab). color_src picks the 3 color channels
+    (fallbacks intensity -> rgb -> mid-gray; intensity x255 to rgb scale).
+    xyz origin-offset before the float32 cast (UTM precision + batch filter)."""
     import numpy as np
     z = np.load(npz_path)
     xyz = (z["xyz"] - np.floor(z["xyz"].min(0))).astype(np.float32)
@@ -1439,9 +1257,7 @@ def ptv3_load_canonical(npz_path, color_src):
         rgb = np.full((len(xyz), 3), 128.0, dtype=np.float32)
     lab = z["label"].astype(np.int64) if "label" in z \
         else np.full(len(xyz), -1, np.int64)
-    # p95-normalized intensity spans [0,2] -> x255 up to 510: clip HERE so
-    # the uint8 tile cache (train) and the float path (infer) agree — an
-    # unclipped cast WRAPS the bright tail (306 -> 50).
+    # clip here: an unclipped uint8 cast WRAPS the p95 bright tail (306 -> 50)
     return xyz, np.clip(rgb, 0.0, 255.0), lab
 
 
@@ -1457,14 +1273,9 @@ def ptv3_tile_and_save(src_paths, out_dir, chunk_xy, stride, load_canonical):
             xyz, rgb, lab = load_canonical(src)
         except Exception as e:
             print(f"  skip {src}: {e}", flush=True); continue
-        # Every feat_* channel the scene carries rides into the cache tiles
-        # (feat_hag included — HAG is an ordinary feature channel; legacy
-        # bare-'hag' scenes surface it via scene_feats).
         extras = scene_feats(np.load(src)) if src.endswith(".npz") else {}
         print(f"    [{fi+1}/{len(src_paths)}] {scene}: {len(xyz):,} pts "
               f"loaded in {time.time()-t0:.1f}s, tiling…", flush=True)
-        # ptv3 tiles are RAW slices (no pooling), so only the tile-index math
-        # runs on the device; gathers stay on the host arrays.
         import torch
         dev = "cuda" if torch.cuda.is_available() else "cpu"
         P = torch.from_numpy(np.ascontiguousarray(xyz)).to(dev)
@@ -1490,11 +1301,8 @@ def ptv3_ensure_prep(prep_dir, ds_root, chunk_xy, stride, load_canonical):
     os.makedirs(f"{prep_dir}/val",   exist_ok=True)
     os.makedirs(f"{prep_dir}/test",  exist_ok=True)
     print(f"  ensuring preprocessed cache -> {prep_dir}", flush=True)
-    # PREP_DIR encodes color/feat/chunk/stride but NOT the class layout, and a
-    # dataset rebuilt under the same name keeps this folder — so stamp the
-    # signature (KP/RandLA's validate_cache) or reordered classes silently
-    # reuse tiles labeled in the OLD index space. Empty lists: ptv3 keeps its
-    # glob idempotency, there are no .done markers to migrate.
+    # signature stamp: PREP_DIR doesn't encode the class layout — a rebuilt
+    # dataset would otherwise silently reuse old-index tiles
     meta = {}
     try:
         with open(f"{ds_root}/dataset_meta.json") as f:
@@ -1519,8 +1327,6 @@ def ptv3_ensure_prep(prep_dir, ds_root, chunk_xy, stride, load_canonical):
             if already_tiled(out_dir, scene): continue
             ptv3_tile_and_save([src], out_dir, chunk, stride, load_canonical)
             any_new[0] = True
-    # CANONICAL: the dataset stage already materialized the 3-way split;
-    # tile each folder into its own PREP folder verbatim (no re-carving).
     train_paths = sorted(glob.glob(f"{ds_root}/train/*.npz"))
     val_paths   = sorted(glob.glob(f"{ds_root}/val/*.npz"))
     test_paths  = sorted(glob.glob(f"{ds_root}/test/*.npz"))
@@ -1529,8 +1335,7 @@ def ptv3_ensure_prep(prep_dir, ds_root, chunk_xy, stride, load_canonical):
     print(f"  [train] {len(train_paths)} canonical scenes", flush=True)
     tile_remaining(train_paths, f"{prep_dir}/train", chunk_xy,
                    train_stride(chunk_xy))
-    # stride (not chunk_xy) so val/test tiles overlap and the final
-    # eval can vote per-voxel over the up-to-4 covering tiles.
+    # val/test keep stride overlap for per-voxel voting
     print(f"  [val] {len(val_paths)} canonical scenes", flush=True)
     tile_remaining(val_paths, f"{prep_dir}/val", chunk_xy, stride)
     print(f"  [test] {len(test_paths)} canonical scenes", flush=True)
@@ -1582,9 +1387,7 @@ def ptv3_augment_xyz(xyz, rot_z, rot_xy, scale_min, scale_max, flip_p,
 
 
 def ptv3_lr_at(ep, base_lr, warmup_pct, n_epochs):
-    """PTv3 outdoor schedule: short linear warmup to base_lr, then cosine
-    decay to ~0. Set on the param groups each epoch — no scheduler state to
-    restore, so RESUME is trivial (the KPConvX cold recipe's lr_at pattern)."""
+    """Linear warmup then cosine decay; stateless, so resume is trivial."""
     import numpy as np
     warm = max(1, int(round(warmup_pct * n_epochs)))
     if ep < warm:
@@ -1598,14 +1401,9 @@ RESUME_RECIPE_KEYS = ("grid_size", "chunk_xy", "features", "n_epochs",
 
 
 def find_latest_unfinished_run(suffix, cfg=None):
-    """Latest UNFINISHED run dir ending in `suffix` with checkpoints (resume
-    target). Runs marked DONE are skipped, so a completed experiment isn't
-    re-resumed on the next launch — but a crashed/retried one is picked
-    straight back up. `cfg` is the fresh run's config dict: a candidate whose
-    run.json disagrees on RESUME_RECIPE_KEYS is skipped (kp_find_latest_
-    checkpoint's rule), so a resumed run never keeps publishing a run.json its
-    weights don't match — on mismatch the caller falls through to a fresh run
-    and writes a correct one. Returns (run_dir, ckpt_path, epoch) or None."""
+    """Latest unfinished run ending in `suffix` with checkpoints. DONE runs
+    and RESUME_RECIPE_KEYS mismatches vs `cfg` are skipped (weights must match
+    the run.json they publish). Returns (run_dir, ckpt_path, epoch) or None."""
     import glob
     def _ep(p):
         return int(os.path.basename(p)[2:5])
@@ -1637,14 +1435,9 @@ def find_latest_unfinished_run(suffix, cfg=None):
 
 def ptv3_make_evaluate(forward, build_feat, feat_spec, grid, chunk_xy,
                        num_classes, class_names):
-    """The PTv3-family voted eval. Per-SCENE overlap voting scored on the
-    ORIGINAL raw points (the protocol KPConvX/RandLA use). Per scene: forward
-    its overlapping tiles (stride chunk_xy/2, each point in up to 4 tiles;
-    EVAL_BATCH tiles per forward via the multi-entry offset), sum
-    center-tapered softmax votes per grid voxel, argmax, then NN-propagate
-    each voxel's prediction to the raw cloud and score against raw GT.
-    forward(batch_dict) -> (N, C) logits tensor; scene_items are
-    (name, load_raw, split_dir) triples."""
+    """PTv3-family voted eval scored on the ORIGINAL raw points (KP protocol).
+    forward(batch_dict) -> (N, C) logits; scene_items are (name, load_raw,
+    split_dir) triples."""
     import glob
     import numpy as np
     import torch
@@ -1660,9 +1453,7 @@ def ptv3_make_evaluate(forward, build_feat, feat_spec, grid, chunk_xy,
         t_test = time.time()
 
         def _run(group):
-            # gc stays per-tile min-subtracted (NOT the training path's global
-            # min): identical serialization codes to the unbatched call, and
-            # the offset-derived batch index keeps clouds apart in spconv.
+            # gc stays per-tile min-subtracted: identical codes to unbatched
             lens = [len(g[2]) for g in group]
             coord = torch.from_numpy(np.concatenate([g[2] for g in group])).cuda()
             featt = torch.from_numpy(np.concatenate([g[3] for g in group])).cuda()
@@ -1675,9 +1466,7 @@ def ptv3_make_evaluate(forward, build_feat, feat_spec, grid, chunk_xy,
             return np.split(lg, np.cumsum(lens)[:-1])
 
         def forward_group(group):
-            # OOM on the batched forward halves bs for the rest of this pass
-            # and retries tile-by-tile; a tile that still OOMs alone is
-            # skipped. Non-OOM RuntimeErrors re-raise (abort eval), as before.
+            # OOM halves bs and retries tile-by-tile; non-OOM re-raises
             nonlocal bs
             if len(group) > 1:
                 try:
@@ -1733,8 +1522,7 @@ def ptv3_make_evaluate(forward, build_feat, feat_spec, grid, chunk_xy,
                     if len(xyz) < 64:
                         continue
                     ex = feat_extras(z, feat_spec, os.path.basename(tile))
-                    # float64 mean: exact centering even for legacy global-UTM
-                    # tiles, where a float32 mean is hundreds of meters off
+                    # float64 mean: float32 is meters off on legacy UTM tiles
                     cxyz = (xyz - xyz.mean(0, keepdims=True, dtype=np.float64)
                             ).astype(np.float32)
                     ok = (np.isfinite(cxyz).all(1)
@@ -1762,7 +1550,6 @@ def ptv3_make_evaluate(forward, build_feat, feat_spec, grid, chunk_xy,
                 np.add.at(votes, uinv, V)
                 pred_u  = votes.argmax(1)
                 rep_xyz = P[ufirst]                      # one raw coord per voxel
-                # Reproject voxel predictions onto the raw scene cloud + raw GT.
                 try:
                     raw_xyz, _, raw_lab = load_raw()
                 except Exception as ex:
@@ -1790,24 +1577,17 @@ def ptv3_make_evaluate(forward, build_feat, feat_spec, grid, chunk_xy,
 
 
 # ============================================================================
-# Cross-trainer plumbing shared by all local trainers and modal shells
-# (this file is baked into every image as /root/train_common.py).
+# Cross-trainer plumbing (baked into every image as /root/train_common.py)
 # ============================================================================
 
-# Input-feature spec vocabulary (FEAT_CHANNELS env / run.json "features").
-# Widths: rgb = 3, everything else 1 (PTv3 additionally expands a
-# single-channel color entry to 3 — its arch rule). HAG is the ordinary
-# feat_hag dataset channel; only `logdk` stays outside the spec (driven by
-# DG_LOGDK_FEAT, appended after the spec channels). "height" is LEGACY-ONLY
-# (removed from every default and the GUI picker; kept in the vocab so old
-# run.json specs still parse at inference).
+# FEAT_CHANNELS / run.json "features" vocabulary. rgb width 3, others 1.
+# "height" is legacy-only — old run.json specs must still parse.
 FEAT_VOCAB = ("x", "y", "z", "height", "intensity", "return_number", "rgb")
 
 
 def parse_feat_spec(env_value, legacy_default):
-    """FEAT_CHANNELS csv ("a,b,c") -> ordered channel-name list. Empty/unset ->
-    the trainer's exact legacy default. Valid names: FEAT_VOCAB or feat_<name>
-    (a dataset feature channel stored under that npz key)."""
+    """FEAT_CHANNELS csv -> ordered names; empty -> the trainer's legacy
+    default. Valid: FEAT_VOCAB or feat_<name>."""
     import re
     names = [s.strip() for s in (env_value or "").split(",") if s.strip()]
     if not names:
@@ -1822,9 +1602,8 @@ def parse_feat_spec(env_value, legacy_default):
 
 
 def feat_spec_tag(spec, legacy):
-    """Short PREP_DIR suffix for a non-default feature spec, so custom-spec
-    prep caches never collide with (or invalidate) the legacy ones. "" when
-    the spec IS the legacy default — every existing cache path stays valid."""
+    """PREP_DIR suffix for a non-default spec; "" when spec == legacy so
+    existing cache paths stay valid."""
     import hashlib
     if list(spec) == list(legacy):
         return ""
@@ -1832,8 +1611,8 @@ def feat_spec_tag(spec, legacy):
 
 
 def feat_extras(z, spec, where):
-    """The feat_* arrays `spec` needs from an npz (tile or scene). A missing
-    key is a clear error naming the channel and what IS available."""
+    """The feat_* arrays `spec` needs from an npz; missing key raises naming
+    what IS available."""
     import numpy as np
     out = {}
     for n in spec:
@@ -1876,14 +1655,9 @@ _ENV_KNOBS = {
 
 
 def env_overrides(g, names):
-    """Env-overridable trainer knobs (the GUI's DG / loss / class-balance panels
-    export DG_*/LOSS_*/RARE_*/EVAL_*/KP_* into the trainer env). Returns the
-    values for `names` in order, each defaulting to g[name]:
-
-        (DG_DENSITY_AUG, ..., RARE_OVERSAMPLE) = tc.env_overrides(globals(), [
-            "DG_DENSITY_AUG", ..., "RARE_OVERSAMPLE"])
-    """
-    import density as dg   # sibling helper, baked into every image next to this file
+    """Values for `names` in order, each env-overridable (the GUI exports
+    DG_*/LOSS_*/RARE_*/EVAL_*/KP_*), defaulting to g[name]."""
+    import density as dg
     out = []
     for name in names:
         env_key, parser = _ENV_KNOBS[name]
@@ -1904,9 +1678,8 @@ def load_dataset_meta(dataset):
 
 
 def load_ckpt_safe(path, map_location="cpu"):
-    """torch.load with weights_only=True (a hand-picked .pth can't run code on
-    load) and the shared re-export hint on failure."""
-    import torch   # lazy: this module stays importable on a torch-less host
+    """torch.load with weights_only=True + the shared re-export hint."""
+    import torch
     try:
         return torch.load(path, map_location=map_location, weights_only=True)
     except Exception as e:
@@ -1918,13 +1691,9 @@ def load_ckpt_safe(path, map_location="cpu"):
 
 
 def modal_shell_run(script, flag_vals, env_json, volumes):
-    """The whole body of every modal_train_* shell's train function: build the
-    trainer command from (flag, value) pairs (None skipped), merge --env-json
-    overrides into the subprocess env, and commit the volumes every 120s plus
-    once on exit — so a crash/preemption still leaves the latest state on the
-    volumes for the local trainer's auto-resume on retry. Volumes arrive as
-    arguments and are duck-typed (.commit()): this module must not import modal
-    (the local trainers import it inside Modal-free containers)."""
+    """Body of every modal_train_* shell: build the trainer command (None
+    flags skipped), merge --env-json into the env, commit volumes every 120s +
+    on exit. Volumes are duck-typed (.commit()) — this module must not import modal."""
     import subprocess
     import sys
     import threading
@@ -1974,8 +1743,7 @@ def _demo():  # ponytail: one runnable check -- `python train_common.py`
     open(b.final, "w").close()
     b.finalize(lambda p: (_ for _ in ()).throw(AssertionError("should not save_last")))
 
-    # write_run_manifest: normalized fields merged over the raw config (read from
-    # run.json; a legacy run_config.json works as the raw source too).
+    # write_run_manifest: normalized fields merged over the raw config
     with open(os.path.join(d, "run_config.json"), "w") as f:
         json.dump({"num_classes": 7, "class_names": list("abcdefg"),
                    "grid_m": 2.0, "chunk_xy_m": 100.0,
@@ -1987,11 +1755,11 @@ def _demo():  # ponytail: one runnable check -- `python train_common.py`
     assert "hag_source" not in m and m.get("feature_mode") != "hag"
     assert m["grid_m"] == 2.0                       # raw config survives the merge
     assert os.path.exists(os.path.join(d, "run.json"))
-    # second call reads the merged run.json itself (idempotent; no run_config needed)
+    # second call is idempotent (reads the merged run.json)
     os.remove(os.path.join(d, "run_config.json"))
     m_again = write_run_manifest(d, "kpconvx_cold")
     assert m_again["grid"] == 2.0 and m_again["grid_m"] == 2.0
-    # DG round-trip: defaults (no env) -> logdk off; env on -> recorded + readable back
+    # DG round-trip
     assert m["dg"] is not None and m["dg"]["logdk"] is False
     os.environ["DG_LOGDK_FEAT"] = "1"; os.environ["DG_LOGDK_K"] = "12"
     m2 = write_run_manifest(d, "kpconvx_cold")
@@ -1999,15 +1767,13 @@ def _demo():  # ponytail: one runnable check -- `python train_common.py`
     assert infer_meta(os.path.join(d, "final_model.pth"))["dg"]["logdk"] is True
     os.environ.pop("DG_LOGDK_FEAT"); os.environ.pop("DG_LOGDK_K")
 
-    # intensity_norm lives under dataset_meta['source'] — read it from there
+    # intensity_norm read from dataset_meta['source']
     assert _intensity_norm_from_meta({"source": {"intensity_norm": "p95"}}) == "p95"
     assert _intensity_norm_from_meta({"intensity_norm": "p95"}) == "p95"   # tolerate top-level
     assert _intensity_norm_from_meta({"source": {}}) == "max"              # default
 
-    # infer_meta reads run.json beside the weights (None for a bare .pth);
-    # a feat_hag spec round-trips through "features" like any other channel.
-    # hag_source is surfaced (None for post-clean-break runs) so trainers can
-    # loudly REJECT legacy --hag weights — same width, different semantics.
+    # infer_meta reads run.json beside the weights; hag_source surfaced so
+    # trainers can reject legacy --hag weights
     im = infer_meta(os.path.join(d, "final_model.pth"))
     assert im and im["num_classes"] == 7 and im["grid"] == 2.0
     assert im["features"] == ["intensity", "return_number", "height", "feat_hag"]
@@ -2029,8 +1795,7 @@ def _demo():  # ponytail: one runnable check -- `python train_common.py`
             ref = set(np.nonzero(m)[0].tolist())
             assert got.get((x0, y0), set()) == ref
 
-    # corrupt cached tile -> scan drops it + the scene's .done and raises so
-    # the (auto-retried) next run re-tiles the scene instead of dying forever
+    # corrupt cached tile: scan heals + raises so the retried run re-tiles
     cd = tempfile.mkdtemp()
     np.savez(f"{cd}/good_x0_y0.npz", lab=np.array([0, 1], np.int32))
     open(f"{cd}/bad_x0_y50.npz", "w").write("not a zip")
@@ -2044,10 +1809,7 @@ def _demo():  # ponytail: one runnable check -- `python train_common.py`
     assert not os.path.exists(f"{cd}/bad.done")          # scene unmarked
     assert os.path.exists(f"{cd}/good_x0_y0.npz")        # good tile untouched
 
-    # ptv3_load_canonical: global-UTM float64 scenes come back scene-local —
-    # centering a 30m tile then must land within |xy|<=40 (the batch filter
-    # that emptied every utonia batch when a float32 mean of ~5e6-magnitude
-    # coords was off by hundreds of meters).
+    # ptv3_load_canonical: global-UTM scenes come back scene-local (float32-safe)
     utm = np.array([620900.0, 4849000.0, 170.0]) + \
         np.random.RandomState(2).rand(20_000, 3) * [30, 30, 5]
     np.savez(f"{cd}/utm.npz", xyz=utm, label=np.zeros(len(utm), np.int32))
@@ -2063,8 +1825,7 @@ def _demo():  # ponytail: one runnable check -- `python train_common.py`
     assert pf() == 0 and pf() == 1 and pf() == 2
     pf.shutdown()
 
-    # kp_grid_subsample (torch-pooled) == brute-force per-voxel reference,
-    # voxel order included (sorted-flat == np.unique(axis=0) lexicographic)
+    # kp_grid_subsample == brute-force reference, voxel order included
     pts2 = rng.rand(2_000, 3).astype(np.float32) * 10 - 5   # negatives too
     at2 = rng.rand(2_000, 2).astype(np.float32)
     lb2 = rng.randint(-1, 4, 2_000).astype(np.int32)
@@ -2145,7 +1906,6 @@ def _demo():  # ponytail: one runnable check -- `python train_common.py`
     assert "3,0.6667,0.5000,0.5000,0.5000" in open(f"{vd}/v.csv").read()
 
     # ---- KP-family pipeline ----------------------------------------------
-    # grid_subsample: two coincident-voxel points merge (mean attrs, majority lab)
     sx, sa, sl = kp_grid_subsample(
         np.array([[0.1, 0.1, 0.1], [0.2, 0.2, 0.2], [5.0, 5.0, 5.0]], np.float32),
         np.array([[0.0], [1.0], [2.0]], np.float32),
@@ -2224,8 +1984,7 @@ def _demo():  # ponytail: one runnable check -- `python train_common.py`
     s = st(train_tiles[0], training=False)
     assert s and s[0].shape == (len(s[2]), 3) and s[1].shape[1] == 3
     assert abs(s[0].mean()) < 1e-3                      # centered
-    # feat_* channels ride the tile cache (mean-pooled) and land where the
-    # spec puts them; requesting an absent one is a clear error naming it.
+    # feat_* channels ride the tile cache (mean-pooled)
     zt = np.load(train_tiles[0])
     assert "feat_demo" in zt.files and np.allclose(zt["feat_demo"], 0.25)
     st3 = kp_make_sample_tile(kp_make_build_feat(False, 8,

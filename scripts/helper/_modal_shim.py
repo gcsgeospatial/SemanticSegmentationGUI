@@ -1,24 +1,6 @@
-"""Offline stand-in for the parts of `modal` the modal_train_*.py scripts use.
-
-Lets each training script import and run with NO Modal account / network:
-
-  * `Volume.from_name(...)` -> object whose methods (`.commit()`, ...) are no-ops.
-  * `@app.function(...)` / `@app.local_entrypoint()` -> return plain callables;
-    `train_X.remote(**kw)` (and `__call__`) run the wrapped body **in-process**.
-  * `Image.debian_slim().apt_install().pip_install()...` -> a *recorder*: every
-    builder call is captured (kind + payload) so tools/check_env_sync.py can diff a
-    Dockerfile straight from the recipe the script already wrote.
-
-Activate before importing a train script:
-
-    import _modal_shim; _modal_shim.install()
-    import modal_train_ptv3            # its `import modal` now resolves here
-    _modal_shim.App.last              # the script's app (entrypoint + image)
-
-The modal_train_*.py scripts only DEFINE things at module level (image, volumes, decorated
-functions) — they never branch on Modal values — so importing under the shim is
-side-effect-free and needs neither torch nor CUDA (both live inside the body).
-"""
+"""Offline stand-in for `modal`: install() registers it in sys.modules so
+modal_train_* scripts import with no account/network. Volumes no-op, functions
+run in-process, Image builders record steps for tools/check_env_sync.py."""
 
 from __future__ import annotations
 
@@ -26,16 +8,12 @@ import sys
 import types
 
 
-# --------------------------------------------------------------------------- #
-# Image builder — records each step, every method returns self (chainable).
-# --------------------------------------------------------------------------- #
 class Recipe:
     def __init__(self):
         self.python_version: str | None = None
         self.base: tuple = ("debian_slim", None)
         self.steps: list[tuple] = []   # (kind, payload) in call order
 
-    # entry point (modal.Image.debian_slim(...))
     @classmethod
     def debian_slim(cls, python_version=None, **_kw):
         img = cls()
@@ -43,7 +21,6 @@ class Recipe:
         img.python_version = python_version
         return img
 
-    # builder methods (record + chain)
     def apt_install(self, *pkgs, **_kw):
         self.steps.append(("apt", [str(p) for p in pkgs]))
         return self
@@ -80,7 +57,7 @@ class Recipe:
         self.steps.append(("workdir", str(path)))
         return self
 
-    # any builder method we didn't enumerate: chain, record nothing.
+    # unenumerated builder methods: chain, record nothing
     def __getattr__(self, _name):
         return lambda *a, **k: self
 
@@ -90,9 +67,6 @@ class _ImageNS:
     debian_slim = Recipe.debian_slim
 
 
-# --------------------------------------------------------------------------- #
-# Volume — every method is a no-op (no cloud).
-# --------------------------------------------------------------------------- #
 class Volume:
     @staticmethod
     def from_name(name, create_if_missing=False, **_kw):
@@ -105,9 +79,6 @@ class Volume:
         return lambda *a, **k: None
 
 
-# --------------------------------------------------------------------------- #
-# Function wrapper — .remote / __call__ run the body here.
-# --------------------------------------------------------------------------- #
 class Function:
     def __init__(self, fn):
         self._fn = fn
@@ -147,7 +118,6 @@ class App:
         return deco(dargs[0]) if _is_bare(dargs, dkw) else deco
 
 
-# small odds & ends the scripts reference at decoration time
 def _noop_factory(*_a, **_k):
     return None
 
@@ -159,14 +129,9 @@ def _build_module() -> types.ModuleType:
     m.Volume = Volume
     m.Retries = _noop_factory
 
-    # Anything else (`modal.<x>`) -> a permissive no-op, so an unforeseen symbol
-    # in one of the variant scripts can't break module import.
-    def __getattr__(name):            # PEP 562 module-level getattr
-        # Dunders MUST raise, not return a no-op. inspect.getmodule() scans every
-        # sys.modules entry and reads `.__file__` (torch does this at import time in
-        # register_debug_prims); a function there makes inspect call
-        # `<func>.endswith(...)` -> AttributeError. The real symbols the scripts use
-        # are all set explicitly above, so only junk lookups reach here.
+    def __getattr__(name):            # PEP 562: any other modal.<x> -> no-op
+        # dunders MUST raise: inspect.getmodule (via torch import) reads
+        # __file__ on every sys.modules entry and chokes on a function
         if name.startswith("__") and name.endswith("__"):
             raise AttributeError(name)
         return _noop_factory
