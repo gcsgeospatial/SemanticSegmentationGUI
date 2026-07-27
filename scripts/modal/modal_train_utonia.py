@@ -1,4 +1,4 @@
-"""Modal shell for Utonia — shells out to local_train_utonia.py so local and
+"""Modal shell for Utonia - shells out to local_train_utonia.py so local and
 cloud run identical code. Flags: --dataset --grid --chunk-xy --epochs --batch
 --steps-per-epoch --freeze-encoder; --mode infer --weights --infer-input.
 GPU/timeout from TT_GPU / TT_TIMEOUT_HOURS."""
@@ -46,7 +46,7 @@ image = (
     .env({"PYTHONUNBUFFERED": "1"})
 )
 
-# pinned upstream clone — the SHA IS the architecture version
+# pinned upstream clone - the SHA IS the architecture version
 image = image.run_commands(
     "git clone https://github.com/Pointcept/Utonia.git /opt/utonia"
     " && git -C /opt/utonia checkout --detach da776a0bd3a48c6df83ac2ae0e27b26141cc7e31"
@@ -80,7 +80,7 @@ def train_utonia(dataset: Optional[str] = None, grid: Optional[float] = None,
                  infer_input: Optional[str] = None,
                  freeze_encoder: Optional[int] = None,
                  env_json: Optional[str] = None):
-    """Shell out to the local trainer — local and cloud run identical code."""
+    """Shell out to the local trainer - local and cloud run identical code."""
     import sys
     sys.path.insert(0, "/root")
     # resume only on Modal's OWN retries (the call id is stable across retries, new per `modal run`); ponytail: /outputs/.attempts markers are never cleaned

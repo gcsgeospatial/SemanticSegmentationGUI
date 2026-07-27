@@ -1,7 +1,7 @@
 # RandLA-Net-pytorch sources + compiled nearest_neighbors/cpp_subsampling,
 # pinned at the same SHA the modal recipe clones. linux-64 + win-64: ships
 # cp311 extensions (torch-free; variants key on python only). Upstream's
-# nearest_neighbors setup.py is replaced (as in the old Dockerfile) — the
+# nearest_neighbors setup.py is replaced (as in the old Dockerfile) - the
 # original hardcodes flags that break on modern toolchains; the replacement
 # lives in nearest_neighbors/setup.py here and is copied in as a path source.
 
@@ -25,7 +25,7 @@ build:
     - if: unix
       then: |
         # the checked-in knn.cpp is stale Cython output (#include "longintrepr.h",
-        # removed in py3.11) — regenerate it. Cython names the module after the
+        # removed in py3.11) - regenerate it. Cython names the module after the
         # .pyx file, and the extension/importers expect `nearest_neighbors`, so
         # regenerate under that name (bare knn.pyx yields a broken PyInit_knn).
         cd "$SRC_DIR/utils/nearest_neighbors"
@@ -47,9 +47,9 @@ build:
     - if: win
       then: |
         rem conda-forge's vs2022 activation only detects VS 17.x / v143; on newer
-        rem VS (e.g. Build Tools 2026) cl never lands on PATH — self-activate then.
+        rem VS (e.g. Build Tools 2026) cl never lands on PATH - self-activate then.
         rem vcvars64 APPENDS to INCLUDE/LIB, so the prefix header paths survive.
-        rem Clear the stale VS vars the failed activation left behind — a bogus
+        rem Clear the stale VS vars the failed activation left behind - a bogus
         rem VSINSTALLDIR makes VsDevCmd.bat error out.
         set "VSINSTALLDIR="
         set "VCINSTALLDIR="
@@ -63,7 +63,7 @@ build:
         rem sign the four size_t for-loops. Binary-mode replace preserves CRLF.
         %PYTHON% -c "p='knn_.cxx'; s=open(p,'rb').read(); s=s.replace(b'for(size_t i=0; i<nqueries; i++){', b'for(long long i=0; i<(long long)nqueries; i++){'); s=s.replace(b'for(size_t bid=0; bid < batch_size; bid++){', b'for(long long bid=0; bid < (long long)batch_size; bid++){'); assert s.count(b'for(long long') == 8, 'upstream knn_.cxx changed'; open(p,'wb').write(s)"
         if %ERRORLEVEL% neq 0 exit 1
-        rem regen under the importable module name — see unix branch note
+        rem regen under the importable module name - see unix branch note
         copy /y knn.pyx nearest_neighbors.pyx
         "%PREFIX%\Scripts\cython.exe" --cplus nearest_neighbors.pyx -o knn.cpp
         if %ERRORLEVEL% neq 0 exit 1

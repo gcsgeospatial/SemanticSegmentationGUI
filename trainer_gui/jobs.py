@@ -21,8 +21,7 @@ EPOCH_RE = re.compile(
 # [val@ep9] acc=... mIoU(5-way)=... mIoU(present 4)=...; test@epN deliberately doesn't match
 VAL_RE = re.compile(
     r"\[(?:val|eval)@ep(\d+)\]\s+acc=([\d.]+)\s+"
-    r"mIoU\(\d+-way\)=([\d.]+)\s+mIoU\(present \d+\)=([\d.]+)"
-    r"(?:\s+worst\((.+?)\)=([\d.]+))?")
+    r"mIoU\(\d+-way\)=([\d.]+)\s+mIoU\(present \d+\)=([\d.]+)")
 RUN_DIR_RE = re.compile(r"/outputs/runs/(\S+)")
 
 
@@ -59,8 +58,6 @@ class LogParser(QObject):
                     "acc": float(v.group(2)),
                     "miou_all": float(v.group(3)),
                     "miou": float(v.group(4)),
-                    "worst_class": v.group(5),
-                    "worst_iou": float(v.group(6)) if v.group(6) else None,
                 })
             if not self._run_id_seen:
                 r = RUN_DIR_RE.search(line)
@@ -124,7 +121,7 @@ class JobRunner(QObject):
         self.proc.start(program, args)
 
     def terminate(self):
-        """Kill the whole process tree — QProcess.kill() alone only hits the
+        """Kill the whole process tree - QProcess.kill() alone only hits the
         direct child (pixi/modal), orphaning the python trainer with the GPU."""
         if not self.running:
             return

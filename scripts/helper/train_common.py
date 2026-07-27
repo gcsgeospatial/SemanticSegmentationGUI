@@ -53,7 +53,7 @@ def write_pred(path, xyz, pred, intensity=None, confidence=None, probs=None,
 
 
 class DatasetExhausted(RuntimeError):
-    """Deterministic 'no usable tiles' signal — must escape the broad
+    """Deterministic 'no usable tiles' signal - must escape the broad
     train-loop excepts that swallow ordinary per-batch failures."""
 
 
@@ -111,7 +111,7 @@ def validated_latest_ckpt(ckpts, ep_of):
 
 
 VAL_FULL_NOTE = ("  val: full raw-scored eval over every val scene, same protocol "
-                 "as the test pass (PROXY_SAMPLING=full — slower than a proxy "
+                 "as the test pass (PROXY_SAMPLING=full - slower than a proxy "
                  "pass, but directly comparable to the final numbers)")
 
 
@@ -123,8 +123,9 @@ def row_protocol(m):
 
 def ranking_protocol(sampling):
     """PROXY_SAMPLING -> the row protocol that crowns final_model.pth.
-    'full' ranks on the same raw-scored eval as the test pass (slow, directly
-    comparable); 'coverage'/'density' rank on the fixed-budget proxy."""
+    'full' (Full Eval) ranks on the same raw-scored eval as the test pass
+    (slow, directly comparable); 'coverage' (Proxy Eval) ranks on the
+    fixed-budget proxy."""
     return "full" if sampling == "full" else "proxy"
 
 
@@ -176,7 +177,7 @@ STOP_SENTINEL = f"{OUTPUTS_ROOT}/STOP"
 
 def clear_stop():
     """Delete a stale STOP sentinel at startup. ponytail: concurrent runs
-    sharing one /outputs share the sentinel — press stop once per run."""
+    sharing one /outputs share the sentinel - press stop once per run."""
     try:
         os.remove(STOP_SENTINEL)
         print("  [stop] removed stale STOP sentinel", flush=True)
@@ -200,7 +201,7 @@ def stop_requested(ep):
 
 def _dg_block() -> dict | None:
     """DG settings that travel WITH the weights (logdk changes model input
-    width — inference rebuilds with the same k). AdaBN/TTA are per-job."""
+    width - inference rebuilds with the same k). AdaBN/TTA are per-job."""
     try:
         import density as dg
     except ImportError:
@@ -222,7 +223,7 @@ def _intensity_norm_from_meta(meta: dict) -> str:
 
 
 def write_run_manifest(run_dir, backbone, dataset=None, weights="final_model.pth"):
-    """Finalize run.json — the single record inference reads, beside the
+    """Finalize run.json - the single record inference reads, beside the
     weights. Merges normalized manifest fields over the trainer's raw config
     (legacy run_config.json accepted as raw source). `backbone` = key."""
     rc = {}
@@ -314,7 +315,7 @@ VOXEL_GPU_MIN = 1_000_000
 def voxel_unique(keys, return_inverse=False, gpu=True):
     """np.unique(keys, axis=0, return_index[, return_inverse]) equivalent,
     ~10x faster via packed int64 codes (order matches); axis=0 on overflow.
-    Big inputs sort on CUDA when available — indices come back identical.
+    Big inputs sort on CUDA when available - indices come back identical.
     gpu=False from threads that run concurrent with a model forward: a sort
     OOM falls back safely, but the ALLOCATION can push the forward into OOM."""
     import numpy as np
@@ -594,7 +595,6 @@ def make_tile_picker(train_tiles, rare_tiles, rare_prob):
 
 _PROXY_FLOOR_PTS = 4096
 _PROXY_FLOOR_TILES = 3
-_PROXY_BETA, _PROXY_CAP = 0.5, 10.0
 PROXY_PROTOCOL_TILES = "proxy_tiles_v2"
 PROXY_PROTOCOL_SPHERES = "proxy_spheres_v2"
 
@@ -612,40 +612,21 @@ def fixed_np_seed(seed=20260724):
         np.random.set_state(st)
 
 
-def proxy_slots(total, inventory, rem, cname):
-    """Split `rem` proxy slots over `inventory` by inverse-frequency^beta.
-    Largest-remainder rounding makes the split sum exact and platform-stable;
-    the no-blind-spot guarantee comes from the caller's floor pass, which runs
-    first. Ties break on (remainder desc, count, name)."""
-    import numpy as np
-    w = class_weights_np(total, _PROXY_BETA, _PROXY_CAP,
-                         absent_to_one=True)[inventory]
-    q = rem * w / w.sum()
-    k = np.floor(q).astype(np.int64)
-    spare = sorted(range(len(inventory)),
-                   key=lambda j: (-float(q[j] - k[j]), int(total[inventory[j]]),
-                                  cname(inventory[j])))
-    for j in spare[:max(0, rem - int(k.sum()))]:
-        k[j] += 1
-    return k
-
-
 def pick_proxy_tiles(val_tiles, num_classes, budget, mode="coverage",
                      class_names=None, cache_path=None, viable=None):
-    """Choose the mid-training proxy-val tile subset: 'coverage' keeps the even
-    stride and greedily adds the richest tiles (add-only, at most
+    """Choose the mid-training Proxy Eval tile subset: an even stride over the
+    val tiles, then greedily add the richest tiles (add-only, at most
     _PROXY_FLOOR_TILES per class) until every val-present class clears a point
-    floor; 'density' drops the stride, takes the same floor first, then splits
-    the rest by inverse-frequency^beta. viable(path)->bool pre-filters tiles the
-    batch path would drop. Returns (tile_paths, report).
-    'full' picks like coverage; the run ranks on the raw-scored full eval
+    floor. viable(path)->bool pre-filters tiles the batch path would drop.
+    Returns (tile_paths, report).
+    'full' picks the same subset; the run ranks on the raw-scored Full Eval
     instead, so the result goes unused (kept so a switch back is cheap)."""
     import numpy as np
-    if mode not in ("coverage", "density", "full"):
+    if mode not in ("coverage", "full"):
         raise ValueError(f"PROXY_SAMPLING={mode!r} is not a sampling mode. Set "
-                         "PROXY_SAMPLING to 'full', 'coverage' or 'density'.")
+                         "PROXY_SAMPLING to 'full' or 'coverage'.")
     if not val_tiles:
-        raise RuntimeError("no val tiles to proxy-score — re-run prep with a "
+        raise RuntimeError("no val tiles to proxy-score - re-run prep with a "
                            "non-empty val split")
     cname = lambda c: (class_names[c] if class_names else str(c))
     bname = [os.path.basename(p) for p in val_tiles]
@@ -692,8 +673,7 @@ def pick_proxy_tiles(val_tiles, num_classes, budget, mode="coverage",
                 break
             _add(i)
 
-    if mode in ("coverage", "full"):
-        _fill(budget)
+    _fill(budget)
     counts = (per_tile[picked].sum(0) if picked else np.zeros(num_classes, np.int64))
     rarest = sorted(inventory, key=lambda c: (int(total[c]), cname(c)))
     covers = {}
@@ -706,21 +686,6 @@ def pick_proxy_tiles(val_tiles, num_classes, budget, mode="coverage",
                 break
             covers.setdefault(bname[got], []).append(cname(c))
             counts += per_tile[got]
-
-    if mode == "density":
-        rem = budget - len(picked)
-        if rem > 0 and inventory:
-            k = proxy_slots(total, inventory, rem, cname)
-            for c in rarest:
-                for _ in range(int(k[inventory.index(c)])):
-                    if len(picked) >= budget:
-                        break
-                    got = _richest(c)
-                    if got is None or not _add(got):
-                        break
-                    covers.setdefault(bname[got], []).append(cname(c))
-                    counts += per_tile[got]
-        _fill(budget)
 
     paths = [val_tiles[i] for i in sorted(picked)]
     if not paths:
@@ -750,7 +715,7 @@ def pick_proxy_tiles(val_tiles, num_classes, budget, mode="coverage",
 
 def split_scenes(ds_root):
     """Read the dataset's three split folders verbatim (never re-carve).
-    Returns (name, pc_path, None) lists — third slot is a legacy cls_path."""
+    Returns (name, pc_path, None) lists - third slot is a legacy cls_path."""
     import glob
     stem = lambda p: os.path.splitext(os.path.basename(p))[0]
 
@@ -799,7 +764,7 @@ def validate_cache(prep_dir, sig, lists, legacy_pair):
 def score_ious(pred, lab, num_classes):
     """Per-class (intersection, union, gt_count) over already-valid-masked
     prediction/label arrays; one bincount pass instead of 3 masks per class.
-    pred must be non-negative (argmax output) — bincount raises otherwise."""
+    pred must be non-negative (argmax output) - bincount raises otherwise."""
     import numpy as np
     pred = np.asarray(pred, dtype=np.int64)
     lab = np.asarray(lab, dtype=np.int64)
@@ -888,7 +853,7 @@ def score_raw_from_voxels(rep_xyz, pred_u, raw_xyz, raw_lab, num_classes,
 
 
 def load_xyz_label(npz_path):
-    """Slim eval-scoring loader: xyz + label only — skips the intensity/
+    """Slim eval-scoring loader: xyz + label only - skips the intensity/
     ret_num/feat_*/rgb channels a 100M-point scene would otherwise
     materialize (GBs) just to score predictions."""
     import numpy as np
@@ -917,16 +882,11 @@ def eval_metrics(t_inter, t_union, t_gt, correct, total, class_names, t_start,
     scored = sorted(present + forced)
     scored_iou = [float(iou_per[c]) for c in scored]
     present_mIoU = float(np.mean(scored_iou)) if scored_iou else 0.0
-    worst_c = min(present, key=lambda c: iou_per[c]) if present else None
-    worst_name = class_names[worst_c] if worst_c is not None else None
-    worst_iou = float(iou_per[worst_c]) if worst_c is not None else None
     extra = extra or {}
     m = {
         "overall_acc": correct / max(total, 1),
         "overall_mIoU": float(np.mean(iou_per)),
         "present_classes_mIoU": present_mIoU,
-        "worst_class": worst_name,
-        "worst_class_iou": worst_iou,
         "per_class_iou": {class_names[c]: float(iou_per[c]) for c in range(num_classes)},
         "per_class_gt_count": {class_names[c]: gt_counts[c] for c in range(num_classes)},
         "present_classes": [class_names[c] for c in present],
@@ -945,7 +905,6 @@ def eval_metrics(t_inter, t_union, t_gt, correct, total, class_names, t_start,
           f"mIoU({num_classes}-way)={m['overall_mIoU']:.4f}  "
           # "mIoU(present N)" wording is load-bearing: the GUI's VAL_RE parses it
           f"mIoU(present {len(scored)})={m['present_classes_mIoU']:.4f}  "
-          + (f"worst({worst_name})={worst_iou:.4f}  " if worst_name is not None else "")
           + f"absent={m['absent_classes']}  raw_pts={total:,}"
           + (f"  forced0={m['forced_zero_classes']}" if forced else "")
           + ("  skipped(" + ",".join(f"{k}={v}" for k, v in skipped.items()) + ")"
@@ -975,7 +934,7 @@ def init_val_csv(val_csv, class_names):
 def append_val_row(val_csv, ep, m, class_names):
     """One val_metrics.csv row: epoch, acc, present-class mIoU, per-class IoUs,
     protocol. Only rows matching the run's ranking protocol seed
-    BestCheckpoint — see row_protocol/ranking_protocol."""
+    BestCheckpoint - see row_protocol/ranking_protocol."""
     ious = [m["per_class_iou"][n] for n in class_names]
     with open(val_csv, "a", newline="", encoding="utf-8") as f:
         csv.writer(f).writerow([ep, f"{m['overall_acc']:.4f}",
@@ -985,25 +944,25 @@ def append_val_row(val_csv, ep, m, class_names):
 
 
 def _proxy_remedy(run_dir):
-    """Both files must go together, and each costs something — say what."""
+    """Both files must go together, and each costs something - say what."""
     return (f"Unset AUTO_RESUME to launch a fresh run, or delete BOTH "
             f"{run_dir}/val_metrics.csv "
             f"(this wipes the run's GUI plot history) and "
             f"{run_dir}/final_model.pth (the run is un-inferrable and "
             f"un-packageable until a later epoch re-crowns it), then relaunch. "
-            f"Close the GUI inference page first — Windows holds the weights "
+            f"Close the GUI inference page first - Windows holds the weights "
             f"open and the delete fails with WinError 32.")
 
 
 def proxy_guard(run_dir, report, protocol, class_names, ranking="proxy"):
-    """Stamp/verify the checkpoint-ranking protocol of run_dir — call ONCE at
+    """Stamp/verify the checkpoint-ranking protocol of run_dir - call ONCE at
     startup right after BestCheckpoint (VAL_EVERY would leave epochs unguarded).
     Hashes tile BASENAMES only: absolute paths differ across win/linux/Modal and
     would falsely wedge a cross-backend resume. Returns False when run_dir must
     be abandoned for a fresh one (pre-upgrade run: v1 rows, or ranking rows with
     no signature); raises RuntimeError when its rows were ranked under another
     protocol or the checkpoint they crowned is gone.
-    ranking='full' stores a bare marker — the full eval covers the whole val
+    ranking='full' stores a bare marker - the full eval covers the whole val
     split, so there is no tile subset to pin. A proxy-mode signature keeps its
     exact pre-'full' shape so in-flight proxy runs still resume."""
     import hashlib
@@ -1132,7 +1091,7 @@ def proxy_val(batches, forward, num_classes, class_names, label, n_units,
 
 
 def scene_arrays(z, n):
-    """(intensity, ret_num) from a scene npz — the ONE place missing-channel
+    """(intensity, ret_num) from a scene npz - the ONE place missing-channel
     fallbacks are decided (intensity -> rgb gray -> zeros; ret_num -> zeros)."""
     import numpy as np
     if "intensity" in z:
@@ -1296,7 +1255,7 @@ def prefetch_map(fn, items, depth=None):
 
 def train_stride(chunk_xy):
     """Train tile stride = chunk_xy * TT_TRAIN_STRIDE (default 0.75).
-    Val/test keep chunk_xy/2 — per-voxel voting needs the overlap."""
+    Val/test keep chunk_xy/2 - per-voxel voting needs the overlap."""
     return chunk_xy * float(os.environ.get("TT_TRAIN_STRIDE", "0.75"))
 
 
@@ -1527,7 +1486,7 @@ def kp_find_latest_checkpoint(opt_type, feature_modes, arch_hash=None,
                               features=None, legacy_features=None,
                               skip_done=False):
     """Most recent run with checkpoints AND this script's recipe (optimizer,
-    feature_mode, ordered feature spec — names, not width — and arch hash).
+    feature_mode, ordered feature spec - names, not width - and arch hash).
     Returns (run_dir, ckpt_path, epoch) or None."""
     import glob
 
@@ -1770,7 +1729,7 @@ def kp_make_predict_points(forward_prob, build_feat, grid, chunk_xy,
 
 def kp_make_target_batches(scenes, make_batch, build_feat, grid,
                            chunk_xy, num_classes, cap=30):
-    """AdaBN target batches over inference scenes — same windows/features
+    """AdaBN target batches over inference scenes - same windows/features
     predict_points will see. make_batch(cxyz, feat) -> model batch."""
     import numpy as np
 
@@ -2288,7 +2247,7 @@ def load_ckpt_safe(path, map_location="cpu"):
 def modal_shell_run(script, flag_vals, env_json, volumes):
     """Body of every modal_train_* shell: build the trainer command (None
     flags skipped), merge --env-json into the env, commit volumes every 120s +
-    on exit. Volumes are duck-typed (.commit()) — this module must not import modal."""
+    on exit. Volumes are duck-typed (.commit()) - this module must not import modal."""
     import subprocess
     import sys
     import threading
@@ -2327,7 +2286,7 @@ def _demo():
     fu = lambda v: {"present_classes_mIoU": v}
     assert row_protocol(px(0.5)) == "proxy" and row_protocol(fu(0.5)) == "full"
     assert ranking_protocol("full") == "full"
-    assert ranking_protocol("coverage") == ranking_protocol("density") == "proxy"
+    assert ranking_protocol("coverage") == "proxy"
     b = BestCheckpoint(d)
     assert b.update(px(0.5)) and not b.update(px(0.4)) and b.update(px(0.6))
     # a full-protocol metric never crowns a proxy-ranked run, however high
@@ -2508,11 +2467,6 @@ def _demo():
                         extra={"skipped_scenes": 0, "scored_on": "raw_points"})
     assert (abs(m_ev["overall_mIoU"] - 0.5) < 1e-9 and m_ev["scored_on"] == "raw_points"
             and m_ev["present_classes"] == ["a", "b"])
-    assert (m_ev["worst_class"] in ("a", "b")
-            and m_ev["worst_class_iou"] == min(m_ev["per_class_iou"].values()))
-    i2, u2, g2 = score_ious(np.array([0, 0, 0]), np.array([0, 1, 1]), 2)
-    m2 = eval_metrics(i2, u2, g2, 1, 3, ["a", "b"], time.time(), 1, "demo")
-    assert m2["worst_class"] == "b" and m2["worst_class_iou"] == 0.0
     vd = tempfile.mkdtemp()
     append_val_row(f"{vd}/v.csv", 3, m_ev, ["a", "b"])
     assert "3,0.6667,0.5000,0.5000,0.5000,full" in open(f"{vd}/v.csv").read()
@@ -2533,8 +2487,7 @@ def _demo():
     assert (abs(m_inv["present_classes_mIoU"] - 1 / 3) < 1e-9
             and m_inv["forced_zero_classes"] == ["c"]
             and m_inv["scored_classes"] == ["a", "b", "c"]
-            and m_inv["absent_classes"] == []
-            and m_inv["worst_class"] in ("a", "b"))
+            and m_inv["absent_classes"] == [])
     m_nof = eval_metrics(i3, u3, g3, 2, 3, ["a", "b", "c"], time.time(), 1, "demo")
     assert m_nof["present_classes_mIoU"] == 0.5
     assert m_nof["forced_zero_classes"] == [] and m_nof["absent_classes"] == ["c"]
@@ -2657,17 +2610,10 @@ def _demo():
     assert cr["covers"] == {"t08.npz": ["pole"], "t09.npz": ["veg"], "t10.npz": ["veg"]}
     assert 8 < cr["n_tiles"] <= 8 + _PROXY_FLOOR_TILES * len(cr["inventory"])
     assert [os.path.basename(p) for p in pcov] == cr["tiles"]
-    _, dr = pick_proxy_tiles(pvt, 4, 8, "density", pnm, cache_path=pcb)
-    assert dr["n_tiles"] == 8 and dr["shortfall"] == {}
-    assert all(v >= dr["floor_points"] for v in dr["per_class_picked"].values())
-    assert "t11.npz" in dr["tiles"] and dr["per_class_picked"]["veg"] == 9000
-    assert dr["per_class_picked"]["veg"] > cr["per_class_picked"]["veg"]
-    assert dr["per_class_picked"]["ground"] < cr["per_class_picked"]["ground"]
     psh = [pvt[i] for i in np.random.RandomState(5).permutation(12)]
-    assert pick_proxy_tiles(psh, 4, 8, "density", pnm)[1]["covers"] == dr["covers"]
-    assert pick_proxy_tiles(sorted(psh), 4, 8, "density", pnm)[1] == dr
+    assert pick_proxy_tiles(sorted(psh), 4, 8, "coverage", pnm)[1] == cr
     assert pick_proxy_tiles(pvt, 4, 8, "coverage", pnm, cache_path=pcb)[1] == cr
-    _, sr = pick_proxy_tiles(pvt, 4, 8, "density", pnm, cache_path=pcb,
+    _, sr = pick_proxy_tiles(pvt, 4, 8, "coverage", pnm, cache_path=pcb,
                              viable=lambda p: not p.endswith("t08.npz"))
     assert sr["shortfall"] == {"pole": [0, sr["floor_points"]]}
     assert "t08.npz" not in sr["tiles"]
@@ -2689,7 +2635,7 @@ def _demo():
         pick_proxy_tiles(pvt, 4, 8, "rare", pnm)
         raise AssertionError("an unknown sampling mode must raise")
     except ValueError as e:
-        assert "PROXY_SAMPLING" in str(e) and "density" in str(e)
+        assert "PROXY_SAMPLING" in str(e) and "coverage" in str(e)
 
     sx, sa, sl = kp_grid_subsample(
         np.array([[0.1, 0.1, 0.1], [0.2, 0.2, 0.2], [5.0, 5.0, 5.0]], np.float32),

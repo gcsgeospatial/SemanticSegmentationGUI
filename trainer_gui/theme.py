@@ -1,4 +1,4 @@
-"""App theming — Light/Dark/System. apply() sets Fusion + QPalette + QSS; status
+"""App theming - Light/Dark/System. apply() sets Fusion + QPalette + QSS; status
 labels use semantic roles via set_accent. Every pair meets WCAG AA (see
 _check_contrast)."""
 
@@ -42,7 +42,7 @@ def resolve(mode: str) -> str:
     try:
         if QApplication.styleHints().colorScheme() == Qt.ColorScheme.Dark:
             return "dark"
-    except Exception:  # noqa: BLE001 — older Qt without colorScheme()
+    except Exception:  # noqa: BLE001 - older Qt without colorScheme()
         pass
     return "light"
 
@@ -168,7 +168,7 @@ def _contrast(fg: str, bg: str) -> float:
     return (max(a, b) + 0.05) / (min(a, b) + 0.05)
 
 
-def _check_contrast():  # ponytail: runnable WCAG AA check — `python trainer_gui/theme.py`
+def _check_contrast():  # ponytail: runnable WCAG AA check - `python trainer_gui/theme.py`
     pairs = [("text", "bg", 4.5), ("text", "panel", 4.5), ("muted", "bg", 4.5),
              ("muted", "panel", 4.5), ("ok", "bg", 4.5), ("warn", "bg", 4.5),
              ("error", "bg", 4.5), ("ok", "panel", 4.5), ("warn", "panel", 4.5),

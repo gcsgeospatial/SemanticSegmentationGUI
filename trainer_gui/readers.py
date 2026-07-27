@@ -37,7 +37,7 @@ def _horizontal_crs(crs):
 def vertical_unit_factor(crs) -> float:
     """Meters per source vertical unit: the vertical-axis unit of a compound/3D
     CRS, else a PROJECTED horizontal's linear unit. z beside geographic (angular)
-    coords is metres, never radians — only a projected horizontal lends its unit."""
+    coords is metres, never radians - only a projected horizontal lends its unit."""
     for ax in crs.axis_info:
         if ax.direction.lower() in ("up", "down"):
             return float(ax.unit_conversion_factor)
@@ -130,7 +130,7 @@ def restore_to_source(xyz, proc_crs_wkt, source_crs_wkt):
     """Inverse of normalize_to_meters: proc-meter coords -> source frame, exact
     round-trip via the same Transformer pair (direction=INVERSE). Every exporter
     calls this. source_crs_wkt None = no transform at ingest (proc IS the source
-    frame) — but a non-meter proc with no source is a legacy pred: hard block (D2)."""
+    frame) - but a non-meter proc with no source is a legacy pred: hard block (D2)."""
     xyz = np.asarray(xyz, np.float64)
     if source_crs_wkt is None:
         if is_legacy_unit_scale_pred(proc_crs_wkt, source_crs_wkt):
@@ -343,7 +343,7 @@ def _read_numpy(path) -> Cloud:
 
 
 def _selfcheck() -> None:
-    """python readers.py — reproject round-trip, identity, and z-unit invariants."""
+    """python readers.py - reproject round-trip, identity, and z-unit invariants."""
     from pyproj import CRS
     rng = np.random.default_rng(0)
 

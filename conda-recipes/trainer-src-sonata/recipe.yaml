@@ -16,7 +16,7 @@ build:
   number: 0
   noarch: generic
   skip:
-    - win   # bash build script; the noarch artifact installs everywhere — build on Linux only
+    - win   # bash build script; the noarch artifact installs everywhere - build on Linux only
   script: |
     mkdir -p "$PREFIX/opt/sonata"
     cp -r "$SRC_DIR"/. "$PREFIX/opt/sonata/"

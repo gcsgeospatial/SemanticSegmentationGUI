@@ -66,7 +66,7 @@ def _randlanet_root() -> str:
         if p and os.path.isdir(p):
             return p
     if env:
-        raise RuntimeError(f"RANDLANET_SRC={env} is not a directory — fix the "
+        raise RuntimeError(f"RANDLANET_SRC={env} is not a directory - fix the "
                            "env var or bake the source at /opt/randlanet")
     raise RuntimeError(
         "RandLA-Net source not found: set RANDLANET_SRC to your RandLA-Net-pytorch "
@@ -877,11 +877,6 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                     for *_, lab in (val_ds.scenes[i] for i in pidx)])
     tot = cnt.sum(0)
     n_slot = {c: PROXY_ANCHORS for c in inv}
-    if PROXY_SAMPLING == "density" and inv and SLOTS > sum(n_slot.values()):
-        k = tc.proxy_slots(tot, inv, SLOTS - sum(n_slot.values()),
-                           lambda c: CLASS_NAMES[c])
-        for j, c in enumerate(inv):
-            n_slot[c] += int(k[j])
     anchors = []
     for c in sorted(inv, key=lambda c: (int(tot[c]), CLASS_NAMES[c])):
         cand = sorted((r for r in range(len(pidx)) if cnt[r, c] > 0),

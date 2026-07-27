@@ -1,4 +1,4 @@
-"""HeightAboveGround — hag_for_cloud is the one engine behind every feat_hag.
+"""HeightAboveGround - hag_for_cloud is the one engine behind every feat_hag.
 
 Two independent axes, never mixed: ground SOURCE (ground_method = labels / csf /
 smrf / zmin) and INTERPOLATION ("grid" numpy raster, or PDAL hag_nn/hag_delaunay;
@@ -177,7 +177,7 @@ def hag_grid_for_cloud(cloud, *, ground_mask=None,
 
 
 def _min_z_per_cell(xyz, cell: float = CSF_DECIM_CELL_M) -> np.ndarray:
-    """Indices of each cell's lowest point (ascending) — the low envelope."""
+    """Indices of each cell's lowest point (ascending) - the low envelope."""
     xy = xyz[:, :2]
     z = xyz[:, 2]
     ij = np.floor((xy - xy.min(0)) / cell).astype(np.int64)
@@ -194,7 +194,7 @@ def _reject_high_ground(cloud, mask, relief_m: float = GRID_HAG_RELIEF_M):
     points sitting more than relief_m above the grid method's own roof-rejecting
     low surface (hag_grid detection). A large flat roof absorbed into ground by
     SMRF/CSF sits well above true ground, so this strips it however the filter
-    mislabeled it — the filter-independent guarantee that a building can't be
+    mislabeled it - the filter-independent guarantee that a building can't be
     ground. Returns the mask unchanged only if the grid surface can't be built."""
     hag = hag_grid_for_cloud(cloud, ground_mask=None)
     if hag is None:
@@ -245,7 +245,7 @@ def csf_ground_mask(cloud) -> "np.ndarray | None":
 def smrf_ground_mask(cloud) -> "np.ndarray | None":
     """Ground mask via PDAL SMRF (Simple Morphological Filter), or None. SMRF's
     window can absorb a flat roof wider than the window into ground (its
-    commission-error failure mode) — so window is set large (SMRF_MAX_WINDOW_M)
+    commission-error failure mode) - so window is set large (SMRF_MAX_WINDOW_M)
     to reach across big buildings, and the height guard (_reject_high_ground)
     strips any roof still wider than the window. CSF remains the safer default."""
     if not pdal_available():
@@ -273,7 +273,7 @@ def smrf_ground_mask(cloud) -> "np.ndarray | None":
 def hag_for_cloud(cloud, *, ground_mask=None, ground_method: str = "labels",
                   hag_filter: str = "grid",
                   notes: "list | None" = None) -> "np.ndarray | None":
-    """The ONE HAG engine (dataset builds, tiles, inference — methods can't
+    """The ONE HAG engine (dataset builds, tiles, inference - methods can't
     diverge). Ground SOURCE picked by ground_method: 'labels' (caller's
     ground_mask), 'csf'/'smrf' (PDAL detection), or 'zmin' (percentile-Z raster
     HAG, which ignores hag_filter); hag_filter picks interpolation for the

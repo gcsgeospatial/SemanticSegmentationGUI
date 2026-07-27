@@ -1,6 +1,6 @@
 """Convert user folders/files into the canonical dataset the scripts consume.
 
-Layout: <staging>/<name>/{dataset_meta.json, train|val|test/<scene>.npz} — xyz f64,
+Layout: <staging>/<name>/{dataset_meta.json, train|val|test/<scene>.npz} - xyz f64,
 label i32 (-1 = ignore), optional rgb u8 / intensity f32 / return_number f32, with
 inference jobs using the same npz minus `label` under scenes/. The split is decided
 ONCE here (point-count fractions over whole scenes, or tiles of a single cloud
@@ -284,7 +284,7 @@ def _atomize(cloud: Cloud, tile_m: float):
 def _seam_drop(xy, keys, uniq, split_of_point, tile_m: float,
                seam_buffer_m: float) -> np.ndarray:
     """Keep-mask: drop points within seam_buffer_m of a neighbouring tile in a
-    different split. ponytail: O(n) tile-edge approximation — can over-drop
+    different split. ponytail: O(n) tile-edge approximation - can over-drop
     slightly, never leaks; effective buffer caps at tile_m."""
     n = len(xy)
     keep = np.ones(n, dtype=bool)
@@ -352,7 +352,7 @@ def _crs_report(crs_wkt: str | None, source_crs_wkt: str | None,
 
 
 def _hag_from_cloud(cloud: Cloud) -> np.ndarray | None:
-    """Source HeightAboveGround/HAG field when one exists and aligns 1:1 — wins
+    """Source HeightAboveGround/HAG field when one exists and aligns 1:1 - wins
     over recomputation; stored as feat_hag."""
     for name, arr in cloud.fields.items():
         key = name.lower().replace("_", "")
@@ -917,7 +917,7 @@ def convert_infer_job(job_id: str, input_dir: str, staging_root: Path, progress=
                       out_dir: Path | None = None) -> Path:
     """Label-less conversion for inference jobs -> <staging>/_infer/<job_id>/ (or
     out_dir), though the container mount stays /datasets/_infer/<job> either way.
-    intensity_norm MUST match the weights' training norm — a mismatch feeds
+    intensity_norm MUST match the weights' training norm - a mismatch feeds
     out-of-distribution intensity. hag/ground_value behave as on the Datasets
     page; a scene without ground_value degrades to detection, never to no HAG."""
     say = progress or (lambda s: None)

@@ -2,7 +2,7 @@
 filename across input folders. Soft vote (averaged "probs") when every member
 carries them, else confidence-weighted hard vote; output adds "agreement" and
 "dominant_member" (las/laz field "ens_member"), class sets clamped via
-infer_run.json. Hard-vote ties go to the earliest input — put your strongest
+infer_run.json. Hard-vote ties go to the earliest input - put your strongest
 model first; output uses the first input's format.
 
 Usage:
@@ -77,7 +77,7 @@ def dominant_member(voted, probs=None, labels=None, weights=None):
 def load_pred(path):
     """(xyz, labels, intensity|None, confidence|None, probs|None) from any
     prediction file. npz is read natively (container-safe); exported formats go
-    through the GUI's readers (probs never survive an export — npz only)."""
+    through the GUI's readers (probs never survive an export - npz only)."""
     if path.endswith(".npz"):
         z = np.load(path)
         # float64: a float32 cast quantizes UTM northing to 0.5 m steps
@@ -116,7 +116,7 @@ def write_out(path, xyz, cls, intensity, confidence, agree, crs_wkt=None,
             d["source_crs_wkt"] = np.asarray(str(source_crs_wkt))
         np.savez(path, **d)
         return
-    # ponytail: agreement is npz-only — dataset._write_pred has no agreement column; add one there if the deliverable ever needs it
+    # ponytail: agreement is npz-only - dataset._write_pred has no agreement column; add one there if the deliverable ever needs it
     sys.path.insert(0, REPO_ROOT)
     from trainer_gui.dataset import _write_pred
     from pathlib import Path
@@ -129,7 +129,7 @@ def write_out(path, xyz, cls, intensity, confidence, agree, crs_wkt=None,
 
 def align_idx(ref_xyz, xyz):
     """Row map from xyz onto ref_xyz: None when rows already match, else NN
-    indices. rtol=0 is load-bearing — the default rtol=1e-5 is ~50 m on UTM."""
+    indices. rtol=0 is load-bearing - the default rtol=1e-5 is ~50 m on UTM."""
     if len(xyz) == len(ref_xyz) and np.allclose(xyz, ref_xyz, rtol=0.0, atol=1e-4):
         return None
     from scipy.spatial import cKDTree
@@ -231,7 +231,7 @@ def ensemble(input_dirs, out_dir, log=print):
             dom = dominant_member(voted, probs=np.stack(probs))
         else:
             noprobs = [d for d, p in zip(input_dirs, probs) if p is None]
-            # the two branches genuinely disagree — say which one ran
+            # the two branches genuinely disagree - say which one ran
             log(f"  {stem}: weighted hard vote (no probs in {noprobs})")
             w = np.stack([c if c is not None else np.ones(len(ref_lab), np.float32)
                           for c in confs])

@@ -1,4 +1,4 @@
-"""Run-artifact figures, drawn into Figure() directly (no pyplot — works headless
+"""Run-artifact figures, drawn into Figure() directly (no pyplot - works headless
 and embedded). Sources: val_metrics.csv, metrics.csv, test_metrics.json,
 run.json (run_config.json on legacy runs).
 """
@@ -103,7 +103,7 @@ val_series = series
 
 
 def full_series(run_dir: Path, metric: str) -> tuple[list, list]:
-    """The full raw-scored val row(s) — only when a proxy curve exists, else
+    """The full raw-scored val row(s) - only when a proxy curve exists, else
     series() already returned them."""
     cols = read_csv_columns(Path(run_dir) / "val_metrics.csv")
     if metric not in cols or not cols.get("epoch") or not _rows(cols, metric, True)[0]:
@@ -230,7 +230,7 @@ def single_run_figure(run_dir: Path, fig: Figure | None = None) -> Figure:
         fx, fy = full_series(run_dir, metric)
         if fx:      # raw-scored: a different scale, so a marker, never the line
             ax.plot(fx, fy, marker="*", ms=11, ls="none", color=color,
-                    label=f"{metric_label(metric)} (full eval)")
+                    label=f"{metric_label(metric)} (Full Eval)")
     for split, color in (("val", "C2"), ("test", "C3")):
         miou = (test.get(split) or {}).get("overall_mIoU")
         if miou is not None:

@@ -1,4 +1,4 @@
-"""Training terminal — entry point + main window (sidebar nav over stacked pages)."""
+"""Training terminal - entry point + main window (sidebar nav over stacked pages)."""
 
 from __future__ import annotations
 

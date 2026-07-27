@@ -48,7 +48,6 @@ class InferPage(QWidget):
         self._run_class_names: list | None = None
         self._manifest_features: list | None = None
         self._hag_ground_value: int | None = None
-        self._hag_ground_method: str = "labels"
         self._modal_cfg_run = ""
         self._run_tag = ""
         self._pending_cfg_run = ""
@@ -128,14 +127,14 @@ class InferPage(QWidget):
         self.run_combo = QComboBox()
         self.run_combo.setEditable(True)
         self.run_combo.lineEdit().setPlaceholderText(
-            "run id — or paste <volume>/runs/<id> straight from the train log")
+            "run id - or paste <volume>/runs/<id> straight from the train log")
         self.run_combo.currentIndexChanged.connect(self._on_run_pick)
         self.run_combo.lineEdit().editingFinished.connect(self._on_run_id_typed)
         run_row = QHBoxLayout()
         run_row.addWidget(self.run_combo, 1)
         self.dl_run_btn = QPushButton("Download run…")
         self.dl_run_btn.setToolTip("Fetch runs/<id> (weights + run.json + metrics) from the "
-                                   "model's outputs volume to <workspace>/inference/<id> — "
+                                   "model's outputs volume to <workspace>/inference/<id> - "
                                    "for backup, local inference later, or the class names.")
         self.dl_run_btn.clicked.connect(self._download_run)
         run_row.addWidget(self.dl_run_btn)
@@ -183,7 +182,7 @@ class InferPage(QWidget):
         ens_hint.setObjectName("pageSub")
         ecol.addWidget(ens_hint)
         wf.addRow(self.ens_box)
-        ens_modal_hint = QLabel("Ensembles run locally — switch to Local mode to enable")
+        ens_modal_hint = QLabel("Ensembles run locally - switch to Local mode to enable")
         ens_modal_hint.setObjectName("pageSub")
         self.ens_switch_btn = QPushButton("Switch to Local")
         self.ens_switch_btn.clicked.connect(self._switch_to_local)
@@ -211,33 +210,45 @@ class InferPage(QWidget):
         iform.addRow("Tile size (m)", self.chunk_spin)
         self.hag_chk = QCheckBox("Compute Height-Above-Ground (HAG)")
         self.hag_chk.setToolTip("Bakes a per-point feat_hag channel into each converted "
-                                "scene — required by runs trained with feat_hag. Ground "
-                                "comes from the class named below when you set one, else "
-                                "it's detected.")
+                                "scene - required by runs trained with feat_hag. Pick "
+                                "the ground source and interpolation below.")
         self.hag_chk.toggled.connect(lambda on: self.hag_opts_w.setVisible(on))
         iform.addRow("Height-Above-Ground", self.hag_chk)
+        # same source × interpolation axes as the Datasets page; default CSF
+        # because inference clouds are usually unlabeled
+        self.hag_ground_method = QComboBox()
+        for _k in pretrain.GROUND_METHODS:
+            self.hag_ground_method.addItem(pretrain.GROUND_LABELS[_k], _k)
+        self.hag_ground_method.setCurrentIndex(
+            self.hag_ground_method.findData("csf"))
+        self.hag_ground_method.setToolTip(
+            "Where ground comes from. Base off ground layer: a classification "
+            "value already in the input clouds. CSF / SMRF: PDAL ground "
+            "detection (needs PDAL). Z-min proxy: percentile-Z raster, no PDAL.")
+        self.hag_ground_method.currentIndexChanged.connect(self._on_hag_method)
         self.hag_filter = QComboBox()
         self.hag_filter.addItems(list(pretrain.HAG_METHODS))
         self.hag_filter.setToolTip("How HAG is interpolated from the ground points. "
                                    "grid: fast raster approximation, no PDAL needed. "
                                    "hag_nn / hag_delaunay: accurate PDAL filters.")
         self.hag_ground = QLineEdit()
-        self.hag_ground.setPlaceholderText("blank = detect (CSF)")
         self.hag_ground.setMaximumWidth(90)
         self.hag_ground.setToolTip("Classification value in the input clouds that means "
-                                   "ground (e.g. 2). When set, those points are the ONLY "
-                                   "ground source — never mixed with detection. Blank = "
-                                   "CSF detects ground instead (needs PDAL; without it "
-                                   "the grid method's own heuristic is the fallback).")
+                                   "ground (e.g. 2). Those points are the ONLY ground "
+                                   "source - never mixed with detection.")
+        self._hag_ground_lbl = QLabel("ground class")
         hag_row = QHBoxLayout()
+        hag_row.addWidget(QLabel("ground source"))
+        hag_row.addWidget(self.hag_ground_method)
         hag_row.addWidget(QLabel("method"))
         hag_row.addWidget(self.hag_filter)
-        hag_row.addWidget(QLabel("ground class"))
+        hag_row.addWidget(self._hag_ground_lbl)
         hag_row.addWidget(self.hag_ground)
         hag_row.addStretch()
         self.hag_opts_w = ui.wrap(hag_row)
         self.hag_opts_w.setVisible(False)
         iform.addRow("", self.hag_opts_w)
+        self._on_hag_method()
         if not pretrain.pdal_available():
             self.hag_chk.setText("Compute Height-Above-Ground (HAG) - grid only, "
                                  "PDAL not installed")
@@ -302,7 +313,7 @@ class InferPage(QWidget):
         self.unclass_spin.setDecimals(2)
         self.unclass_spin.setValue(0.50)
         tip = ("Raw max-softmax confidence: points below the cut export as ASPRS "
-               "class 1 (Unclassified — processed, no class assigned). The .npz "
+               "class 1 (Unclassified - processed, no class assigned). The .npz "
                "keeps the raw prediction, so re-exporting at a new threshold "
                "never re-runs inference.")
         self.unclass_chk.setToolTip(tip)
@@ -385,7 +396,7 @@ class InferPage(QWidget):
                "Pick a run (or a local .pth), a folder of clouds, and run on Modal."))
         self.ens_box.setEnabled(local)
         self.ens_box.setToolTip(
-            "" if local else "Ensemble runs on the LOCAL backend only — the "
+            "" if local else "Ensemble runs on the LOCAL backend only - the "
             "per-member Modal download loop isn't wired. Switch execution to "
             "local on the Settings page to use it.")
         if not local:
@@ -439,7 +450,7 @@ class InferPage(QWidget):
                 continue
             missing = local and not local_cli.installed(b, self.repo_root)
             self.backbone_combo.setItemText(
-                i, b.label + ("  — env not installed" if missing else ""))
+                i, b.label + ("  - env not installed" if missing else ""))
 
     def showEvent(self, ev):
         super().showEvent(ev)
@@ -451,7 +462,7 @@ class InferPage(QWidget):
         self._rebuild_class_list()
 
     def _rebuild_class_list(self):
-        """All-checked list of the run's classes. Deliberately not persisted —
+        """All-checked list of the run's classes. Deliberately not persisted -
         all-on is the safe default."""
         self.class_list.blockSignals(True)
         self.class_list.clear()
@@ -468,7 +479,7 @@ class InferPage(QWidget):
         self._sync_class_mask_label()
 
     def _excluded_classes(self) -> list[str]:
-        """Unticked class names — the run's EXCLUDE_CLASSES env value."""
+        """Unticked class names - the run's EXCLUDE_CLASSES env value."""
         if not self.class_list.isEnabled():
             return []
         return [self.class_list.item(i).text() for i in range(self.class_list.count())
@@ -482,7 +493,7 @@ class InferPage(QWidget):
             self.class_mask_lbl.setText("⚠ keep at least 2 classes enabled")
         else:
             self.class_mask_lbl.setText(
-                f"masking {len(exc)} of {total}: {', '.join(exc)} — next-best class wins")
+                f"masking {len(exc)} of {total}: {', '.join(exc)} - next-best class wins")
 
     @staticmethod
     def _names_from_manifest(m: dict) -> list | None:
@@ -541,7 +552,7 @@ class InferPage(QWidget):
         return None
 
     def _combo_run_ref(self) -> tuple:
-        """(volume, run_id) from the run combo — typed text wins over
+        """(volume, run_id) from the run combo - typed text wins over
         currentData(); volume is '' unless pasted."""
         return _parse_run_ref(self.run_combo.currentText())
 
@@ -686,12 +697,7 @@ class InferPage(QWidget):
                              f"using {self.hag_filter.currentText()}.")
             self._append(f"[hag] run trained with feat_hag; HAG enabled, "
                          f"method={self.hag_filter.currentText()}.")
-            meta_src = ((self._dataset_meta(m) or {}).get("source") or {})
-            gm = meta_src.get("hag_ground_method")
-            if not gm:
-                hs = str(m.get("hag_source") or "")
-                gm = hs.split("+", 1)[1] if "+" in hs else (hs if hs == "zmin" else "")
-            self._hag_ground_method = gm or "labels"
+            # ground source is the user's call - train-time source doesn't bind it
         if self._dg.get("logdk"):
             self._append(f"[dg] trained with the log-d_k density channel "
                          f"(k={self._dg.get('logdk_k', 8)}); recomputed at inference.")
@@ -908,7 +914,7 @@ class InferPage(QWidget):
             *self._crs_probe, declared if type(declared) is int else None)
         if block:
             self.crs_status.setText(f"⚠ {self._crs_probe_name}: {detected}. "
-                                    f"Blocks Run — {block}.")
+                                    f"Blocks Run - {block}.")
         else:
             self.crs_status.setText(f"{self._crs_probe_name}: detected {detected} · {action}.")
 
@@ -918,6 +924,14 @@ class InferPage(QWidget):
                 and self._manifest.get("backbone") in BACKBONES):
             return BACKBONES[self._manifest["backbone"]]
         return BACKBONES[self.backbone_combo.currentData()]
+
+    def _on_hag_method(self):
+        """Ground-class field only for 'Base off ground layer'; zmin is
+        self-contained and ignores the interpolation method."""
+        key = self.hag_ground_method.currentData()
+        self._hag_ground_lbl.setVisible(key == "labels")
+        self.hag_ground.setVisible(key == "labels")
+        self.hag_filter.setEnabled(key != "zmin")
 
     def _check_hag(self) -> bool:
         """Reconcile the HAG box with the run's feature spec and parse the
@@ -931,13 +945,15 @@ class InferPage(QWidget):
         elif self.hag_chk.isChecked() and not need:
             self._append("[hag] note: this run doesn't use feat_hag; computing "
                          "HAG only costs conversion time.")
-        gtxt = self.hag_ground.text().strip()
-        if self.hag_chk.isChecked() and gtxt:
+        if self.hag_chk.isChecked() \
+                and self.hag_ground_method.currentData() == "labels":
+            gtxt = self.hag_ground.text().strip()
             try:
                 self._hag_ground_value = int(gtxt)
             except ValueError:
-                self._append(f"Ground class '{gtxt}' isn't an integer - clear it to "
-                             f"detect ground, or enter a classification value.")
+                self._append("HAG 'Base off ground layer' needs a ground class - "
+                             "enter the classification value that means ground "
+                             "(e.g. 2), or pick CSF / SMRF / Z-min proxy.")
                 return False
         return True
 
@@ -984,7 +1000,7 @@ class InferPage(QWidget):
             "manifest": manifest, "dg": (manifest or {}).get("dg") or {},
             "grid": self.grid_spin.value(), "chunk": self.chunk_spin.value()})
         src = Path(mpath).parent.name if mpath else w.name
-        self.ens_list.addItem(f"{bkey} — {src}")
+        self.ens_list.addItem(f"{bkey} - {src}")
         self._append(f"[ensemble] member {len(self._ens_members)}: {bkey} ({w})")
 
     def _remove_ens_member(self):
@@ -1171,16 +1187,15 @@ class InferPage(QWidget):
                 self._append("[hag] re-enabled for the ensemble: a member's spec "
                              "includes feat_hag (the last-loaded run didn't).")
         hag_filter = self.hag_filter.currentText() if hag_on else "grid"
-        # infer data is unlabeled: 'labels' training degrades to detection here
-        if self._hag_ground_value is not None:
-            ground_method = "labels"
-        elif self._hag_ground_method in ("csf", "smrf", "zmin"):
-            ground_method = self._hag_ground_method
-        else:
+        ground_method = self.hag_ground_method.currentData()
+        if ground_method == "labels" and self._hag_ground_value is None:
+            # ensemble re-enable path skipped _check_hag's parse; don't launch
+            # 'labels' without a class
             ground_method = "csf"
+            self._append("[hag] no ground class set - using CSF detection.")
         if hag_on:
             src = (f"ground = class {self._hag_ground_value}"
-                   if self._hag_ground_value is not None
+                   if ground_method == "labels"
                    else f"{pretrain.GROUND_LABELS.get(ground_method, ground_method)} detection")
             self._append(f"[1/4] Computing HeightAboveGround ({hag_filter}, {src}) "
                          "for the input scenes.")
@@ -1634,7 +1649,7 @@ def _localize_paths(text: str, job_id: str, pred_dir, staged) -> str:
 
 def _scene_channel_report(staged,
                           features: list | None = None) -> tuple[list[str], bool]:
-    """(log lines, blocking) — verify the converted scenes carry what the run
+    """(log lines, blocking) - verify the converted scenes carry what the run
     needs: rgb / feat_* are hard requirements (blocking); missing intensity /
     return_number only warns; features None = legacy, never blocking."""
     import numpy as np

@@ -283,7 +283,7 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
     def _scene_of(p):
         b = os.path.basename(p)
         return b.rsplit("_x", 1)[0]
-    # the dataset stage decided the 3-way split — read verbatim, never re-carve
+    # the dataset stage decided the 3-way split - read verbatim, never re-carve
     train_tiles = sorted(glob.glob(f"{PREP_DIR}/train/*.npz"))
     val_tiles   = sorted(glob.glob(f"{PREP_DIR}/val/*.npz"))
     test_tiles  = sorted(glob.glob(f"{PREP_DIR}/test/*.npz"))

@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "trainer-gui"
 version = "0.1.0"
 description = "Unified training terminal for the Modal point-cloud training scripts"
-# <3.13: open3d and numpy<2 ship no wheels for 3.13 — use `pixi install` here,
+# <3.13: open3d and numpy<2 ship no wheels for 3.13 - use `pixi install` here,
 # which pins python 3.11 (see pixi.toml).
 requires-python = ">=3.10,<3.13"
 dependencies = [

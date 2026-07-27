@@ -31,7 +31,7 @@ build:
     - if: win
       then: |
         rem conda-forge's vs2022 activation only detects VS 17.x / v143; on newer
-        rem VS (e.g. Build Tools 2026) cl never lands on PATH — self-activate then.
+        rem VS (e.g. Build Tools 2026) cl never lands on PATH - self-activate then.
         rem Clear the stale VS vars the failed activation left behind first.
         set "VSINSTALLDIR="
         set "VCINSTALLDIR="

@@ -25,7 +25,7 @@ def _kpconv_root() -> str:
 
 @contextlib.contextmanager
 def _cwd(path):
-    """load_kernels() caches kernel dispositions to a CWD-relative path —
+    """load_kernels() caches kernel dispositions to a CWD-relative path -
     build the net under the KPConv root so the pre-baked cache is found."""
     old = os.getcwd()
     os.chdir(path)
@@ -434,7 +434,7 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
 
     # neighborhood_limits: a train/infer mismatch silently changes the pyramid, so the limits travel in run.json and inference restores them
     def calibrate_neighbors(tiles, k=CALIB_TILES, untouched=CALIB_UNTOUCHED):
-        """Per-layer limits keeping `untouched` of neighborhoods uncropped —
+        """Per-layer limits keeping `untouched` of neighborhoods uncropped -
         KPConv's own calibration rule. The probe runs uncropped by construction."""
         hist_n = int(np.ceil(4 / 3 * np.pi * (cfg.deform_radius + 1) ** 3))
         hists = np.zeros((cfg.num_layers, hist_n), np.int64)
@@ -554,7 +554,7 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
                             weight_decay=SGD_WD)
 
     def lr_at(ep):
-        """Closed-form exponential decay — resume lands on the right lr."""
+        """Closed-form exponential decay - resume lands on the right lr."""
         return SGD_LR0 * (LR_DECAY ** ep)
 
     if resume_ckpt is not None:
@@ -723,7 +723,7 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
                 while made < n:
                     if fails >= 200:
                         raise tc.DatasetExhausted(
-                            "PreciseBN: 200 consecutive tile failures — training "
+                            "PreciseBN: 200 consecutive tile failures - training "
                             "tiles can't build batches; re-run dataset prep")
                     s = sample_tile(pick_train_tile(), training=False)
                     if s is None:
@@ -766,7 +766,7 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
             if s is not None:
                 return s
         raise tc.DatasetExhausted(
-            "1000 consecutive empty tile draws — training tiles are empty or "
+            "1000 consecutive empty tile draws - training tiles are empty or "
             "too small; re-run dataset prep")
     prefetch = (tc.make_prefetcher(
         lambda: make_kp_batch([_draw() for _ in range(PACK_N)]),

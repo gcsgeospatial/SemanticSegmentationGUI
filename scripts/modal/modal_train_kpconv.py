@@ -1,4 +1,4 @@
-"""Modal shell for the original KPConv (cold-start) — shells out to
+"""Modal shell for the original KPConv (cold-start) - shells out to
 local_train_kpconv.py so local and cloud run identical code. Flags: --dataset
 --grid --chunk-xy --epochs --batch --steps-per-epoch; --mode eval|infer
 --weights --infer-input. GPU/timeout from TT_GPU / TT_TIMEOUT_HOURS."""
@@ -34,7 +34,7 @@ image = (
     .env({"PYTHONUNBUFFERED": "1", "MPLBACKEND": "Agg"})
 )
 
-# pinned upstream clone — the SHA IS the architecture version
+# pinned upstream clone - the SHA IS the architecture version
 image = image.run_commands(
     "git clone https://github.com/HuguesTHOMAS/KPConv-PyTorch.git /opt/kpconv"
     " && git -C /opt/kpconv checkout --detach d19c575d3fa9fcfd5a74845b5b27aac7e50472c7",
@@ -75,7 +75,7 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
                  chunk_xy: Optional[float] = None, epochs: Optional[int] = None,
                  batch: Optional[int] = None, steps_per_epoch: Optional[int] = None,
                  env_json: Optional[str] = None):
-    """Shell out to the local trainer — local and cloud run identical code."""
+    """Shell out to the local trainer - local and cloud run identical code."""
     import sys
     sys.path.insert(0, "/root")
     # resume only on Modal's OWN retries (the call id is stable across retries, new per `modal run`); ponytail: /outputs/.attempts markers are never cleaned

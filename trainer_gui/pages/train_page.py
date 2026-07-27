@@ -21,7 +21,7 @@ from ..backbones import BACKBONES, GPU_CHOICES, GPU_VRAM_GB, batch_for_vram
 from ..jobs import FuncWorker, JobRunner, LogParser
 from ..logconsole import LogConsole
 
-# Channels each arch CAN consume — a capability filter. "height" is removed, don't reintroduce it; standard channels are pre-checked as a reversible default (default_feature_checks), geo/hag extras stay opt-in.
+# Channels each arch CAN consume - a capability filter. "height" is removed, don't reintroduce it; standard channels are pre-checked as a reversible default (default_feature_checks), geo/hag extras stay opt-in.
 _FEAT_STANDARD = {
     "randlanet":    ["intensity", "return_number"],
     "kpconvx_cold": ["intensity", "return_number"],
@@ -75,8 +75,6 @@ class TrainPage(QWidget):
         self._run_live = False
         self._run_t0: float | None = None
         self._run_epochs = 0
-        self._last_worst = ""
-        self._last_epoch_txt = ""
         self._local_vram: float | None | str = "?"   # nvidia-smi is slow; probe once
         self.batch_note: QLabel | None = None
 
@@ -117,25 +115,23 @@ class TrainPage(QWidget):
         self.val_every.valueChanged.connect(self._refresh_summaries)
         form.addRow("Validate every N epochs", self.val_every)
         self.proxy_sampling = QComboBox()
-        self.proxy_sampling.addItem("Full (same as the test pass)", "full")
-        self.proxy_sampling.addItem("Proxy — coverage (natural mix)", "coverage")
-        self.proxy_sampling.addItem("Proxy — density (rare-heavy)", "density")
+        self.proxy_sampling.addItem("Full Eval", "full")
+        self.proxy_sampling.addItem("Proxy Eval", "coverage")
         self.proxy_sampling.setToolTip(
-            "Full scores every val scene on its original points, exactly like the "
-            "final test pass — the mIoU you see mid-training is the number you get "
-            "at the end, and it picks the best checkpoint on that. Costs a full "
-            "eval every N epochs; raise 'Validate every N epochs' if that is too "
-            "slow.\n"
-            "The proxy modes score a fixed 48-tile subset at voxel resolution "
-            "instead: much faster, but the numbers run high and are not comparable "
-            "to the test result. Coverage keeps the natural class mix; density "
-            "spends its tile budget on rare classes, which steadies rare-class IoU "
-            "but inflates it further.\n"
-            "Fixed for the life of a run — resuming with a different setting is "
+            "Full Eval scores every val scene on its original points, exactly "
+            "like the final test pass: the mIoU you see mid-training is the "
+            "number you get at the end, and it picks the best checkpoint on "
+            "that. Costs a full eval every N epochs; raise 'Validate every N "
+            "epochs' if that is too slow.\n"
+            "Proxy Eval scores a fixed 48-tile subset at voxel resolution "
+            "instead: much faster, but only good for watching epoch-to-epoch "
+            "drift; the numbers run high and are not comparable to the test "
+            "result.\n"
+            "Fixed for the life of a run: resuming with a different setting is "
             "refused, because the two score on different scales.")
         form.addRow("Validation scoring", self.proxy_sampling)
         form.addRow("Input features", self._features_row())
-        self.detach_chk = QCheckBox("Detach (return immediately — launch several models in parallel)")
+        self.detach_chk = QCheckBox("Detach (return immediately - launch several models in parallel)")
         self.detach_chk.setToolTip("Runs in the cloud without streaming logs here. Reattach with "
                                    "`modal app logs <app>`; the run id appears under runs/ on the "
                                    "model's outputs volume (the Inference page Run field is editable).")
@@ -163,7 +159,7 @@ class TrainPage(QWidget):
         self.stop_ckpt_btn.clicked.connect(self._stop_graceful)
         run_row.addWidget(self.stop_ckpt_btn)
         self.stop_btn = QPushButton("Kill")
-        self.stop_btn.setToolTip("Hard-kill the process now — no final eval; a later "
+        self.stop_btn.setToolTip("Hard-kill the process now - no final eval; a later "
                                  "launch with AUTO_RESUME=1 continues from the last "
                                  "periodic checkpoint (all backbones).")
         self.stop_btn.clicked.connect(self._stop)
@@ -202,8 +198,8 @@ class TrainPage(QWidget):
 
         metrics_col = QVBoxLayout()
         metrics_col.addWidget(QLabel("Live epoch metrics"))
-        self.metrics_table = QTableWidget(0, 5)
-        self.metrics_table.setHorizontalHeaderLabels(["Epoch", "Loss", "Acc", "mIoU", "Worst class"])
+        self.metrics_table = QTableWidget(0, 4)
+        self.metrics_table.setHorizontalHeaderLabels(["Epoch", "Loss", "Acc", "mIoU"])
         self.metrics_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.metrics_table.verticalHeader().setVisible(False)
         self.metrics_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
@@ -237,7 +233,7 @@ class TrainPage(QWidget):
             "Pick a dataset and model. Parameters are pre-filled; edit before launching. "
             + ("Runs locally in the model's pixi env on your GPU."
                if local else
-               "Runs on a Modal cloud GPU — upload the dataset from the Datasets page "
+               "Runs on a Modal cloud GPU - upload the dataset from the Datasets page "
                "first; the finished run lands on the model's outputs volume."))
         self.cfg_btn.setVisible(local)
         # graceful stop is local-only: the sentinel rides the /outputs bind mount
@@ -977,23 +973,17 @@ class TrainPage(QWidget):
         else:
             self._append(f"\n✗ Exited with code {code}.")
 
-    def _set_progress_lbl(self):
-        self.progress_lbl.setText(
-            self._last_epoch_txt
-            + (f" · {self._last_worst}" if self._last_worst else ""))
-
     def _on_epoch(self, m: dict):
         total = self._run_epochs
         if total:
             self.progress_bar.setRange(0, total)
             self.progress_bar.setValue(min(m["epoch"], total))
-        self._last_epoch_txt = (f"epoch {m['epoch']}/{total or '?'} · "
-                                f"loss {m['loss']:.2f} · miou {m['miou']:.2f}")
-        self._set_progress_lbl()
+        self.progress_lbl.setText(f"epoch {m['epoch']}/{total or '?'} · "
+                                  f"loss {m['loss']:.2f} · miou {m['miou']:.2f}")
         r = self.metrics_table.rowCount()
         self.metrics_table.insertRow(r)
         for col, val in enumerate((str(m["epoch"]), f"{m['loss']:.4f}",
-                                   f"{m['acc']:.4f}", f"{m['miou']:.4f}", "—")):
+                                   f"{m['acc']:.4f}", f"{m['miou']:.4f}")):
             item = QTableWidgetItem(val)
             item.setTextAlignment(Qt.AlignCenter)
             self.metrics_table.setItem(r, col, item)
@@ -1003,15 +993,10 @@ class TrainPage(QWidget):
         """Grey starred row for a held-out val pass: no train loss, val acc/mIoU
         (present-classes). Colored at insert time from the current theme."""
         grey = QBrush(QColor(theme.colors(appstate.get("ui_theme", "system"))["muted"]))
-        worst = (f"{m['worst_class']} {m['worst_iou']:.3f}"
-                 if m.get("worst_class") and m.get("worst_iou") is not None else "—")
-        if worst != "—":
-            self._last_worst = f"worst {worst}"
-            self._set_progress_lbl()
         r = self.metrics_table.rowCount()
         self.metrics_table.insertRow(r)
-        for col, val in enumerate((f"{m['epoch']}★", "—",
-                                   f"{m['acc']:.4f}", f"{m['miou']:.4f}", worst)):
+        for col, val in enumerate((f"{m['epoch']}★", "-",
+                                   f"{m['acc']:.4f}", f"{m['miou']:.4f}")):
             item = QTableWidgetItem(val)
             item.setTextAlignment(Qt.AlignCenter)
             item.setForeground(grey)

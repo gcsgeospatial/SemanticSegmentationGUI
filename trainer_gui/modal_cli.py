@@ -16,7 +16,7 @@ def modal_exe() -> str:
 
 
 def volume_create(volume: str) -> tuple[str, list[str]]:
-    # errors if the volume exists — run as JobRunner's `pre` step, exit ignored
+    # errors if the volume exists - run as JobRunner's `pre` step, exit ignored
     return modal_exe(), ["volume", "create", volume]
 
 
@@ -51,7 +51,7 @@ def run_script(script: str, flags: dict, detach: bool = False,
     return modal_exe(), args
 
 
-# ---- thin synchronous helpers (background threads only — they block) ----
+# ---- thin synchronous helpers (background threads only - they block) ----
 
 def fetch_run_manifest(volume: str, run_id: str, timeout: int = 60) -> dict | None:
     """Blocking: read runs/<run_id>/run.json (legacy run_config.json) off an

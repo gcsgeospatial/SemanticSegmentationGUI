@@ -1,8 +1,8 @@
-# Density Domain-Generalization — implementation spec
+# Density Domain-Generalization - implementation spec
 
 Goal: one trained model that segments point clouds at densities it was **not** trained on
 (denser **and** sparser), as close to true cross-density generalization as the information
-allows. Engineering substrate only — no dataset/brand specifics.
+allows. Engineering substrate only - no dataset/brand specifics.
 
 ## The theory in one screen
 
@@ -29,7 +29,7 @@ first and must coarsen `g` (trading resolution) to serve very sparse clouds.
 | D0 | canonical `g0 = 1/sqrt(rho_min)`; subsample train+infer to it | puts the sparsest served cloud at `o=1`, inside the invariant band | config `GRID*`; inference subsample | **partly built-in** (KPConvX tiles at GRID; PTv3/RandLA voxelize) |
 | D0b | inference: thin dense cloud to `g0` | removes the only shift on the dense side, exactly (`o->1`) | infer path | **built-in for KPConvX** (`_predict_points` grid_subsample); wire for PTv3/RandLA if raw>grid |
 | D0c | keep metric coords, float64-before-center | avoids a self-made density/scale confound | already done (origin offset, float64 load) | **already present** |
-| D1 | density/grid jitter augmentation | widens `p_train(o)` so `o_test` lands in the calibrated band — the bulk lever, only one that helps sparse | batch assembly (train) | **WIRE** `density.effective_grid` |
+| D1 | density/grid jitter augmentation | widens `p_train(o)` so `o_test` lands in the calibrated band - the bulk lever, only one that helps sparse | batch assembly (train) | **WIRE** `density.effective_grid` |
 | D2a | KPConvX sum→mean / inverse-density aggregation | stops `E[activation] ∝ o` at source; removes the cliff | `cfg.model.kp_aggregation` (line 619) | **stage** (config-reachable; retrain+GPU) |
 | D2b | AdaBN: recompute BN stats on target at inference | re-aligns frozen source stats to target `o`; label-free, exact for moments 1–2 | infer path | **WIRE** `density.adabn_recalibrate` |
 | D2c | BN→GroupNorm in magnitude-sensitive blocks | per-sample norm has no cross-sample stat to be wrong | `cfg.model.norm` (line 625) / lib | **stage** (config/lib; retrain) |
@@ -45,7 +45,7 @@ first and must coarsen `g` (trading resolution) to serve very sparse clouds.
 # --- density domain-generalization (density.py) ---
 DG_DENSITY_AUG   = False   # D1: per-tile effective-grid jitter during training
 DG_COARSEN_MAX   = 2.5     # = 1/(g0*sqrt(rho_min)); sweep output density down by this factor
-DG_P_NATIVE      = 0.5     # P(tile kept at native grid) — the full-occupancy anchor
+DG_P_NATIVE      = 0.5     # P(tile kept at native grid) - the full-occupancy anchor
 DG_LOGDK_FEAT    = False   # D3b: append log k-th-NN distance as an input channel (needs +1 in-dim, retrain)
 DG_LOGDK_K       = 8
 DG_INFER_ADABN   = False   # D2b: recompute BN stats on the target tiles before predicting
@@ -69,20 +69,20 @@ index whenever points are dropped/subsampled.
 ## Build & validation order
 
 1. **Free / label-free first (no retrain):** D2b AdaBN + D5 TTA in the infer path. Run on a
-   different-density cloud, compare to baseline — this *measures how much density hurts today*.
+   different-density cloud, compare to baseline - this *measures how much density hurts today*.
 2. **Bulk retrain lever:** D1 jitter (+ optionally D3b input). Retrain, compare on the same
-   held-out different-density cloud (NOT a same-density val split — that moves opposite).
+   held-out different-density cloud (NOT a same-density val split - that moves opposite).
 3. **Deeper retrains, isolated ablations:** D2a/D2c (config), D4 (consistency), D2d (RandLA lib).
 4. Each as an isolated A/B, never stacked, so each gain is attributable.
 
 Hard ceiling: nothing recovers detail absent from a natively-sparse `o<1` cloud. Dense side is
-fully solvable (canonicalize); sparse side is bounded by the `e^-o` empty-cell residual — train
+fully solvable (canonicalize); sparse side is bounded by the `e^-o` empty-cell residual - train
 tolerance (D1) and average variance (D5), do not expect to canonicalize it away.
 
-## Status — wired 2026-06-28 (all flag-gated, defaults reproduce prior behaviour)
+## Status - wired 2026-06-28 (all flag-gated, defaults reproduce prior behaviour)
 
 `density.py` self-checks pass (`pixi run python scripts/helper/density.py`); all 6 scripts
-`py_compile`-clean. Verified by compile + helper unit self-checks only — NOT yet run on GPU/data.
+`py_compile`-clean. Verified by compile + helper unit self-checks only - NOT yet run on GPU/data.
 
 | Change | kpconvx | ptv3 | randla |
 |--------|:---:|:---:|:---:|
@@ -91,60 +91,60 @@ tolerance (D1) and average variance (D5), do not expect to canonicalize it away.
 | **D5** density-TTA (infer) | ok | ok | ok |
 | **D2b** AdaBN (infer) | ok | n/a¹ | ok |
 | **D3b** log d_k input channel | ok | ok | ok |
-| **D2a/D2c** aggregation/norm flags | ok | — | — |
+| **D2a/D2c** aggregation/norm flags | ok | - | - |
 
 The AdaBN target-batch builders read the scene's feat_* channels (feat_hag included), so BN
 stats are estimated on the same feature predict is fed. ¹ PTv3 BN is pooling/stem only, so
 BN-TTA barely helps. (HAG became the ordinary `feat_hag` channel 2026-07-13; the `*_hag`
 script twins this table used to track are gone.)
 **D3b** (`DG_LOGDK_FEAT`) appends `log` of the k-th-NN distance as an input channel and bumps the
-model input dim by 1 — retrain-only (old weights won't load); KPConvX feeds it through the single
+model input dim by 1 - retrain-only (old weights won't load); KPConvX feeds it through the single
 `build_feat`, PTv3/RandLA at every inline feature site (train/eval/infer/AdaBN). **D2a/D2c**
-(`KP_AGGREGATION`/`KP_NORM`) surface the KPConvX `cfg` knobs as module constants — change + retrain to A/B.
+(`KP_AGGREGATION`/`KP_NORM`) surface the KPConvX `cfg` knobs as module constants - change + retrain to A/B.
 
 **Still staged (NOT wired, with the reason each is held):**
-- **D4 consistency loss** — in-script (dual-branch `f(x)≈f(decimate(x))`, stop-grad logit-KL on the
+- **D4 consistency loss** - in-script (dual-branch `f(x)≈f(decimate(x))`, stop-grad logit-KL on the
   shared index subset, separate BN per branch). Held because correct per-point index alignment
   through each backbone's internal pyramid/voxel re-subsample can't be verified without a GPU run,
   and there's no runnable check possible here. Recipe is fully specified (Tier-4 above); it's a
-  short, well-scoped job once a GPU is available — just not safe to ship blind.
-- **D2d RandLA LocSE rel-coord normalization** and **D3b FiLM modulation** — live inside the external
+  short, well-scoped job once a GPU is available - just not safe to ship blind.
+- **D2d RandLA LocSE rel-coord normalization** and **D3b FiLM modulation** - live inside the external
   pip packages (`/opt/kpconvx`, `/opt`, `/opt/randlanet`), not in this repo. Need the library vendored
   (or a monkey-patch shim) before they can be wired.
-- **D0/D0b explicit knob** — all three backbones already grid-canonicalize density at inference, so a
+- **D0/D0b explicit knob** - all three backbones already grid-canonicalize density at inference, so a
   separate knob is a no-op for the current grids; expose only if a deploy needs a g0 ≠ the model grid.
-- ~~GUI wiring for train-time DG~~ — wired: the Train page's "Density generalization (advanced)"
+- ~~GUI wiring for train-time DG~~ - wired: the Train page's "Density generalization (advanced)"
   box injects `DG_*` env at launch (`analysis.dg_config_to_env`); the direct env route still works.
 
-**How to turn on — three ways (all the same `DG_*` knobs).** The GUI is split by lifecycle.
+**How to turn on - three ways (all the same `DG_*` knobs).** The GUI is split by lifecycle.
 > **Note:** both GUI routes are live: the Train page's "Density generalization (advanced)" box
 > injects `DG_*` env at launch, and the Inference page's "Domain adaptation" row sets
 > `DG_INFER_ADABN` / `DG_INFER_TTA` / `TT_SAVE_PROBS` (run.json logdk recovery unchanged).
 > Route 2 (direct `DG_*` env vars on the standalone `local_train_*.py` scripts) still works.
-- **Train-time** (`density_aug`, `logdk`) — bake into the weights:
+- **Train-time** (`density_aug`, `logdk`) - bake into the weights:
 1. **GUI**: Datasets page -> select a saved dataset -> **"Density generalization (advanced)"** panel.
    It reads the dataset's stored density, takes your **target inference density**, and **Recommend**
    fills the train toggles (`analysis.dg_recommend`); **Save to dataset** persists it (`appstate`
    `dg_config`). The Train page injects them as `DG_*` env at launch (local docker `-e`). At the end of
    training `write_run_manifest` reads the same env and records a **`dg` block in `run.json`** (logdk +
    k), so the model is self-describing.
-- **Inference-time** (`adabn`, `tta`) — label-free, no retrain, applies to any model:
+- **Inference-time** (`adabn`, `tta`) - label-free, no retrain, applies to any model:
 1. **GUI**: Inference page -> Input box -> **AdaBN** / **Density TTA** toggles. The launch
    (`_infer_dg_env`) also re-injects `DG_LOGDK_FEAT`/`_K` **recovered from the run.json `dg` block**, so
    a logdk-trained model rebuilds at the right width and recomputes the channel automatically. (A bare
-   `.pth` with no run.json can't recover logdk — pick the run.json, or the load fails loudly.)
+   `.pth` with no run.json can't recover logdk - pick the run.json, or the load fails loudly.)
 - Either lifecycle, **directly**:
 2. **Env var**: `DG_DENSITY_AUG=1 DG_INFER_ADABN=1 python local_train_kpconvx_cold.py ...`.
    Each script reads `DG_*` in its config block via `dg.env_bool/float/int/str(name, globals()[name])`.
 3. **Edit the constant** in the script's config block.
 
-Cheapest first read on how much density hurts today — no retrain: `DG_INFER_ADABN=1` and/or
+Cheapest first read on how much density hurts today - no retrain: `DG_INFER_ADABN=1` and/or
 `DG_INFER_TTA=3` on a different-density cloud. Bulk lever (retrain): `DG_DENSITY_AUG=1`, tune
 `DG_COARSEN_MAX` to `1/(g0*sqrt(rho_min))` (the GUI's Recommend computes `sqrt(train/infer)` for you).
 
 **Plumbing:** `scripts/helper/density.py` `env_*` helpers + per-script env-shadow block;
 `train_common.py` `_dg_block`/`write_run_manifest` (records the `dg` block in run.json) + `infer_meta`
-(reads it back); `trainer_gui/analysis.py` `dg_recommend`/`dg_config_to_env` (train-time only —
+(reads it back); `trainer_gui/analysis.py` `dg_recommend`/`dg_config_to_env` (train-time only -
 currently no production caller: train-time DG is disabled in the GUI, panel hidden, no `DG_*` env
 injected); `pages/infer_page.py` `_infer_dg_env` (logdk recovery; the AdaBN/TTA toggles are hidden);
 `local_cli.run_script(env=)` (used by BOTH train and infer launches).

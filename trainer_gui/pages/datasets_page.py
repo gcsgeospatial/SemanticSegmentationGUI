@@ -1,5 +1,5 @@
 """Datasets page: point at clouds, name classes, split train/val/test, Build.
-Intensity is p95-normalized (i/p95 clipped to 0..2) — the single norm across
+Intensity is p95-normalized (i/p95 clipped to 0..2) - the single norm across
 build + train + inference."""
 
 from __future__ import annotations
@@ -120,7 +120,7 @@ class DatasetsPage(QWidget):
             b.clicked.connect(slot)
             in_row.addWidget(b)
         form.addRow("Input", ui.wrap(in_row))
-        self.crs_status = QLabel("Pick an input — its CRS and the reprojection action appear here.")
+        self.crs_status = QLabel("Pick an input - its CRS and the reprojection action appear here.")
         self.crs_status.setWordWrap(True)
         theme.set_accent(self.crs_status, "muted")
         form.addRow("CRS", self.crs_status)
@@ -138,18 +138,18 @@ class DatasetsPage(QWidget):
         return box
 
     def _features_box(self) -> QWidget:
-        """Only checked fields are baked into scenes — no implicit channels.
+        """Only checked fields are baked into scenes - no implicit channels.
         intensity starts checked as a default, not a requirement."""
-        box = QGroupBox("3 · Feature channels — input fields the model trains on")
+        box = QGroupBox("3 · Feature channels - input fields the model trains on")
         self.feat_group = box
         box.setToolTip("Per-point fields baked into every scene. ONLY what's "
-                       "checked here ends up in the dataset — nothing is "
+                       "checked here ends up in the dataset - nothing is "
                        "implicit. intensity starts checked as a default; "
                        "uncheck it and the dataset carries none. Every scene "
                        "must have a checked field - a missing one fails the "
                        "build.")
         lay = QVBoxLayout(box)
-        self.feat_hint = QLabel("Pick an input above — its per-point fields appear here.")
+        self.feat_hint = QLabel("Pick an input above - its per-point fields appear here.")
         theme.set_accent(self.feat_hint, "muted")
         lay.addWidget(self.feat_hint)
         self.feat_list = QListWidget()
@@ -180,8 +180,8 @@ class DatasetsPage(QWidget):
         return box
 
     def _calculated_box(self) -> QWidget:
-        """Channels computed from xyz at build time — not fields of the input."""
-        box = QGroupBox("4 · Calculated features — computed at build time")
+        """Channels computed from xyz at build time - not fields of the input."""
+        box = QGroupBox("4 · Calculated features - computed at build time")
         lay = QVBoxLayout(box)
         self.hag_box = QGroupBox("Compute Height-Above-Ground (HAG)"
                                  + ("" if pretrain.pdal_available()
@@ -191,7 +191,7 @@ class DatasetsPage(QWidget):
         self.hag_box.setToolTip("Bakes a per-point feat_hag channel into every scene. Pick "
                                 "the ground source and interpolation below. Select feat_hag "
                                 "in the Train page's feature list to feed it to any model.")
-        # ground SOURCE — orthogonal to interpolation (any source × any filter)
+        # ground SOURCE - orthogonal to interpolation (any source × any filter)
         self.hag_ground_method = QComboBox()
         for _k in pretrain.GROUND_METHODS:
             self.hag_ground_method.addItem(pretrain.GROUND_LABELS[_k], _k)
@@ -226,9 +226,9 @@ class DatasetsPage(QWidget):
         self.hag_opts_w.setVisible(False)
         self._on_hag_method()
         lay.addWidget(self.hag_box)
-        geo_lbl = QLabel("Geometric features (pgeof) — max neighbors (k)"
+        geo_lbl = QLabel("Geometric features (pgeof) - max neighbors (k)"
                          + ("" if pretrain.pgeof_available()
-                            else "  (pgeof not installed — the build will fail)"))
+                            else "  (pgeof not installed - the build will fail)"))
         self.geo_k = QSpinBox()
         self.geo_k.setRange(10, 500)
         self.geo_k.setSingleStep(10)
@@ -502,7 +502,7 @@ class DatasetsPage(QWidget):
     def _render_crs(self, *_):
         """Show the probed input's detected CRS + the auto action (or the D1 block)."""
         if not self._crs_probe:
-            self.crs_status.setText("Pick an input — its CRS and the reprojection "
+            self.crs_status.setText("Pick an input - its CRS and the reprojection "
                                     "action appear here.")
             return
         declared = parse_epsg(self.declare_epsg.text())
@@ -510,7 +510,7 @@ class DatasetsPage(QWidget):
             *self._crs_probe, declared if type(declared) is int else None)
         if block:
             self.crs_status.setText(f"⚠ {self._crs_probe_name}: {detected}. "
-                                    f"Blocks Build — {block}.")
+                                    f"Blocks Build - {block}.")
         else:
             self.crs_status.setText(f"{self._crs_probe_name}: detected {detected} · {action}.")
 
@@ -567,7 +567,7 @@ class DatasetsPage(QWidget):
                 self.class_table.setCellWidget(r, 0, cell)
                 cnt = sum(self._label_values.get(v, 0) for v in vals)
                 for col, text in ((1, ",".join(str(v) for v in vals)),
-                                  (2, f"{cnt:,}" if cnt else "—")):
+                                  (2, f"{cnt:,}" if cnt else "-")):
                     item = QTableWidgetItem(text)
                     item.setFlags(item.flags() & ~Qt.ItemIsEditable)
                     self.class_table.setItem(r, col, item)
@@ -1117,7 +1117,7 @@ def parse_epsg(text):
 
 
 def _looks_like_degrees(xyz) -> bool:
-    """No-CRS coords sitting in lon/lat bounds with a small span — the D1 trigger.
+    """No-CRS coords sitting in lon/lat bounds with a small span - the D1 trigger.
     The span guard keeps small projected-metre local clouds from false-blocking."""
     import numpy as np
     if len(xyz) == 0:
@@ -1151,6 +1151,6 @@ def crs_story(source_wkt, proc_wkt, looks_degrees, declared_epsg):
     if declared_epsg is not None:
         return "none in file", f"declared EPSG:{declared_epsg} → reproject", None
     if looks_degrees:
-        return ("none — coordinates look like lat/lon degrees", None,
+        return ("none - coordinates look like lat/lon degrees", None,
                 "declare its EPSG in the 'Declare CRS (EPSG)' box")
     return "none", "keep as-is (assumed projected metres)", None

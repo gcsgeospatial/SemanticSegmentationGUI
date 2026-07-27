@@ -1,4 +1,4 @@
-"""LogConsole — console widget for streaming process output: chunk-safe line
+"""LogConsole - console widget for streaming process output: chunk-safe line
 assembly, \\r frames replace the previous line, ANSI SGR -> colors (other
 escapes stripped), timestamp + severity coloring, toolbar. The core is
 deliberately theme-invariant (always dark), hence module color constants;

@@ -2,9 +2,9 @@
 
 Desktop GUI (PySide6) for training and running point-cloud semantic-segmentation
 models. Bring a folder of point clouds, pick a model, train it, run inference,
-view the predicted cloud — all in one window.
+view the predicted cloud - all in one window.
 
-Two execution backends: **Local (pixi)** and **Modal (cloud)** — switched in
+Two execution backends: **Local (pixi)** and **Modal (cloud)** - switched in
 the sidebar. Both run the same `scripts/local/` trainers (the Modal shells
 subprocess them on a cloud GPU; see `scripts/modal/README.md`). Everything
 below is the local path.
@@ -34,7 +34,7 @@ trainer-gui        # or: python -m trainer_gui
 ## How it runs training/inference
 
 The GUI never trains in-process. Locally it runs each trainer inside a
-per-model **pixi environment** (`envs/pixi.toml` — one env per backbone, all
+per-model **pixi environment** (`envs/pixi.toml` - one env per backbone, all
 CUDA/torch deps + the pinned model sources as `trainer-src-*` conda packages):
 
 ```
@@ -50,16 +50,16 @@ No container, no mounts: the GUI passes host dirs via env vars (the
 | `TT_DATASETS_ROOT` | staging root | canonical datasets + `_infer/<job>` inputs |
 | `TT_OUTPUTS_ROOT` | your chosen folder | `runs/<id>/` weights + predictions |
 | `TT_DATASET_DIR` / `TT_INFER_DIR` / `TT_PRED_DIR` | overrides | out-of-workspace datasets / infer jobs |
-| `TT_TRAIN_STRIDE` | — | train-tile stride as a fraction of chunk_xy (default 0.75; 0.5 = legacy 4× overlap, 1.0 = none). Val/test always keep chunk/2 for eval voting. Changing it re-tiles into a fresh `_ts*` prep dir. |
+| `TT_TRAIN_STRIDE` | - | train-tile stride as a fraction of chunk_xy (default 0.75; 0.5 = legacy 4× overlap, 1.0 = none). Val/test always keep chunk/2 for eval voting. Changing it re-tiles into a fresh `_ts*` prep dir. |
 
 Code lives in `trainer_gui/local_cli.py`. **No pixi on PATH (or not a
 Linux/CUDA host) → the GUI prints the exact command instead of running it**
-(dry-run — this dev box is Intel Arc, no CUDA).
+(dry-run - this dev box is Intel Arc, no CUDA).
 
 ## The scripts
 
 ```
-scripts/local/    the real trainers/inferencers — plain argparse, no modal.
+scripts/local/    the real trainers/inferencers - plain argparse, no modal.
                   Edit these. Run standalone: python scripts/local/local_train_ptv3.py --dataset X
 scripts/modal/    thin shells that bake the local twin into a modal.Image
                   and subprocess it in the cloud (train_common.modal_shell_run).
@@ -73,7 +73,7 @@ Each `local_train_<model>.py` takes the same kebab-case flags the GUI fills in
 ## The pixi environments & conda packages
 
 One pixi environment per model in `envs/pixi.toml` (env name = backbone key,
-`_` → `-`), locked in `envs/pixi.lock` — solvable from any OS, installable on
+`_` → `-`), locked in `envs/pixi.lock` - solvable from any OS, installable on
 the Linux GPU box:
 
 ```bash
@@ -82,7 +82,7 @@ pixi run --manifest-path envs/pixi.toml -e <model> sanity # import check
 ```
 
 Model sources are **conda packages** (`conda-recipes/trainer-src-*`, pinned
-upstream SHAs, C++ extensions prebuilt) on a public prefix.dev channel — users
+upstream SHAs, C++ extensions prebuilt) on a public prefix.dev channel - users
 need zero auth. Trained checkpoints ship the same way:
 
 ```bash
@@ -91,7 +91,7 @@ pixi run --manifest-path envs/pixi.toml -e pkg upload
 ```
 
 and installed `trainer-weights-*` packages show up in the Infer page's
-**Installed…** picker. The modal recipes stay the dependency source of truth —
+**Installed…** picker. The modal recipes stay the dependency source of truth -
 `tools/check_env_sync.py` (run by the smoke test) fails on any drift between
 them, `envs/pixi.toml`, and the recipe SHAs. Full details:
 `conda-recipes/README.md`.
@@ -109,7 +109,7 @@ them, `envs/pixi.toml`, and the recipe SHAs. Full details:
 | Utonia (pretrained encoder) | `utonia` | `scripts/local/local_train_utonia.py` |
 
 The `concerto`/`sonata`/`utonia` backbones fine-tune Pointcept's self-supervised
-pretrained encoders (one shared trainer — `local_train_concerto.py`; the other
+pretrained encoders (one shared trainer - `local_train_concerto.py`; the other
 two are thin wrappers). Their HuggingFace **weights are CC-BY-NC 4.0
 (non-commercial)**; `--freeze-encoder 1` gives a linear probe.
 
@@ -126,42 +126,42 @@ silent fallback.
 
 Three pages, front to back. Each one fills one of the bind-mounts above.
 
-### 1. Datasets — turn raw clouds into a trainable dataset
+### 1. Datasets - turn raw clouds into a trainable dataset
 
 Builds `/datasets/<name>` (the canonical `.npz` splits). Three numbered sections,
 top to bottom:
 
-1. **New dataset** — give it a **Name**, point **Input** at a file or a folder of
+1. **New dataset** - give it a **Name**, point **Input** at a file or a folder of
    clouds (`las/laz`, `ply`, ASCII `txt/csv/xyz/pts`, `pcd`, `npy/npz`). The
    **Label field** dropdown auto-probes the first file for label fields (e.g.
-   `classification`, `scalar_label`) — pick which one holds the class. **Output
+   `classification`, `scalar_label`) - pick which one holds the class. **Output
    folder** defaults to the app staging dir.
-2. **Classes** — click **Scan label values**: every distinct label value shows up
+2. **Classes** - click **Scan label values**: every distinct label value shows up
    as a row (value, points seen, editable class name, a **Train** checkbox).
    Rename classes, **uncheck** any value that means "unknown" (→ ignore-label,
    dropped from loss + mIoU), select rows + **Combine** to merge several values
    into one class. **Analyze density** prints pts/m², spacing and a suggested tile
    size, and pre-computes the per-model param recommendations the Train page uses.
-3. **Train / val / test split** — set **Validation** and **Test** fractions
+3. **Train / val / test split** - set **Validation** and **Test** fractions
    (train = the remainder), **Split mode** (Balanced mirrors the class mix /
    Random fills by point count), and the **seed** (default 42). Already have
    split folders? Tick **Separate train/val/test folders (use as-is)**. Optional
    **Compute Height-Above-Ground (HAG)** bakes a per-point `feat_hag` channel
    (ground = your labeled ground class when set, else CSF detection; never a
-   mix) — select it in the Train page's feature list to use it.
+   mix) - select it in the Train page's feature list to use it.
 
 Hit **Build dataset**. It writes `train/ val/ test/` `.npz` to staging; progress
 streams in the console. Done → the dataset appears under **Saved Datasets** and is
 ready to pick on the Train page.
 
-### 2. Train — run a model on the dataset
+### 2. Train - run a model on the dataset
 
 Writes `/outputs/runs/<id>/` (weights + logs + `run.json`).
 
 - Pick the **Dataset** (the status line confirms *✓ train/val/test standard met*)
   and a **Model**. **Configure model…** opens a popup showing that model's pixi
   env status and an **Install / update env** button.
-- **Parameters** are pre-filled from the density analysis (**★** = recommended) —
+- **Parameters** are pre-filled from the density analysis (**★** = recommended) -
   grid/sub-grid, epochs, batch, steps/epoch, tile size. All editable.
 - **Smoke run** (2 epochs × 50 steps) validates a new dataset end-to-end fast.
 - Optional: per-run **Domain generalization** (train robust to a different
@@ -170,10 +170,10 @@ Writes `/outputs/runs/<id>/` (weights + logs + `run.json`).
   The exact `pixi run` is echoed to the log; then logs stream live and per-epoch
   **Loss / Acc / mIoU** fill the metrics table. **Stop process** kills it.
 
-On finish, each run dir has the weights and a **`run.json`** — the single file
+On finish, each run dir has the weights and a **`run.json`** - the single file
 Inference needs.
 
-### 3. Inference — label new clouds with a trained model
+### 3. Inference - label new clouds with a trained model
 
 Reads a run's `run.json` + weights, writes predictions to a host folder.
 
@@ -197,7 +197,7 @@ Reads a run's `run.json` + weights, writes predictions to a host folder.
   PLY…**, and **Class colours & names…** to set the legend.
 - **Ensemble 2-3 models** (typically ~+2 mIoU): run inference on the same input
   with each trained model (a separate output folder per model), then
-  majority-vote the folders —
+  majority-vote the folders -
   `python scripts/local/ensemble_vote.py --inputs predsA predsB [predsC] --out voted`
   (strongest model first; it wins vote ties). Works across backbones and
   formats: all three models predict the same raw points, and the voter reads
@@ -207,10 +207,10 @@ Reads a run's `run.json` + weights, writes predictions to a host folder.
 
 `<staging>/<name>/` (bind-mounted to `/datasets/<name>`):
 
-- `dataset_meta.json` — classes (source value → index → name), per-split counts,
+- `dataset_meta.json` - classes (source value → index → name), per-split counts,
   density stats, per-model recommendations, and the recorded split (mode, seed,
   fractions).
-- `train/<scene>.npz`, `val/<scene>.npz`, `test/<scene>.npz` — `xyz` (f32),
+- `train/<scene>.npz`, `val/<scene>.npz`, `test/<scene>.npz` - `xyz` (f32),
   `label` (i32, −1 = ignored), plus `rgb`/`intensity`/`return_number`/`feat_hag`
   when the source has them.
 
@@ -223,11 +223,11 @@ and never re-split.
 ## Repo layout
 
 ```
-trainer_gui/     the PySide6 app (pip/pixi package) — pages/, local_cli.py, ...
+trainer_gui/     the PySide6 app (pip/pixi package) - pages/, local_cli.py, ...
 scripts/local/   the real trainers/inferencers (run in per-model pixi envs)
 scripts/modal/   thin shells (see its README.md)
 scripts/helper/  train_common.py, density.py, _modal_shim.py
-envs/            pixi.toml + pixi.lock — one training env per backbone
+envs/            pixi.toml + pixi.lock - one training env per backbone
 conda-recipes/   trainer-src-* recipes + README (rattler-build / prefix.dev)
 tools/           check_env_sync.py (modal↔pixi drift), package_weights.py
 ```
@@ -236,5 +236,5 @@ tools/           check_env_sync.py (modal↔pixi drift), package_weights.py
 
 ```powershell
 cd trainer_gui
-python tests/smoke_test.py     # or: pixi run test
+python smoke_test.py           # or: pixi run test
 ```

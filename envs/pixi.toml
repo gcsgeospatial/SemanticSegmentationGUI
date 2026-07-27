@@ -1,4 +1,4 @@
-# Per-architecture training environments (linux-64/CUDA only) — replaces docker/.
+# Per-architecture training environments (linux-64/CUDA only) - replaces docker/.
 #
 # One [feature.<key>] + one [environments] entry per backbone; environment names
 # equal Backbone.key so the GUI maps `pixi run -e <key>` with no lookup table.
@@ -11,7 +11,7 @@
 #
 # Model sources come from trainer-src-* conda packages (conda-recipes/), which
 # install to $PREFIX/opt/<pkg> and export <PKG>_SRC on activation, published on
-# the public prefix.dev channel below (live since 2026-07-20) — see
+# the public prefix.dev channel below (live since 2026-07-20) - see
 # conda-recipes/README.md for rebuild/upload steps.
 
 [workspace]

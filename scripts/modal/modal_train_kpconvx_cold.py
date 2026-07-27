@@ -1,4 +1,4 @@
-"""Modal shell for KPConvX-L (cold-start) — shells out to
+"""Modal shell for KPConvX-L (cold-start) - shells out to
 local_train_kpconvx_cold.py so local and cloud run identical code. Flags:
 --dataset --grid --chunk-xy --epochs --batch --steps-per-epoch; --mode
 eval|infer --weights --infer-input. GPU/timeout from TT_GPU / TT_TIMEOUT_HOURS."""
@@ -38,7 +38,7 @@ image = (
     .env({"PYTHONUNBUFFERED": "1"})
 )
 
-# pinned clone of the keops-free fork (torch-cluster neighbor search) —
+# pinned clone of the keops-free fork (torch-cluster neighbor search) -
 # the SHA IS the architecture version
 image = image.run_commands(
     "git clone https://github.com/orion-hoch/ml-kpconvx-windows-acessible.git /tmp/ml-kpconvx"
@@ -78,7 +78,7 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
                   chunk_xy: Optional[float] = None, epochs: Optional[int] = None,
                   batch: Optional[int] = None, steps_per_epoch: Optional[int] = None,
                   env_json: Optional[str] = None):
-    """Shell out to the local trainer — local and cloud run identical code."""
+    """Shell out to the local trainer - local and cloud run identical code."""
     import sys
     sys.path.insert(0, "/root")
     # resume only on Modal's OWN retries (call id stable across retries, new

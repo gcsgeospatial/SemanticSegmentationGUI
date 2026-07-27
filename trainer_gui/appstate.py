@@ -63,7 +63,7 @@ def dataset_run_roots() -> list[Path]:
 
 
 def run_roots(repo_root: str | None = None) -> list[Path]:
-    """Every place local runs live — the ONE discovery source for the Plotting
+    """Every place local runs live - the ONE discovery source for the Plotting
     list and Inference run picker (each root walked one level deep)."""
     roots = [*dataset_run_roots(), workspace_dir() / "inference", runs_dir()]
     if repo_root:
@@ -86,7 +86,7 @@ def runs_dir() -> Path:
 
 
 def local_runs_dir() -> Path:
-    """Where local training writes runs/<id>/... — the TT_OUTPUTS_ROOT default."""
+    """Where local training writes runs/<id>/... - the TT_OUTPUTS_ROOT default."""
     d = app_dir() / "local_runs"
     d.mkdir(parents=True, exist_ok=True)
     return d
@@ -171,7 +171,7 @@ _KEEP_ON_DELETE = ("runs", "infer")
 
 
 def _rmtree_force(path: Path) -> str:
-    """Best-effort remove (Windows read-only retry). Returns "" or the error —
+    """Best-effort remove (Windows read-only retry). Returns "" or the error -
     never raises (a throw would skip the caller's list refresh)."""
     import shutil
     import stat

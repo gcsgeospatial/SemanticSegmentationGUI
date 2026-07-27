@@ -1,4 +1,4 @@
-"""Utonia entry point — thin wrapper over local_train_concerto.py (the launch
+"""Utonia entry point - thin wrapper over local_train_concerto.py (the launch
 contract is by filename); only swaps the package/HF constants."""
 import os
 import sys
@@ -6,7 +6,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import local_train_concerto as _base
 
-# applied per CALL, not at import — several wrappers may share one process
+# applied per CALL, not at import - several wrappers may share one process
 _CFG = dict(PKG="utonia", HF_NAME="utonia",
             HF_REPO="Pointcept/Utonia", BB_KEY="utonia")
 

@@ -1,4 +1,4 @@
-"""LOCAL (pixi) execution builders — the mirror of modal_cli. local_train_*.py
+"""LOCAL (pixi) execution builders - the mirror of modal_cli. local_train_*.py
 runs on the host in its pixi env (name = backbone key, '_' -> '-'), reading
 paths from the TT_* contract: TT_DATASETS_ROOT, TT_OUTPUTS_ROOT, and
 TT_DATASET_DIR/TT_INFER_DIR/TT_PRED_DIR overrides. run_script returns
@@ -42,13 +42,13 @@ def env_dir(backbone, repo_root: str = "") -> Path:
 
 def installed(backbone, repo_root: str = "") -> bool:
     """Cheap install check: a solved+installed pixi env has conda-meta/ on
-    disk. Pure directory scan — no subprocess, can't hang."""
+    disk. Pure directory scan - no subprocess, can't hang."""
     return (env_dir(backbone, repo_root) / "conda-meta").is_dir()
 
 
 def env_preflight(backbone, repo_root: str = "") -> tuple[bool, str]:
     """(proceed, message) for the backbone's pixi env. Blocks when the env
-    isn't installed yet — a first install downloads multi-GB CUDA wheels, which
+    isn't installed yet - a first install downloads multi-GB CUDA wheels, which
     shouldn't happen as a surprise side effect of pressing Launch."""
     if installed(backbone, repo_root):
         return True, ""
@@ -59,7 +59,7 @@ def env_preflight(backbone, repo_root: str = "") -> tuple[bool, str]:
 
 
 def _nvidia_smi_gpus() -> "tuple[bool, str]":
-    """(has_gpu, detail). Runs `nvidia-smi -L` — the binary existing on PATH
+    """(has_gpu, detail). Runs `nvidia-smi -L` - the binary existing on PATH
     doesn't mean a GPU responds (dead/mismatched driver, zero visible devices),
     so probe the actual device list, not just shutil.which."""
     exe = shutil.which("nvidia-smi")
@@ -139,11 +139,11 @@ def run_script(script: str, flags: dict, backbone, *, repo_root: str = "",
 
     `script` (the modal_train_*.py name) is accepted for call-site parity with
     modal_cli but unused: locally we run the decoupled local_train_<key>.py
-    directly, and the return is (program, args, env) — pass env to JobRunner
+    directly, and the return is (program, args, env) - pass env to JobRunner
     extra_env. `--frozen` = the committed pixi.lock is the contract: install
     exactly what it says, never re-solve (it was `--locked`, but pixi's
-    up-to-date check false-positives on multi-env pypi index attribution —
-    pandas flagged as cu124 in every env, still broken in pixi 0.73 — so revisit
+    up-to-date check false-positives on multi-env pypi index attribution -
+    pandas flagged as cu124 in every env, still broken in pixi 0.73 - so revisit
     when prefix-dev/pixi fixes the satisfiability check)."""
     args = ["run", "--manifest-path", manifest_path(repo_root), "--frozen",
             "-e", env_name(backbone),
@@ -158,7 +158,7 @@ def run_script(script: str, flags: dict, backbone, *, repo_root: str = "",
 
 
 def install(backbone, repo_root: str = "") -> tuple[str, list[str]]:
-    """`pixi install -e <env>` for a backbone's environment — the 'build/pull'
+    """`pixi install -e <env>` for a backbone's environment - the 'build/pull'
     action of the env manager UI (streamed by the same runner that ran
     docker pull)."""
     return pixi_exe(), ["install", "--manifest-path", manifest_path(repo_root),
@@ -177,7 +177,7 @@ def installed_weights(backbone, repo_root: str = "") -> list[tuple[str, str]]:
 
 def all_statuses(progress=None) -> list[dict]:
     """Per-backbone env status for the GUI env manager (one dict each):
-    {key,label,env,installed,pixi}. A pure directory scan — instant, so a
+    {key,label,env,installed,pixi}. A pure directory scan - instant, so a
     FuncWorker thread stays trivial. `progress` is the FuncWorker hook
     (unused here)."""
     from .backbones import BACKBONES

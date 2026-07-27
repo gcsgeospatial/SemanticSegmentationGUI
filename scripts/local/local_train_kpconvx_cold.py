@@ -16,7 +16,7 @@ def _kpconvx_root() -> str:
         if p and os.path.isdir(p):
             return p
     if env:
-        raise RuntimeError(f"KPCONVX_SRC={env} is not a directory — fix the "
+        raise RuntimeError(f"KPCONVX_SRC={env} is not a directory - fix the "
                            "env var or bake the source at /opt/kpconvx")
     raise RuntimeError(
         "KPConvX source not found: set KPCONVX_SRC to your KPConvX Standalone "
@@ -580,7 +580,7 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
                 while made < n:
                     if fails >= 200:
                         raise tc.DatasetExhausted(
-                            "PreciseBN: 200 consecutive tile failures — training "
+                            "PreciseBN: 200 consecutive tile failures - training "
                             "tiles can't build batches; re-run dataset prep")
                     s = sample_tile(pick_train_tile(), training=False)
                     if s is None:
@@ -623,7 +623,7 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
             if s is not None:
                 return s
         raise tc.DatasetExhausted(
-            "1000 consecutive empty tile draws — training tiles are empty or "
+            "1000 consecutive empty tile draws - training tiles are empty or "
             "too small; re-run dataset prep")
     prefetch = (tc.make_prefetcher(
         lambda: make_kp_pack([_draw() for _ in range(PACK_N)]),

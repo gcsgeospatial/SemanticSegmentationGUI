@@ -4,7 +4,7 @@ Each entry maps a backbone to its script, Modal app name, outputs volume and
 the parameters its (refactored) local_entrypoint accepts.
 
 Grid/tile defaults are fixed at the published ALS operating point (0.25 m grid,
-50 m tile) rather than derived from dataset density — the ALS literature picks
+50 m tile) rather than derived from dataset density - the ALS literature picks
 grid by target-class size, not point spacing. Batch is the one value scaled to
 hardware, because VRAM is the only thing it actually controls.
 """
@@ -156,7 +156,7 @@ VRAM_RESERVE_GB = 2.0
 
 def batch_for_vram(b: Backbone, vram_gb: float) -> int:
     """Batch that fits `vram_gb`, scaled linearly from the backbone's known-good
-    (batch_default @ min_vram_gb) pair — VRAM tracks total points, and points
+    (batch_default @ min_vram_gb) pair - VRAM tracks total points, and points
     scale with batch. Capped at 2x default: past that the tuned LR stops holding
     (AdamW wants sqrt-scaling) and batch stops being a free hardware knob."""
     head = max(float(vram_gb) - VRAM_RESERVE_GB, 0.0)

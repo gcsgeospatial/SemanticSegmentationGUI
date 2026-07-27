@@ -1,4 +1,4 @@
-"""Modal shell for RandLA-Net (cold-start) — shells out to
+"""Modal shell for RandLA-Net (cold-start) - shells out to
 local_train_randlanet.py so local and cloud run identical code. Flags:
 --dataset --sub-grid --num-points --epochs --batch --steps-per-epoch;
 --mode infer --weights --infer-input. GPU/timeout from TT_GPU / TT_TIMEOUT_HOURS."""
@@ -37,7 +37,7 @@ image = (
     .env({"PYTHONUNBUFFERED": "1"})
 )
 
-# pinned upstream clone — the SHA IS the architecture version
+# pinned upstream clone - the SHA IS the architecture version
 image = image.run_commands(
     "git clone https://github.com/tsunghan-wu/RandLA-Net-pytorch.git /opt/randlanet"
     " && git -C /opt/randlanet checkout --detach 75adeacdb796db07e69ba990c36409c5d3ee886b"
@@ -100,7 +100,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                     mode: str = "train", weights: Optional[str] = None,
                     infer_input: Optional[str] = None,
                env_json: Optional[str] = None):
-    """Shell out to the local trainer — local and cloud run identical code."""
+    """Shell out to the local trainer - local and cloud run identical code."""
     import sys
     sys.path.insert(0, "/root")
     # resume only on Modal's OWN retries (the call id is stable across retries, new per `modal run`); ponytail: /outputs/.attempts markers are never cleaned

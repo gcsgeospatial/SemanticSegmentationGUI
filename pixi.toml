@@ -6,7 +6,7 @@ channels = ["conda-forge"]
 platforms = ["win-64", "linux-64"]
 
 # Pinned to 3.11: open3d ships no wheels for Python 3.13 (your base conda), and
-# numpy<2 has no 3.13 wheels either. Everything here is local-side only — the
+# numpy<2 has no 3.13 wheels either. Everything here is local-side only - the
 # training itself runs in each script's own Modal image.
 [dependencies]
 python = "3.11.*"
@@ -35,4 +35,4 @@ PYTHONDONTWRITEBYTECODE = "1"
 
 [tasks]
 gui = "trainer-gui"                    # launch the desktop app
-test = "python tests/smoke_test.py"    # local pipeline checks (no Modal calls)
+test = "python smoke_test.py"          # drift checks (no Modal calls)

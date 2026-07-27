@@ -1,4 +1,4 @@
-"""Modal shell for Sonata — shells out to local_train_sonata.py so local and
+"""Modal shell for Sonata - shells out to local_train_sonata.py so local and
 cloud run identical code. Flags: --dataset --grid --chunk-xy --epochs --batch
 --steps-per-epoch --freeze-encoder; --mode infer --weights --infer-input.
 GPU/timeout from TT_GPU / TT_TIMEOUT_HOURS."""
@@ -46,7 +46,7 @@ image = (
     .env({"PYTHONUNBUFFERED": "1"})
 )
 
-# pinned upstream clone — the SHA IS the architecture version
+# pinned upstream clone - the SHA IS the architecture version
 image = image.run_commands(
     "git clone https://github.com/facebookresearch/sonata.git /opt/sonata"
     " && git -C /opt/sonata checkout --detach 18c09ff8d713494f78a8213792262b910977a65d"
@@ -80,7 +80,7 @@ def train_sonata(dataset: Optional[str] = None, grid: Optional[float] = None,
                  infer_input: Optional[str] = None,
                  freeze_encoder: Optional[int] = None,
                  env_json: Optional[str] = None):
-    """Shell out to the local trainer — local and cloud run identical code."""
+    """Shell out to the local trainer - local and cloud run identical code."""
     import sys
     sys.path.insert(0, "/root")
     # resume only on Modal's OWN retries (the call id is stable across retries, new per `modal run`); ponytail: /outputs/.attempts markers are never cleaned

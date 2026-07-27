@@ -33,7 +33,7 @@ def env_str(name, default):
     return v if v not in (None, "") else default
 
 
-# D1 — density/grid jitter: per-tile effective grid g_eff >= g0.
+# D1 - density/grid jitter: per-tile effective grid g_eff >= g0.
 def effective_grid(g0, coarsen_max=2.5, p_native=0.5, rng=None):
     """g0 with prob p_native, else log-uniform in [g0, g0*coarsen_max]
     (coarsen_max = 1/(g0*sqrt(rho_min)) reaches output density rho_min)."""
@@ -43,7 +43,7 @@ def effective_grid(g0, coarsen_max=2.5, p_native=0.5, rng=None):
     return float(g0) * float(np.exp(rng.uniform(0.0, np.log(coarsen_max))))
 
 
-# D0/D0b — canonicalize to a grid: first point per g-cell.
+# D0/D0b - canonicalize to a grid: first point per g-cell.
 def voxel_first_idx(xyz, g):
     """Indices of the first point per g-voxel; slice every per-point companion
     array by them too."""
@@ -52,7 +52,7 @@ def voxel_first_idx(xyz, g):
     return np.sort(idx)
 
 
-# D3b — local-density input channel: log d_k ~ -0.5 log rho (pair with D1).
+# D3b - local-density input channel: log d_k ~ -0.5 log rho (pair with D1).
 def local_density_logdk(xyz, k=8):
     """Per-point log distance to the k-th nearest neighbour (natural log).
     Larger = sparser. Returns float32 array, shape (N,)."""
@@ -67,7 +67,7 @@ def local_density_logdk(xyz, k=8):
     return np.log(np.maximum(dk, 1e-6)).astype(np.float32)
 
 
-# D2b — AdaBN: re-estimate BN running stats on the unlabeled target.
+# D2b - AdaBN: re-estimate BN running stats on the unlabeled target.
 def adabn_recalibrate(model, batches, forward, momentum=None, reset=True):
     """Refresh BN running mean/var over target `batches` via forward(model, b).
     momentum None = cumulative (PreciseBN); float = exponential, and reset zeroes

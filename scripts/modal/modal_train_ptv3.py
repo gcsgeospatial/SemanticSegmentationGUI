@@ -1,4 +1,4 @@
-"""Modal shell for PointTransformerV3 — shells out to local_train_ptv3.py so
+"""Modal shell for PointTransformerV3 - shells out to local_train_ptv3.py so
 local and cloud run identical code. Flags: --dataset --grid --chunk-xy
 --epochs --batch --steps-per-epoch; --mode infer --weights --infer-input.
 GPU/timeout from TT_GPU / TT_TIMEOUT_HOURS."""
@@ -45,7 +45,7 @@ image = (
     .env({"PYTHONUNBUFFERED": "1"})
 )
 
-# pinned upstream clone — the SHA IS the architecture version
+# pinned upstream clone - the SHA IS the architecture version
 image = image.run_commands(
     "git clone https://github.com/Pointcept/PointTransformerV3.git /opt/ptv3"
     " && git -C /opt/ptv3 checkout --detach 3229e9b7de1770c8ad17c316f8e349982de509f8"
@@ -79,7 +79,7 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                mode: str = "train", weights: Optional[str] = None,
                infer_input: Optional[str] = None,
                env_json: Optional[str] = None):
-    """Shell out to the local trainer — local and cloud run identical code."""
+    """Shell out to the local trainer - local and cloud run identical code."""
     import sys
     sys.path.insert(0, "/root")
     # resume only on Modal's OWN retries (the call id is stable across retries, new per `modal run`); ponytail: /outputs/.attempts markers are never cleaned
