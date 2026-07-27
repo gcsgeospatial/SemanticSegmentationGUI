@@ -35,7 +35,6 @@ class DatasetsPage(QWidget):
         self._scanned_for: str | None = None
         self._copied_classes: dict[int, tuple[str, bool]] = {}
         self._run_open = False
-        # (source_wkt, proc_wkt, looks_degrees) of the probed first input, or None
         self._crs_probe = None
         self._crs_probe_name = ""
 
@@ -48,14 +47,13 @@ class DatasetsPage(QWidget):
         self.sub.setObjectName("pageSub")
         root.addWidget(self.sub)
 
-        root.addWidget(self._new_dataset_box())    # 1
-        root.addWidget(self._classes_box())        # 2
-        root.addWidget(self._features_box())       # 3  input features
-        root.addWidget(self._calculated_box())     # 4  computed channels: HAG + geometric
-        root.addWidget(self._tiling_box())         # 5  split + build
+        root.addWidget(self._new_dataset_box())
+        root.addWidget(self._classes_box())
+        root.addWidget(self._features_box())
+        root.addWidget(self._calculated_box())
+        root.addWidget(self._tiling_box())
         root.addLayout(self._status_block())
 
-        # ---- saved datasets: bottom layer ----
         root.addWidget(QLabel("Saved Datasets"))
         sd_row = QHBoxLayout()
         sd_col = QVBoxLayout()
@@ -83,7 +81,6 @@ class DatasetsPage(QWidget):
         self._reload_known()
 
         self._on_split_changed()
-        # classes/build stay greyed until a label scan has run for the picked input
         self.input_edit.textChanged.connect(self._update_scan_gate)
         self._update_scan_gate()
 
@@ -108,7 +105,6 @@ class DatasetsPage(QWidget):
         self._reload_known()
         self._refresh_next_btn()
 
-    # ============================================================= 1. New dataset
     def _new_dataset_box(self) -> QWidget:
         box = QGroupBox("1 · New dataset")
         form = QFormLayout(box)
@@ -139,10 +135,8 @@ class DatasetsPage(QWidget):
         self.field_combo = QComboBox()
         self.field_combo.setEditable(True)
         form.addRow("Label field", self.field_combo)
-        # Datasets always build into <workspace>/<name> — no per-build output pick.
         return box
 
-    # ============================================================= 2. Input features
     def _features_box(self) -> QWidget:
         """Only checked fields are baked into scenes — no implicit channels.
         intensity starts checked as a default, not a requirement."""
@@ -161,7 +155,6 @@ class DatasetsPage(QWidget):
         self.feat_list = QListWidget()
         self.feat_list.setMaximumHeight(110)
         lay.addWidget(self.feat_list)
-        # explicit mapping only — color is never auto-detected
         self.rgb_box = QGroupBox("RGB color (rare)")
         self.rgb_box.setCheckable(True)
         self.rgb_box.setChecked(False)
@@ -186,7 +179,6 @@ class DatasetsPage(QWidget):
         lay.addWidget(self.rgb_box)
         return box
 
-    # ============================================================= 3. Calculated features
     def _calculated_box(self) -> QWidget:
         """Channels computed from xyz at build time — not fields of the input."""
         box = QGroupBox("4 · Calculated features — computed at build time")
@@ -232,9 +224,8 @@ class DatasetsPage(QWidget):
         hag_lay.addWidget(self.hag_opts_w)
         self.hag_box.toggled.connect(self.hag_opts_w.setVisible)
         self.hag_opts_w.setVisible(False)
-        self._on_hag_method()          # ground-class field only for 'Base off ground layer'
+        self._on_hag_method()
         lay.addWidget(self.hag_box)
-        # stored raw as feat_geo_<name>
         geo_lbl = QLabel("Geometric features (pgeof) — max neighbors (k)"
                          + ("" if pretrain.pgeof_available()
                             else "  (pgeof not installed — the build will fail)"))
@@ -271,7 +262,6 @@ class DatasetsPage(QWidget):
         self.hag_ground.setVisible(key == "labels")
         self.hag_filter.setEnabled(key != "zmin")
 
-    # ============================================================= 4. Classes
     def _classes_box(self) -> QWidget:
         box = QGroupBox("2 · Classes - uncheck 'Train' to ignore a value; select rows + "
                         "Combine to merge into one class")
@@ -313,12 +303,10 @@ class DatasetsPage(QWidget):
         cl.addWidget(self.analyze_label)
         return box
 
-    # ============================================================= 5. Split
     def _tiling_box(self) -> QWidget:
         box = QGroupBox("5 · Train / val / test split")
         self.tile_box = box
         self.split_form = form = QFormLayout(box)
-        # whole-scene split only; scripts tile per model
         self.val_spin = QDoubleSpinBox()
         self.val_spin.setRange(0.05, 0.90)
         self.val_spin.setSingleStep(0.05)
@@ -362,7 +350,6 @@ class DatasetsPage(QWidget):
         form.addRow("", ui.wrap(row))
         return box
 
-    # ============================================================= shared console
     def _status_block(self) -> QVBoxLayout:
         self.log = LogConsole()
         self.log.setMinimumHeight(140)
@@ -371,14 +358,12 @@ class DatasetsPage(QWidget):
         lay.addWidget(self.log)
         return lay
 
-    # ------------------------------------------------------------- widgets
     def _set_busy(self, on: bool):
         """One worker at a time; Stop lights up only while something runs."""
         for b in (self.scan_btn, self.analyze_btn, self.tile_btn):
             b.setEnabled(not on)
         self.stop_btn.setEnabled(on)
         if on:
-            # a running scan must stay stoppable, so lift the scan gate while busy
             self.tile_box.setEnabled(True)
         else:
             self._update_scan_gate()
@@ -386,7 +371,7 @@ class DatasetsPage(QWidget):
     def _update_scan_gate(self, *_):
         """Classes + build stay greyed until the current input has been scanned."""
         if self.worker.running:
-            return   # _set_busy owns the buttons while a job runs
+            return
         ready = bool(self._label_values) and self._scanned_for == self.input_edit.text().strip()
         for w in (self.class_table, self.combine_btn, self.analyze_btn):
             w.setEnabled(ready)
@@ -444,7 +429,6 @@ class DatasetsPage(QWidget):
         train = max(0.0, 1.0 - self.val_spin.value() - self.test_spin.value())
         self.train_label.setText(f"Train: {train:.0%}")
 
-    # ------------------------------------------------------------- pickers
     def _pick_input_folder(self):
         d = QFileDialog.getExistingDirectory(self, "Input data folder")
         if d:
@@ -480,8 +464,8 @@ class DatasetsPage(QWidget):
             self._render_crs()
             return
         try:
-            cloud = read_points(files[0])   # one read feeds both fields and CRS
-        except Exception as e:  # noqa: BLE001
+            cloud = read_points(files[0])
+        except Exception as e:
             self._append(f"Could not probe {files[0].name}: {e}")
             self._render_crs()
             return
@@ -492,14 +476,13 @@ class DatasetsPage(QWidget):
             if i >= 0:
                 self.field_combo.setCurrentIndex(i)
                 break
-        # intensity starts checked — a default, not a requirement; nothing else is
         self.feat_list.clear()
         for f in fields:
             if f == self.field_combo.currentText():
                 continue
-            if f.lower() in ("x", "y", "z"):   # geometry, never a feature channel
+            if f.lower() in ("x", "y", "z"):
                 continue
-            if f.lower() in ("red", "green", "blue"):   # color lives in the RGB box, not here
+            if f.lower() in ("red", "green", "blue"):
                 continue
             it = QListWidgetItem(f)
             it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
@@ -531,7 +514,6 @@ class DatasetsPage(QWidget):
         else:
             self.crs_status.setText(f"{self._crs_probe_name}: detected {detected} · {action}.")
 
-    # ------------------------------------------------------------- config
     def _spec(self) -> LabelSpec:
         return LabelSpec(kind="field", field=self.field_combo.currentText().strip())
 
@@ -540,10 +522,9 @@ class DatasetsPage(QWidget):
         return SplitConfig(
             val_frac=float(self.val_spin.value()),
             test_frac=float(self.test_spin.value()),
-            mode=mode, seed=42,   # TODO(not ready): split-seed UI hidden; fixed at 42
+            mode=mode, seed=42,
             strategy="provided" if self.split_provided_chk.isChecked() else "auto")
 
-    # ------------------------------------------------------------- copy settings
     def _copy_settings_menu(self):
         names = sorted(appstate.known_datasets())
         if not names:
@@ -566,11 +547,9 @@ class DatasetsPage(QWidget):
             return
         src = meta.get("source", {})
         copied = []
-        # -- classes: stashed so a later scan re-applies names instead of wiping them
         if meta.get("classes"):
             groups: dict[int, tuple[str, list[int]]] = {}
             for cl in meta["classes"]:
-                # written metas carry "source_values" (list); in-memory rows singular
                 vals = cl.get("source_values") or [cl.get("source_value", cl["index"])]
                 groups.setdefault(int(cl["index"]), (str(cl["name"]), []))[1].extend(
                     int(v) for v in vals)
@@ -595,7 +574,6 @@ class DatasetsPage(QWidget):
                 self.class_table.setItem(r, 3, QTableWidgetItem(nm))
             self._copied_classes = {v: (nm, train) for vals, nm, train in rows for v in vals}
             copied.append(f"{len(groups)} classes (+{len(rows) - len(groups)} ignored)")
-        # -- split config
         sp = meta.get("split", {})
         req = sp.get("requested", {})
         if "val" in req:
@@ -606,7 +584,6 @@ class DatasetsPage(QWidget):
             self.mode_combo.setCurrentIndex(0 if sp["mode"] == "balanced" else 1)
         if req or sp.get("mode"):
             copied.append("split")
-        # -- features: canonical intensity/return_number ride the has_* flags
         fields, geo, geo_k = set(), set(), None
         for fc in src.get("feature_channels") or []:
             sf = fc.get("source_field", "")
@@ -630,13 +607,12 @@ class DatasetsPage(QWidget):
             if geo_k is not None:
                 self.geo_k.setValue(int(geo_k))
             copied.append("features")
-        # -- HAG ("source_dimension" means HAG came pre-baked, nothing to compute)
         hag_src = src.get("hag_source")
         if hag_src is not None and hag_src != "source_dimension":
             self.hag_box.setChecked(bool(hag_src))
             if hag_src:
                 gm = src.get("hag_ground_method")
-                if not gm:          # legacy: parse the ground source from hag_source
+                if not gm:
                     gm = (hag_src.split("+", 1)[1] if "+" in hag_src
                           else (hag_src if hag_src == "zmin" else ""))
                 k = self.hag_ground_method.findData(gm)
@@ -656,7 +632,6 @@ class DatasetsPage(QWidget):
         self._append(f"Copied from '{name}': {', '.join(copied)}. Scan labels on the "
                      f"new input to verify the values before Build.")
 
-    # ------------------------------------------------------------- scan / analyze
     def _scan_labels(self):
         in_path = self.input_edit.text().strip()
         if not os.path.exists(in_path):
@@ -677,7 +652,6 @@ class DatasetsPage(QWidget):
     def _on_scanned(self, counts):
         self._set_busy(False)
         self._label_values = counts
-        # default-ignore 0 only for ASPRS-style classification fields
         ignore_zero = "class" in self._spec().field.lower()
         self.class_table.setRowCount(len(counts))
         for r, (val, cnt) in enumerate(counts.items()):
@@ -694,7 +668,6 @@ class DatasetsPage(QWidget):
                 item.setFlags(item.flags() & ~Qt.ItemIsEditable)
                 self.class_table.setItem(r, col, item)
             self.class_table.setItem(r, 3, QTableWidgetItem(f"class_{val}"))
-        # re-apply "Copy settings from…" names to the fresh scan
         if self._copied_classes:
             for r in range(self.class_table.rowCount()):
                 for v in _parse_values(self.class_table.item(r, 1).text()):
@@ -703,7 +676,7 @@ class DatasetsPage(QWidget):
                         self.class_table.item(r, 3).setText(nm)
                         self.class_table.cellWidget(r, 0).findChild(QCheckBox).setChecked(train)
                         break
-        self._scanned_for = self._scan_in_path   # unlocks classes + build
+        self._scanned_for = self._scan_in_path
         self._update_scan_gate()
         self._append(f"Found {len(counts)} label values. Name them, uncheck any "
                      f"'unknown', then Build.")
@@ -729,15 +702,11 @@ class DatasetsPage(QWidget):
 
     def _on_analyzed(self, stats):
         self._set_busy(False)
-        recs = analysis.recommend(stats)
-        chunk = next(iter(recs.values())).get("chunk_xy", 0.0)
         self.analyze_label.setText(
             f"Density: {stats['mean_pts_per_m2']:.2f} pts/m²  ·  "
-            f"spacing {stats['mean_spacing_m']:.2f} m  ·  "
-            f"largest scene {stats['max_scene_points']:,} pts  ·  "
-            f"suggested tile {chunk:.0f} m (set per model on the Train page).")
+            f"mean spacing {stats['mean_spacing_m']:.2f} m  ·  "
+            f"largest scene {stats['max_scene_points']:,} pts")
 
-    # ------------------------------------------------------------- convert/upload
     def _combine_selected(self):
         """Collapse selected rows into one whose Source value lists every merged
         value ("5,6") and Points seen is their total, under a shared name."""
@@ -800,7 +769,7 @@ class DatasetsPage(QWidget):
                                     declared if type(declared) is int else None)
             if block:
                 self._append(f"✗ '{self._crs_probe_name}' carries no CRS and its "
-                             f"coordinates look like lat/lon degrees — {block} to "
+                             f"coordinates look like lat/lon degrees: {block} to "
                              f"reproject it, then Build.")
                 return None
         split = self._split_config()
@@ -860,7 +829,7 @@ class DatasetsPage(QWidget):
             "geo_k": int(self.geo_k.value()),
             "rgb_fields": rgb_sel if len(mapped) == 3 else None,
             "declared_crs_epsg": declared if type(declared) is int else None,
-            "max_workers": 1,   # TODO(not ready): parallel UI hidden; force single-process
+            "max_workers": 1,
         }
 
     def _start_tiling(self):
@@ -878,8 +847,6 @@ class DatasetsPage(QWidget):
                      f"val={split.val_frac:.0%} test={split.test_frac:.0%} {split.mode} "
                      f"seed={split.seed}, ignored values: {ignored}) -> {out_root}…")
 
-        # only passed when the user declared one — keeps the meter-UTM path's call
-        # byte-identical until dataset.convert_dataset gains the param
         crs_kw = ({"declared_crs_epsg": plan["declared_crs_epsg"]}
                   if plan["declared_crs_epsg"] is not None else {})
 
@@ -935,7 +902,6 @@ class DatasetsPage(QWidget):
         if self._staged_dir is None:
             return
         if appstate.get_exec_mode() == "local":
-            # plain page switch; the Train page reloads its dataset list on entry
             ui.navigate("Train")
         else:
             self._start_upload(self._staged_dir)
@@ -967,8 +933,8 @@ class DatasetsPage(QWidget):
         if not self._register_dataset(staged):
             QMessageBox.warning(
                 self, "Not a dataset",
-                f"{staged} has no readable dataset_meta.json — not a converted "
-                f"dataset. Build it with 'Build dataset' first.")
+                f"{staged} has no readable dataset_meta.json. Build it with "
+                f"'Build dataset' first.")
             return
         self._reload_known()
         self._append(f"✓ Added '{staged.name}' from {staged}.")
@@ -1022,13 +988,12 @@ class DatasetsPage(QWidget):
                          f"runs/ + infer/ under {staged or 'nothing on disk'} for records.")
 
     def _start_upload(self, staged: Path):
-        # one shared datasets volume (TT_DATASET_VOLUME), each dataset under /<name>
         self._uploading = staged
         name = staged.name
         self.upload_saved_btn.setEnabled(False)
         self._begin_run(f"upload '{name}'")
         self._append(f"\nUploading -> {modal_cli.DATASETS_VOLUME}:/{name} …\n"
-                     f"(first ensuring the volume exists — a \"Volume "
+                     f"(first ensuring the volume exists: a \"Volume "
                      f"'{modal_cli.DATASETS_VOLUME}' already exists\" error here is "
                      f"EXPECTED and harmless; the upload continues right after)")
         prog, args = modal_cli.volume_put(modal_cli.DATASETS_VOLUME, str(staged), f"/{name}")
@@ -1068,7 +1033,6 @@ class DatasetsPage(QWidget):
         self._end_run("failed")
         QMessageBox.critical(self, "Dataset error", tb)
 
-    # ------------------------------------------------------------- known list
     def _reload_known(self):
         """Rows are '<name>   <badge>'; the bare name rides in UserRole."""
         c = theme.colors(appstate.get("ui_theme", "system"))
@@ -1080,7 +1044,7 @@ class DatasetsPage(QWidget):
             elif info.get("uploaded"):
                 suffix, color = "✓ uploaded", c["ok"]
             else:
-                suffix, color = "● staged", None   # default text color
+                suffix, color = "● staged", None
             it = QListWidgetItem(f"{name}   {suffix}")
             it.setData(Qt.UserRole, name)
             if color:
@@ -1128,7 +1092,6 @@ class DatasetsPage(QWidget):
         else:
             self.stats_label.setText(f"{name}\n{status}")
 
-    # ------------------------------------------------------------- helpers
     def _append(self, text: str, newline: bool = True):
         ui.append_log(self.log, text, newline)
 
@@ -1138,8 +1101,7 @@ def _parse_values(text: str) -> list[int]:
     return [int(t) for t in text.replace(",", " ").split() if t]
 
 
-# --- CRS surface: labels readers' reprojection outcome; no reprojection here.
-# infer_page imports crs_probe/crs_story/parse_epsg so the two pages share one impl.
+# --- CRS surface: labels readers' reprojection outcome; infer_page imports crs_probe/crs_story/parse_epsg so the two pages share one impl.
 
 def parse_epsg(text):
     """Declare-CRS field -> int, None (blank = auto-detect), or False (not an integer)."""
@@ -1182,11 +1144,11 @@ def crs_probe(cloud):
 def crs_story(source_wkt, proc_wkt, looks_degrees, declared_epsg):
     """(detected, action, block) for the CRS surface + D1 preflight. block is a
     remedy string (degree-looking no-CRS input with no declared EPSG) or None."""
-    if source_wkt:                     # ingest reprojected it
+    if source_wkt:
         return _crs_name(source_wkt), f"reproject → {_crs_name(proc_wkt)}", None
-    if proc_wkt:                       # identity fast-path: already metre-projected
+    if proc_wkt:
         return _crs_name(proc_wkt), "keep as-is (already metre-projected)", None
-    if declared_epsg is not None:      # no CRS, but the user declared one
+    if declared_epsg is not None:
         return "none in file", f"declared EPSG:{declared_epsg} → reproject", None
     if looks_degrees:
         return ("none — coordinates look like lat/lon degrees", None,

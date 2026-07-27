@@ -14,22 +14,20 @@ ASCII_EXTS = {".txt", ".csv", ".xyz", ".pts"}
 
 @dataclass
 class Cloud:
-    xyz: np.ndarray                      # (N, 3) float64
-    rgb: np.ndarray | None = None        # (N, 3) uint8
-    intensity: np.ndarray | None = None  # (N,) float32, raw (not normalized)
+    xyz: np.ndarray
+    rgb: np.ndarray | None = None
+    intensity: np.ndarray | None = None
     return_number: np.ndarray | None = None
-    fields: dict = field(default_factory=dict)  # name -> (N,) array, label candidates
-    crs_wkt: str | None = None           # CRS of the STORED coords (the processing CRS)
-    source_crs_wkt: str | None = None    # original CRS, set ONLY when a transform occurred
+    fields: dict = field(default_factory=dict)
+    crs_wkt: str | None = None
+    source_crs_wkt: str | None = None
 
     @property
     def n(self) -> int:
         return len(self.xyz)
 
 
-# --- CRS reprojection: every xyz downstream is projected & meter-denominated ---
-# pyproj is a GUI-env dep; keep it lazy. normalize_to_meters (ingest) and
-# restore_to_source (export) are inverses built from the same Transformer pair.
+# pyproj is a GUI-env dep, so keep it lazy; normalize_to_meters (ingest) and restore_to_source (export) are inverses built from the same Transformer pair
 
 def _horizontal_crs(crs):
     """Horizontal sub-CRS of a compound CRS, else the CRS itself."""
@@ -79,9 +77,10 @@ def _estimate_utm(crs, xyz, CRS, Transformer):
 def normalize_to_meters(xyz, source_crs_wkt):
     """Reproject a cloud into a projected, meter-denominated CRS.
     Returns (xyz_meters, proc_wkt, source_wkt); source_wkt is set ONLY when a
-    transform occurred (its presence is the exact round-trip signal). Identity
+    transform occurred (its presence is the exact round-trip signal). The identity
     fast-path (already projected+meter, or no/unparseable CRS) keeps coords
-    byte-identical. xy via pyproj Transformer(always_xy=True); z by vertical unit."""
+    byte-identical; xy goes via pyproj Transformer(always_xy=True), z by vertical
+    unit."""
     xyz = np.asarray(xyz, np.float64)
     if not source_crs_wkt:
         return xyz, None, None
@@ -90,21 +89,29 @@ def normalize_to_meters(xyz, source_crs_wkt):
     except ImportError:
         if _wkt_looks_meter_projected(source_crs_wkt):
             return xyz, source_crs_wkt, None
-        raise ValueError("pyproj is required to reproject this source CRS to meters "
-                         "— install pyproj in the GUI environment")
+        raise ValueError("pyproj is required to reproject this source CRS to meters. "
+                         "Install pyproj in the GUI environment")
     try:
         crs = CRS.from_wkt(source_crs_wkt)
     except Exception as e:
         raise ValueError("source CRS WKT is present but unparseable, so the cloud "
-                         "cannot be reprojected to meters — declare the EPSG code on "
+                         "cannot be reprojected to meters. Declare the EPSG code on "
                          "the prep/inference page to override it") from e
     if _is_meter_horizontal(crs):
-        return xyz, source_crs_wkt, None       # identity fast-path: bytes unchanged
+        return xyz, source_crs_wkt, None
     utm = _estimate_utm(crs, xyz, CRS, Transformer)
     x, y = Transformer.from_crs(_horizontal_crs(crs), utm, always_xy=True).transform(
         xyz[:, 0], xyz[:, 1])
     z = xyz[:, 2] * vertical_unit_factor(crs)
-    return np.column_stack([x, y, z]).astype(np.float64), utm.to_wkt(), source_crs_wkt
+    out = np.column_stack([x, y, z]).astype(np.float64)
+    # pyproj returns inf (not an error) for points outside the target zone, and a single inf poisons the cache, surfacing later as a cryptic CUDA gather assert
+    bad = int((~np.isfinite(out[:, :2])).any(1).sum())
+    if bad:
+        raise ValueError(
+            f"reprojecting to meters produced {bad} non-finite XY point(s): they fall "
+            "outside the target UTM zone (no-data XY sentinels, or the wrong source CRS). "
+            "Remove those points or declare the correct EPSG on the prep/inference page")
+    return out, utm.to_wkt(), source_crs_wkt
 
 
 def is_legacy_unit_scale_pred(crs_wkt, source_crs_wkt) -> bool:
@@ -128,7 +135,7 @@ def restore_to_source(xyz, proc_crs_wkt, source_crs_wkt):
     if source_crs_wkt is None:
         if is_legacy_unit_scale_pred(proc_crs_wkt, source_crs_wkt):
             raise ValueError("prediction npz predates the CRS reprojection contract "
-                             "(non-meter CRS with no source_crs_wkt) — re-run the "
+                             "(non-meter CRS with no source_crs_wkt); re-run the "
                              "inference job to re-stage it under the new CRS contract")
         return xyz
     from pyproj import CRS, Transformer
@@ -154,9 +161,7 @@ def read_points(path: str | Path, declared_crs_epsg: int | None = None) -> Cloud
         cloud = _read_numpy(path)
     else:
         raise ValueError(f"Unsupported point-cloud format: {ext} ({path})")
-    # D1 remedy: a declared EPSG fills in for a cloud carrying no CRS, then rides
-    # the same reprojection-to-meters as an embedded one (formats other than
-    # las/laz never carry a CRS, so this is their only route to georeferencing)
+    # D1 remedy: a declared EPSG fills in for a cloud carrying no CRS and rides the same reprojection-to-meters (formats other than las/laz never carry one)
     if declared_crs_epsg is not None and cloud.crs_wkt is None:
         from pyproj import CRS
         wkt = CRS.from_epsg(int(declared_crs_epsg)).to_wkt()
@@ -169,14 +174,12 @@ def list_label_fields(path: str | Path) -> list[str]:
     return sorted(read_points(path).fields.keys())
 
 
-# ---------------------------------------------------------------- las / laz
-
 def _read_las(path) -> Cloud:
     import laspy
 
     las = laspy.read(str(path))
     xyz = np.column_stack([las.x, las.y, las.z]).astype(np.float64)
-    try:        # GeoTIFF-key or WKT VLR -> pyproj CRS; malformed/absent -> None
+    try:
         crs = las.header.parse_crs()
     except Exception:
         crs = None
@@ -185,7 +188,7 @@ def _read_las(path) -> Cloud:
     rgb = None
     if {"red", "green", "blue"}.issubset(dims):
         rgb = np.column_stack([las.red, las.green, las.blue]).astype(np.float64)
-        if rgb.max() > 255:  # 16-bit color
+        if rgb.max() > 255:
             rgb = rgb / 257.0
         rgb = np.clip(rgb, 0, 255).astype(np.uint8)
 
@@ -207,7 +210,7 @@ def _read_las(path) -> Cloud:
             fields[d.name] = arr
     wkt = crs.to_wkt() if crs is not None else None
     xyz, proc_wkt, source_wkt = normalize_to_meters(xyz, wkt)
-    if source_wkt is not None:      # reprojected: heights are vertical, scale by vertical unit
+    if source_wkt is not None:
         vf = vertical_unit_factor(crs)
         for k in list(fields):
             if k.lower().replace("_", "") in ("heightaboveground", "hag"):
@@ -215,8 +218,6 @@ def _read_las(path) -> Cloud:
     return Cloud(xyz=xyz, rgb=rgb, intensity=intensity, return_number=ret, fields=fields,
                  crs_wkt=proc_wkt, source_crs_wkt=source_wkt)
 
-
-# ---------------------------------------------------------------- ply
 
 def _read_ply(path) -> Cloud:
     from plyfile import PlyData
@@ -256,12 +257,10 @@ def _read_ply(path) -> Cloud:
     return Cloud(xyz=xyz, rgb=rgb, intensity=intensity, return_number=ret, fields=fields)
 
 
-# ---------------------------------------------------------------- ascii
-
 def _sniff_delimiter(path) -> str | None:
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         line = f.readline()
-    return "," if "," in line else None  # None -> whitespace
+    return "," if "," in line else None
 
 
 def _read_ascii(path) -> Cloud:
@@ -279,8 +278,6 @@ def _read_ascii(path) -> Cloud:
     return Cloud(xyz=xyz, intensity=intensity, return_number=ret, fields=fields)
 
 
-# ---------------------------------------------------------------- pcd
-
 def _read_pcd(path) -> Cloud:
     import open3d as o3d
 
@@ -290,7 +287,7 @@ def _read_pcd(path) -> Cloud:
     if pc.has_colors():
         rgb = np.clip(np.asarray(pc.colors) * 255.0, 0, 255).astype(np.uint8)
     intensity = None
-    try:  # the legacy reader drops non-xyz/rgb attrs; the tensor reader keeps them
+    try:
         t = o3d.t.io.read_point_cloud(str(path))
         if "intensity" in t.point:
             intensity = t.point["intensity"].numpy().reshape(-1).astype(np.float32)
@@ -298,8 +295,6 @@ def _read_pcd(path) -> Cloud:
         pass
     return Cloud(xyz=xyz, rgb=rgb, intensity=intensity)
 
-
-# ---------------------------------------------------------------- npy / npz
 
 def _read_numpy(path) -> Cloud:
     ext = Path(path).suffix.lower()
@@ -340,22 +335,18 @@ def _read_numpy(path) -> Cloud:
         arr = np.asarray(z[key])
         if arr.ndim == 1 and len(arr) == len(xyz) and np.issubdtype(arr.dtype, np.number):
             fields[key] = arr
-    # a staged/pred npz already carries its processing (+ source) CRS — surface it
-    # so read_points reports the real CRS and declared-EPSG fill never overrides it
+    # a staged/pred npz already carries its processing (+ source) CRS, so surface it and the declared-EPSG fill can never override it
     crs_wkt = str(z["crs_wkt"]) if "crs_wkt" in z.files else None
     source_crs_wkt = str(z["source_crs_wkt"]) if "source_crs_wkt" in z.files else None
     return Cloud(xyz=xyz, rgb=rgb, intensity=intensity, return_number=ret, fields=fields,
                  crs_wkt=crs_wkt, source_crs_wkt=source_crs_wkt)
 
 
-# ---------------------------------------------------------------- self-check
-
 def _selfcheck() -> None:
     """python readers.py — reproject round-trip, identity, and z-unit invariants."""
     from pyproj import CRS
     rng = np.random.default_rng(0)
 
-    # EPSG:2263 (US-ft) reprojects to UTM meters and restores sub-mm.
     ft = CRS.from_epsg(2263).to_wkt()
     src = np.column_stack([rng.uniform(9.8e5, 9.9e5, 500),
                            rng.uniform(2.0e5, 2.1e5, 500),
@@ -366,7 +357,6 @@ def _selfcheck() -> None:
     err = np.abs(back - src).max()
     assert err < 1e-3, f"ftUS round-trip {err} ft exceeds sub-mm"
 
-    # projected meter source is the identity fast-path (bytes unchanged, no source).
     utm = CRS.from_epsg(32618).to_wkt()
     um = np.column_stack([rng.uniform(5e5, 5.1e5, 300), rng.uniform(4.5e6, 4.51e6, 300),
                           rng.uniform(0, 50, 300)])
@@ -375,7 +365,6 @@ def _selfcheck() -> None:
     assert m2 is um or np.array_equal(m2, um), "identity must not change bytes"
     assert np.array_equal(restore_to_source(m2, proc2, s2), um), "identity restore is a no-op"
 
-    # compound ftUS-horizontal / metre-vertical: xy moves, z is unchanged.
     comp = CRS.from_user_input("EPSG:2263+5703").to_wkt()
     cz = src[:, 2].copy()
     mc, procc, sc = normalize_to_meters(src, comp)
@@ -385,7 +374,6 @@ def _selfcheck() -> None:
     bc = restore_to_source(mc, procc, sc)
     assert np.abs(bc - src).max() < 1e-3, "compound round-trip exceeds sub-mm"
 
-    # geographic (2D lon/lat): xy reprojects, z beside degrees stays metres.
     geo = CRS.from_epsg(4326).to_wkt()
     gsrc = np.column_stack([rng.uniform(-73.99, -73.90, 300),
                             rng.uniform(40.70, 40.78, 300), rng.uniform(0, 100, 300)])
@@ -394,7 +382,6 @@ def _selfcheck() -> None:
     assert np.allclose(mg[:, 2], gsrc[:, 2]), "geographic z must stay metres (not radians)"
     assert np.abs(restore_to_source(mg, procg, sg)[:, :2] - gsrc[:, :2]).max() < 1e-7
 
-    # D2: a legacy non-meter pred (proc ftUS, no source) hard-blocks at restore.
     try:
         restore_to_source(src, ft, None)
         raise AssertionError("legacy ftUS pred must hard-block")

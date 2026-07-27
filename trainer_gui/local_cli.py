@@ -76,6 +76,21 @@ def _nvidia_smi_gpus() -> "tuple[bool, str]":
     return True, f"{len(gpus)} GPU(s)"
 
 
+def local_vram_gb() -> float | None:
+    """Smallest visible GPU's total VRAM in GB, or None if undetectable.
+    Smallest, not largest: a run is capped by the weakest device it may land on."""
+    exe = shutil.which("nvidia-smi")
+    if exe is None:
+        return None
+    try:
+        p = subprocess.run([exe, "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+                           capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    mibs = [int(ln.strip()) for ln in p.stdout.splitlines() if ln.strip().isdigit()]
+    return min(mibs) / 1024.0 if mibs else None
+
+
 def gpu_preflight() -> tuple[bool, str]:
     """(proceed, message) for GPU availability. The trainers are CUDA-only
     (every script calls .cuda(), no CPU path), so hard-block when GPUs are
@@ -124,12 +139,12 @@ def run_script(script: str, flags: dict, backbone, *, repo_root: str = "",
 
     `script` (the modal_train_*.py name) is accepted for call-site parity with
     modal_cli but unused: locally we run the decoupled local_train_<key>.py
-    directly. Returns (program, args, env) — pass env to JobRunner extra_env.
-    `--frozen` = the committed pixi.lock is the contract: install exactly what
-    it says, never re-solve. Was `--locked`, but pixi's up-to-date check
-    false-positives on multi-env pypi index attribution (pandas flagged as
-    cu124 in every env; still broken in pixi 0.73) — revisit when
-    prefix-dev/pixi fixes the satisfiability check."""
+    directly, and the return is (program, args, env) — pass env to JobRunner
+    extra_env. `--frozen` = the committed pixi.lock is the contract: install
+    exactly what it says, never re-solve (it was `--locked`, but pixi's
+    up-to-date check false-positives on multi-env pypi index attribution —
+    pandas flagged as cu124 in every env, still broken in pixi 0.73 — so revisit
+    when prefix-dev/pixi fixes the satisfiability check)."""
     args = ["run", "--manifest-path", manifest_path(repo_root), "--frozen",
             "-e", env_name(backbone),
             "python", f"scripts/local/local_train_{backbone.key}.py"]

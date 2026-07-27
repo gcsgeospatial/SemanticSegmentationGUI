@@ -1,11 +1,11 @@
 """Convert user folders/files into the canonical dataset the scripts consume.
 
 Layout: <staging>/<name>/{dataset_meta.json, train|val|test/<scene>.npz} — xyz f64,
-label i32 (-1 = ignore), optional rgb u8 / intensity f32 / return_number f32.
-Inference jobs use the same npz minus `label`, under scenes/.
-The split is decided ONCE here (point-count fractions over whole scenes, or tiles
-of a single cloud reassembled into holey per-split clouds) and recorded in
-dataset_meta.json; trainers read the folders verbatim.
+label i32 (-1 = ignore), optional rgb u8 / intensity f32 / return_number f32, with
+inference jobs using the same npz minus `label` under scenes/. The split is decided
+ONCE here (point-count fractions over whole scenes, or tiles of a single cloud
+reassembled into holey per-split clouds) and recorded in dataset_meta.json;
+trainers read the folders verbatim.
 """
 
 from __future__ import annotations
@@ -30,9 +30,9 @@ from .readers import (SUPPORTED_EXTS, Cloud, list_label_fields, read_points,
 class LabelSpec:
     """Label source. kind="field": named field in the cloud. kind="file": companion
     file at truth_dir / (scene name with src_suffix -> dst_suffix), one label/point."""
-    kind: str = "field"            # "field" | "file"
-    field: str = ""                # for kind="field"
-    truth_dir: str = ""            # for kind="file"
+    kind: str = "field"
+    field: str = ""
+    truth_dir: str = ""
     src_suffix: str = "_PC3.txt"
     dst_suffix: str = "_CLS.txt"
 
@@ -41,14 +41,15 @@ class LabelSpec:
 class SplitConfig:
     """val_frac/test_frac: target point-count fractions. mode "balanced" mirrors
     the global class mix (+ rare-class presence); "random" fills by points.
-    seam_buffer_m/tile_m: single-cloud only. strategy "provided" = explicit folders."""
+    seam_buffer_m/tile_m are single-cloud only, and strategy "provided" = explicit
+    folders."""
     val_frac: float = 0.15
     test_frac: float = 0.15
-    mode: str = "balanced"        # "balanced" | "random"
+    mode: str = "balanced"
     seed: int = 42
     seam_buffer_m: float = 1.0
     tile_m: float = 50.0
-    strategy: str = "auto"        # "auto" | "provided"
+    strategy: str = "auto"
 
 
 def discover_scenes(folder: str | Path) -> list[Path]:
@@ -59,7 +60,6 @@ def discover_scenes(folder: str | Path) -> list[Path]:
                  if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS)
     if top:
         return top
-    # converted datasets keep their scenes under train/val/test
     sub = [p for split in ("train", "val", "test") if (folder / split).is_dir()
            for p in sorted((folder / split).iterdir())
            if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS]
@@ -119,7 +119,6 @@ def feat_key(field: str) -> str:
     return s
 
 
-# intensity/return_number keep canonical npz keys (not feat_*); baking is still opt-in.
 _CANON_SPELLINGS = {
     "intensity": "intensity", "scalar_intensity": "intensity",
     "return_number": "return_number", "returnnumber": "return_number",
@@ -146,8 +145,6 @@ def sanitize_name(name: str) -> str:
         raise ValueError("Dataset name is empty after sanitizing")
     return s.lower()
 
-
-# ---- splitting: atoms = whole scenes or grid tiles; targets = point-count fractions
 
 _SPLITS = ("train", "val", "test")
 
@@ -205,7 +202,6 @@ def _guarantee_presence(assign, hist, allowed):
             cand = [i for i in range(n) if hist[i, c] > 0 and assign[i] != s]
             if not cand:
                 continue
-            # prefer an atom whose source split keeps class c after it leaves
             keeps = lambda i: any(hist[j, c] > 0 and assign[j] == assign[i] and j != i
                                   for j in range(n))
             cand.sort(key=lambda i: (not keeps(i), -hist[i, c]))
@@ -235,7 +231,7 @@ def allocate_splits(pts, hist, val_frac: float, test_frac: float,
     n = len(pts)
     C = hist.shape[1] if (hist.ndim == 2 and hist.size) else 0
     fr = np.array([max(0.0, 1.0 - val_frac - test_frac), val_frac, test_frac])
-    allowed = fr > 0                                   # never assign to a 0-target split
+    allowed = fr > 0
     rng = np.random.RandomState(int(seed))
     assign = np.full(n, -1, dtype=np.int64)
     if n == 0:
@@ -252,16 +248,15 @@ def allocate_splits(pts, hist, val_frac: float, test_frac: float,
             got[s] += pts[i]
     else:
         H = hist.sum(0)
-        target = np.outer(fr, H)                       # (3, C) point-count targets
+        target = np.outer(fr, H)
         got = np.zeros((3, C))
-        # critical class per atom = its rarest present class; feed the most-starved split
         crit = np.full(n, -1, dtype=np.int64)
         for i in range(n):
             pres = np.where(hist[i] > 0)[0]
             if len(pres):
                 crit[i] = int(pres[np.argmin(H[pres])])
         rarest = np.array([H[crit[i]] if crit[i] >= 0 else np.inf for i in range(n)])
-        order = np.lexsort((-pts, rarest))             # rarest class first, big first
+        order = np.lexsort((-pts, rarest))
         for i in order:
             need = target - got
             primary = need[:, crit[i]] if crit[i] >= 0 else need.sum(1)
@@ -280,7 +275,6 @@ def _atomize(cloud: Cloud, tile_m: float):
     """XY grid tiles for a single cloud -> (keys, uniq, inv)."""
     xy = cloud.xyz[:, :2]
     keys = np.floor((xy - xy.min(0)) / max(float(tile_m), 1e-6)).astype(np.int64)
-    # 1-D packed code: ~10x faster than unique(axis=0) on multi-M clouds
     span = int(keys[:, 1].max()) + 1
     code, inv = np.unique(keys[:, 0] * span + keys[:, 1], return_inverse=True)
     uniq = np.column_stack([code // span, code % span])
@@ -299,11 +293,11 @@ def _seam_drop(xy, keys, uniq, split_of_point, tile_m: float,
     tile = max(float(tile_m), 1e-6)
     b = min(float(seam_buffer_m), tile)
     k0 = uniq.min(0)
-    grid = np.full(uniq.max(0) - k0 + 3, -1, dtype=np.int64)   # +1 pad each side; -1 = empty
+    grid = np.full(uniq.max(0) - k0 + 3, -1, dtype=np.int64)
     kx = keys[:, 0] - k0[0] + 1
     ky = keys[:, 1] - k0[1] + 1
     grid[kx, ky] = split_of_point
-    u = xy - xy.min(0) - keys * tile                           # offset in [0, tile)
+    u = xy - xy.min(0) - keys * tile
     near = {-1: (u < b), 1: (u > tile - b), 0: np.ones((n, 2), dtype=bool)}
     drop = np.zeros(n, dtype=bool)
     for dx in (-1, 0, 1):
@@ -325,8 +319,6 @@ def _savez_fast(path: Path, arrays: dict) -> None:
             with zf.open(name + ".npy", "w", force_zip64=True) as f:
                 np.lib.format.write_array(f, np.asanyarray(a))
 
-
-# --------------------------------------------------------------------- conversion
 
 def _crs_label(wkt: str | None) -> str:
     """Short 'AUTH:CODE' (or CRS name) for a WKT, for the reproject info line."""
@@ -385,9 +377,9 @@ def _apply_rgb_mapping(cloud: Cloud, rgb_fields) -> Cloud:
                              f"(have: {sorted(cloud.fields)})")
         cols.append(np.asarray(cloud.fields[key], np.float64).reshape(-1))
     c = np.column_stack(cols)
-    if c.max() > 255:            # 16-bit color
+    if c.max() > 255:
         c = c / 257.0
-    elif 0 < c.max() <= 1.0:     # unit-range floats
+    elif 0 < c.max() <= 1.0:
         c = c * 255.0
     cloud.rgb = np.clip(c, 0, 255).astype(np.uint8)
     return cloud
@@ -404,19 +396,16 @@ def _convert_one(cloud: Cloud, raw: np.ndarray | None, value_to_index: dict[int,
     """Write one (already-read, already-cropped) cloud to a canonical npz.
     compute_hag stores feat_hag when an aligned result is possible; a scene
     without it blocks runs that require the channel."""
-    # xyz stays float64 — UTM-scale coords quantize to 0.5 m in float32;
-    # trainers origin-shift to a local frame before their own casts.
+    # xyz stays float64: UTM-scale coords quantize to 0.5 m in float32, and trainers origin-shift to a local frame before their own casts
     crs_warning = _crs_report(cloud.crs_wkt, cloud.source_crs_wkt, cloud.xyz, out_path.stem)
     out: dict[str, np.ndarray] = {"xyz": cloud.xyz.astype(np.float64)}
-    # crs_wkt = processing CRS of the stored coords; source_crs_wkt present = a
-    # transform occurred (the round-trip signal); both ferry scene npz -> pred npz.
+    # crs_wkt = processing CRS of the stored coords; source_crs_wkt present = a transform occurred (the round-trip signal), both ferry scene npz -> pred npz
     if cloud.crs_wkt:
         out["crs_wkt"] = np.asarray(cloud.crs_wkt)
     if cloud.source_crs_wkt:
         out["source_crs_wkt"] = np.asarray(cloud.source_crs_wkt)
 
     class_counts: dict[int, int] = {}
-    # no class mapping = inference: raw only locates ground, don't write labels
     if raw is not None and value_to_index:
         label = np.full(cloud.n, -1, dtype=np.int32)
         for src_val, idx in value_to_index.items():
@@ -427,7 +416,6 @@ def _convert_one(cloud: Cloud, raw: np.ndarray | None, value_to_index: dict[int,
 
     if cloud.rgb is not None:
         out["rgb"] = cloud.rgb
-    # canonical channels bake only when selected — no implicit channels
     canon_wanted, feature_fields = split_feature_fields(feature_fields)
     raw_imax = None
     if "intensity" in canon_wanted and cloud.intensity is not None:
@@ -455,7 +443,6 @@ def _convert_one(cloud: Cloud, raw: np.ndarray | None, value_to_index: dict[int,
         if hag_notes:
             hag_warning = f"⚠ {out_path.stem}: {hag_notes[0]}"
 
-    # feat_geo_<nm>, stored raw; a ferried whole-cloud value wins over recomputation
     if geo_features:
         from . import pretrain
         have = {nm: np.asarray(cloud.fields[f"feat_geo_{nm.lower()}"], np.float32)
@@ -466,7 +453,6 @@ def _convert_one(cloud: Cloud, raw: np.ndarray | None, value_to_index: dict[int,
         for nm in geo_features:
             out[f"feat_geo_{nm.lower()}"] = have[nm]
 
-    # feat_<name>: v/p95(|v|) clipped to [-2, 2]; a missing field fails loud
     feature_scales: dict[str, float] = {}
     for fld in (feature_fields or []):
         key = next((k for k in cloud.fields if k.lower() == fld.lower()), None)
@@ -545,13 +531,12 @@ def _available_ram_bytes() -> int | None:
             m.dwLength = ctypes.sizeof(_MS)
             if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)):
                 return int(m.ullAvailPhys)
-        except Exception:                             # noqa: BLE001 — any ctypes failure = unknown
+        except Exception:
             pass
     return None
 
 
-# fat per-worker RAM estimate (LAZ inflates 10-20x + transient copies);
-# overshooting only costs parallelism, never a crash
+# fat per-worker RAM estimate (LAZ inflates 10-20x + transient copies); overshooting only costs parallelism, never a crash
 _RAM_PER_FILE_FACTOR = 30
 _RAM_HEADROOM = 0.7
 
@@ -601,7 +586,7 @@ def _convert_many(files: list[Path], dest_for, spec, value_to_index, intensity_n
     say(f"  {mode}: {workers} worker(s) [{why}]")
     out = []
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        for f, st in zip(files, ex.map(work, files)):   # map preserves input order
+        for f, st in zip(files, ex.map(work, files)):
             say(f"  converted {f.name}")
             out.append(st)
     return out
@@ -645,7 +630,7 @@ def _plan_and_convert(input_files: list[Path], val_files: list[Path] | None,
     vfrac = 0.0 if val_files else split.val_frac
     tfrac = 0.0 if test_files else split.test_frac
 
-    if vfrac <= 0.0 and tfrac <= 0.0:                  # everything explicit -> all inputs train
+    if vfrac <= 0.0 and tfrac <= 0.0:
         stats["train"].extend(_convert_many(
             input_files, lambda f: out_root / "train" / f"{f.stem}.npz",
             spec, value_to_index, intensity_norm, say, compute_hag=compute_hag,
@@ -655,14 +640,13 @@ def _plan_and_convert(input_files: list[Path], val_files: list[Path] | None,
             max_workers=max_workers))
         return stats
 
-    # single cloud: tile as measurement, allocate tiles, reassemble per split
     if len(input_files) == 1:
         f = input_files[0]
         say(f"  single-cloud split {f.name} (tile-measure -> holey clouds) ...")
         cloud = _apply_rgb_mapping(read_points(f, declared_crs_epsg), rgb_fields)
         raw = read_labels(f, cloud, spec) if spec is not None else None
         if compute_hag and _hag_from_cloud(cloud) is None:
-            from . import pretrain                      # whole-cloud HAG, ferried via fields
+            from . import pretrain
             gmask = (raw == int(ground_value)) if (raw is not None and ground_value is not None) else None
             hag_notes: list = []
             h = pretrain.hag_for_cloud(cloud, ground_mask=gmask, hag_filter=hag_filter, ground_method=ground_method,
@@ -672,7 +656,6 @@ def _plan_and_convert(input_files: list[Path], val_files: list[Path] | None,
             for hn in hag_notes:
                 say(f"  ⚠ {f.stem}: {hn}")
         if geo_features:
-            # whole-cloud once (seam-consistent); after HAG so PDAL never sees the columns
             from . import pretrain
             say(f"  computing {len(geo_features)} geometric feature(s) whole-cloud "
                 f"(pgeof optimal, k≤{geo_k}) ...")
@@ -695,7 +678,6 @@ def _plan_and_convert(input_files: list[Path], val_files: list[Path] | None,
             emit(split_name, sub, sub_raw, f.stem, hag_already=True)
         return stats
 
-    # folder of clouds: convert to a pool, allocate whole scenes, move
     say(f"  converting {len(input_files)} scene(s), then allocating by point count ...")
     pool = _convert_many(input_files, lambda f: out_root / "_pool" / f"{f.stem}.npz",
                          spec, value_to_index, intensity_norm, say, compute_hag=compute_hag,
@@ -703,7 +685,7 @@ def _plan_and_convert(input_files: list[Path], val_files: list[Path] | None,
                          feature_fields=feature_fields, geo_features=geo_features,
                          geo_k=geo_k, rgb_fields=rgb_fields,
                          max_workers=max_workers, declared_crs_epsg=declared_crs_epsg)
-    for st in pool:                                    # input order kept -> deterministic alloc
+    for st in pool:
         st["_pool_path"] = out_root / "_pool" / st["scene"]
     pts = [st["n_points"] for st in pool]
     hist = [_hist_from_counts(st["class_counts"], num_classes) for st in pool]
@@ -740,16 +722,13 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
                     progress=None) -> Path:
     """Convert `inputs` (files/folders) into a staged canonical dataset.
 
-    classes: [{"index", "source_value", "name"}].
-    feature_fields: source fields baked into every scene as feat_<name>.
-    geo_features: pgeof names, computed from xyz via Weinmann optimal
-        neighborhood (search ceiling geo_k neighbors).
-    compute_hag: bake feat_hag; ground_value labels are the ONLY ground source
-        when set, else CSF detects ground (grid heuristic is the PDAL-less
-        fallback); hag_filter = "grid" | "hag_nn" | "hag_delaunay".
+    classes = [{"index", "source_value", "name"}]; feature_fields = source fields
+    baked into every scene as feat_<name>; geo_features = pgeof names computed from
+    xyz via Weinmann optimal neighborhood (search ceiling geo_k neighbors).
+    compute_hag bakes feat_hag, where ground_value labels are the ONLY ground
+    source when set (else CSF detects ground, with the grid heuristic as the
+    PDAL-less fallback) and hag_filter = "grid" | "hag_nn" | "hag_delaunay".
     """
-    from . import analysis
-
     split = split or SplitConfig()
     name = sanitize_name(name)
     out_root = staging_root / name
@@ -818,9 +797,7 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
     for w in sorted({s["hag_warning"] for s in all_stats if s.get("hag_warning")}):
         say(w)
     if len({s.get("crs_wkt") for s in all_stats} - {None}) > 1:
-        # harmless now: coords are guaranteed meters, trainers are frame-invariant,
-        # mixed units can no longer occur (ingest reprojects every scene)
-        say("ℹ scenes span multiple processing-CRS zones — fine: coords are meters "
+        say("ℹ scenes span multiple processing-CRS zones. Fine: coords are meters "
             "and trainers frame-invariant.")
     total_pts = sum(s["n_points"] for s in all_stats)
     total_area = sum(s["area_m2"] for s in all_stats)
@@ -831,12 +808,10 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
             c[f"{sp}_count"] = sum(s["class_counts"].get(int(c["index"]), 0)
                                    for s in scene_stats[sp])
 
-    # several source values may combine into one class: count unique indices
     idx_to_name: dict[int, str] = {}
     for c in classes:
         idx_to_name.setdefault(int(c["index"]), c["name"])
 
-    # collapse combined classes to one entry per index (counts already total per index)
     by_index: dict[int, dict] = {}
     for c in classes:
         i = int(c["index"])
@@ -862,7 +837,6 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
     }
     if feature_fields:
         stats["feature_scales"] = {s["scene"]: s["feature_scales"] for s in all_stats}
-    # hag_src: how HAG was produced; inference reproduces the method from this
     if not all(s["has_hag"] for s in all_stats):
         hag_src = ""
     elif not compute_hag:
@@ -888,9 +862,7 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
             "rgb_fields": rgb_fields,
             "hag_ground_value": (int(ground_value) if ground_value is not None else None),
             "hag_ground_method": (ground_method if compute_hag else None),
-            # source_field "@geo:<name>"/"@hag:<method>" = computed channels,
-            # recomputed at inference. Canonical intensity/return_number ride the
-            # has_* flags, never this list.
+            # source_field "@geo:<name>"/"@hag:<method>" = computed channels, recomputed at inference; canonical intensity/return_number ride the has_* flags instead
             "feature_channels": ([{"name": feat_key(f), "source_field": f, "norm": "p95abs"}
                                   for f in split_feature_fields(feature_fields)[1]]
                                  + [{"name": f"geo_{nm.lower()}",
@@ -899,7 +871,6 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
                                     for nm in (geo_features or [])]
                                  + ([{"name": "hag", "source_field": f"@hag:{hag_src}",
                                       "norm": "raw"}] if hag_src else [])),
-            # per-scene CRS: proc = stored coords' CRS, source set = a reprojection ran
             "crs": {s["scene"]: {"proc": s.get("crs_wkt"),
                                  "source": s.get("source_crs_wkt")} for s in all_stats},
             "ignore_values": [int(v) for v in ignore_values],
@@ -924,7 +895,6 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
         "splits": splits,
         "stats": stats,
     }
-    meta["recommendations"] = analysis.recommend(meta)
 
     with open(out_root / "dataset_meta.json", "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
@@ -932,7 +902,6 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
     return out_root
 
 
-# classification-bearing field names, best first (matches datasets_page._scan_labels)
 _GROUND_FIELD_CANDIDATES = ("classification", "Classification", "scalar_label",
                             "label", "class")
 
@@ -947,13 +916,11 @@ def convert_infer_job(job_id: str, input_dir: str, staging_root: Path, progress=
                       declared_crs_epsg: int | None = None,
                       out_dir: Path | None = None) -> Path:
     """Label-less conversion for inference jobs -> <staging>/_infer/<job_id>/ (or
-    out_dir). The container mount stays /datasets/_infer/<job> either way.
+    out_dir), though the container mount stays /datasets/_infer/<job> either way.
     intensity_norm MUST match the weights' training norm — a mismatch feeds
     out-of-distribution intensity. hag/ground_value behave as on the Datasets
     page; a scene without ground_value degrades to detection, never to no HAG."""
     say = progress or (lambda s: None)
-    # infer scenes always carry intensity/return_number when the source has them;
-    # the checkpoint's FEAT_CHANNELS decides what's consumed
     feature_fields = list(feature_fields or []) + ["intensity", "return_number"]
     if hag:
         from . import pretrain
@@ -975,7 +942,6 @@ def convert_infer_job(job_id: str, input_dir: str, staging_root: Path, progress=
     files = discover_scenes(input_dir)
     if not files:
         raise FileNotFoundError(f"No supported point-cloud files in {input_dir}")
-    # one spec for the whole job so "ground" can't change fields mid-job
     spec = None
     if hag and ground_value is not None:
         fields = list_label_fields(files[0])
@@ -1025,24 +991,23 @@ PRED_EXPORT_FORMATS = ("las", "laz", "ply", "txt", "csv")
 def export_predictions(pred_dir, fmt: str, progress=None, class_map=None,
                        unclass_threshold=None) -> list[Path]:
     """Export each <name>_pred.npz as <name>_pred.<fmt> (xyz + classification
-    [+ confidence]). class_map remaps model indices to source values. Points below
-    unclass_threshold export as class 1 (0 if 1 is taken; 255 with no class_map).
-    The npz keeps the raw prediction so a new threshold re-exports without re-running."""
+    [+ confidence]), with class_map remapping model indices to source values.
+    Points below unclass_threshold export as class 1 (0 if 1 is taken; 255 with no
+    class_map). The npz keeps the raw prediction so a new threshold re-exports
+    without re-running."""
     fmt = fmt.lower().lstrip(".")
     if fmt not in PRED_EXPORT_FORMATS:
         raise ValueError(f"unsupported prediction format '{fmt}' "
                          f"(one of {', '.join(PRED_EXPORT_FORMATS)})")
     say = progress or (lambda s: None)
-    unclass = 1                             # ASPRS "Unclassified"
+    unclass = 1
     if unclass_threshold is not None and class_map and 1 in class_map.values():
         unclass = 0
-        say("  (class 1 is taken by the model's own classes — low-confidence "
+        say("  (class 1 is taken by the model's own classes; low-confidence "
             "points export as class 0 instead)")
     elif unclass_threshold is not None and not class_map:
-        # ponytail: raw indices make 0 and 1 real classes; 255 is free under the
-        # uint8 clip below. Breaks at K>255, which the cast already can't do.
         unclass = 255
-        say("  (no class map — export carries raw model indices; low-confidence "
+        say("  (no class map: export carries raw model indices; low-confidence "
             "points export as 255)")
     written: list[Path] = []
     legend_said = False
@@ -1063,8 +1028,6 @@ def export_predictions(pred_dir, fmt: str, progress=None, class_map=None,
             say("  ens_member field (ensemble's dominant model per point): "
                 + (", ".join(f"{i}={n}" for i, n in enumerate(member_names))
                    if member_names else "member indices in ensemble input order"))
-        # _write_pred restores coords to the source frame; a legacy unit-scale pred
-        # (non-meter crs_wkt, no source_crs_wkt) hard-blocks there (D2).
         if class_map:
             lut = np.arange(max(int(cls.max(initial=0)), max(class_map)) + 1)
             for i, v in class_map.items():
@@ -1075,7 +1038,6 @@ def export_predictions(pred_dir, fmt: str, progress=None, class_map=None,
             mask = conf < unclass_threshold
             cls[mask] = unclass
             low = int(mask.sum())
-        # ponytail: uint8 classification (LAS pf6 / uchar); >255 classes would clip.
         cls = np.clip(cls, 0, 255).astype(np.uint8)
         dst = src.with_suffix(f".{fmt}")
         _write_pred(dst, xyz, cls, fmt, confidence=conf, crs_wkt=crs_wkt,
@@ -1089,11 +1051,11 @@ def export_predictions(pred_dir, fmt: str, progress=None, class_map=None,
 
 def _write_pred(dst: Path, xyz: np.ndarray, cls: np.ndarray, fmt: str,
                 confidence=None, crs_wkt=None, source_crs_wkt=None, member=None):
-    """One classified cloud -> dst. xyz is inverse-transformed back to the source
-    frame via the shared keystone restore (raises the D2 legacy block); the embedded
+    """One classified cloud -> dst, with xyz inverse-transformed back to the source
+    frame via the shared keystone restore (raises the D2 legacy block). The embedded
     las/laz WKT VLR is the SOURCE CRS so deliverables overlay the input clouds.
-    confidence rides in las/laz (Extra Bytes) and txt/csv; member (ensemble dominant
-    model) as las/laz "ens_member". ply stays classification-only."""
+    confidence rides in las/laz (Extra Bytes) and txt/csv, member (ensemble dominant
+    model) as las/laz "ens_member", and ply stays classification-only."""
     xyz = restore_to_source(xyz, crs_wkt, source_crs_wkt)
     geo_wkt = source_crs_wkt or crs_wkt
     if fmt in ("las", "laz"):
@@ -1108,7 +1070,7 @@ def _write_pred(dst: Path, xyz: np.ndarray, cls: np.ndarray, fmt: str,
                 from pyproj import CRS
                 h.add_crs(CRS.from_wkt(geo_wkt))
             except Exception:
-                pass    # a CRS-less deliverable beats no deliverable
+                pass
         h.offsets = xyz.min(0)
         h.scales = [0.001] * 3
         las = laspy.LasData(h)
@@ -1120,13 +1082,12 @@ def _write_pred(dst: Path, xyz: np.ndarray, cls: np.ndarray, fmt: str,
             las.ens_member = member
         las.write(str(dst))
     elif fmt == "ply":
-        # double, not float: UTM-scale coords quantize to 0.5 m in a float32 parse
         header = ("ply\nformat ascii 1.0\n" + f"element vertex {len(xyz)}\n"
                   "property double x\nproperty double y\nproperty double z\n"
                   "property uchar classification\nend_header")
         np.savetxt(dst, np.column_stack([xyz, cls]),
                    fmt=["%.3f"] * 3 + ["%d"], header=header, comments="")
-    elif fmt == "txt":                                       # x y z class [confidence]
+    elif fmt == "txt":
         cols = [xyz, cls] + ([confidence] if confidence is not None else [])
         np.savetxt(dst, np.column_stack(cols), fmt="%.3f %.3f %.3f %d"
                    + (" %.3f" if confidence is not None else ""))
@@ -1140,19 +1101,16 @@ def _write_pred(dst: Path, xyz: np.ndarray, cls: np.ndarray, fmt: str,
                    comments="")
 
 
-# --------------------------------------------------------------------- self-check
-
 def _selfcheck():
     """Allocator hits targets + both build paths materialize three disjoint splits."""
     import tempfile
 
-    # allocator: balanced mode hits point targets and spreads a rare class
     C = 3
-    pts = [1000] * 7 + [400, 400, 400]       # 10 atoms
+    pts = [1000] * 7 + [400, 400, 400]
     hist = np.zeros((10, C), dtype=np.int64)
     for i in range(7):
         hist[i, 0] = 700; hist[i, 1] = 300
-    hist[7, 2] = hist[8, 2] = hist[9, 2] = 400   # rare class: one carrier per split
+    hist[7, 2] = hist[8, 2] = hist[9, 2] = 400
     a = allocate_splits(pts, hist, 0.2, 0.2, "balanced", 42)
     assert set(a.tolist()) == {0, 1, 2}, "all three splits used"
     got = np.zeros((3, C))
@@ -1163,7 +1121,6 @@ def _selfcheck():
     tot = sum(pts)
     train_frac = sum(pts[i] for i in range(10) if a[i] == 0) / tot
     assert 0.45 <= train_frac <= 0.75, f"train point-frac ~0.6, got {train_frac:.2f}"
-    # random mode: no crash, all assigned, three splits non-empty for these sizes
     ar = allocate_splits(pts, hist, 0.2, 0.2, "random", 1)
     assert (ar >= 0).all() and set(ar.tolist()) == {0, 1, 2}
 
@@ -1174,7 +1131,6 @@ def _selfcheck():
     classes = [{"index": i, "source_value": i, "name": f"c{i}"} for i in range(3)]
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
-        # single cloud -> 3 holey clouds (tile-measure + seam buffer, points only removed)
         np.savez(td / "scene.npz", xyz=xyz, classification=cls)
         out = convert_dataset("selftest", td / "scene.npz",
                               LabelSpec(kind="field", field="classification"),
@@ -1191,7 +1147,6 @@ def _selfcheck():
         kept = sum(meta["splits"][sp]["total_points"] for sp in _SPLITS)
         assert kept <= n, "seam buffer only removes points"
         assert kept >= 0.5 * n, "seam buffer must not delete most points"
-        # folder of clouds -> whole-scene 3-way; no scene in two splits; pool cleaned
         multi = td / "multi"; multi.mkdir()
         for k in range(9):
             np.savez(multi / f"s{k}.npz", xyz=xyz, classification=cls)
@@ -1204,7 +1159,6 @@ def _selfcheck():
         assert len(union) == 9 and sum(len(names[sp]) for sp in _SPLITS) == 9, \
             "every scene assigned exactly once"
         assert not (out2 / "_pool").exists(), "pool dir cleaned up"
-        # provided val folder -> test allocated from inputs
         vdir = td / "vprov"; vdir.mkdir()
         np.savez(vdir / "v0.npz", xyz=xyz, classification=cls)
         out3 = convert_dataset("selftest3", multi, LabelSpec(field="classification"),

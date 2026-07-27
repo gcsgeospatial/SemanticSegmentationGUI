@@ -25,7 +25,7 @@ def soft_vote(probs, labels=None):
     Averages over the COVERING models only (all-zero row = not covered);
     points nobody covered fall back to a plain vote over `labels`."""
     probs = np.asarray(probs, np.float32)
-    cov = (probs.sum(-1) > 0).sum(0)                  # (N,) models that saw each point
+    cov = (probs.sum(-1) > 0).sum(0)
     p = probs.sum(0) / np.maximum(cov, 1)[:, None]
     lab, conf = p.argmax(1), p.max(1).astype(np.float32)
     miss = cov == 0
@@ -49,7 +49,7 @@ def weighted_vote(labels, weights):
         counts[idx, row] += w
     mx = counts.max(1)
     out = np.full(n, -1, labels.dtype)
-    for row in labels:                       # priority order = input order
+    for row in labels:
         sel = (out < 0) & (counts[idx, row] == mx)
         out[sel] = row[sel]
     conf = mx / np.maximum(counts.sum(1), 1e-9)
@@ -89,7 +89,7 @@ def load_pred(path):
     from trainer_gui.readers import read_points
     c = read_points(path)
     lab = c.fields.get("classification")
-    if lab is None and len(c.fields) == 1:   # single label-candidate field
+    if lab is None and len(c.fields) == 1:
         lab = next(iter(c.fields.values()))
     if lab is None:
         raise ValueError(f"{path}: no 'classification' field (has {list(c.fields)})")
@@ -116,8 +116,7 @@ def write_out(path, xyz, cls, intensity, confidence, agree, crs_wkt=None,
             d["source_crs_wkt"] = np.asarray(str(source_crs_wkt))
         np.savez(path, **d)
         return
-    # ponytail: agreement is npz-only — dataset._write_pred has no agreement
-    # column; add one there if the deliverable ever needs it.
+    # ponytail: agreement is npz-only — dataset._write_pred has no agreement column; add one there if the deliverable ever needs it
     sys.path.insert(0, REPO_ROOT)
     from trainer_gui.dataset import _write_pred
     from pathlib import Path
@@ -133,7 +132,7 @@ def align_idx(ref_xyz, xyz):
     indices. rtol=0 is load-bearing — the default rtol=1e-5 is ~50 m on UTM."""
     if len(xyz) == len(ref_xyz) and np.allclose(xyz, ref_xyz, rtol=0.0, atol=1e-4):
         return None
-    from scipy.spatial import cKDTree      # lazy: only the mismatch path needs it
+    from scipy.spatial import cKDTree
     return cKDTree(xyz).query(ref_xyz)[1]
 
 
@@ -188,12 +187,12 @@ def check_class_clamp(input_dirs, log=print):
     for d in input_dirs:
         info = _class_info(d)
         if info is None:
-            log(f"  note: no infer_run.json in {d} — class check skipped for it")
+            log(f"  note: no infer_run.json in {d}; class check skipped for it")
         else:
             infos[d] = info
     if len({(n, tuple(names)) for n, names in infos.values()}) > 1:
         raise ValueError(
-            "class mismatch across ensemble inputs — every model must share one "
+            "class mismatch across ensemble inputs. Every model must share one "
             "class set:\n" + "\n".join(f"  {d}: {n} classes {names}"
                                        for d, (n, names) in infos.items()))
 
@@ -230,7 +229,7 @@ def ensemble(input_dirs, out_dir, log=print):
             log(f"  {stem}: soft vote (all {len(probs)} members carry probs)")
             voted, conf = soft_vote(np.stack(probs), stacked)
             dom = dominant_member(voted, probs=np.stack(probs))
-        else:                                            # fallback: weighted hard vote
+        else:
             noprobs = [d for d, p in zip(input_dirs, probs) if p is None]
             # the two branches genuinely disagree — say which one ran
             log(f"  {stem}: weighted hard vote (no probs in {noprobs})")
@@ -258,44 +257,35 @@ def self_test():
     import shutil
     import tempfile
 
-    # soft vote overturns the 2-1 hard majority: two unsure models vs one sure one
     sv = np.array([[[0.9, 0.1]], [[0.45, 0.55]], [[0.45, 0.55]]], np.float32)
     lab, conf = soft_vote(sv)
     hard, _ = weighted_vote(np.array([[0], [1], [1]]), np.ones((3, 1), np.float32))
     assert hard.tolist() == [1] and lab.tolist() == [0] and abs(conf[0] - 0.6) < 1e-6
-    # coverage: pt0 all-covered, pt1 seen by model 0 only, pt2 seen by nobody
     cv = np.array([[[0.9, 0.1], [0.2, 0.8], [0.0, 0.0]],
                    [[0.45, 0.55], [0.0, 0.0], [0.0, 0.0]],
                    [[0.45, 0.55], [0.0, 0.0], [0.0, 0.0]]], np.float32)
     lab, conf = soft_vote(cv, np.array([[0, 1, 3], [1, 1, 3], [1, 1, 4]]))
-    assert lab.tolist() == [0, 1, 3]          # pt2 keeps the NN-filled majority, not 0
-    assert np.allclose(conf, [0.6, 0.8, 2 / 3])   # pt1 undiluted by the 2 non-covering
-    # weighted hard vote: confidence flips the majority; conf = winning share
+    assert lab.tolist() == [0, 1, 3]
+    assert np.allclose(conf, [0.6, 0.8, 2 / 3])
     lab, conf = weighted_vote(np.array([[0, 0], [1, 0], [1, 0]]),
                               np.array([[0.9, 1.0], [0.2, 1.0], [0.2, 1.0]], np.float32))
     assert lab.tolist() == [0, 0] and abs(conf[0] - 0.9 / 1.3) < 1e-6 and conf[1] == 1.0
-    # unweighted all-way tie keeps the old semantics: earliest model wins
     assert weighted_vote(np.array([[1], [2], [3]]),
                          np.ones((3, 1), np.float32))[0].tolist() == [1]
-    # agreement: exact per-point fraction of models matching the final label
     ag = agreement(np.array([[0, 0], [1, 0], [1, 1]]), np.array([0, 0]))
     assert np.allclose(ag, [1 / 3, 2 / 3]) and ag.dtype == np.float32
-    # dominant member — soft: highest prob mass on the voted class
     dm = dominant_member(np.array([0, 1]),
                          probs=np.array([[[0.2, 0.8], [0.2, 0.8]],
                                          [[0.9, 0.1], [0.3, 0.7]]], np.float32))
     assert dm.tolist() == [1, 0] and dm.dtype == np.uint8
-    # dominant member — hard: highest weight among label-matching members
     dm = dominant_member(np.array([0]), labels=np.array([[1], [0], [0]]),
                          weights=np.array([[0.9], [0.5], [0.6]], np.float32))
     assert dm.tolist() == [2]
-    # identical clouds take the row-aligned fast path; mismatched fall back to NN
     xyz = np.random.rand(100, 3).astype(np.float32)
     assert align_idx(xyz, xyz) is None
     idx = align_idx(xyz, xyz[::2])
     assert len(idx) == 100 and (idx[::2] == np.arange(50)).all()
 
-    # end-to-end over folders: soft vote, clamp refusal, probs-missing fallback
     tmp = tempfile.mkdtemp(prefix="ensemble_vote_st_")
     try:
         x3 = np.random.rand(3, 3).astype(np.float32)
@@ -316,15 +306,12 @@ def self_test():
         quiet = lambda s: None
         ensemble(dirs, os.path.join(tmp, "out"), log=quiet)
         z = np.load(os.path.join(tmp, "out", "s_pred.npz"))
-        # point 0 is the overturn: hard majority 2-1 for class 1, soft vote -> 0
         assert z["classification"].tolist() == [0, 0, 1]
         assert z["confidence"].dtype == np.float32 and z["agreement"].dtype == np.float32
-        assert np.allclose(z["confidence"], [0.6, 0.7, 0.7], atol=2e-3)   # f16 probs
+        assert np.allclose(z["confidence"], [0.6, 0.7, 0.7], atol=2e-3)
         assert np.allclose(z["agreement"], [1 / 3, 1.0, 1.0])
-        # soft dominance: per point, member with the most mass on the voted class
         assert z["dominant_member"].tolist() == [0, 2, 0]
         assert z["member_names"].tolist() == ["m0", "m1", "m2"]
-        # clamp: mismatched class_names refuse loudly
         with open(os.path.join(dirs[1], "infer_run.json"), "w", encoding="utf-8") as f:
             json.dump({"num_classes": 2, "class_names": ["a", "c"]}, f)
         try:
@@ -334,16 +321,13 @@ def self_test():
             pass
         with open(os.path.join(dirs[1], "infer_run.json"), "w", encoding="utf-8") as f:
             json.dump({"num_classes": 2, "class_names": ["a", "b"]}, f)
-        # one dir without probs -> confidence-weighted hard vote for every scene
         zp = np.load(os.path.join(dirs[2], "s_pred.npz"))
         slim = {k: zp[k] for k in zp.files if k != "probs"}
         np.savez(os.path.join(dirs[2], "s_pred.npz"), **slim)
         ensemble(dirs, os.path.join(tmp, "out3"), log=quiet)
         z3 = np.load(os.path.join(tmp, "out3", "s_pred.npz"))
-        # point 0: w(0)=0.9 vs w(1)=0.55+0.55=1.1 -> label 1, share 1.1/2.0
         assert z3["classification"].tolist() == [1, 0, 1]
         assert np.allclose(z3["confidence"], [0.55, 1.0, 1.0], atol=1e-6)
-        # hard dominance: pt0 tie (m1/m2 both 0.55) -> earliest matching member
         assert z3["dominant_member"].tolist() == [1, 2, 0]
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

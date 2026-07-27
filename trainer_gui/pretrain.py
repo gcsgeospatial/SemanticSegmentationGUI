@@ -2,8 +2,8 @@
 
 Two independent axes, never mixed: ground SOURCE (ground_method = labels / csf /
 smrf / zmin) and INTERPOLATION ("grid" numpy raster, or PDAL hag_nn/hag_delaunay;
-zmin is self-contained and ignores it). Returns None on any failure — the scene
-then has no hag key and *_hag models refuse to run. pdal imports lazily.
+zmin is self-contained and ignores it). Returns None on any failure (the scene
+then has no hag key and *_hag models refuse to run); pdal imports lazily.
 """
 
 from __future__ import annotations
@@ -13,42 +13,35 @@ import re
 
 import numpy as np
 
-HAG_FILTERS = ("hag_nn", "hag_delaunay")     # PDAL filters (accurate path)
+HAG_FILTERS = ("hag_nn", "hag_delaunay")
 HAG_METHODS = ("grid",) + HAG_FILTERS
 
-# Ground SOURCE (orthogonal to interpolation): labels = caller's ground class,
-# csf/smrf = PDAL detection, zmin = percentile-Z raster HAG (no classification,
-# ignores hag_filter). GROUND_LABELS maps to the datasets-page dropdown text.
 GROUND_METHODS = ("labels", "csf", "smrf", "zmin")
 GROUND_LABELS = {"labels": "Base off ground layer", "csf": "CSF",
                  "smrf": "SMRF", "zmin": "Z-min proxy"}
 
-# pgeof compute_features_optimal output columns, in return order (12 cols)
 _PGEOF_OPTIMAL_COLS = ("linearity", "planarity", "scattering", "verticality",
                        "normal_x", "normal_y", "normal_z",
                        "length", "surface", "volume", "curvature", "optimal_nn")
-# user-selectable geometric channels (raw normal components excluded)
 GEO_FEATURES = ("linearity", "planarity", "scattering", "verticality",
                 "length", "surface", "volume", "curvature", "optimal_nn")
 
 
 def pdal_available() -> bool:
     try:
-        import pdal  # noqa: F401
+        import pdal
         return True
-    except Exception:  # noqa: BLE001
+    except Exception:
         return False
 
 
 def pgeof_available() -> bool:
     try:
-        import pgeof  # noqa: F401
+        import pgeof
         return True
-    except Exception:  # noqa: BLE001
+    except Exception:
         return False
 
-
-# ---------------------------------------------------------------- Stage A: HAG
 
 def _structured_from_cloud(cloud) -> np.ndarray:
     """Pack a Cloud into a PDAL-dimension-named structured array."""
@@ -59,7 +52,6 @@ def _structured_from_cloud(cloud) -> np.ndarray:
         dt.append(("Intensity", "u2"))
         cols["Intensity"] = np.clip(cloud.intensity, 0, 65535).astype(np.uint16)
     if cloud.return_number is not None:
-        # ground filters reject ReturnNumber/NumberOfReturns of 0
         rn = np.clip(cloud.return_number, 1, 255).astype(np.uint8)
         dt.append(("ReturnNumber", "u1"))
         cols["ReturnNumber"] = rn
@@ -91,7 +83,6 @@ def _structured_from_cloud(cloud) -> np.ndarray:
             dt.append((dim, "f8"))
             cols[dim] = arr0.astype(np.float64)
         used.add(dim.lower())
-    # always carry a Classification dim so CSF/ground-assignment can write
     if "classification" not in used:
         dt.append(("Classification", "u1"))
         cols["Classification"] = np.zeros(n, dtype=np.uint8)
@@ -101,45 +92,31 @@ def _structured_from_cloud(cloud) -> np.ndarray:
     return arr
 
 
-# ponytail: fixed grid-HAG heuristics sized for buildings on gentle terrain —
-# promote to parameters if a dataset's terrain/structures fight them
 GRID_HAG_CELL_M = 2.0
 GRID_HAG_OPEN_M = 35.0
 GRID_HAG_RELIEF_M = 2.5
-_GRID_HAG_MAX_DIM = 4096          # grow the cell instead of a huge raster
+_GRID_HAG_MAX_DIM = 4096
 
-# Past this nearest-fill distance the ground raster is extrapolating, not
-# interpolating (a building wider than its ground context, or detection
-# failure) — worth a per-scene warning, not silence.
 GRID_HAG_GAP_WARN_M = 50.0
 
-# CSF decimation cell: only a cell's lowest point can be ground, so CSF runs on
-# the min-Z-per-cell low envelope — 10-50x fewer points, and a cleaner envelope
-# in low vegetation (the cell minimum is the most-likely-ground return).
-# Coverage is unchanged (every cell keeps a point), so the cloth always spans a
-# building with its surrounding ground, however large the footprint. Must stay
-# well under the CSF cloth resolution (~1-2 m) so the cloth has support.
+# CSF decimation cell: only a cell's lowest point can be ground, so CSF runs on the min-Z-per-cell envelope; must stay well under the cloth resolution (~1-2 m)
 CSF_DECIM_CELL_M = 0.5
 
-# SMRF max window: a flat roof survives as ground unless the morphological window
-# reaches real ground across it, so this must exceed the widest building footprint
-# (~200 m diameter). slope buffers gentle terrain; the height guard below backstops
-# whatever any filter still misses.
+# SMRF max window must exceed the widest building footprint (~200 m) or a flat roof survives as ground; the height guard backstops what any filter still misses
 SMRF_MAX_WINDOW_M = 100.0
 
 
 def hag_grid_for_cloud(cloud, *, ground_mask=None,
                        cell: float = GRID_HAG_CELL_M,
                        notes: "list | None" = None) -> "np.ndarray | None":
-    """HAG from a rasterized ground surface (numpy/scipy, no PDAL). With a mask:
-    per-cell mean Z, holes nearest-filled (never a second ground source). Without:
-    low-percentile Z + grey opening rejects roof cells. Error ~ cell x slope —
-    a feature channel, not survey ground. float32 (n,) or None.
-    notes (a list, when given) collects warning strings — e.g. a nearest-fill
-    gap past GRID_HAG_GAP_WARN_M, where HAG is extrapolated."""
+    """HAG from a rasterized ground surface (numpy/scipy, no PDAL): with a mask,
+    per-cell mean Z with holes nearest-filled; without, low-percentile Z + a grey
+    opening that rejects roof cells. Error ~ cell x slope, so this is a feature
+    channel, not survey ground. Returns float32 (n,) or None; `notes` collects
+    warnings such as a nearest-fill gap past GRID_HAG_GAP_WARN_M."""
     try:
         from scipy import ndimage
-    except Exception:  # noqa: BLE001
+    except Exception:
         return None
     n = cloud.n
     if n == 0:
@@ -158,27 +135,24 @@ def hag_grid_for_cloud(cloud, *, ground_mask=None,
     if ground_mask is not None:
         gm = np.asarray(ground_mask, dtype=bool).reshape(-1)
         if len(gm) != n or not gm.any():
-            gm = None                              # unusable mask -> detection
+            gm = None
 
     grid = np.zeros(ncell, np.float64)
-    if gm is not None:                             # labeled: mean ground Z per cell
+    if gm is not None:
         cnt = np.bincount(flat[gm], minlength=ncell)
         zsum = np.bincount(flat[gm], weights=z[gm], minlength=ncell)
         valid = cnt > 0
         grid[valid] = zsum[valid] / cnt[valid]
         g2, v2 = grid.reshape(dims), valid.reshape(dims)
-    else:                                          # detect: low-percentile Z + opening
-        # packed cell-id|quantized-Z argsort: ~2.5x faster than lexsort
+    else:
         zq = ((z - z.min()) * ((1 << 20) - 1) / max(float(z.max() - z.min()), 1e-9))
         order = np.argsort((flat << 20) | zq.astype(np.int64))
         counts = np.bincount(flat, minlength=ncell)
         starts = np.concatenate(([0], np.cumsum(counts)[:-1]))
         valid = counts > 0
         pick = starts[valid] + (0.05 * (counts[valid] - 1)).astype(np.int64)
-        grid[valid] = z[order][pick]               # 5th-pctile resists low noise
+        grid[valid] = z[order][pick]
         g2, v2 = grid.reshape(dims), valid.reshape(dims)
-        # nearest-fill first so the opening sees a full surface, then reject
-        # cells the opening lowered past the relief tolerance (roofs)
         if (~v2).any():
             near = ndimage.distance_transform_edt(~v2, return_distances=False,
                                                   return_indices=True)
@@ -187,16 +161,16 @@ def hag_grid_for_cloud(cloud, *, ground_mask=None,
         opened = ndimage.grey_opening(g2, size=size, mode="nearest")
         v2 = v2 & ((g2 - opened) <= GRID_HAG_RELIEF_M)
         if not v2.any():
-            return None                            # nothing survives -> no ground
+            return None
 
-    if (~v2).any():                                # nearest-fill holes (final surface)
+    if (~v2).any():
         dist, near = ndimage.distance_transform_edt(~v2, return_indices=True)
         g2 = np.where(v2, g2, 0.0)[tuple(near)]
         gap = float(dist.max()) * cell
         if notes is not None and gap > GRID_HAG_GAP_WARN_M:
             notes.append(f"HAG ground nearest-filled across a ~{gap:.0f} m gap "
                          f"(building wider than its ground context, or no ground "
-                         f"detected there) — feat_hag in that area is extrapolated")
+                         f"detected there); feat_hag in that area is extrapolated")
     coords = np.ascontiguousarray(((xy - mn) / cell - 0.5).T)
     ground_at = ndimage.map_coordinates(g2, coords, order=1, mode="nearest")
     return (z - ground_at).astype(np.float32)
@@ -208,8 +182,6 @@ def _min_z_per_cell(xyz, cell: float = CSF_DECIM_CELL_M) -> np.ndarray:
     z = xyz[:, 2]
     ij = np.floor((xy - xy.min(0)) / cell).astype(np.int64)
     flat = ij[:, 0] * (int(ij[:, 1].max()) + 1) + ij[:, 1]
-    # packed cell-id|quantized-Z argsort (same trick as hag_grid_for_cloud):
-    # first occurrence per cell in the sorted order = that cell's minimum
     zq = ((z - z.min()) * ((1 << 20) - 1) / max(float(z.max() - z.min()), 1e-9))
     order = np.argsort((flat << 20) | zq.astype(np.int64))
     fo = flat[order]
@@ -231,30 +203,25 @@ def _reject_high_ground(cloud, mask, relief_m: float = GRID_HAG_RELIEF_M):
 
 
 def csf_ground_mask(cloud) -> "np.ndarray | None":
-    """Ground mask via PDAL CSF, or None. CSF over SMRF: no window-size contract,
-    so large flat roofs can't be absorbed into ground (the SMRF failure mode).
+    """Ground mask via PDAL CSF, or None; preferred over SMRF because it has no
+    window-size contract, so large flat roofs can't be absorbed into ground.
 
-    CSF sees only the min-Z-per-cell decimation (CSF_DECIM_CELL_M) — points that
-    aren't their cell's low point can't be ground, so this drops nothing valid,
-    runs the cloth on 10-50x fewer points, and denoises the low-vegetation
-    envelope. The returned mask is full-length; non-envelope points are simply
-    False (not a ground source), which the interpolation handles natively.
-    A height guard (_reject_high_ground) strips any cloth-ground point sitting
-    above true ground — a roof the cloth still rested on can't survive."""
+    CSF sees only the min-Z-per-cell decimation (CSF_DECIM_CELL_M), which drops
+    nothing valid and runs the cloth on 10-50x fewer points; the returned mask is
+    full-length, with non-envelope points simply False. A height guard
+    (_reject_high_ground) strips any cloth-ground point sitting above true
+    ground."""
     if not pdal_available():
         return None
     import pdal
     from .readers import Cloud
     try:
         keep = _min_z_per_cell(cloud.xyz)
-        # fresh sub-Cloud: geometry (+ returns for CSF's last-return logic) only,
-        # so a stale source Classification can never leak into the mask
+        # fresh sub-Cloud carries geometry (+ returns for CSF's last-return logic) only, so a stale source Classification can never leak into the mask
         sub = Cloud(xyz=cloud.xyz[keep],
                     return_number=(cloud.return_number[keep]
                                    if cloud.return_number is not None else None))
         arr = _structured_from_cloud(sub)
-        # rigidness 3 = stiff cloth for flat/gentle terrain (buildings on gentle
-        # ground); the height guard catches any roof it still rests on
         csf = pdal.Pipeline(json.dumps([{"type": "filters.csf", "rigidness": 3}]),
                             arrays=[arr])
         csf.execute()
@@ -263,7 +230,7 @@ def csf_ground_mask(cloud) -> "np.ndarray | None":
         if (len(sarr) != len(keep)
                 or not (np.isclose(ax[0], sub.xyz[0, 0])
                         and np.isclose(ax[-1], sub.xyz[-1, 0]))):
-            return None   # PDAL dropped/reordered points -> can't map the mask back
+            return None
         gm = np.asarray(sarr["Classification"]) == 2
         if not gm.any():
             return None
@@ -271,7 +238,7 @@ def csf_ground_mask(cloud) -> "np.ndarray | None":
         mask[keep[gm]] = True
         mask = _reject_high_ground(cloud, mask)
         return mask if mask.any() else None
-    except Exception:  # noqa: BLE001
+    except Exception:
         return None
 
 
@@ -295,11 +262,11 @@ def smrf_ground_mask(cloud) -> "np.ndarray | None":
         if (len(out) != cloud.n
                 or not (np.isclose(ax[0], cloud.xyz[0, 0])
                         and np.isclose(ax[-1], cloud.xyz[-1, 0]))):
-            return None   # PDAL dropped/reordered points -> can't map back
+            return None
         gm = np.asarray(out["Classification"]) == 2
         gm = _reject_high_ground(cloud, gm)
         return gm if gm.any() else None
-    except Exception:  # noqa: BLE001
+    except Exception:
         return None
 
 
@@ -309,9 +276,9 @@ def hag_for_cloud(cloud, *, ground_mask=None, ground_method: str = "labels",
     """The ONE HAG engine (dataset builds, tiles, inference — methods can't
     diverge). Ground SOURCE picked by ground_method: 'labels' (caller's
     ground_mask), 'csf'/'smrf' (PDAL detection), or 'zmin' (percentile-Z raster
-    HAG — no classification, ignores hag_filter). hag_filter picks interpolation
-    for the mask-based methods. float32 (n,) or None — never fabricated.
-    notes collects per-scene warnings (grid path's large fill gaps)."""
+    HAG, which ignores hag_filter); hag_filter picks interpolation for the
+    mask-based methods. Returns float32 (n,) or None, never fabricated, and
+    `notes` collects per-scene warnings (grid path's large fill gaps)."""
     if hag_filter not in HAG_METHODS:
         raise ValueError(f"hag_filter must be one of {HAG_METHODS}, got {hag_filter!r}")
     if ground_method not in GROUND_METHODS:
@@ -320,17 +287,17 @@ def hag_for_cloud(cloud, *, ground_mask=None, ground_method: str = "labels",
     if ground_method == "zmin":
         return hag_grid_for_cloud(cloud, ground_mask=None, notes=notes)
     if ground_method == "csf":
-        ground_mask = csf_ground_mask(cloud)          # None without PDAL
+        ground_mask = csf_ground_mask(cloud)
     elif ground_method == "smrf":
-        ground_mask = smrf_ground_mask(cloud)         # None without PDAL
+        ground_mask = smrf_ground_mask(cloud)
     if ground_mask is not None:
         ground_mask = np.asarray(ground_mask, dtype=bool).reshape(-1)
         if len(ground_mask) != cloud.n or not ground_mask.any():
-            ground_mask = None                        # unusable mask
+            ground_mask = None
     if hag_filter == "grid":
         return hag_grid_for_cloud(cloud, ground_mask=ground_mask, notes=notes)
     if ground_mask is None or not pdal_available():
-        return None                                   # nothing to anchor HAG to
+        return None
     import pdal
     try:
         arr = _structured_from_cloud(cloud)
@@ -343,17 +310,13 @@ def hag_for_cloud(cloud, *, ground_mask=None, ground_method: str = "labels",
             return None
         ax = np.asarray(out["X"], np.float64)
         if not (np.isclose(ax[0], cloud.xyz[0, 0]) and np.isclose(ax[-1], cloud.xyz[-1, 0])):
-            return None   # PDAL reordered the points -> can't pair them back up
+            return None
         return np.asarray(out["HeightAboveGround"], np.float32)
-    except Exception:  # noqa: BLE001
+    except Exception:
         return None
 
 
-# ------------------------------------------------ Stage A': geometric features
-
-# KNN runs in query blocks: the full (n,k) table at k=100 is ~1.2 KB/pt of
-# transients, which OOM-killed multi-10M-point preps. Block output is identical.
-# ponytail: rebuilds the kd-tree per block — build-once KNN if that ever dominates.
+# KNN runs in query blocks: the full (n,k) table at k=100 is ~1.2 KB/pt of transients, which OOM-killed multi-10M-point preps
 _GEO_BLOCK_PTS = 1_000_000
 
 
@@ -362,8 +325,8 @@ def geo_features_for_cloud(xyz, names, geo_k: int = 100) -> "dict[str, np.ndarra
     are always explicitly requested, so failures must be loud.
 
     Weinmann optimal-neighborhood features via pgeof: fetch geo_k neighbors
-    once, then pick the eigenentropy-minimizing sub-neighborhood per point. The
-    chosen size is exposed as the 'optimal_nn' channel."""
+    once, then pick the eigenentropy-minimizing sub-neighborhood per point, and
+    the chosen size is exposed as the 'optimal_nn' channel."""
     bad = [n for n in names if n not in GEO_FEATURES]
     if bad:
         raise ValueError(f"unknown geometric feature(s) {bad}; "
@@ -373,21 +336,18 @@ def geo_features_for_cloud(xyz, names, geo_k: int = 100) -> "dict[str, np.ndarra
     except ImportError as e:
         raise RuntimeError("Geometric feature channels need the 'pgeof' "
                            "package (pip install pgeof).") from e
-    # pgeof's optimal path is float32-only; real coords sit at UTM magnitude
-    # (northing ~4.5e6), where float32 resolution is ~0.5 m and would destroy the
-    # cm-scale geometry. Center in float64 first — every geo feature is
-    # translation-invariant, so this is exact, not an approximation.
+    # pgeof's optimal path is float32-only and UTM northings resolve to ~0.5 m there, so center in float64 first (geo features are translation-invariant, so this is exact)
     pts = np.asarray(xyz, dtype=np.float64)
     pts = np.ascontiguousarray(pts - pts.mean(axis=0), dtype=np.float32)
     n = len(pts)
-    k = int(min(geo_k, n))                 # can't fetch more neighbors than points
-    if k < 3:                              # degenerate cloud: no meaningful PCA
+    k = int(min(geo_k, n))
+    if k < 3:
         return {nm: np.zeros(n, np.float32) for nm in names}
-    k_min_search = min(10, k)              # >=10 advised for feature robustness
+    k_min_search = min(10, k)
     feats = np.empty((n, len(_PGEOF_OPTIMAL_COLS)), np.float32)
     for s in range(0, n, _GEO_BLOCK_PTS):
         q = pts[s:s + _GEO_BLOCK_PTS]
-        knn, _ = pgeof.knn_search(pts, q, k)       # (B, k) indices into pts
+        knn, _ = pgeof.knn_search(pts, q, k)
         nn = np.ascontiguousarray(knn.ravel().astype("uint32"))
         nn_ptr = np.ascontiguousarray((np.arange(len(q) + 1) * k).astype("uint32"))
         feats[s:s + _GEO_BLOCK_PTS] = pgeof.compute_features_optimal(
@@ -398,8 +358,6 @@ def geo_features_for_cloud(xyz, names, geo_k: int = 100) -> "dict[str, np.ndarra
             for nm in names}
 
 
-# --------------------------------------------------------------------- self-check
-
 def _selfcheck():
     """Grid HAG: detection and labeled paths agree on a flat scene with a roof."""
     from .readers import Cloud
@@ -408,8 +366,8 @@ def _selfcheck():
     xyz = np.vstack([np.column_stack([g[~on_roof], np.zeros((~on_roof).sum())]),
                      np.column_stack([g[on_roof], np.full(on_roof.sum(), 10.0)])])
     ng = int((~on_roof).sum())
-    for h in (hag_grid_for_cloud(Cloud(xyz=xyz)),                       # detection
-              hag_grid_for_cloud(Cloud(xyz=xyz),                        # labeled
+    for h in (hag_grid_for_cloud(Cloud(xyz=xyz)),
+              hag_grid_for_cloud(Cloud(xyz=xyz),
                                  ground_mask=np.arange(len(xyz)) < ng)):
         assert h is not None and len(h) == len(xyz)
         assert abs(float(h[:ng].mean())) < 0.3, "ground HAG ~0"

@@ -6,11 +6,14 @@ Only check code the shipped app reaches; if this file is the only caller, delete
 
 from __future__ import annotations
 
+import csv
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import numpy as np
@@ -21,8 +24,8 @@ sys.path.insert(0, str(_ROOT))
 for _d in ("scripts/local", "scripts/modal", "scripts/helper"):
     sys.path.insert(0, str(_ROOT / _d))
 
-from trainer_gui import analysis, dataset  # noqa: E402
-from trainer_gui.dataset import LabelSpec  # noqa: E402
+from trainer_gui import analysis, dataset
+from trainer_gui.dataset import LabelSpec
 
 RNG = np.random.default_rng(7)
 CHECKS = []
@@ -56,7 +59,7 @@ def write_laz(path, xyz, labels, intensity, extra=None):
     las.red = (RNG.uniform(0, 65535, len(xyz))).astype(np.uint16)
     las.green = (RNG.uniform(0, 65535, len(xyz))).astype(np.uint16)
     las.blue = (RNG.uniform(0, 65535, len(xyz))).astype(np.uint16)
-    for name, vals in (extra or {}).items():   # float Extra Bytes dims
+    for name, vals in (extra or {}).items():
         las.add_extra_dim(laspy.ExtraBytesParams(name=name, type=np.float32))
         las[name] = vals.astype(np.float32)
     las.write(str(path))
@@ -88,7 +91,6 @@ def main():
     tmp = Path(tempfile.mkdtemp(prefix="trainer_gui_smoke_"))
     print(f"workdir: {tmp}")
     try:
-        # ---------------- LAZ dataset with field labels (value 0 ignored)
         laz_root = tmp / "laz_src"
         for split, k in (("train", 2), ("val", 1), ("test", 1)):
             d = laz_root / split
@@ -139,63 +141,9 @@ def main():
         check("meta: per-class train/val/test counts populated",
               meta["classes"][0]["train_count"] > 0
               and all(f"{sp}_count" in meta["classes"][0] for sp in ("train", "val", "test")))
-        check("meta: recommendations for all backbones",
-              "ptv3" in meta["recommendations"] and "kpconvx_cold" in meta["recommendations"])
-        grid = meta["recommendations"]["ptv3"]["grid"]
-        check(f"meta: ptv3 grid clamped to band (got {grid})", 0.10 <= grid <= 2.0)
-        check("meta: kpconvx grid clamped to its band",
-              0.4 <= meta["recommendations"]["kpconvx_cold"]["grid"] <= 2.0)
+        check("meta: no recommendations block (grid/tile are fixed defaults)",
+              "recommendations" not in meta)
 
-        # ---------------- analysis.recommend: density sweep (o = rho*g^2 >= 1, see scripts/DENSITY_DG.md)
-        DENSITIES = (0.5, 2.0, 10.0, 50.0, 100.0, 250.0, 1000.0)
-        recs = {rho: analysis.recommend({"stats": {"mean_pts_per_m2": rho,
-                                                   "mean_spacing_m": rho ** -0.5}})
-                for rho in DENSITIES}
-        def _in_band(rho, k, rec):
-            dflt = next(int(p.default) for p in analysis.BACKBONES[k].params
-                        if p.flag == "batch")
-            return (rho * rec["grid"] ** 2 >= 0.99 and 1 <= rec["batch"] <= dflt
-                    and (10 <= rec["chunk_xy"] <= 200 if "chunk_xy" in rec else True))
-
-        bad = [f"rho={rho} {k}" for rho, r in recs.items() for k, rec in r.items()
-               if not _in_band(rho, k, rec)]
-        check("recommend: o>=1, batch<=default, chunk in band across the sweep"
-              + (" - bad: " + ", ".join(bad) if bad else ""), not bad)
-        check("recommend: grids shrink monotonically with density",
-              all(recs[hi][k]["grid"] <= recs[lo][k]["grid"] + 1e-9
-                  for lo, hi in zip(DENSITIES, DENSITIES[1:]) for k in recs[hi]))
-        r05 = analysis.recommend({"stats": {"mean_pts_per_m2": 0.5,
-                                            "mean_spacing_m": 0.5 ** -0.5}})
-        check("recommend: kpconvx reproduces the proven sparse recipe (g=2.0, chunk=100)",
-              r05["kpconvx_cold"]["grid"] == 2.0 and r05["kpconvx_cold"]["chunk_xy"] == 100)
-        r100 = analysis.recommend({"stats": {"mean_pts_per_m2": 100.0,
-                                             "mean_spacing_m": 0.1}})
-        check("recommend: randlanet num_points adapts with density (pyramid-friendly)",
-              r05["randlanet"]["num_points"] == 8192
-              and r100["randlanet"]["num_points"] == 45056
-              and r05["randlanet"]["num_points"] % 4096 == 0)
-        check("recommend: ptv3 tiles stay clear of the script's 80k train crop",
-              all(analysis.recommend({"stats": {"mean_pts_per_m2": d,
-                                                "mean_spacing_m": d ** -0.5}}
-                                     )["ptv3"]["chunk_xy"] ** 2 * d <= 80_000
-                  for d in (2.0, 10.0, 50.0)))
-        dg_wide = analysis.dg_recommend(1000.0, 2.0)   # UAV-trained, QL2 inference
-        check("dg: dense-trained gap sized to the real (pinned) grid, not the ratio",
-              4.5 <= dg_wide["coarsen_max"] <= 5.0 and dg_wide["p_native"] == 0.35
-              and dg_wide["tta"] == 4 and dg_wide["logdk"]
-              and "exceeds the aug range" not in dg_wide["rationale"])
-        dg_over = analysis.dg_recommend(50.0, 0.5)     # beyond the aug range
-        check("dg: gap beyond the aug range caps at 6 + retrain advice",
-              dg_over["coarsen_max"] == 6.0
-              and "exceeds the aug range" in dg_over["rationale"])
-        dg_mid = analysis.dg_recommend(8.0, 2.0)       # QL1 -> QL2: modest 4x
-        check("dg: modest gap stays in the aug range",
-              1.5 <= dg_mid["coarsen_max"] <= 2.0
-              and "exceeds the aug range" not in dg_mid["rationale"])
-        check("dg: no aug when the pinned training grid already covers the target",
-              analysis.dg_recommend(100.0, 50.0)["density_aug"] is False)
-
-        # ---------------- scene split: whole scenes into disjoint train/val/test
         sc_src = tmp / "scene_src"
         sc_src.mkdir()
         for i in range(3):
@@ -227,7 +175,6 @@ def main():
         wc = dataset._worker_cap_detail(list(sc_src.glob("*.laz")))[0]
         check(f"convert: worker cap RAM/core-clamped (got {wc})", 1 <= wc <= 3)
 
-        # ---------------- single-cloud split (seam_buffer=0 conserves points)
         staged_sp = dataset.convert_dataset(
             "laz_spatial", str(laz_root / "train" / "scene0.laz"), spec, classes, [0],
             tmp / "staging", split=dataset.SplitConfig(val_frac=0.3, test_frac=0.3,
@@ -245,7 +192,6 @@ def main():
               + msp["splits"]["test"]["total_points"] == 20_000)
         check("single-cloud split: meta marks tile atoms", msp["split"]["atom_unit"] == "tile")
 
-        # ---------------- PLY dataset with field labels
         ply_root = tmp / "ply_src"
         for split, k in (("train", 2), ("val", 1)):
             d = ply_root / split
@@ -264,7 +210,6 @@ def main():
         check("ply npz: rgb present u8 (explicit mapping)", col(zp, "rgb").dtype == np.uint8)
         check("ply npz: all labels mapped", set(np.unique(zp["label"])) == {0, 1, 2})
 
-        # ---------------- ASCII dataset with companion label files (per-scene)
         txt_root = tmp / "txt_src"
         truth = txt_root / "truth"
         truth.mkdir(parents=True)
@@ -290,7 +235,6 @@ def main():
         check("ascii npz: intensity + return_number captured",
               "intensity" in zt.files and "return_number" in zt.files)
 
-        # ---------------- inference job conversion (no labels)
         job = dataset.convert_infer_job("test_job", str(txt_root / "val"), tmp / "staging")
         zi = np.load(job / "scenes" / "JAX_val0_PC3.npz")
         check("infer npz: no label key", "label" not in zi.files)
@@ -298,7 +242,6 @@ def main():
         check("infer npz: p95 intensity clipped to [0,2]",
               0.0 <= zi["intensity"].min() and zi["intensity"].max() <= 2.0)
 
-        # ---------------- backbones + appstate
         from trainer_gui import appstate
         from trainer_gui.backbones import BACKBONES
 
@@ -312,7 +255,6 @@ def main():
         check("convert: p95-norm intensity >= max-norm and <= 2",
               ip95.max() >= imax.max() and ip95.max() <= 2.0)
 
-        # ---------------- backbones: registry contracts
         check("backbones: registry = the 4 cold scripts + 3 pcssl encoders",
               set(BACKBONES) == {"ptv3", "randlanet", "kpconvx_cold", "kpconv",
                                  "concerto", "sonata", "utonia"})
@@ -336,11 +278,32 @@ def main():
               BACKBONES["ptv3"].outputs_volume == "ptv3-outputs"
               and BACKBONES["randlanet"].outputs_volume == "randlanet-cold-outputs"
               and BACKBONES["kpconvx_cold"].outputs_volume == "kpconvx-cold-outputs")
-        check("backbones: each carries a recommended GPU + min VRAM (Train specs bar)",
+        check("backbones: each carries a recommended GPU + min VRAM (feeds batch_for_vram)",
               all(b.rec_gpu and b.min_vram_gb > 0 for b in BACKBONES.values())
               and BACKBONES["kpconvx_cold"].min_vram_gb >= BACKBONES["randlanet"].min_vram_gb)
 
-        # ---------------- density generalization: env mapping + run.json round-trip
+        from trainer_gui.backbones import (ALS_GRID_M, ALS_TILE_M, KP_TILE_M,
+                                           GPU_CHOICES, GPU_VRAM_GB, batch_for_vram)
+        _KP = {"kpconv", "kpconvx_cold"}
+        check("backbones: every backbone ships the fixed ALS grid default",
+              all(next(p.default for p in b.params if p.flag == b.grid_flag) == ALS_GRID_M
+                  for b in BACKBONES.values()))
+        check("backbones: tile = 50 m, except the KP family at 100 x grid (25 m)",
+              all(next(p.default for p in b.params if p.flag == "chunk-xy")
+                  == (KP_TILE_M if k in _KP else ALS_TILE_M)
+                  for k, b in BACKBONES.items() if b.has_chunk)
+              and KP_TILE_M == 100 * ALS_GRID_M)
+        check("backbones: every Modal GPU choice has a VRAM figure",
+              all(g in GPU_VRAM_GB for g in GPU_CHOICES))
+        check("batch_for_vram: reference VRAM reproduces the backbone default",
+              all(batch_for_vram(b, b.min_vram_gb) == b.batch_default
+                  for b in BACKBONES.values()))
+        check("batch_for_vram: monotonic in VRAM, floors at 1, caps at 2x default",
+              all(batch_for_vram(b, 4) >= 1
+                  and batch_for_vram(b, 2 * b.min_vram_gb) >= batch_for_vram(b, b.min_vram_gb)
+                  and batch_for_vram(b, 10_000) == 2 * b.batch_default
+                  for b in BACKBONES.values()))
+
         import train_common
 
         dg_cfg = {"density_aug": True, "coarsen_max": 2.5, "p_native": 0.5,
@@ -382,7 +345,6 @@ def main():
         check("dg: baseline run (no DG env) records logdk off",
               train_common.write_run_manifest(str(dg_run), "ptv3")["dg"]["logdk"] is False)
 
-        # ---------------- graceful stop: the /outputs/STOP sentinel contract
         _orig_sentinel = train_common.STOP_SENTINEL
         stop_f = tmp / "STOP"
         train_common.STOP_SENTINEL = str(stop_f)
@@ -397,7 +359,6 @@ def main():
         finally:
             train_common.STOP_SENTINEL = _orig_sentinel
 
-        # ---------------- path contract: TT_* env roots (unset = container mounts)
         import importlib
         _tt_saved = {k: os.environ.pop(k, None)
                      for k in ("TT_DATASETS_ROOT", "TT_OUTPUTS_ROOT",
@@ -433,7 +394,6 @@ def main():
                     os.environ[k] = v
             importlib.reload(train_common)
 
-        # ---------------- class masking: EXCLUDE_CLASSES parse + prob renorm
         mask_names = ["ground", "veg", "building"]
         os.environ["EXCLUDE_CLASSES"] = "veg"
         try:
@@ -466,9 +426,16 @@ def main():
               and np.allclose(mm.max(1), [0.6, 0.6 / 0.9], atol=1e-6))
         check("mask: empty exclusion is identity",
               np.array_equal(train_common.apply_class_mask(mp.copy(), []), mp))
-        import inspect
+        import inspect as _insp
         check("mask: kp_make_predict_points accepts exclude_idx",
-              "exclude_idx" in inspect.signature(train_common.kp_make_predict_points).parameters)
+              "exclude_idx" in _insp.signature(
+                  train_common.kp_make_predict_points).parameters)
+        allx = train_common.apply_class_mask(np.array([[1.0, 0.0, 0.0]], np.float32), [0])
+        nearx = train_common.apply_class_mask(np.array([[0.98, 0.01, 0.01]], np.float32), [0])
+        check("mask: fully-excluded row stays finite via the 1e-12 floor (no NaN)",
+              np.isfinite(allx).all() and np.all(allx == 0.0)
+              and np.isfinite(nearx).all()
+              and np.allclose(nearx[0], [0.0, 0.5, 0.5], atol=1e-6))
 
         from trainer_gui.pages.infer_page import _entry_name, _localize_paths, _parse_run_ref
         check("infer: _parse_run_ref handles pasted volume paths and bare ids",
@@ -482,6 +449,14 @@ def main():
         check("modal_cli: volume get spells out --force (short -f was removed)",
               "--force" in modal_cli.volume_get("v", "runs/x", "d")[1]
               and "-f" not in modal_cli.volume_get("v", "runs/x", "d")[1])
+        _mprog, _margs = modal_cli.run_script(
+            "modal_train_ptv3.py", {"grid": 0.05, "skip": None, "dataset": "d"},
+            detach=True, env={"DG_LOGDK_FEAT": 1})
+        check("modal_cli: run_script = modal run --detach, None flags skipped, env as one --env-json",
+              _margs[:2] == ["run", "--detach"] and "modal_train_ptv3.py" in _margs
+              and _margs[_margs.index("--grid") + 1] == "0.05"
+              and "--skip" not in _margs
+              and json.loads(_margs[_margs.index("--env-json") + 1]) == {"DG_LOGDK_FEAT": "1"})
         from trainer_gui.pages.infer_page import _manifest_in
         mdir = tmp / "dl_run"
         mdir.mkdir()
@@ -509,7 +484,6 @@ def main():
               hag_ok_block is False
               and not any("feat_hag" in s for s in hag_ok_lines))
 
-        # ---------------- feature channels: user-picked extra dims as feat_<name>
         feat_root = tmp / "feat_src"
         for split, k in (("train", 2), ("val", 1)):
             d = feat_root / split
@@ -564,11 +538,10 @@ def main():
             pfs_raised = True
         check("feat: parse_feat_spec raises on an unknown channel name", pfs_raised)
 
-        # ---------------- computed geometric channels (pgeof optimal neighborhood)
         from trainer_gui import pretrain
         gp = np.mgrid[0:40, 0:40].reshape(2, -1).T.astype(np.float64) * 0.4
-        geo_plane = np.c_[gp, np.zeros(len(gp))]              # 16x16 m flat plane
-        geo_wall = np.c_[np.full(len(gp), 30.0), gp]          # vertical plane at x=30
+        geo_plane = np.c_[gp, np.zeros(len(gp))]
+        geo_wall = np.c_[np.full(len(gp), 30.0), gp]
         geo_xyz = np.vstack([geo_plane, geo_wall])
         g1 = pretrain.geo_features_for_cloud(
             geo_xyz, ["planarity", "linearity", "verticality", "scattering"], 60)
@@ -583,10 +556,7 @@ def main():
               g1["planarity"][:n_pl].mean() > 0.6
               and g1["verticality"][:n_pl].mean() < 0.2
               and g1["verticality"][n_pl:].mean() > 0.5)
-        # pgeof's optimal path is float32-only, so raw UTM coords (northing ~4.5e6,
-        # where float32 resolves ~0.5 m) would wreck the geometry — the engine
-        # centers first. This guards that: translation to UTM magnitude must not move
-        # features (would fail loudly, maxΔ~0.4, without centering).
+        # pgeof's optimal path is float32-only and raw UTM coords resolve to ~0.5 m there, so the engine centers first; this guards that (maxΔ~0.4 without centering)
         g_utm = pretrain.geo_features_for_cloud(
             geo_xyz + [585000.0, 4507000.0, 0.0],
             ["planarity", "verticality"], 60)
@@ -659,10 +629,9 @@ def main():
         check("infer: _localize_paths maps container paths to the host output folder",
               _localize_paths("labeling -> /datasets/_infer/J/predictions/s_pred.ply",
                               "J", r"C:\out", r"C:\stage") == r"labeling -> C:\out/s_pred.ply"
-              and _localize_paths("done — predictions in _infer/J/predictions",
-                                  "J", r"C:\out", r"C:\stage") == r"done — predictions in C:\out")
+              and _localize_paths("done: predictions in _infer/J/predictions",
+                                  "J", r"C:\out", r"C:\stage") == r"done: predictions in C:\out")
 
-        # ---------------- prediction export (Inference page format picker)
         exd = tmp / "pred_export"
         exd.mkdir()
         ex_cls = np.array([0, 1, 2, 3, 4, 2, 0], np.int64)
@@ -692,7 +661,6 @@ def main():
               and list(np.asarray(pv["classification"]).astype(int)) == list(ex_cls))
         (exd / "sceneX_pred.npz").unlink()
 
-        # ---------------- CRS: meter-projected at ingest, restored to source at export
         import pyproj
         utm33 = pyproj.CRS.from_epsg(32633)
         ch = laspy.LasHeader(point_format=6, version="1.4")
@@ -720,7 +688,6 @@ def main():
         for f in ("crs_src.las", "crs_scene.npz", "crsY_pred.npz", "crsY_pred.las"):
             (exd / f).unlink()
 
-        # geographic (lon/lat) source now REPROJECTS to an estimated meter UTM zone
         gh = laspy.LasHeader(point_format=6, version="1.4")
         gh.offsets = [0, 0, 0]
         gh.scales = [1e-7, 1e-7, 0.001]
@@ -751,7 +718,34 @@ def main():
         for f in ("geo_src.las", "geo.npz", "geoY_pred.npz", "geoY_pred.las"):
             (exd / f).unlink()
 
-        # no-CRS heuristic: degree-like coords are a D1 hard block; metric passes silent
+        from trainer_gui import readers as _readers
+        ft_crs = pyproj.CRS.from_epsg(2263)
+        fh = laspy.LasHeader(point_format=6, version="1.4")
+        fh.offsets = [1_000_000, 200_000, 0]
+        fh.scales = [0.01, 0.01, 0.01]
+        fh.add_crs(ft_crs)
+        fl = laspy.LasData(fh)
+        f_z = np.linspace(1.0, 50.0, 7)
+        fl.x = 1_000_000 + ex_xyz[:, 0]
+        fl.y = 200_000 + ex_xyz[:, 1]
+        fl.z = f_z
+        fl.classification = ex_cls.astype(np.uint8)
+        fl.write(str(exd / "foot_src.las"))
+        dataset.convert_scene(exd / "foot_src.las", None, {}, exd / "foot.npz")
+        _vf = _readers.vertical_unit_factor(ft_crs)
+        with np.load(exd / "foot.npz") as zf:
+            fproc = pyproj.CRS.from_wkt(str(zf["crs_wkt"]))
+            fxyz = np.asarray(zf["xyz"], np.float64)
+            check("crs: foot-projected source reprojects to meter UTM; z scaled by the survey-foot factor",
+                  fproc.is_projected
+                  and abs(_readers.vertical_unit_factor(fproc) - 1.0) < 1e-9
+                  and "source_crs_wkt" in zf.files
+                  and pyproj.CRS.from_wkt(str(zf["source_crs_wkt"])).to_epsg() == 2263
+                  and 0.30 < _vf < 0.31
+                  and np.allclose(np.sort(fxyz[:, 2]), np.sort(f_z * _vf), atol=1e-2))
+        for f in ("foot_src.las", "foot.npz"):
+            (exd / f).unlink()
+
         try:
             dataset._crs_report(None, None,
                                 np.array([[13.0, 52.0, 0.0], [13.1, 52.1, 1.0]]), "g")
@@ -763,7 +757,6 @@ def main():
         check("crs: no-CRS + degree-like coords is a D1 hard block naming the declare-CRS remedy",
               d1_raised and wutm is None)
 
-        # D2: a legacy unit-scale pred (non-meter crs_wkt, no source_crs_wkt) blocks export
         np.savez(exd / "legacyZ_pred.npz",
                  xyz=(ex_xyz + [9.8e5, 1.9e5, 0]).astype(np.float64),
                  classification=ex_cls.astype(np.int32),
@@ -803,9 +796,8 @@ def main():
         check("export: re-export of the kept npz at threshold 0.0 marks nothing",
               list(c0) == [10, 11, 12])
 
-        # ---------------- ensemble vote (the Qt member loop is GUI-side, untestable here)
         import ensemble_vote as evote
-        _q = lambda s: None   # quiet log
+        _q = lambda s: None
 
         sv_lab, sv_conf = evote.soft_vote(np.array(
             [[[0.9, 0.1]], [[0.45, 0.55]], [[0.45, 0.55]]], np.float32))
@@ -860,12 +852,10 @@ def main():
         np.savez(ens / "m2" / "s_pred.npz", **slim)
         evote.ensemble(edirs, str(ens / "out3"), log=_q)
         with np.load(ens / "out3" / "s_pred.npz") as ez3:
-            # point 0: w(0)=0.9 vs w(1)=0.55+0.55 -> label 1, share 1.1/2.0
             check("ensemble: probs missing anywhere -> weighted-hard fallback",
                   ez3["classification"].tolist() == [1, 0, 1]
                   and np.allclose(ez3["confidence"], [0.55, 1.0, 1.0], atol=1e-6))
 
-        # ---------------- plots: read val curves, build figures, average runs
         from trainer_gui import plots
         run = tmp / "runs_demo" / "ptv3" / "20260101_000000_demo_ptv3"
         run.mkdir(parents=True)
@@ -897,8 +887,17 @@ def main():
         line_labels = [str(ln.get_label()) for ln in fig.get_axes()[0].get_lines()]
         check("plots: multi_run_figure overlays runs + an average line",
               len(line_labels) == 3 and any("average" in s for s in line_labels))
+        runp = tmp / "runs_demo" / "ptv3" / "20260103_000000_demo_ptv3"
+        runp.mkdir(parents=True)
+        (runp / "val_metrics.csv").write_text(
+            "epoch,val_acc,val_miou,iou_Ground,protocol\n"
+            "9,0.80,0.40,0.70,proxy\n19,0.90,0.55,0.80,proxy\n29,0.95,0.88,0.90,full\n",
+            encoding="utf-8")
+        check("plots: the full-eval row is split off the proxy ranking curve",
+              plots.series(runp, "val_miou") == ([9, 19], [0.40, 0.55])
+              and plots.full_series(runp, "val_miou") == ([29], [0.88])
+              and plots.full_series(run, "val_miou") == ([], []))
 
-        # ---------------- inline HAG during tiling (ground_value=2 -> labels only, no CSF)
         staged_ih = dataset.convert_dataset(
             "laz_hag_inline", str(laz_root / "train"), spec, classes, [0], tmp / "staging",
             val_inputs=[str(laz_root / "val")], test_inputs=[str(laz_root / "test")],
@@ -934,7 +933,6 @@ def main():
               and "smrf_fill" not in inspect.signature(dataset.convert_infer_job).parameters
               and "use_smrf" not in inspect.signature(pretrain.hag_for_cloud).parameters
               and "smrf_cell" not in inspect.signature(pretrain.hag_for_cloud).parameters)
-        # labels == detection would mean ground_value never reached ground_mask
         job_d = dataset.convert_infer_job("hag_detect_job", str(laz_root / "val"),
                                           tmp / "staging", hag=True, hag_filter="grid")
         zjd = np.load(next((job_d / "scenes").glob("*.npz")))
@@ -954,12 +952,10 @@ def main():
               "feat_hag" in zjz.files
               and zjz["feat_hag"].shape[0] == zjz["xyz"].shape[0])
 
-        # ---------------- analysis.scan_folder on raw files
         stats = analysis.scan_folder(dataset.discover_scenes(laz_root / "train"))
         check("analysis: density > 0", stats["mean_pts_per_m2"] > 0)
         check("analysis: rgb detected", stats["has_rgb"])
 
-        # ---------------- log parser (needs QCoreApplication for signals)
         from PySide6.QtCore import QCoreApplication
         app = QCoreApplication.instance() or QCoreApplication([])
         from trainer_gui.jobs import LogParser
@@ -972,8 +968,20 @@ def main():
         check("parser: epoch line parsed", seen["epochs"]
               and seen["epochs"][0]["epoch"] == 12 and abs(seen["epochs"][0]["miou"] - 0.7012) < 1e-9)
         check("parser: run id extracted", seen["run"] == "20260611_010101_demo_ptv3")
+        vseen = []
+        pv = LogParser()
+        pv.val_metrics.connect(lambda m: vseen.append(m))
+        pv.feed("  [val@ep9] acc=0.9100 mIoU(5-way)=0.6000 mIoU(present 4)=0.7000 worst(Power Line)=0.1200\n")
+        pv.feed("  [val@ep5] acc=0.9 mIoU(5-way)=0.6 mIoU(present 4)=0.7\n")
+        pv.feed("  [test@ep9] acc=0.9 mIoU(5-way)=0.6 mIoU(present 4)=0.7 worst(Ground)=0.5\n")
+        check("parser: val line parses worst-class (name may hold a space); test@ line ignored",
+              len(vseen) == 2
+              and vseen[0]["epoch"] == 9 and abs(vseen[0]["miou"] - 0.70) < 1e-9
+              and abs(vseen[0]["miou_all"] - 0.60) < 1e-9
+              and vseen[0]["worst_class"] == "Power Line"
+              and abs(vseen[0]["worst_iou"] - 0.12) < 1e-9
+              and vseen[1]["worst_class"] is None)
 
-        # ---------------- ground-truth comparison stats (Inference page)
         gtc = tmp / "gtcmp"
         gtc.mkdir()
         np.savez(gtc / "sceneY_pred.npz", xyz=make_xyz(5).astype(np.float32),
@@ -987,12 +995,157 @@ def main():
               and gm["per_class_iou"] == {0: 1.0, 1: 0.5, 2: 0.5}
               and abs(gm["miou"] - 2 / 3) < 1e-9)
 
-        # ================= LOCAL backend =================
+        _i, _u, _g = train_common.score_ious(np.array([0, 0, 1]), np.array([0, 1, 1]), 2)
+        _m = train_common.eval_metrics(_i, _u, _g, 2, 3, ["a", "b"], time.time(), 1, "demo")
+        check("eval_metrics: worst_class = the min present-class IoU, named",
+              _m["worst_class"] in ("a", "b")
+              and _m["worst_class_iou"] == min(_m["per_class_iou"].values()))
+        _i2, _u2, _g2 = train_common.score_ious(np.array([0, 0, 0]), np.array([0, 1, 1]), 2)
+        _m2 = train_common.eval_metrics(_i2, _u2, _g2, 1, 3, ["a", "b"], time.time(), 1, "demo")
+        check("eval_metrics: a present-but-never-predicted class is the worst at IoU 0",
+              _m2["worst_class"] == "b" and _m2["worst_class_iou"] == 0.0
+              and _m2["absent_classes"] == [])
+
+        _vd = tmp / "valcsv"
+        _vd.mkdir()
+        _vc = str(_vd / "val_metrics.csv")
+        train_common.init_val_csv(_vc, ["a", "b"])
+        train_common.append_val_row(
+            _vc, 0, dict(_m, protocol=train_common.PROXY_PROTOCOL_TILES), ["a", "b"])
+        train_common.append_val_row(_vc, 9, dict(_m, present_classes_mIoU=0.99), ["a", "b"])
+        _vrows = list(csv.DictReader(open(_vc, newline="", encoding="utf-8")))
+        check("val csv: proxy_val rows tagged proxy, full-eval rows tagged full",
+              [r["protocol"] for r in _vrows] == ["proxy", "full"])
+        check("val csv: a full-protocol row never seeds the best (resume can't freeze final_model)",
+              abs(train_common.best_val_miou(_vc) - float(_vrows[0]["val_miou"])) < 1e-9)
+        _v1 = str(_vd / "v1.csv")
+        Path(_v1).write_text("epoch,val_acc,val_miou,iou_a,iou_b\n0,0.9,0.88,0.9,0.86\n",
+                             encoding="utf-8")
+        check("val csv: a pre-protocol (v1) csv seeds nothing", train_common.best_val_miou(_v1) == -1.0)
+        train_common.init_val_csv(_v1, ["a", "b"])
+        train_common.init_val_csv(_v1, ["a", "b"])
+        check("val csv: v1 header upgraded in place, once, keeping prior rows",
+              Path(_v1).read_text(encoding="utf-8").splitlines()
+              == ["epoch,val_acc,val_miou,iou_a,iou_b,protocol", "0,0.9,0.88,0.9,0.86"])
+
+        _i3, _u3, _g3 = train_common.score_ious(np.array([0, 0, 1]),
+                                                np.array([0, 1, 1]), 3)
+        _minv = train_common.eval_metrics(_i3, _u3, _g3, 2, 3, ["a", "b", "c"],
+                                          time.time(), 1, "demo",
+                                          force_present=[0, 1, 2])
+        _mno = train_common.eval_metrics(_i3, _u3, _g3, 2, 3, ["a", "b", "c"],
+                                         time.time(), 1, "demo")
+        check("eval_metrics: an inventory class with no sample GT scores 0 in the denominator",
+              abs(_minv["present_classes_mIoU"] - 1 / 3) < 1e-9
+              and abs(_mno["present_classes_mIoU"] - 0.5) < 1e-9
+              and _minv["forced_zero_classes"] == ["c"]
+              and _minv["scored_classes"] == ["a", "b", "c"]
+              and _minv["absent_classes"] == [])
+        check("eval_metrics: worst_class ignores forced zeros (else it pins there forever)",
+              _minv["worst_class"] in ("a", "b") and _mno["forced_zero_classes"] == [])
+
+        _gd = tmp / "proxyguard"
+        _gd.mkdir()
+        _grep = {"mode": "coverage", "floor_points": 4096, "inventory": [0, 1],
+                 "tiles": ["t1.npz", "t0.npz"]}
+        _gcsv = str(_gd / "val_metrics.csv")
+        _PT = train_common.PROXY_PROTOCOL_TILES
+        train_common.init_val_csv(_gcsv, ["a", "b"])
+        _stamped = train_common.proxy_guard(str(_gd), _grep, _PT, ["a", "b"])
+        _sig = json.loads((_gd / "proxy_val.json").read_text(encoding="utf-8"))
+        check("proxy guard: header-only run is stamped at startup, basenames only",
+              _stamped and _sig["protocol"] == _PT and _sig["mode"] == "coverage"
+              and str(_gd) not in json.dumps(_sig) and len(_sig["tiles_sha1"]) == 16)
+        train_common.append_val_row(_gcsv, 0, dict(_m, protocol=_PT), ["a", "b"])
+        _blocked = []
+        for _rp, _why in ((_grep, "orphan"), ({**_grep, "mode": "density"}, "switch")):
+            if _why == "switch":
+                (_gd / "final_model.pth").write_text("", encoding="utf-8")
+            try:
+                train_common.proxy_guard(str(_gd), _rp, _PT, ["a", "b"])
+            except RuntimeError as e:
+                _blocked.append(str(e))
+        check("proxy guard: proxy rows with no final_model.pth block, remedy names the collateral",
+              len(_blocked) == 2 and "final_model.pth" in _blocked[0]
+              and "plot history" in _blocked[0]
+              and "delete BOTH" not in _blocked[0])
+        check("proxy guard: a sampling-mode switch blocks, naming EVAL_ONLY",
+              "density" in _blocked[1] and "EVAL_ONLY" in _blocked[1])
+        check("proxy guard: an unchanged protocol passes (tile order-free)",
+              train_common.proxy_guard(str(_gd), {**_grep, "tiles": ["t0.npz", "t1.npz"]},
+                                       _PT, ["a", "b"]))
+        (_gd / "proxy_val.json").unlink()
+        check("proxy guard: pre-signature proxy rows start fresh instead of hard-blocking",
+              train_common.proxy_guard(str(_gd), _grep, _PT, ["a", "b"]) is False)
+        _ud = tmp / "proxyv1"
+        _ud.mkdir()
+        (_ud / "val_metrics.csv").write_text(
+            "epoch,val_acc,val_miou,iou_a,iou_b\n40,0.9,0.81,0.9,0.72\n", encoding="utf-8")
+        (_ud / "final_model.pth").write_text("", encoding="utf-8")
+        _v1_raw = train_common.proxy_guard(str(_ud), _grep, _PT, ["a", "b"])
+        train_common.init_val_csv(str(_ud / "val_metrics.csv"), ["a", "b"])
+        check("proxy guard: a pre-protocol-column (v1) run dir starts fresh, unstamped",
+              _v1_raw is False
+              and train_common.proxy_guard(str(_ud), _grep, _PT, ["a", "b"]) is False
+              and not (_ud / "proxy_val.json").exists())
+
+        _pd = tmp / "proxytiles"
+        _pd.mkdir()
+        for _i, _nm in enumerate("abcdefgh"):
+            _lab = (np.array([0] * 6000 + [1] * 3000, np.int32) if _i < 7
+                    else np.array([0] * 100 + [2] * 5000, np.int32))
+            np.savez(_pd / f"{_nm}.npz", lab=_lab)
+        _vt = sorted(str(p) for p in _pd.glob("*.npz"))
+        _cb = str(_pd / "cb.npz")
+        _cov, _crep = train_common.pick_proxy_tiles(_vt, 3, 4, "coverage",
+                                                    ["g", "v", "pole"], cache_path=_cb)
+        check("proxy pick: coverage keeps the stride and adds the only rare-class tile",
+              _crep["tiles"] == ["a.npz", "c.npz", "e.npz", "g.npz", "h.npz"]
+              and _crep["covers"] == {"h.npz": ["pole"]}
+              and _crep["per_class_picked"]["pole"] == 5000
+              and _crep["shortfall"] == {} and _crep["inventory"] == [0, 1, 2])
+        _den, _drep = train_common.pick_proxy_tiles(_vt, 3, 4, "density",
+                                                    ["g", "v", "pole"], cache_path=_cb)
+        check("proxy pick: density holds the floor first, then fills by inverse-freq",
+              _drep["tiles"] == ["a.npz", "b.npz", "c.npz", "h.npz"]
+              and _drep["n_tiles"] == 4
+              and _drep["per_class_picked"]["v"] >= _crep["floor_points"])
+        _skip, _srep = train_common.pick_proxy_tiles(
+            _vt, 3, 4, "density", ["g", "v", "pole"], cache_path=_cb,
+            viable=lambda p: not p.endswith(("a.npz", "h.npz")))
+        check("proxy pick: a non-viable tile falls back to next-richest; floor miss reported",
+              "a.npz" not in _srep["tiles"] and "h.npz" not in _srep["tiles"]
+              and _srep["shortfall"] == {"pole": [0, _srep["floor_points"]]})
+        try:
+            train_common.pick_proxy_tiles(_vt, 3, 4, "rare")
+            check("proxy pick: unknown mode rejected", False)
+        except ValueError as e:
+            check("proxy pick: unknown mode rejected naming PROXY_SAMPLING",
+                  "PROXY_SAMPLING" in str(e) and "coverage" in str(e))
+        _cc, _pm, _ptm = train_common.scan_class_balance(_vt, 3, cache_path=_cb,
+                                                         with_counts=True)
+        np.savez(_pd / "h.npz", lab=np.array([0] * 100 + [2] * 7000, np.int32))
+        _cc2, _, _pt2 = train_common.scan_class_balance(_vt, 3, cache_path=_cb,
+                                                        with_counts=True)
+        check("class balance: per-tile counts cached, and a re-prepped tile misses the cache",
+              _ptm.shape == (8, 3) and np.array_equal(_ptm.sum(0), _cc)
+              and _pm.tolist() == (_ptm > 0).tolist()
+              and _pt2[7, 2] == 7000 and _cc2[2] == 7000)
+
+        _sa_rgb = train_common.scene_arrays({"rgb": np.full((3, 3), 128, np.uint8)}, 3)
+        _sa_zero = train_common.scene_arrays({}, 3)
+        _sa_ret = train_common.scene_arrays({"ret_num": np.array([1, 2, 3], np.float32)}, 3)
+        check("scene_arrays: intensity falls back rgb-gray -> zeros; ret_num aliases return_number",
+              np.allclose(_sa_rgb[0], 128 / 255.0) and _sa_rgb[0].shape == (3,)
+              and np.all(_sa_zero[0] == 0.0) and np.all(_sa_zero[1] == 0.0)
+              and np.allclose(_sa_ret[1], [1, 2, 3]) and np.all(_sa_ret[0] == 0.0))
+
         import importlib
 
         import _modal_shim
         from trainer_gui import local_cli
         BB = BACKBONES
+        os.environ["PROXY_SAMPLING"] = "coverage"
 
         SCRIPTS = [Path(b.script).stem for b in BB.values()]
         shim_ok, recipe_ok = True, True
@@ -1003,7 +1156,7 @@ def main():
                     sys.modules.pop(m, None)
             try:
                 mod = importlib.import_module(nm)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 shim_ok = False
                 continue
             app = _modal_shim.App.last
@@ -1024,25 +1177,41 @@ def main():
         for nm in LOCAL:
             try:
                 lm = importlib.import_module(nm)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 local_ok = False
                 continue
             fn = next((getattr(lm, n) for n in dir(lm) if n.startswith("train_")), None)
             if fn is None or hasattr(lm, "outputs_volume") or hasattr(lm, "datasets_volume"):
                 local_ok = False
         check(f"local: all {len(LOCAL)} local_train_*.py import + expose train fn + no volume stubs", local_ok)
+        _psrc = {}
+        for nm in LOCAL:
+            with open(importlib.import_module(nm).__file__, encoding="utf-8") as f:
+                _psrc[nm] = f.read()
+        _wrap = [n for n in LOCAL if "import local_train_concerto as" in _psrc[n]]
+        _own = [n for n in LOCAL if n not in _wrap]
+        _optin = [re.search(r"env_overrides\(\s*globals\(\),\s*\[(.*?)\]", _psrc[n], re.S)
+                  for n in _own]
+        check(f"proxy: all {len(LOCAL)} trainers opt PROXY_SAMPLING in "
+              f"({len(_own)} own env_overrides lists + {len(_wrap)} concerto wrappers)",
+              len(_wrap) == 2 and len(_own) == 5
+              and all(m and "PROXY_SAMPLING" in m.group(1) for m in _optin)
+              and all(importlib.import_module(n).PROXY_SAMPLING == "coverage" for n in _own)
+              and all("PROXY_SAMPLING" not in importlib.import_module(n)._CFG for n in _wrap))
+        check("proxy: every trainer picks its subset and guards the protocol at startup",
+              all("tc.pick_proxy_tiles(" in s and "tc.proxy_guard(" in s
+                  for s in (_psrc[n] for n in _own)))
         infer_gate_ok = True
         for nm in LOCAL:
             lm = importlib.import_module(nm)
             fn = next((getattr(lm, n) for n in dir(lm) if n.startswith("train_")), None)
             try:
-                fn(dataset=None, mode="infer")   # no weights -> should fault in the infer branch
+                fn(dataset=None, mode="infer")
                 infer_gate_ok = False
-            except Exception as e:               # noqa: BLE001
+            except Exception as e:
                 if "dataset is required" in str(e).lower():
                     infer_gate_ok = False
         check(f"local: --mode infer runs dataset-free (all {len(LOCAL)} backbones)", infer_gate_ok)
-        # stub predict — the real trainers fault at missing weights before predicting
         il_dir = tmp / "infer_loop"
         il_dir.mkdir()
         _il_conf = np.array([0.4, 1.0, 0.7], np.float32)
@@ -1071,7 +1240,6 @@ def main():
         check("local: modal wrapper bakes its local_train script into the image",
               any(k == "copy_file" and "local_train_ptv3.py" in p["src"] for k, p in _steps))
 
-        # ---------------- env sync (modal.Image recipes are the source of truth)
         import tools.check_env_sync as sync
         check("sync: all 7 pixi features + recipe SHAs match their modal recipes",
               sync.check_all() == [])
@@ -1098,7 +1266,6 @@ def main():
               and appstate._app_base("darwin", {}) == Path.home() / "Library" / "Application Support"
               and appstate._app_base("win32", {"LOCALAPPDATA": "/la"}) == Path("/la"))
 
-        # ---------------- local_cli + appstate (throwaway APPDATA)
         _old_appdata = os.environ.get("APPDATA")
         os.environ["APPDATA"] = str(tmp / "appdata_local")
         try:
@@ -1165,7 +1332,7 @@ def main():
                   and "--dataset" in args and "myds" in args and "--grid" in args)
             check("local_cli: env carries the TT_* path contract + CUDA device pick",
                   renv["TT_DATASETS_ROOT"] and renv["TT_OUTPUTS_ROOT"]
-                  and renv["CUDA_VISIBLE_DEVICES"] == "0"   # gpus="0" set above
+                  and renv["CUDA_VISIBLE_DEVICES"] == "0"
                   and renv["TT_GPU"] == "A100")
             _, _, renv_o = local_cli.run_script(
                 "modal_train_ptv3.py", {"dataset": "d"}, BB["ptv3"],
@@ -1176,11 +1343,17 @@ def main():
             check("local_cli: env names = backbone keys with '_' -> '-' (pixi rule)",
                   local_cli.env_name(BB["kpconvx_cold"]) == "kpconvx-cold"
                   and local_cli.env_name(BB["ptv3"]) == "ptv3")
+            # pcssl wrappers are a separate launch (own key/env/script) but must carry the Train page's env verbatim: no per-backbone gating
+            _, sargs, senv = local_cli.run_script(
+                "modal_train_sonata.py", {"dataset": "d"}, BB["sonata"],
+                repo_root="/repo", env={"PROXY_SAMPLING": "density"})
+            check("local_cli: sonata/utonia launch their own script with PROXY_SAMPLING forwarded",
+                  "scripts/local/local_train_sonata.py" in sargs
+                  and senv["PROXY_SAMPLING"] == "density"
+                  and local_cli.env_name(BB["utonia"]) == "utonia")
 
-            # ---- workspace re-root (host-side only; container paths unchanged)
             ws = tmp / "ws"
             appstate.set_workspace(str(ws))
-            # clear the datasets_root a prior check pinned, so blank derives from the workspace
             appstate.set_local_config({**appstate.local_config(), "datasets_root": ""})
             check("appstate: workspace_dir + datasets_root default to the set workspace",
                   appstate.workspace_dir() == ws
@@ -1238,7 +1411,7 @@ def main():
             else:
                 os.environ["APPDATA"] = _old_appdata
 
-    except Exception as e:   # a raised check arg (e.g. missing npz key) must not blind the summary
+    except Exception as e:
         import traceback
         traceback.print_exc()
         check(f"smoke aborted early: {type(e).__name__}: {e}", False)

@@ -20,10 +20,10 @@ image = (
     .pip_install(
         "torch==2.3.0",
         "torchvision==0.18.0",
-        "numpy<2.0",       # keeps numpy.distutils importable for the cpp setup.py builds
+        "numpy<2.0",
         "scipy",
         "scikit-learn",
-        "matplotlib",      # hard import of kernels/kernel_points.py (model build)
+        "matplotlib",
         "tqdm",
         "tensorboard",
         "pandas<3",
@@ -78,8 +78,7 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
     """Shell out to the local trainer — local and cloud run identical code."""
     import sys
     sys.path.insert(0, "/root")
-    # resume only on Modal's OWN retries (call id stable across retries, new
-    # per `modal run`). ponytail: /outputs/.attempts markers never cleaned.
+    # resume only on Modal's OWN retries (the call id is stable across retries, new per `modal run`); ponytail: /outputs/.attempts markers are never cleaned
     fcid = modal.current_function_call_id()
     marker = f"/outputs/.attempts/{fcid}" if fcid else ""
     if not fcid or os.path.exists(marker):

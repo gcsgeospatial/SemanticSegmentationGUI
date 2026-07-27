@@ -19,8 +19,7 @@ app = modal.App(APP_NAME)
 image = (
     modal.Image.debian_slim(python_version="3.10")
     .apt_install("git", "wget", "build-essential", "cmake", "ninja-build", "libgl1", "libglib2.0-0")
-    # torch 2.5 + cu124 + spconv-cu124 (upstream combo); no flash-attn —
-    # trainer uses the enable_flash=False fallback. HF cache: /outputs/hf_cache
+    # torch 2.5 + cu124 + spconv-cu124 (upstream combo); no flash-attn, the trainer uses the enable_flash=False fallback (HF cache: /outputs/hf_cache)
     .pip_install(
         "torch==2.5.0",
         "torchvision==0.20.0",
@@ -83,8 +82,7 @@ def train_concerto(dataset: Optional[str] = None, grid: Optional[float] = None,
     """Shell out to the local trainer — local and cloud run identical code."""
     import sys
     sys.path.insert(0, "/root")
-    # resume only on Modal's OWN retries (call id stable across retries, new
-    # per `modal run`). ponytail: /outputs/.attempts markers never cleaned.
+    # resume only on Modal's OWN retries (the call id is stable across retries, new per `modal run`); ponytail: /outputs/.attempts markers are never cleaned
     fcid = modal.current_function_call_id()
     marker = f"/outputs/.attempts/{fcid}" if fcid else ""
     if not fcid or os.path.exists(marker):

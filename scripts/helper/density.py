@@ -49,7 +49,7 @@ def voxel_first_idx(xyz, g):
     array by them too."""
     keys = np.floor(np.asarray(xyz)[:, :3] / float(g)).astype(np.int64)
     _, idx = np.unique(keys, axis=0, return_index=True)
-    return np.sort(idx)            # preserve original point order
+    return np.sort(idx)
 
 
 # D3b — local-density input channel: log d_k ~ -0.5 log rho (pair with D1).
@@ -62,7 +62,7 @@ def local_density_logdk(xyz, k=8):
     if n <= 1:
         return np.zeros(n, np.float32)
     kk = min(k, n - 1)
-    d, _ = cKDTree(xyz).query(xyz, k=kk + 1)   # +1: self is the 0-distance hit
+    d, _ = cKDTree(xyz).query(xyz, k=kk + 1)
     dk = d[:, -1]
     return np.log(np.maximum(dk, 1e-6)).astype(np.float32)
 
@@ -70,7 +70,7 @@ def local_density_logdk(xyz, k=8):
 # D2b — AdaBN: re-estimate BN running stats on the unlabeled target.
 def adabn_recalibrate(model, batches, forward, momentum=None, reset=True):
     """Refresh BN running mean/var over target `batches` via forward(model, b).
-    momentum None = cumulative (PreciseBN); float = exponential. reset zeroes
+    momentum None = cumulative (PreciseBN); float = exponential, and reset zeroes
     stats first (pure AdaBN). Leaves model.eval(); returns the model."""
     import torch
     import torch.nn as nn
@@ -86,8 +86,8 @@ def adabn_recalibrate(model, batches, forward, momentum=None, reset=True):
             if bn.running_var is not None:
                 bn.running_var.fill_(1.0)
             bn.num_batches_tracked.zero_()
-        bn.momentum = momentum          # float -> exponential avg; None -> cumulative
-        bn.train()                      # train mode == update running stats on forward
+        bn.momentum = momentum
+        bn.train()
     with torch.no_grad():
         for batch in batches:
             forward(model, batch)
@@ -101,29 +101,25 @@ def adabn_recalibrate(model, batches, forward, momentum=None, reset=True):
 def _demo():
     rng = np.random.default_rng(0)
 
-    # effective_grid: native anchor returns g0; jitter stays in [g0, g0*max].
     g0 = 0.8
-    assert effective_grid(g0, coarsen_max=1.0, rng=rng) == g0           # no jitter
+    assert effective_grid(g0, coarsen_max=1.0, rng=rng) == g0
     gs = [effective_grid(g0, 2.5, p_native=0.0, rng=rng) for _ in range(2000)]
     assert all(g0 <= g <= g0 * 2.5 + 1e-9 for g in gs)
-    assert max(gs) > g0 * 2.0                                            # range exercised
+    assert max(gs) > g0 * 2.0
 
-    # voxel_first_idx: dense cloud canonicalizes to ~1 pt/cell
     side = 20.0
-    dense = rng.uniform(0, side, size=(40000, 3)); dense[:, 2] = 0.0     # ~100 pts/m^2
+    dense = rng.uniform(0, side, size=(40000, 3)); dense[:, 2] = 0.0
     idx = voxel_first_idx(dense, g0)
     cells = (side / g0) ** 2
     out_o = len(idx) / cells
-    assert 0.6 < out_o <= 1.0, out_o                                     # ~1 pt per cell
+    assert 0.6 < out_o <= 1.0, out_o
     denser = rng.uniform(0, side, size=(120000, 3)); denser[:, 2] = 0.0
-    assert abs(len(voxel_first_idx(denser, g0)) - len(idx)) < 0.1 * len(idx)  # cap: 3x density, ~same out
+    assert abs(len(voxel_first_idx(denser, g0)) - len(idx)) < 0.1 * len(idx)
 
-    # local_density_logdk: sparser cloud -> larger log d_k.
     sparse = rng.uniform(0, side, size=(2000, 3)); sparse[:, 2] = 0.0
     assert local_density_logdk(sparse).mean() > local_density_logdk(dense).mean()
-    assert local_density_logdk(np.zeros((1, 3))).shape == (1,)          # degenerate ok
+    assert local_density_logdk(np.zeros((1, 3))).shape == (1,)
 
-    # env overrides: default when unset; parsed when set.
     os.environ.pop("DG_TEST_X", None)
     assert env_bool("DG_TEST_X", True) is True and env_int("DG_TEST_X", 8) == 8
     os.environ["DG_TEST_X"] = "off"; assert env_bool("DG_TEST_X", True) is False

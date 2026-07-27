@@ -12,15 +12,14 @@ APP_NAME      = "ptv3"
 GPU_TYPE      = os.environ.get("TT_GPU", "A100")
 TIMEOUT_HOURS = int(os.environ.get("TT_TIMEOUT_HOURS", "24"))
 
-DATASETS_ROOT = "/datasets"   # terminal-datasets volume
+DATASETS_ROOT = "/datasets"
 
 app = modal.App(APP_NAME)
 
 image = (
     modal.Image.debian_slim(python_version="3.10")
     .apt_install("git", "wget", "build-essential", "cmake", "ninja-build", "libgl1", "libglib2.0-0")
-    # torch 2.1 + cu118 + spconv-cu118: the cu124 build device-asserts and
-    # fails NVRTC — cu118 is what PTv3 is developed against
+    # torch 2.1 + cu118 + spconv-cu118: the cu124 build device-asserts and fails NVRTC, and cu118 is what PTv3 is developed against
     .pip_install(
         "torch==2.1.0",
         "torchvision==0.16.0",
@@ -83,8 +82,7 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
     """Shell out to the local trainer — local and cloud run identical code."""
     import sys
     sys.path.insert(0, "/root")
-    # resume only on Modal's OWN retries (call id stable across retries, new
-    # per `modal run`). ponytail: /outputs/.attempts markers never cleaned.
+    # resume only on Modal's OWN retries (the call id is stable across retries, new per `modal run`); ponytail: /outputs/.attempts markers are never cleaned
     fcid = modal.current_function_call_id()
     marker = f"/outputs/.attempts/{fcid}" if fcid else ""
     if not fcid or os.path.exists(marker):

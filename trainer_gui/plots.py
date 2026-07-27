@@ -41,12 +41,14 @@ def read_csv_columns(path: Path) -> dict[str, list]:
     path = Path(path)
     if not path.exists():
         return {}
-    with open(path, newline="") as fh:
+    # utf-8 matches the trainers' writers; errors="replace" tolerates legacy cp1252-written runs (only class-name header cells are ever non-ASCII)
+    with open(path, newline="", encoding="utf-8", errors="replace") as fh:
         reader = csv.DictReader(fh)
         cols: dict[str, list] = {n: [] for n in (reader.fieldnames or [])}
         for row in reader:
             for n in cols:
-                cols[n].append(_f(row[n]))
+                # protocol stays a string: it selects rows, it isn't plotted
+                cols[n].append(row[n] if n == "protocol" else _f(row[n]))
     return cols
 
 
@@ -72,24 +74,41 @@ def read_test_metrics(run_dir: Path) -> dict:
     return {}
 
 
+def _rows(cols: dict, metric: str, proxy: bool) -> tuple[list, list]:
+    """(epochs, values) for the rows of one protocol. A blank/absent protocol
+    (legacy runs, metrics.csv) counts as full."""
+    prot = cols.get("protocol") or [None] * len(cols.get("epoch") or [])
+    xy = [(e, v) for e, v, p in zip(cols["epoch"], cols[metric], prot)
+          if e is not None and v is not None and (p == "proxy") == proxy]
+    return [e for e, _ in xy], [v for _, v in xy]
+
+
 def series(run_dir: Path, metric: str) -> tuple[list, list]:
     """(epochs, values) for `metric`, blanks dropped. Sourced from val_metrics.csv
     (the periodic val pass) when the column lives there, else metrics.csv (the
-    per-epoch training curves)."""
+    per-epoch training curves). Proxy rows are the checkpoint-ranking curve; the
+    final full raw-scored row is on another scale and never joins it."""
     for fname in ("val_metrics.csv", "metrics.csv"):
         cols = read_csv_columns(Path(run_dir) / fname)
         if metric in cols and cols.get("epoch"):
-            xs, ys = [], []
-            for e, v in zip(cols["epoch"], cols[metric]):
-                if e is not None and v is not None:
-                    xs.append(e)
-                    ys.append(v)
+            xs, ys = _rows(cols, metric, proxy=True)
+            if not xs:      # legacy / EVAL_ONLY runs: full-protocol rows only
+                xs, ys = _rows(cols, metric, proxy=False)
             if xs:
                 return xs, ys
     return [], []
 
 
-val_series = series   # back-compat alias
+val_series = series
+
+
+def full_series(run_dir: Path, metric: str) -> tuple[list, list]:
+    """The full raw-scored val row(s) — only when a proxy curve exists, else
+    series() already returned them."""
+    cols = read_csv_columns(Path(run_dir) / "val_metrics.csv")
+    if metric not in cols or not cols.get("epoch") or not _rows(cols, metric, True)[0]:
+        return [], []
+    return _rows(cols, metric, proxy=False)
 
 
 def _has_data(cols: dict, name: str) -> bool:
@@ -128,7 +147,7 @@ def discover_runs(root: Path) -> list[Path]:
             continue
         if is_run_dir(child):
             found.add(child)
-        else:                                  # one more level (backbone subdirs)
+        else:
             for grand in child.iterdir():
                 if is_run_dir(grand):
                     found.add(grand)
@@ -143,8 +162,6 @@ def run_label(run_dir: Path) -> str:
     return f"{name}" + (f"  [{bb}]" if bb else "")
 
 
-# --------------------------------------------------------------------------- multi
-
 def multi_run_figure(run_dirs, metric: str = "val_miou", *, show_runs: bool = True,
                      show_avg: bool = True, fig: Figure | None = None) -> Figure:
     """Overlay `metric` vs epoch for each run; optional mean ± std band across runs.
@@ -156,7 +173,7 @@ def multi_run_figure(run_dirs, metric: str = "val_miou", *, show_runs: bool = Tr
     fig.clear()
     ax = fig.add_subplot(111)
 
-    series = []   # (label, {epoch: value})
+    series = []
     for d in run_dirs:
         xs, ys = val_series(d, metric)
         if xs:
@@ -193,8 +210,6 @@ def multi_run_figure(run_dirs, metric: str = "val_miou", *, show_runs: bool = Tr
     return fig
 
 
-# --------------------------------------------------------------------------- single
-
 def single_run_figure(run_dir: Path, fig: Figure | None = None) -> Figure:
     """Compact 2x2 dashboard for one run, focused on the val curves the periodic
     val pass records (the live train metrics are already on the Train page)."""
@@ -207,12 +222,15 @@ def single_run_figure(run_dir: Path, fig: Figure | None = None) -> Figure:
     title = f"{cfg.get('backbone', 'model')}  |  {cfg.get('dataset', '')}  |  {run_dir.name}"
     fig.suptitle(title, fontsize=13, fontweight="bold")
 
-    # 1) val mIoU + val accuracy, with final val/test references
     ax = axes[0, 0]
     for metric, color in (("val_miou", "C0"), ("val_acc", "C1")):
         xs, ys = val_series(run_dir, metric)
         if xs:
             ax.plot(xs, ys, marker="o", ms=3, color=color, label=metric_label(metric))
+        fx, fy = full_series(run_dir, metric)
+        if fx:      # raw-scored: a different scale, so a marker, never the line
+            ax.plot(fx, fy, marker="*", ms=11, ls="none", color=color,
+                    label=f"{metric_label(metric)} (full eval)")
     for split, color in (("val", "C2"), ("test", "C3")):
         miou = (test.get(split) or {}).get("overall_mIoU")
         if miou is not None:
@@ -221,14 +239,12 @@ def single_run_figure(run_dir: Path, fig: Figure | None = None) -> Figure:
     ax.grid(alpha=0.3)
     ax.legend(fontsize=8)
 
-    # 2) per-class val IoU over epochs
     ax = axes[0, 1]
     cols = read_csv_columns(run_dir / "val_metrics.csv")
-    epochs = cols.get("epoch") or []
     plotted = False
+    proxy = "val_miou" in cols and bool(_rows(cols, "val_miou", True)[0])
     for name in [c for c in cols if c.startswith("iou_")]:
-        xs = [e for e, v in zip(epochs, cols[name]) if e is not None and v is not None]
-        ys = [v for e, v in zip(epochs, cols[name]) if e is not None and v is not None]
+        xs, ys = _rows(cols, name, proxy=proxy)
         if xs:
             ax.plot(xs, ys, marker=".", ms=4, label=name[4:])
             plotted = True
@@ -240,7 +256,6 @@ def single_run_figure(run_dir: Path, fig: Figure | None = None) -> Figure:
     if plotted:
         ax.legend(fontsize=8, ncol=2)
 
-    # 3) training-health: train loss + train mIoU
     ax = axes[1, 0]
     m = read_csv_columns(run_dir / "metrics.csv")
     me = m.get("epoch") or []
@@ -255,7 +270,6 @@ def single_run_figure(run_dir: Path, fig: Figure | None = None) -> Figure:
         ax2.set_ylabel("train mIoU", color="C4")
     ax.legend(fontsize=8, loc="center right")
 
-    # 4) final per-class IoU bars (val + test)
     ax = axes[1, 1]
     ref = test.get("test") or test.get("val") or {}
     classes = list((ref.get("per_class_iou") or {}).keys())

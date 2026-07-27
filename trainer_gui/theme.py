@@ -181,7 +181,7 @@ def _check_contrast():  # ponytail: runnable WCAG AA check — `python trainer_g
         for fg, bg, mn in pairs:
             r = _contrast(c[fg], c[bg])
             assert r >= mn, f"{name}: {fg} on {bg} = {r:.2f} < {mn} (WCAG AA)"
-    print("ok — both themes meet WCAG AA")
+    print("ok: both themes meet WCAG AA")
 
 
 if __name__ == "__main__":

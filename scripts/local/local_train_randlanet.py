@@ -1,49 +1,237 @@
 """RandLA-Net local trainer, cold start, on a canonical trainer_gui dataset.
 FEAT_CHANNELS env overrides the input spec; run.json "features" records it and
 inference rebuilds from it. Flags: --dataset --sub-grid --num-points --epochs
---batch --steps-per-epoch | --mode infer --weights ... --infer-input <job_id>.
+--batch --steps-per-epoch | --mode infer --weights --infer-input <job_id>.
 """
 
 import os
+import sys
+from types import SimpleNamespace
 from typing import Optional
 
-N_EPOCHS      = 100              # 250-300 for a full run
+import numpy as np
+try:
+    import torch
+    from torch.utils.data import Dataset
+except ImportError:
+    torch = None
+    Dataset = object
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "helper"))
+import density as dg
+import train_common as tc
+
+N_EPOCHS      = 100
 BATCH_SIZE    = 6
 VAL_BATCH     = 12
 
-NUM_POINTS    = 45056            # 4096*11, RandLA SemKITTI default
-SUB_GRID_SIZE = 0.30             # 30 cm — sparse aerial LiDAR (~2 pts/m²) vs KITTI
-# FEAT_CHANNELS env: ordered csv; "" = legacy [x,y,z,intensity,return_number]
+NUM_POINTS    = 45056
+SUB_GRID_SIZE = 0.25
 FEAT_CHANNELS = ""
-AUG_COLOR     = 0.8      # per-channel keep prob, non-coordinate channels only
+AUG_COLOR     = 0.8
 
-# density domain-generalization (scripts/helper/density.py; DENSITY_DG.md)
-DG_DENSITY_AUG = False   # D1: per-sphere coarser SUB_GRID during training
-DG_COARSEN_MAX = 2.0     # = 1/(SUB_GRID_SIZE*sqrt(rho_min)); density sweep-down factor
-DG_P_NATIVE    = 0.5     # P(sphere kept at native SUB_GRID_SIZE)
-DG_INFER_ADABN = False   # D2b: recompute BN stats on target tiles before predicting (RandLA is pure-BN)
-DG_INFER_TTA   = 0       # D5: # extra density(scale) views to average at inference (0=off)
-EVAL_VOTES     = 2       # overlap-vote passes at eval/inference; 1 = single pass
-# D3b: log k-th-NN-distance input channel; bumps IN_DIM (old fc0 won't load)
+DG_DENSITY_AUG = False
+DG_COARSEN_MAX = 2.0
+DG_P_NATIVE    = 0.5
+DG_INFER_ADABN = False
+DG_INFER_TTA   = 0
+EVAL_VOTES     = 2
 DG_LOGDK_FEAT  = False
 DG_LOGDK_K     = 8
 
 CLASS_WEIGHTING  = True
-WEIGHT_BETA      = 0.5           # 0.5 = inverse-sqrt frequency
-WEIGHT_CAP       = 5.0           # clamp weights to [1/CAP, CAP] after mean-norm
-LOVASZ_WEIGHT    = 1.0           # + LOVASZ_WEIGHT * lovasz_softmax; 0 disables
-USE_FOCAL        = False         # focal pointwise term instead of weighted CE
+WEIGHT_BETA      = 0.5
+WEIGHT_CAP       = 5.0
+LOVASZ_WEIGHT    = 1.0
+USE_FOCAL        = False
 FOCAL_GAMMA      = 2.0
 RARE_OVERSAMPLE  = True
-RARE_FREQ_THRESH = 0.02          # classes under 2% of train points count as rare
-RARE_CENTER_PROB = 0.25          # P(center the next train sphere on a rare-class point)
-VAL_EVERY        = 10            # held-out val pass every N epochs (no weight updates)
+RARE_FREQ_THRESH = 0.02
+RARE_CENTER_PROB = 0.25
+VAL_EVERY        = 10
+PROXY_SAMPLING   = "coverage"
+PROXY_TILES      = 48
+PROXY_ANCHORS    = 3
 
-RESUME           = False  # force-continue latest matching unfinished run
-# AUTO_RESUME=1: set by the cloud shell on Modal retries; exportable locally
+RESUME           = False
 AUTO_RESUME      = os.environ.get("AUTO_RESUME", "0") == "1"
 
 DATASETS_ROOT = os.environ.get("TT_DATASETS_ROOT", "/datasets")
+
+
+def _randlanet_root() -> str:
+    """RandLA-Net-pytorch source root: RANDLANET_SRC or /opt/randlanet (Modal image)."""
+    env = os.environ.get("RANDLANET_SRC")
+    for p in (env, "/opt/randlanet"):
+        if p and os.path.isdir(p):
+            return p
+    if env:
+        raise RuntimeError(f"RANDLANET_SRC={env} is not a directory — fix the "
+                           "env var or bake the source at /opt/randlanet")
+    raise RuntimeError(
+        "RandLA-Net source not found: set RANDLANET_SRC to your RandLA-Net-pytorch "
+        "clone (the pixi env activation sets it) or bake it at /opt/randlanet")
+
+
+_DP = None
+def _dp():
+    """utils.data_process.DataProcessing from the source tree, imported once."""
+    global _DP
+    if _DP is None:
+        root = _randlanet_root()
+        if root not in sys.path:
+            sys.path.insert(0, root)
+        from utils.data_process import DataProcessing
+        _DP = DataProcessing
+    return _DP
+
+
+# data plumbing stays at module level: Windows-spawn DataLoader workers pickle the dataset/collate by qualified name, so <locals> classes/closures can't cross
+class Collater:
+    """Batch assembly (KNN pyramid + tensor packing); picklable across spawn."""
+    def __init__(self, num_layers, k_n, sub_sampling_ratio, feat_spec, nonxyz):
+        self.num_layers = num_layers
+        self.k_n = k_n
+        self.sub_sampling_ratio = sub_sampling_ratio
+        self.feat_spec = feat_spec
+        self.nonxyz = nonxyz
+
+    def tf_map(self, batch_pc, batch_label, batch_pc_idx, batch_cloud_idx):
+        DP = _dp()
+        input_points, input_neighbors, input_pools, input_up = [], [], [], []
+        for i in range(self.num_layers):
+            neigh = DP.knn_search(batch_pc, batch_pc, self.k_n)
+            sub_n = batch_pc.shape[1] // self.sub_sampling_ratio[i]
+            sub_points = batch_pc[:, :sub_n, :]
+            pool_i = neigh[:, :sub_n, :]
+            up_i  = DP.knn_search(sub_points, batch_pc, 1)
+            input_points.append(batch_pc); input_neighbors.append(neigh)
+            input_pools.append(pool_i);    input_up.append(up_i)
+            batch_pc = sub_points
+        return (input_points + input_neighbors + input_pools + input_up
+                + [batch_label, batch_pc_idx, batch_cloud_idx])
+
+    def __call__(self, batch):
+        pcs, feats, lbs, idxs, cinds = zip(*batch)
+        pcs  = np.stack(pcs);  feats = np.stack(feats); lbs = np.stack(lbs)
+        idxs = np.stack(idxs); cinds = np.stack(cinds)
+        flat = self.tf_map(pcs, lbs, idxs, cinds)
+        n = self.num_layers
+        d = {"xyz": [], "neigh_idx": [], "sub_idx": [], "interp_idx": []}
+        for t in flat[:n]:           d["xyz"].append(torch.from_numpy(t).float())
+        for t in flat[n:2*n]:        d["neigh_idx"].append(torch.from_numpy(t).long())
+        for t in flat[2*n:3*n]:      d["sub_idx"].append(torch.from_numpy(t).long())
+        for t in flat[3*n:4*n]:      d["interp_idx"].append(torch.from_numpy(t).long())
+        ax = {"x": 0, "y": 1, "z": 2}
+        cols = [pcs[:, :, ax[n2]] if n2 in ax else feats[:, :, self.nonxyz.index(n2)]
+                for n2 in self.feat_spec]
+        tail = feats[:, :, len(self.nonxyz):]
+        full_feat = np.concatenate([np.stack(cols, axis=2), tail],
+                                   axis=2)
+        d["features"] = torch.from_numpy(full_feat).float().transpose(1, 2)
+        d["labels"]   = torch.from_numpy(flat[4*n]).long()
+        d["input_inds"] = torch.from_numpy(flat[4*n+1]).long()
+        d["cloud_inds"] = torch.from_numpy(flat[4*n+2]).long()
+        return d
+
+
+class Scenes(Dataset):
+    """Scene cache + sphere sampler; o = sampling knobs (SimpleNamespace).
+    Picklable across spawn: __getstate__ strips the cache, workers reload lazily."""
+    def __init__(self, split, files, o, label=None):
+        self.split = split
+        self.o = o
+        self.label = label or split
+        self.files = files
+        self.scenes = [self._load(f) for f in self.files]
+        self.rare_idx, self.rare_scenes = None, None
+        self._rng = None
+        print(f"  [{self.label}] {len(self.scenes)} scenes", flush=True)
+
+    def __getstate__(self):
+        return {**self.__dict__, "scenes": None, "_rng": None}
+
+    def _load(self, f):
+        z = np.load(f)
+        tc.require_finite_xyz(z["xyz"], os.path.basename(f))
+        extras = tc.feat_extras(z, self.o.feat_spec, os.path.basename(f))
+        return (z["xyz"], z["intensity"], z["ret_num"], extras, z["lab"])
+
+    def _scene(self, i):
+        if self.scenes is None:
+            self.scenes = [None] * len(self.files)
+        if self.scenes[i] is None:
+            self.scenes[i] = self._load(self.files[i])
+        return self.scenes[i]
+
+    def set_rare_classes(self, rare_classes):
+        self.rare_idx = [np.where(np.isin(lab, rare_classes))[0]
+                         for *_, lab in self.scenes]
+        self.rare_scenes = [i for i, r in enumerate(self.rare_idx) if len(r)]
+
+    def sample_sphere(self, cloud_idx, center_idx, augment=False, rng=np.random):
+        o = self.o
+        xyz, intensity, ret_num, extras, lab = self._scene(cloud_idx)
+        center = xyz[center_idx:center_idx + 1]
+        d2 = np.sum((xyz - center) ** 2, axis=1)
+        sel = np.argpartition(d2, min(o.num_points, len(xyz) - 1))[:o.num_points]
+        if len(sel) < o.num_points:
+            sel = np.concatenate([sel, rng.choice(len(xyz), o.num_points - len(sel))])
+        rng.shuffle(sel)
+        if augment and o.density_aug:
+            g_eff = dg.effective_grid(o.sub_grid, o.coarsen_max, o.p_native, rng=rng)
+            if g_eff > o.sub_grid:
+                keep = dg.voxel_first_idx(xyz[sel], g_eff)
+                sel = sel[keep]
+                if len(sel) < o.num_points:
+                    sel = np.concatenate([sel, rng.choice(sel, o.num_points - len(sel))])
+                rng.shuffle(sel)
+        pc = (xyz[sel] - center).astype(np.float32)
+        if augment:
+            theta = rng.rand() * 2 * np.pi
+            cs, sn = np.cos(theta), np.sin(theta)
+            R = np.array([[cs, -sn, 0], [sn, cs, 0], [0, 0, 1]], np.float32)
+            pc = pc @ R.T
+            if rng.rand() < 0.5:
+                pc[:, 0] *= -1.0
+            pc = pc * np.float32(rng.uniform(0.9, 1.1))
+        src = {"intensity": intensity, "return_number": ret_num, **extras}
+        cols = [src[n][sel] for n in o.nonxyz]
+        if augment:
+            cols = [np.zeros_like(c) if rng.rand() > o.aug_color else c
+                    for c in cols]
+        if o.logdk_feat:
+            cols.append(dg.local_density_logdk(pc, o.logdk_k))
+        feat2 = (np.stack(cols, axis=1) if cols
+                 else np.zeros((len(sel), 0))).astype(np.float32)
+        lb = lab[sel].astype(np.int64)
+        return pc.astype(np.float32), feat2, lb, sel.astype(np.int32), \
+               np.array([cloud_idx], dtype=np.int32)
+
+    def __len__(self):
+        return self.o.steps * self.o.batch_size if self.split == "train" \
+            else len(self.files)
+
+    def __getitem__(self, idx):
+        r = self._rng if self._rng is not None else np.random
+        if self.split == "train":
+            if (self.rare_scenes and self.o.rare_oversample
+                    and r.rand() < self.o.rare_center_prob):
+                ci = self.rare_scenes[r.randint(len(self.rare_scenes))]
+                pick = int(self.rare_idx[ci][r.randint(len(self.rare_idx[ci]))])
+            else:
+                ci = r.randint(len(self.files))
+                pick = r.randint(len(self._scene(ci)[0]))
+            return self.sample_sphere(ci, pick, augment=True, rng=r)
+        return self.sample_sphere(idx, r.randint(len(self._scene(idx)[0])),
+                                  augment=False, rng=r)
+
+
+def _worker_init(worker_id):
+    # PyTorch reseeds python/torch per worker but NOT numpy; without this every worker replays identical sphere picks and augmentations
+    info = torch.utils.data.get_worker_info()
+    info.dataset._rng = np.random.RandomState(info.seed % (2 ** 32))
+
 
 def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = None,
                     num_points: Optional[int] = None, epochs: Optional[int] = None,
@@ -54,30 +242,25 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         raise ValueError("--dataset is required: pass a canonical trainer_gui "
                          "dataset name under /datasets. The only "
                          "dataset-free path is --mode infer.")
-    import os, sys, time, json, csv, glob
+    import time, json, csv, glob
     from datetime import datetime, timezone
-    import numpy as np
-    import torch
-    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "helper"))
-    import density as dg
-    import train_common as tc
-    # GUI env-overridable knobs (train_common._ENV_KNOBS); closures capture these
     (DG_DENSITY_AUG, DG_COARSEN_MAX, DG_P_NATIVE, DG_LOGDK_FEAT, DG_LOGDK_K,
      DG_INFER_ADABN, DG_INFER_TTA, EVAL_VOTES, USE_FOCAL, FOCAL_GAMMA,
      CLASS_WEIGHTING, WEIGHT_BETA, RARE_OVERSAMPLE,
-     RARE_CENTER_PROB, VAL_EVERY, FEAT_CHANNELS) = tc.env_overrides(globals(), [
+     RARE_CENTER_PROB, VAL_EVERY, FEAT_CHANNELS,
+     PROXY_SAMPLING) = tc.env_overrides(globals(), [
         "DG_DENSITY_AUG", "DG_COARSEN_MAX", "DG_P_NATIVE", "DG_LOGDK_FEAT",
         "DG_LOGDK_K", "DG_INFER_ADABN", "DG_INFER_TTA", "EVAL_VOTES",
         "USE_FOCAL", "FOCAL_GAMMA", "CLASS_WEIGHTING", "WEIGHT_BETA",
-        "RARE_OVERSAMPLE", "RARE_CENTER_PROB", "VAL_EVERY", "FEAT_CHANNELS"])
+        "RARE_OVERSAMPLE", "RARE_CENTER_PROB", "VAL_EVERY", "FEAT_CHANNELS",
+        "PROXY_SAMPLING"])
     import torch.nn as nn
     import torch.optim as optim
     from torch.utils.data import DataLoader, Dataset
 
-    # --- resolve config: CLI args override the module defaults ---------------
     SUB_GRID_SIZE = sub_grid if sub_grid is not None else globals()["SUB_GRID_SIZE"]
     FEAT_LEGACY = ["x", "y", "z", "intensity", "return_number"]
-    FEAT_SPEC = (list(FEAT_LEGACY) if mode == "infer"   # env ignored at infer
+    FEAT_SPEC = (list(FEAT_LEGACY) if mode == "infer"
                  else tc.parse_feat_spec(FEAT_CHANNELS, FEAT_LEGACY))
     bad = [n for n in FEAT_SPEC
            if n not in FEAT_LEGACY and not n.startswith("feat_")]
@@ -93,26 +276,22 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     if dataset:
         ds_root = tc.dataset_dir(dataset)
         ds_meta, NUM_CLASSES, CLASS_NAMES = tc.load_dataset_meta(dataset)
-        # custom feature spec = its own cache family ("" tag keeps old caches valid)
         PREP_DIR = (f"{ds_root}/prep/randlanet"
                     f"_grid{int(round(SUB_GRID_SIZE * 100))}_p95"
                     f"{tc.feat_spec_tag(FEAT_SPEC, FEAT_LEGACY)}")
     else:
-        # infer mode: real classes come from the checkpoint; placeholders for Cfg
         ds_meta, NUM_CLASSES, CLASS_NAMES, PREP_DIR = {}, 0, [], None
 
-    # sklearn >=0.24 compat: confusion_matrix's third positional changed meaning
     import sklearn.metrics as _skm
     _orig_cm = _skm.confusion_matrix
     def _cm_compat(y_true, y_pred, labels=None, **kwargs):
         return _orig_cm(y_true, y_pred, labels=labels, **kwargs)
     _skm.confusion_matrix = _cm_compat
 
-    sys.path.insert(0, os.environ.get("RANDLANET_SRC", "/opt/randlanet"))
+    sys.path.insert(0, _randlanet_root())
     from network.RandLANet import Network
     import network.pytorch_utils as pt_utils
     from utils.metric import compute_acc, IoUCalculator
-    from utils.data_process import DataProcessing as DP
 
     def build_net(num_classes_, in_dim=IN_DIM):
         """Network with fc0 rebuilt for in_dim channels. Upstream hardcodes
@@ -123,7 +302,6 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
             net_.fc0 = pt_utils.Conv1d(in_dim, 8, kernel_size=1, bn=True)
         return net_.to(device)
 
-    # labels pre-remapped 0..K-1 with ignored -> -1 (upstream hardcodes 0-ignored)
     _class_w = None
     _ce = nn.CrossEntropyLoss(ignore_index=-1)
     def compute_loss(end_points, num_classes):
@@ -144,7 +322,6 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         end_points["loss"] = loss
         return loss, end_points
 
-    # --- config (mirrors ConfigSemanticKITTI but tuned for sparse aerial) ----
     class Cfg:
         k_n = 16
         num_layers = 4
@@ -166,13 +343,16 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         saving = True
         saving_path = None
     cfg = Cfg()
+    collate_fn = Collater(cfg.num_layers, cfg.k_n, cfg.sub_sampling_ratio,
+                          FEAT_SPEC, NONXYZ)
 
-    # --- canonical scene loader ---------------------------------------------
     def load_canonical(npz_path):
         """Scene npz -> (xyz, intensity, return_number, label, feat_* extras)."""
         z = np.load(npz_path)
+        raw = z["xyz"]
+        tc.require_finite_xyz(raw, os.path.basename(npz_path))
         # origin shift before float32 cast keeps UTM coords sub-meter precise
-        xyz = (z["xyz"] - np.floor(z["xyz"].min(0))).astype(np.float32)
+        xyz = (raw - np.floor(raw.min(0))).astype(np.float32)
         intensity, ret_num = tc.scene_arrays(z, len(xyz))
         lab = z["label"].astype(np.int32) if "label" in z \
             else np.full(len(xyz), -1, np.int32)
@@ -185,7 +365,6 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                 {n: v[uniq] for n, v in extras.items()})
 
     def _cache_signature():
-        # everything that changes cached scene content; mismatch = rebuild
         sig = {
             "format_version": 2,
             "coord_frame": "scene-local",
@@ -193,18 +372,15 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
             "dataset": dataset,
             "sub_grid_size": SUB_GRID_SIZE,
             "num_classes": NUM_CLASSES,
-            "class_names": CLASS_NAMES,   # reorder changes label space at same count
-            # reproduces the legacy string byte-for-byte so old caches stay valid
+            "class_names": CLASS_NAMES,
             "feature_recipe": ",".join(FEAT_SPEC).replace("x,y,z", "xyz"),
         }
-        # fold split seed/mode in so a dataset re-split invalidates the cache
         sp = ds_meta.get("split", {}) if isinstance(ds_meta, dict) else {}
         sig["split_seed"] = sp.get("seed")
         sig["split_mode"] = sp.get("mode")
         return sig
 
     def ensure_prep():
-        # .done marker per scene; an interrupted scene is redone, not left partial
         print(f"  ensuring preprocessed cache -> {PREP_DIR}", flush=True)
         for split in ("train", "val", "test"):
             os.makedirs(f"{PREP_DIR}/{split}", exist_ok=True)
@@ -227,8 +403,8 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                     xyz, intensity, ret_num, lab, extras = grid_subsample(
                         xyz, intensity, ret_num, lab, extras, SUB_GRID_SIZE)
                 except Exception as e:
-                    raise RuntimeError(f"failed to load/subsample {pc_path}: {e} — "
-                                       "fix or remove the scene, then re-run") from e
+                    raise RuntimeError(f"failed to load/subsample {pc_path}: {e}. "
+                                       "Fix or remove the scene, then re-run") from e
                 tile = dict(xyz=xyz.astype(np.float32),
                             intensity=intensity.astype(np.float32),
                             ret_num=ret_num.astype(np.float32),
@@ -236,7 +412,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                 for n, v in extras.items():
                     tile[n] = v.astype(np.float32)
                 np.savez_compressed(out, **tile)
-                open(out + ".done", "w").close()      # mark complete after a clean write
+                open(out + ".done", "w").close()
                 any_new = True
                 print(f"    [{i+1}/{len(items)}] {name}: {n_in:,} -> "
                       f"{len(xyz):,} pts in {time.time()-t0:.1f}s", flush=True)
@@ -246,128 +422,8 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
             print("  all scenes already cached.", flush=True)
         return train_list, val_list, test_list
 
-    # --- batch assembly (standalone so inference can reuse it) ---------------
-    def tf_map(batch_pc, batch_label, batch_pc_idx, batch_cloud_idx):
-        input_points, input_neighbors, input_pools, input_up = [], [], [], []
-        for i in range(cfg.num_layers):
-            neigh = DP.knn_search(batch_pc, batch_pc, cfg.k_n)
-            sub_n = batch_pc.shape[1] // cfg.sub_sampling_ratio[i]
-            sub_points = batch_pc[:, :sub_n, :]
-            pool_i = neigh[:, :sub_n, :]
-            up_i  = DP.knn_search(sub_points, batch_pc, 1)
-            input_points.append(batch_pc); input_neighbors.append(neigh)
-            input_pools.append(pool_i);    input_up.append(up_i)
-            batch_pc = sub_points
-        flat = (input_points + input_neighbors + input_pools + input_up
-                + [batch_label, batch_pc_idx, batch_cloud_idx])
-        return flat
-
-    def collate_fn(batch):
-        # feat2 = non-coordinate spec channels then log d_k; assembled in FEAT_SPEC order
-        pcs, feats, lbs, idxs, cinds = zip(*batch)
-        pcs  = np.stack(pcs);  feats = np.stack(feats); lbs = np.stack(lbs)
-        idxs = np.stack(idxs); cinds = np.stack(cinds)
-        flat = tf_map(pcs, lbs, idxs, cinds)
-        n = cfg.num_layers
-        d = {"xyz": [], "neigh_idx": [], "sub_idx": [], "interp_idx": []}
-        for t in flat[:n]:           d["xyz"].append(torch.from_numpy(t).float())
-        for t in flat[n:2*n]:        d["neigh_idx"].append(torch.from_numpy(t).long())
-        for t in flat[2*n:3*n]:      d["sub_idx"].append(torch.from_numpy(t).long())
-        for t in flat[3*n:4*n]:      d["interp_idx"].append(torch.from_numpy(t).long())
-        ax = {"x": 0, "y": 1, "z": 2}
-        cols = [pcs[:, :, ax[n2]] if n2 in ax else feats[:, :, NONXYZ.index(n2)]
-                for n2 in FEAT_SPEC]
-        tail = feats[:, :, len(NONXYZ):]           # log d_k
-        full_feat = np.concatenate([np.stack(cols, axis=2), tail],
-                                   axis=2)          # (B, N, IN_DIM)
-        d["features"] = torch.from_numpy(full_feat).float().transpose(1, 2)
-        d["labels"]   = torch.from_numpy(flat[4*n]).long()
-        d["input_inds"] = torch.from_numpy(flat[4*n+1]).long()
-        d["cloud_inds"] = torch.from_numpy(flat[4*n+2]).long()
-        return d
-
-    # --- Dataset ------------------------------------------------------------
-    class Scenes(Dataset):
-        def __init__(self, split, files=None, label=None):
-            self.split = split
-            self.label = label or split
-            if files is None:
-                files = sorted(glob.glob(f"{PREP_DIR}/{split}/*.npz"))
-            self.files = files
-            self.scenes = [self._load(f) for f in self.files]
-            # filled in after the class-frequency scan; until then uniform sampling
-            self.rare_idx, self.rare_scenes = None, None
-            print(f"  [{self.label}] {len(self.scenes)} scenes", flush=True)
-
-        @staticmethod
-        def _load(f):
-            z = np.load(f)
-            extras = tc.feat_extras(z, FEAT_SPEC, os.path.basename(f))
-            return (z["xyz"], z["intensity"], z["ret_num"], extras, z["lab"])
-
-        def set_rare_classes(self, rare_classes):
-            self.rare_idx = [np.where(np.isin(lab, rare_classes))[0]
-                             for *_, lab in self.scenes]
-            self.rare_scenes = [i for i, r in enumerate(self.rare_idx) if len(r)]
-
-        def sample_sphere(self, cloud_idx, center_idx, augment=False, rng=np.random):
-            xyz, intensity, ret_num, extras, lab = self.scenes[cloud_idx]
-            center = xyz[center_idx:center_idx + 1]
-            d2 = np.sum((xyz - center) ** 2, axis=1)
-            sel = np.argpartition(d2, min(cfg.num_points, len(xyz) - 1))[:cfg.num_points]
-            if len(sel) < cfg.num_points:
-                sel = np.concatenate([sel, rng.choice(len(xyz), cfg.num_points - len(sel))])
-            rng.shuffle(sel)
-            # D1: re-subsample the sphere to a coarser grid; fixed-N kept by padding
-            if augment and DG_DENSITY_AUG:
-                g_eff = dg.effective_grid(SUB_GRID_SIZE, DG_COARSEN_MAX, DG_P_NATIVE, rng=rng)
-                if g_eff > SUB_GRID_SIZE:
-                    keep = dg.voxel_first_idx(xyz[sel], g_eff)
-                    sel = sel[keep]
-                    if len(sel) < cfg.num_points:
-                        sel = np.concatenate([sel, rng.choice(sel, cfg.num_points - len(sel))])
-                    rng.shuffle(sel)
-            pc = (xyz[sel] - center).astype(np.float32)
-            if augment:
-                theta = rng.rand() * 2 * np.pi
-                cs, sn = np.cos(theta), np.sin(theta)
-                R = np.array([[cs, -sn, 0], [sn, cs, 0], [0, 0, 1]], np.float32)
-                pc = pc @ R.T
-                if rng.rand() < 0.5:
-                    pc[:, 0] *= -1.0
-                pc = pc * np.float32(rng.uniform(0.9, 1.1))
-            src = {"intensity": intensity, "return_number": ret_num, **extras}
-            cols = [src[n][sel] for n in NONXYZ]
-            if augment:      # per-channel feature dropout (see AUG_COLOR)
-                cols = [np.zeros_like(c) if rng.rand() > AUG_COLOR else c
-                        for c in cols]
-            if DG_LOGDK_FEAT:   # D3b conditioning channel — never dropped
-                cols.append(dg.local_density_logdk(pc, DG_LOGDK_K))
-            feat2 = (np.stack(cols, axis=1) if cols
-                     else np.zeros((len(sel), 0))).astype(np.float32)
-            lb = lab[sel].astype(np.int64)
-            return pc.astype(np.float32), feat2, lb, sel.astype(np.int32), \
-                   np.array([cloud_idx], dtype=np.int32)
-
-        def __len__(self):
-            return cfg.train_steps * BATCH_SIZE if self.split == "train" else len(self.scenes)
-
-        def __getitem__(self, idx):
-            if self.split == "train":
-                if (self.rare_scenes and RARE_OVERSAMPLE
-                        and np.random.rand() < RARE_CENTER_PROB):
-                    ci = self.rare_scenes[np.random.randint(len(self.rare_scenes))]
-                    pick = int(self.rare_idx[ci][np.random.randint(len(self.rare_idx[ci]))])
-                else:
-                    ci = np.random.randint(len(self.scenes))
-                    pick = np.random.randint(len(self.scenes[ci][0]))
-                return self.sample_sphere(ci, pick, augment=True)
-            return self.sample_sphere(idx, np.random.randint(len(self.scenes[idx][0])),
-                                      augment=False)
-
     device = torch.device("cuda")
 
-    # --- Prediction helpers (shared by post-training demo + infer mode) ------
     import traceback
     from scipy.spatial import cKDTree
 
@@ -375,10 +431,9 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         SAVE_PROBS = os.environ.get("TT_SAVE_PROBS") == "1"
 
         def _predict_scene(pc_path):
-            # grid-subsample, sphere-sweep predict in blocks, NN-propagate to raw
             z = np.load(pc_path)
-            # scene-local frame for compute; deliverable keeps original coords
             raw0 = z["xyz"]
+            tc.require_finite_xyz(raw0, os.path.basename(pc_path))
             xyz0 = (raw0 - np.floor(raw0.min(0))).astype(np.float32)
             itn0, ret0 = tc.scene_arrays(z, len(xyz0))
             ex0 = tc.feat_extras(z, FEAT_SPEC, os.path.basename(pc_path))
@@ -390,8 +445,6 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
             sub_votes = np.zeros((len(sub_xyz), num_classes), np.float32)
             N = cfg.num_points
             n_passes = max(int(EVAL_VOTES), 1)
-            # sphere sweep matches training geometry (seed-centered kNN blocks)
-            # ponytail: capped at 2x ideal sphere count — residue filled by NN reprojection
             max_blocks = 2 * (len(sub_xyz) // N + 1)
             with torch.no_grad():
               for vp in range(n_passes):
@@ -412,18 +465,16 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                     cols = ([sub_src[n2][sel] for n2 in NONXYZ]
                             + ([dg.local_density_logdk(block, DG_LOGDK_K)] if DG_LOGDK_FEAT else []))
                     f2 = (np.stack(cols, axis=1) if cols
-                          else np.zeros((len(block), 0), np.float32))   # D3b
-                    orig = sel.astype(np.int64)                 # indices into sub_xyz
-                    if real < N:                         # pad the short sphere
+                          else np.zeros((len(block), 0), np.float32))
+                    orig = sel.astype(np.int64)
+                    if real < N:
                         pad = np.random.choice(real, N - real)
                         block = np.concatenate([block, block[pad]], axis=0)
                         f2 = np.concatenate([f2, f2[pad]], axis=0)
                         orig = np.concatenate([orig, np.full(N - real, -1, np.int64)])
-                    # first-N subsampling requires shuffled point order
                     perm = np.random.permutation(N)
                     block, f2, orig = block[perm], f2[perm], orig[perm]
                     pc0 = (block - sub_xyz[seed]).astype(np.float32)
-                    # D5 density-TTA: average softmax over scaled views; off -> [1.0]
                     views = [1.0] + (list(np.linspace(0.85, 1.2, DG_INFER_TTA))
                                      if DG_INFER_TTA else [])
                     prob = None
@@ -443,15 +494,14 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                     sub_votes[orig[valid]] += prob[valid]
             valid = sub_votes.sum(1) > 0
             if not valid.any():
-                # tiny scene, zero votes: lowest non-excluded class, confidence 0
                 fb = min(set(range(num_classes)) - set(exclude_idx or ()))
                 return (raw0, np.full(len(xyz0), fb, np.int64), itn0,
                         np.zeros(len(xyz0), np.float32),
                         np.zeros((len(xyz0), num_classes), np.float16)
                         if SAVE_PROBS else None)
             nn = cKDTree(sub_xyz[valid]).query(xyz0, workers=-1)[1]
-            vv = sub_votes[valid]                    # copy — safe to normalize in place
-            vv /= vv.sum(1, keepdims=True)           # vote sums exceed 1 -> distribution
+            vv = sub_votes[valid]
+            vv /= vv.sum(1, keepdims=True)
             vv = tc.apply_class_mask(vv, exclude_idx)
             pred = vv.argmax(1)[nn]
             conf = vv.max(1)[nn]
@@ -459,7 +509,6 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
             return raw0, np.clip(pred, 0, num_classes - 1), itn0, conf, probs
         return _predict_scene
 
-    # --- inference-only mode -------------------------------------------------
     if mode == "infer":
         if not weights or not infer_input:
             raise ValueError("--mode infer requires --weights and --infer-input")
@@ -471,7 +520,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         fc3_key = next((k for k in sd if k.startswith("fc3.") and k.endswith("weight")), None)
         num_classes = int(sd[fc3_key].shape[0]) if fc3_key else NUM_CLASSES
         class_names = [f"class_{i}" for i in range(num_classes)]
-        meta = tc.infer_meta(wpath)     # run.json beside the weights
+        meta = tc.infer_meta(wpath)
         if meta:
             class_names = meta.get("class_names") or class_names
             if meta.get("grid") is not None:
@@ -480,13 +529,13 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                 cfg.num_points = int(meta["num_points"])
                 cfg.num_sub_points = [cfg.num_points // r
                                       for r in (4, 16, 64, 256)]
-        # rebuild the exact assembly from run.json; env is ignored at infer
         mf = (meta or {}).get("features") or []
-        # present-but-malformed features must fail hard, not silently fall back
         FEAT_SPEC = (tc.parse_feat_spec(",".join(mf), FEAT_LEGACY)
                      if mf else list(FEAT_LEGACY))
         NONXYZ = [n for n in FEAT_SPEC if n not in ("x", "y", "z")]
         IN_DIM = len(FEAT_SPEC) + (1 if DG_LOGDK_FEAT else 0)
+        collate_fn = Collater(cfg.num_layers, cfg.k_n, cfg.sub_sampling_ratio,
+                              FEAT_SPEC, NONXYZ)
 
         fc0_key = next((k for k in sd if k.startswith("fc0.") and sd[k].dim() >= 2), None)
         ckpt_in_dim = int(sd[fc0_key].shape[1]) if fc0_key is not None else 3
@@ -495,8 +544,8 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
             raise ValueError(
                 f"checkpoint fc0 expects {ckpt_in_dim} input channels but this "
                 f"script feeds {IN_DIM} ({FEAT_SPEC}"
-                f"{' + logdk' if DG_LOGDK_FEAT else ''}) "
-                f"— use weights trained with the same feature recipe")
+                f"{' + logdk' if DG_LOGDK_FEAT else ''}). "
+                f"Use weights trained with the same feature recipe")
         net.load_state_dict(sd)
         net.eval()
         print(f"  [infer] loaded {weights} ({num_classes} classes: {class_names}; "
@@ -508,7 +557,6 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
             raise FileNotFoundError(f"No scenes under {run_dir}/scenes")
 
         run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_infer")
-        # predictions live beside the input scenes, whatever model produced them
         pred_dir = os.environ.get("TT_PRED_DIR") or f"{run_dir}/predictions"
         os.makedirs(pred_dir, exist_ok=True)
         exc_idx = tc.exclude_class_idx(class_names)
@@ -521,7 +569,6 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
 
         predict_scene = make_predict_scene(net, num_classes, exclude_idx=exc_idx)
         if DG_INFER_ADABN:
-            # D2b: re-estimate BN running stats on the target tiles (label-free)
             print("  [infer] AdaBN: recomputing BN stats on target tiles...", flush=True)
 
             def _target_batches(cap=30):
@@ -532,13 +579,13 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                         return
                     z = np.load(pc_path)
                     raw0 = z["xyz"]
+                    tc.require_finite_xyz(raw0, os.path.basename(pc_path))
                     xyz0 = (raw0 - np.floor(raw0.min(0))).astype(np.float32)
                     itn0, ret0 = tc.scene_arrays(z, len(xyz0))
                     ex0 = tc.feat_extras(z, FEAT_SPEC, os.path.basename(pc_path))
                     keys = np.floor(xyz0 / SUB_GRID_SIZE).astype(np.int64)
                     uniq = tc.voxel_unique(keys)
                     sx = xyz0[uniq]
-                    # BN stats must see exactly what _predict_scene will feed the net
                     s_src = {"intensity": itn0[uniq], "return_number": ret0[uniq],
                              **{n: v[uniq] for n, v in ex0.items()}}
                     rng = np.random.RandomState(20250720)
@@ -560,7 +607,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                         cols = ([s_src[n][sel] for n in NONXYZ]
                                 + ([dg.local_density_logdk(block, DG_LOGDK_K)] if DG_LOGDK_FEAT else []))
                         f2 = (np.stack(cols, axis=1) if cols
-                              else np.zeros((len(block), 0), np.float32))   # D3b
+                              else np.zeros((len(block), 0), np.float32))
                         if real < N:
                             pad = np.random.choice(real, N - real)
                             block = np.concatenate([block, block[pad]], 0)
@@ -582,22 +629,34 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         tc.run_infer_scenes(scenes, predict_scene, pred_dir, run_dir, infer_cfg)
         return
 
-    # --- training mode -------------------------------------------------------
     print("=" * 70)
     print(f"  RandLA-Net  {dataset}  "
           f"({tc.gpu_name()}, {N_EPOCHS} ep, batch {BATCH_SIZE})")
     print("=" * 70)
-    # clear stale STOP before the slow prep; a stop clicked during startup survives
     tc.clear_stop()
     train_list, val_list, test_list = ensure_prep()
+    train_files = sorted(glob.glob(f"{PREP_DIR}/train/*.npz"))
+    val_files   = sorted(glob.glob(f"{PREP_DIR}/val/*.npz"))
+    test_files  = sorted(glob.glob(f"{PREP_DIR}/test/*.npz"))
+
+    proxy_files, proxy_rep = tc.pick_proxy_tiles(
+        val_files, NUM_CLASSES, PROXY_TILES, mode=PROXY_SAMPLING,
+        class_names=CLASS_NAMES,
+        cache_path=f"{PREP_DIR}/val_class_balance_cache.npz",
+        viable=lambda p: np.load(p)["lab"].size >= 64)
+    proxy_rep["tiles"].append(f"anchors={PROXY_ANCHORS} "
+                              f"slots={cfg.val_steps * VAL_BATCH} "
+                              f"num_points={cfg.num_points}")
+    print(proxy_rep["text"], flush=True)
+
     tag = dataset
-    # resume only when RESUME_RECIPE_KEYS agree — never republish a mismatched manifest
-    # ponytail: sub_grid_size/num_points aren't compared; a mismatched in_dim
-    # still fails loudly at load_state_dict
     _recipe = {"features": FEAT_SPEC, "n_epochs": N_EPOCHS,
                "num_classes": NUM_CLASSES, "class_names": CLASS_NAMES}
     resume_info = (tc.find_latest_unfinished_run(f"{tag}_randlanet_cold", _recipe)
                    if (RESUME or AUTO_RESUME) else None)
+    if resume_info and not tc.proxy_guard(resume_info[0], proxy_rep,
+                                          tc.PROXY_PROTOCOL_SPHERES, CLASS_NAMES):
+        resume_info = None
     if resume_info:
         run_dir, resume_ckpt, resume_epoch = resume_info
         run_id = os.path.basename(run_dir)
@@ -619,7 +678,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                 "n_epochs": N_EPOCHS,
                 "batch_size": BATCH_SIZE, "num_points": NUM_POINTS,
                 "sub_grid_size": SUB_GRID_SIZE, "in_dim": IN_DIM,
-                "features": FEAT_SPEC,   # inference rebuilds this exact assembly
+                "features": FEAT_SPEC,
                 "steps_per_epoch": STEPS,
                 "eval_votes": EVAL_VOTES,
                 "class_balance": {"weighting": CLASS_WEIGHTING, "beta": WEIGHT_BETA,
@@ -638,15 +697,17 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                 "test_scenes":  [n for n, _, _ in test_list],
             }, f, indent=2)
 
-    train_files = sorted(glob.glob(f"{PREP_DIR}/train/*.npz"))
-    val_files   = sorted(glob.glob(f"{PREP_DIR}/val/*.npz"))
-    test_files  = sorted(glob.glob(f"{PREP_DIR}/test/*.npz"))
+    dso = SimpleNamespace(
+        num_points=cfg.num_points, steps=cfg.train_steps, batch_size=BATCH_SIZE,
+        feat_spec=FEAT_SPEC, nonxyz=NONXYZ, aug_color=AUG_COLOR,
+        sub_grid=SUB_GRID_SIZE, density_aug=DG_DENSITY_AUG,
+        coarsen_max=DG_COARSEN_MAX, p_native=DG_P_NATIVE,
+        logdk_feat=DG_LOGDK_FEAT, logdk_k=DG_LOGDK_K,
+        rare_oversample=RARE_OVERSAMPLE, rare_center_prob=RARE_CENTER_PROB)
+    train_ds = Scenes("train", train_files, dso)
+    val_ds   = Scenes("val",   val_files,   dso, label="val")
+    test_ds  = Scenes("test",  test_files,  dso, label="test")
 
-    train_ds = Scenes("train", files=train_files)
-    val_ds   = Scenes("val",   files=val_files,   label="val")
-    test_ds  = Scenes("test",  files=test_files,  label="test")
-
-    # --- class-balanced loss + rare-centered sphere sampling ----------------
     print("  scanning train scenes for class balance…", flush=True)
     class_counts = np.zeros(NUM_CLASSES, dtype=np.int64)
     for *_, lab in train_ds.scenes:
@@ -660,7 +721,6 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     print(f"  class counts: {dict(zip(CLASS_NAMES, class_counts.tolist()))}", flush=True)
     print(f"  rare classes: {[CLASS_NAMES[c] for c in rare_classes]}", flush=True)
     if CLASS_WEIGHTING:
-        # rebind the closures compute_loss uses (_class_w, _ce)
         w = tc.class_weights_np(class_counts, WEIGHT_BETA, WEIGHT_CAP)
         _class_w = torch.tensor(w, dtype=torch.float32).to(device)
         _ce = nn.CrossEntropyLoss(weight=_class_w, ignore_index=-1)
@@ -669,6 +729,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
 
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=False,
                               num_workers=4, collate_fn=collate_fn,
+                              worker_init_fn=_worker_init,
                               pin_memory=True, drop_last=True)
 
     net = build_net(NUM_CLASSES)
@@ -682,12 +743,11 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
             opt.load_state_dict(rckpt["optim"])
         print(f"  resumed weights{' + optimizer' if 'optim' in rckpt else ''} "
               f"at epoch {start_epoch}", flush=True)
-    # built after the resume load so ExponentialLR continues the decayed lr
     sched = optim.lr_scheduler.ExponentialLR(opt, 0.95)
 
     metrics_csv = f"{run_dir}/metrics.csv"
-    if not os.path.exists(metrics_csv):       # keep prior rows when resuming
-        with open(metrics_csv, "w", newline="") as f:
+    if not os.path.exists(metrics_csv):
+        with open(metrics_csv, "w", newline="", encoding="utf-8") as f:
             csv.writer(f).writerow([
                 "epoch", "train_loss", "val_loss", "train_acc", "val_acc",
                 "train_iou", "val_iou", "sec_per_iter", "sec_per_epoch",
@@ -701,13 +761,8 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
             batch[k] = [t.to(device) for t in batch[k]]
         return batch
 
-    # full-coverage val every VAL_EVERY epochs -> val_metrics.csv (same protocol
-    # as the final test); heavy — raise VAL_EVERY if it costs too much
     val_csv = f"{run_dir}/val_metrics.csv"
-    if not os.path.exists(val_csv):           # keep prior rows when resuming
-        with open(val_csv, "w", newline="") as f:
-            csv.writer(f).writerow(["epoch", "val_acc", "val_miou"] +
-                                   [f"iou_{n}" for n in CLASS_NAMES])
+    tc.init_val_csv(val_csv, CLASS_NAMES)
 
     def evaluate(ds, name2src, label):
         """Full-coverage eval scored on raw points: sphere-sweep the subsampled
@@ -733,13 +788,11 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                     p = torch.softmax(end_points["logits"].transpose(1, 2).float(),
                                       -1).cpu().numpy()
                     for bi, orig in enumerate(pend_blocks):
-                        valid = orig >= 0           # drop padded positions
+                        valid = orig >= 0
                         votes[orig[valid]] += p[bi, valid]
                     pend_items, pend_blocks = [], []
 
                 n_passes = max(int(EVAL_VOTES), 1)
-                # sphere sweep = training geometry; fixed seed keeps rows comparable
-                # ponytail: capped at 2x ideal sphere count — residue filled by NN reprojection
                 max_blocks = 2 * (len(xyz) // N + 1)
                 for vp in range(n_passes):
                     rng = np.random.RandomState(20250720 + vp)
@@ -759,14 +812,13 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                         cols = ([src[n][sel] for n in NONXYZ]
                                 + ([dg.local_density_logdk(pts_blk, DG_LOGDK_K)] if DG_LOGDK_FEAT else []))
                         f2 = (np.stack(cols, axis=1) if cols
-                              else np.zeros((len(sel), 0))).astype(np.float32)   # D3b
+                              else np.zeros((len(sel), 0))).astype(np.float32)
                         orig = sel.astype(np.int64)
-                        if real < N:                         # pad the short sphere
+                        if real < N:
                             pad = np.random.choice(real, N - real)
                             pts_blk = np.concatenate([pts_blk, pts_blk[pad]], axis=0)
                             f2 = np.concatenate([f2, f2[pad]], axis=0)
                             orig = np.concatenate([orig, np.full(N - real, -1, np.int64)])
-                        # first-N subsampling requires shuffled input; track originals
                         perm = np.random.permutation(N)
                         pts_blk, f2, orig = pts_blk[perm], f2[perm], orig[perm]
                         pc_c = (pts_blk - xyz[seed]).astype(np.float32)
@@ -778,7 +830,6 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                             flush()
                     flush()
                 pred = votes.argmax(1)
-                # reproject subsampled predictions onto the raw cloud
                 name = os.path.splitext(os.path.basename(ds.files[i]))[0]
                 raw_src = name2src.get(name)
                 got = votes.sum(1) > 0
@@ -789,16 +840,15 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                     print(f"  [{label}] skip {name}: no votes", flush=True)
                     n_skipped += 1; continue
                 try:
-                    raw_xyz, _, _, raw_lab, _ = load_canonical(raw_src[0])
+                    raw_xyz, raw_lab = tc.load_xyz_label(raw_src[0])
+                except tc.NonFiniteXYZ:
+                    raise
                 except Exception as ex:
                     print(f"  [{label}] skip {name}: raw reload failed: {ex}", flush=True)
                     n_skipped += 1; continue
-                _, nn = cKDTree(xyz[got]).query(raw_xyz, workers=-1)
-                raw_pred = pred[got][nn]
-                v = raw_lab >= 0
-                rp, rl = raw_pred[v], raw_lab[v]
-                correct += int((rp == rl).sum()); total += int(v.sum())
-                i_, u_, g_ = tc.score_ious(rp, rl, NUM_CLASSES)
+                i_, u_, g_, c_, t_ = tc.score_raw_from_voxels(
+                    xyz[got], pred[got], raw_xyz, raw_lab, NUM_CLASSES)
+                correct += c_; total += t_
                 t_inter += i_; t_union += u_; t_gt += g_
                 n_scenes += 1
         return tc.eval_metrics(
@@ -812,12 +862,73 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     val_src = {n: (p, c) for n, p, c in val_list}
 
     best = tc.BestCheckpoint(run_dir)
+    tc.proxy_guard(run_dir, proxy_rep, tc.PROXY_PROTOCOL_SPHERES, CLASS_NAMES)
     tc.write_run_manifest(run_dir, "randlanet", dataset)
 
+    SLOTS = cfg.val_steps * VAL_BATCH
+    inv = proxy_rep["inventory"]
+    pidx = [val_ds.files.index(p) for p in proxy_files]
+    cnt = np.stack([np.bincount(lab[(lab >= 0) & (lab < NUM_CLASSES)],
+                                minlength=NUM_CLASSES)
+                    for *_, lab in (val_ds.scenes[i] for i in pidx)])
+    tot = cnt.sum(0)
+    n_slot = {c: PROXY_ANCHORS for c in inv}
+    if PROXY_SAMPLING == "density" and inv and SLOTS > sum(n_slot.values()):
+        k = tc.proxy_slots(tot, inv, SLOTS - sum(n_slot.values()),
+                           lambda c: CLASS_NAMES[c])
+        for j, c in enumerate(inv):
+            n_slot[c] += int(k[j])
+    anchors = []
+    for c in sorted(inv, key=lambda c: (int(tot[c]), CLASS_NAMES[c])):
+        cand = sorted((r for r in range(len(pidx)) if cnt[r, c] > 0),
+                      key=lambda r: (-int(cnt[r, c]),
+                                     os.path.basename(val_ds.files[pidx[r]])))
+        for j, r in enumerate(cand):
+            n = n_slot[c] // len(cand) + (j < n_slot[c] % len(cand))
+            if not n:
+                continue
+            pts = np.flatnonzero(val_ds.scenes[pidx[r]][4] == c)
+            anchors += [(pidx[r], int(p), c)
+                        for p in pts[::max(1, len(pts) // n)][:n]]
+    anchors = anchors[:SLOTS]
+    print(f"  proxy val: {len(anchors)}/{SLOTS} class-anchored spheres, "
+          f"{SLOTS - len(anchors)} from the scene rotation", flush=True)
+
+    def _proxy_batches(rng):
+        for s in range(cfg.val_steps):
+            items = []
+            for b in range(VAL_BATCH):
+                slot = s * VAL_BATCH + b
+                if slot < len(anchors):
+                    ci, pick, c = anchors[slot]
+                    npts = len(val_ds.scenes[ci][0])
+                    if npts < 64 or pick >= npts:
+                        raise RuntimeError(
+                            f"proxy val scene {os.path.basename(val_ds.files[ci])} "
+                            f"(curated for {CLASS_NAMES[c]}) has {npts} points at "
+                            f"batch time: delete {PREP_DIR} and re-run the prep")
+                else:
+                    ci = slot % len(val_ds.files)
+                    pick = int(rng.randint(len(val_ds.scenes[ci][0])))
+                items.append(val_ds.sample_sphere(ci, pick, rng=rng))
+            batch = _to_device(collate_fn(items))
+            yield batch, batch["labels"]
+
     def run_eval(ep, write_json=False):
-        # val scores current weights; the final call scores TEST on the
-        # best-tracked checkpoint (what final_model.pth actually is).
-        # PreciseBN: re-estimate BN stats with frozen weights before scoring.
+        if not write_json:
+            net.eval()
+            m = tc.proxy_val(
+                _proxy_batches(np.random.RandomState(20260724)),
+                lambda b: net(b)["logits"].transpose(1, 2).reshape(-1, NUM_CLASSES),
+                NUM_CLASSES, CLASS_NAMES, f"eval@ep{ep}",
+                cfg.val_steps, tc.PROXY_PROTOCOL_SPHERES, inventory=inv)
+            net.train()
+            # weights before the csv row: a kill between them must not seed a phantom best that final_model.pth can never match
+            if best.update(m["present_classes_mIoU"]):
+                tc.atomic_torch_save({"model": net.state_dict(), "epoch": ep},
+                                     best.final)
+            tc.append_val_row(val_csv, ep, m, CLASS_NAMES)
+            return m
         def _bn_batches(n=32):
             it = iter(train_loader)
             for _ in range(n):
@@ -834,32 +945,30 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         net.eval()
         m = evaluate(val_ds, val_src, f"eval@ep{ep}")
         tc.append_val_row(val_csv, ep, m, CLASS_NAMES)
-        if best.update(m["present_classes_mIoU"]):
-            torch.save({"model": net.state_dict(), "epoch": ep}, best.final)
-        if write_json:
-            swapped = os.path.exists(best.final)
-            if swapped:
-                live_state = {k: v.clone() for k, v in net.state_dict().items()}
-                net.load_state_dict(torch.load(best.final, map_location=device,
-                                               weights_only=True)["model"])
-                net.eval()
-            m_test = evaluate(test_ds, {n: (p, c) for n, p, c in test_list}, "test")
-            if swapped:
-                net.load_state_dict(live_state)
-            with open(f"{run_dir}/test_metrics.json", "w") as fj:
-                json.dump({"val": m, "test": m_test,
-                           "val_scenes": [n for n, _, _ in val_list],
-                           "test_scenes": [n for n, _, _ in test_list]}, fj, indent=2)
+        # deliberately no best.update: full-protocol numbers would always beat the proxy rows and spuriously crown the last epoch
+        swapped = os.path.exists(best.final)
+        if swapped:
+            live_state = {k: v.clone() for k, v in net.state_dict().items()}
+            net.load_state_dict(torch.load(best.final, map_location=device,
+                                           weights_only=True)["model"])
+            net.eval()
+        m_test = evaluate(test_ds, {n: (p, c) for n, p, c in test_list}, "test")
+        if swapped:
+            net.load_state_dict(live_state)
+        with open(f"{run_dir}/test_metrics.json", "w", encoding="utf-8") as fj:
+            json.dump({"val": m, "test": m_test,
+                       "val_scenes": [n for n, _, _ in val_list],
+                       "test_scenes": [n for n, _, _ in test_list]}, fj, indent=2)
         net.train()
         return m
 
     t_run = time.time()
-    AMP = os.environ.get("TT_AMP") == "1"   # opt-in bf16 autocast
+    AMP = os.environ.get("TT_AMP") == "1"
     print(f"  starting at epoch {start_epoch}, up to {N_EPOCHS}, "
           f"{cfg.train_steps} steps/epoch"
           f"{' [bf16 autocast]' if AMP else ''}", flush=True)
     LOG_EVERY = 20
-    ep = N_EPOCHS - 1     # final-eval label when the loop never runs
+    ep = N_EPOCHS - 1
     for ep in range(start_epoch, N_EPOCHS):
         net.train()
         iou_calc = IoUCalculator(cfg)
@@ -875,7 +984,6 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=AMP):
                 end_points = net(batch)
                 loss, end_points = compute_loss(end_points, NUM_CLASSES)
-            # skip non-finite batches + clip grads (RandLA at lr=1e-2 spikes)
             if not torch.isfinite(loss):
                 opt.zero_grad(set_to_none=True)
                 continue
@@ -902,7 +1010,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         sec_per_epoch = time.time() - t_ep
         train_acc = correct / max(total, 1)
         gpu_mem = torch.cuda.max_memory_allocated() / 1e6
-        with open(metrics_csv, "a", newline="") as f:
+        with open(metrics_csv, "a", newline="", encoding="utf-8") as f:
             csv.writer(f).writerow([
                 ep, f"{ep_loss/max(n_steps,1):.4f}", "", f"{train_acc:.4f}", "",
                 f"{mean_iou:.4f}", "", f"{sec_per_iter:.4f}",
@@ -912,23 +1020,21 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
               f"acc={train_acc:.4f} miou={mean_iou:.4f} "
               f"s/iter={sec_per_iter:.3f} s/ep={sec_per_epoch:.1f}", flush=True)
         if (ep + 1) % 5 == 0:
-            torch.save({"model": net.state_dict(), "optim": opt.state_dict(),
-                        "epoch": ep},
-                       f"{run_dir}/checkpoints/ep{ep:03d}.pth")
+            tc.atomic_torch_save({"model": net.state_dict(),
+                                  "optim": opt.state_dict(), "epoch": ep},
+                                 f"{run_dir}/checkpoints/ep{ep:03d}.pth")
         stop = tc.stop_requested(ep)
         if (ep + 1) % VAL_EVERY == 0 and ep != N_EPOCHS - 1 and not stop:
-            run_eval(ep)               # last epoch handled by the final eval below
+            run_eval(ep)
         if stop:
-            break                      # falls through to the final eval + finalize
+            break
 
-    # final full-coverage eval over val + test -> test_metrics.json
     print("  final evaluation (val + test)…", flush=True)
     run_eval(ep, write_json=True)
-    best.finalize(lambda p: torch.save(
+    best.finalize(lambda p: tc.atomic_torch_save(
         {"model": net.state_dict(), "epoch": ep}, p))
     print(f"  total wall-clock {(time.time() - t_run)/3600:.2f} h")
 
-    # DONE marker: AUTO_RESUME skips completed runs
     open(f"{run_dir}/DONE", "w").close()
     print(f"  run complete -> {run_id}", flush=True)
 

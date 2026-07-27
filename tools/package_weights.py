@@ -5,8 +5,8 @@
 
 Reads <run_dir>/run.json (backbone + dataset), stages final_model.pth +
 run.json, generates a rattler-build recipe, and builds
-trainer-weights-<dataset>-<key> into conda-recipes/output/. Upload with the
-`upload` pixi task. Installed packages land in
+trainer-weights-<dataset>-<key> into conda-recipes/output/; upload with the
+`upload` pixi task, and installed packages land in
 $PREFIX/share/trainer-weights/<name>/ where the GUI's Infer page finds them.
 
 Runs on any platform rattler-build supports (noarch package, no shell script:
@@ -64,7 +64,7 @@ def main(argv=None):
     weights, manifest = run / "final_model.pth", run / "run.json"
     for f in (weights, manifest):
         if not f.exists():
-            sys.exit(f"error: {f} not found — package a FINISHED run")
+            sys.exit(f"error: {f} not found. Package a FINISHED run")
     rc = json.loads(manifest.read_text(encoding="utf-8-sig"))
     backbone = rc.get("backbone") or "model"
     dataset = rc.get("dataset") or "custom"

@@ -109,7 +109,7 @@ class MainWindow(QWidget):
             ui.polish_forms(page)
             self.stack.addWidget(ui.scroll_v(page))
 
-        ui.set_navigator(self._navigate)   # pages jump via ui.navigate("Train", …)
+        ui.set_navigator(self._navigate)
         self.nav.setCurrentRow(0)
 
     def _on_mode_change(self):
@@ -140,7 +140,6 @@ class MainWindow(QWidget):
             page.receive_nav(**kwargs)
 
     def _go(self, row: int):
-        # PAGES = [Datasets, Train, Inference, Plotting]
         if row == 1:
             self.train_page.reload_datasets()
         elif row == 2:
@@ -205,7 +204,7 @@ def main() -> int:
         try:
             import ctypes
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("trainer_gui")
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
     app = QApplication(sys.argv)
     app.installEventFilter(_NoWheelEdit(app))

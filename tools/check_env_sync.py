@@ -1,14 +1,14 @@
 """Drift checker: envs/pixi.toml + conda-recipes/ vs the modal.Image recipes.
 
-The modal_train_*.py scripts stay the single source of truth for training
-deps. This tool imports each under the offline `_modal_shim` (exactly like
-gen_dockerfiles.py did), re-derives per backbone:
+The modal_train_*.py scripts stay the single source of truth for training deps,
+so this tool imports each under the offline `_modal_shim` and re-derives per
+backbone:
 
   - the pip package pins + torch index / find-links URLs
   - the pinned model-source git SHA
 
 and diffs them against the pixi feature's pypi-dependencies / pypi-options
-and the trainer-src recipe's context sha. Run by the smoke test; exits
+and the trainer-src recipe's context sha. Run by the smoke test, it exits
 non-zero listing every mismatch on drift.
 
     python tools/check_env_sync.py
@@ -122,19 +122,19 @@ def compare(key: str, modal: dict, pixi: dict, rsha: str | None) -> list[str]:
         if name not in pixi["pins"]:
             errs.append(f"{key}: pip dep '{name}' in modal recipe but not in pixi feature")
         elif _base_ver(pixi["pins"][name]) != _base_ver(con):
-            errs.append(f"{key}: '{name}' pin drift — modal '{con}' vs pixi "
+            errs.append(f"{key}: '{name}' pin drift: modal '{con}' vs pixi "
                         f"'{pixi['pins'][name]}'")
     for name in pixi["pins"]:
         if name not in modal["pins"]:
             errs.append(f"{key}: pip dep '{name}' in pixi feature but not in modal recipe")
     if modal["index_url"] and pixi["index_url"] != modal["index_url"]:
-        errs.append(f"{key}: index-url drift — modal '{modal['index_url']}' vs pixi "
+        errs.append(f"{key}: index-url drift: modal '{modal['index_url']}' vs pixi "
                     f"'{pixi['index_url']}'")
     for fl in modal["find_links"]:
         if fl not in pixi["find_links"]:
             errs.append(f"{key}: find-links '{fl}' in modal recipe but not in pixi feature")
     if modal["sha"] and rsha != modal["sha"]:
-        errs.append(f"{key}: model-source SHA drift — modal '{modal['sha']}' vs "
+        errs.append(f"{key}: model-source SHA drift: modal '{modal['sha']}' vs "
                     f"recipe '{rsha}'")
     return errs
 
@@ -154,8 +154,8 @@ def main():
     for e in errs:
         print(f"  DRIFT  {e}")
     if errs:
-        sys.exit(f"{len(errs)} drift(s) between modal recipes and pixi/conda specs — "
-                 "fix envs/pixi.toml / conda-recipes to mirror scripts/modal.")
+        sys.exit(f"{len(errs)} drift(s) between modal recipes and pixi/conda specs. "
+                 "Fix envs/pixi.toml / conda-recipes to mirror scripts/modal.")
     print(f"env sync OK: {len(BACKBONES)} backbones match their modal recipes")
 
 

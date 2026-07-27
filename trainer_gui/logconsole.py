@@ -14,7 +14,6 @@ from collections import deque
 from PySide6.QtGui import QColor, QGuiApplication, QTextCharFormat, QTextCursor
 from PySide6.QtWidgets import QHBoxLayout, QPlainTextEdit, QToolButton, QVBoxLayout, QWidget
 
-# ---- theme-invariant console colors ----
 CONSOLE_BG = "#0e1116"
 CONSOLE_TEXT = "#d6dae3"
 CONSOLE_MUTED = "#6b7383"
@@ -26,7 +25,7 @@ CONSOLE_ACCENT = "#7f9cff"
 _SEV_COLOR = {"ok": CONSOLE_OK, "warn": CONSOLE_WARN, "error": CONSOLE_ERROR}
 _ANSI_FG = {30: CONSOLE_MUTED, 31: CONSOLE_ERROR, 32: CONSOLE_OK, 33: CONSOLE_WARN,
             34: CONSOLE_ACCENT, 35: "#d29ae0", 36: "#7ecfd4", 37: CONSOLE_TEXT}
-_ANSI_FG.update({k + 60: v for k, v in list(_ANSI_FG.items())})  # bright 90-97
+_ANSI_FG.update({k + 60: v for k, v in list(_ANSI_FG.items())})
 
 _SGR_RE = re.compile(r"\x1b\[([0-9;]*)m")
 # every non-SGR escape: other CSI (cursor/erase), OSC titles, single-char escapes
@@ -41,8 +40,8 @@ class LineAssembler:
 
     def __init__(self):
         self._buf = ""
-        self._soft = False      # last commit was \r-open: next commit replaces it
-        self._carry_cr = False  # chunk ended in \r; join with the next chunk
+        self._soft = False
+        self._carry_cr = False
 
     def feed(self, text: str) -> list[tuple[str, str]]:
         if self._carry_cr:
@@ -84,7 +83,7 @@ def _ansi_segments(raw: str) -> list[tuple[str, str | None]]:
             segs.append((_OTHER_ESC_RE.sub("", raw[pos:m.start()]), color))
         codes = [int(x) for x in m.group(1).split(";") if x] or [0]
         for code in codes:
-            if code in (38, 48):     # extended color — args follow; ignore the rest
+            if code in (38, 48):
                 break
             if code == 0:
                 color = None
@@ -160,7 +159,6 @@ class LogConsole(QWidget):
         lay.addWidget(bar)
         lay.addWidget(self._edit, 1)
 
-    # ---- public API (pages code against exactly these) --------------------------
 
     def append(self, text: str, newline: bool = True) -> None:
         for kind, line in self._asm.feed(text + ("\n" if newline else "")):
@@ -178,13 +176,12 @@ class LogConsole(QWidget):
         self._asm = LineAssembler()
         self._doc_has_content = False
 
-    def setPlaceholderText(self, text: str) -> None:  # noqa: N802 — Qt casing
+    def setPlaceholderText(self, text: str) -> None:
         self._edit.setPlaceholderText(text)
 
     def plain_widget(self) -> QPlainTextEdit:
         return self._edit
 
-    # ---- internals ---------------------------------------------------------------
 
     @staticmethod
     def _tool(text: str, checkable: bool = False, checked: bool = False,
@@ -205,7 +202,7 @@ class LogConsole(QWidget):
         return f
 
     def _header(self, text: str) -> None:
-        for kind, line in self._asm.flush():   # keep a split partial line in order
+        for kind, line in self._asm.flush():
             self._commit(kind, line)
         entry = (None, [(text, None)], None, True)
         self._entries.append(entry)
@@ -258,18 +255,18 @@ class LogConsole(QWidget):
         cur.removeSelectedText()
         if self._visible(entry):
             self._insert_entry(cur, entry)
-        elif cur.atStart():                    # replacement is filtered out
+        elif cur.atStart():
             self._doc_has_content = False
         else:
-            cur.deletePreviousChar()           # drop the now-empty block
+            cur.deletePreviousChar()
         self._autoscroll(at_bottom)
 
     def _insert_entry(self, cur: QTextCursor, entry) -> None:
         ts, segs, sev, header = entry
-        if header:                              # muted, never severity-colored
+        if header:
             cur.insertText("".join(t for t, _ in segs), self._fmt(CONSOLE_MUTED))
             return
-        if not segs:                            # blank line: no lone timestamp
+        if not segs:
             return
         cur.insertText(ts + " ", self._fmt(CONSOLE_MUTED))
         sev_color = _SEV_COLOR.get(sev)
@@ -278,7 +275,7 @@ class LogConsole(QWidget):
             if first:
                 first = False
                 m = _TAG_RE.match(text)
-                if m:                           # [local]/[modal]/[loss]/… tag
+                if m:
                     cur.insertText(m.group(0), self._fmt(CONSOLE_ACCENT))
                     text = text[m.end():]
                     if not text:
@@ -298,20 +295,16 @@ class LogConsole(QWidget):
 
 
 if __name__ == "__main__":
-    # logic-level self-check (no QApplication): line assembly, ANSI, severity
     asm = LineAssembler()
     assert asm.feed("hel") == []
     assert asm.feed("lo\nwor") == [("append", "hello")]
     assert asm.feed("ld\n") == [("append", "world")]
-    # \r progress frames: each frame replaces the previous one
     assert asm.feed("\r 10%|#") == []
     assert asm.feed("\r 20%|##") == [("append", " 10%|#")]
     assert asm.feed("\r100%|###\ndone\n") == [
         ("replace", " 20%|##"), ("replace", "100%|###"), ("append", "done")]
-    # \r\n is a plain newline — even when split across chunks
     assert asm.feed("a\r") == []
     assert asm.feed("\nb\n") == [("append", "a"), ("append", "b")]
-    # ANSI: SGR maps to colors; erase/cursor escapes are stripped
     assert _ansi_segments("\x1b[31mfail\x1b[0m ok\x1b[2K\x1b[1A") == [
         ("fail", CONSOLE_ERROR), (" ok", None)]
     assert _ansi_segments("\x1b[92mbright\x1b[m") == [("bright", CONSOLE_OK)]
@@ -321,4 +314,4 @@ if __name__ == "__main__":
     assert _classify("✓ saved checkpoint") == "ok"
     assert _classify("ep  12: loss=0.4321 acc=0.9123") is None
     assert _TAG_RE.match("[local] starting docker").group(0) == "[local]"
-    print("ok — logconsole line pipeline")
+    print("ok: logconsole line pipeline")

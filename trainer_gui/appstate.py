@@ -104,9 +104,9 @@ def set_exec_mode(mode: str) -> None:
 
 # local-backend defaults; retired keys in old state.json (docker-era) are ignored
 _DEFAULT_LOCAL_CONFIG = {
-    "datasets_root": "",   # -> TT_DATASETS_ROOT (default: workspace_dir())
-    "outputs_root": "",    # -> TT_OUTPUTS_ROOT  (default: local_runs_dir())
-    "gpus": "all",         # "all" | CUDA device id | "" to disable
+    "datasets_root": "",
+    "outputs_root": "",
+    "gpus": "all",
 }
 
 

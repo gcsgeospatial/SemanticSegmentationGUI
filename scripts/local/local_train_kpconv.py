@@ -1,7 +1,7 @@
 """Original KPConv (deformable KPFCNN, KPConv-PyTorch) local trainer on a
-canonical trainer_gui dataset, cold start. Reuses only Config, KPFCNN,
-p2p_fitting_regularizer and segmentation_inputs from the upstream repo.
-Native SGD recipe + the shared trainer_gui enhancements. neighborhood_limits
+canonical trainer_gui dataset, cold start; native SGD recipe + the shared
+trainer_gui enhancements, reusing only Config, KPFCNN, p2p_fitting_regularizer
+and segmentation_inputs from the upstream repo. neighborhood_limits
 are calibrated once per prep cache and travel in run.json (inference restores
 them). Modes: train | eval | infer | --self-test (host check, no GPU/C++).
 """
@@ -35,70 +35,65 @@ def _cwd(path):
         os.chdir(old)
 
 
-FEATURE_MODE  = "native"     # [1, intensity, return_number] (+ selected feat_*)
+FEATURE_MODE  = "native"
 N_EPOCHS      = 150
-EPOCH_STEPS   = 300          # optimizer steps / epoch
-PACK_N        = 3            # tiles packed per forward (deformable is heavier than KPConvX)
-ACCUM         = 2            # grad-accumulated forwards / step
+EPOCH_STEPS   = 300
+PACK_N        = 3
+ACCUM         = 2
 CHECKPOINT_GAP = 10
-VAL_EVERY     = 10           # held-out val pass every N epochs
+VAL_EVERY     = 10
+PROXY_TILES   = 48
+PROXY_SAMPLING = "coverage"
 
-RESUME = False               # continue the most recent same-recipe run
-# AUTO_RESUME=1: set by the cloud shell on Modal retries; exportable locally
+RESUME = False
 AUTO_RESUME = os.environ.get("AUTO_RESUME", "0") == "1"
 
 CLASS_WEIGHTING = True
-WEIGHT_BETA     = 0.5        # 0.5 = inverse-sqrt frequency
-WEIGHT_CAP      = 5.0        # clamp each weight to [1/CAP, CAP] after mean-norm
-LOVASZ_WEIGHT   = 1.0        # total loss = <pointwise> + w * lovasz_softmax
+WEIGHT_BETA     = 0.5
+WEIGHT_CAP      = 5.0
+LOVASZ_WEIGHT   = 1.0
 USE_FOCAL       = False
 FOCAL_GAMMA     = 2.0
 RARE_OVERSAMPLE = True
-RARE_CLASSES    = None       # explicit class indices, or None -> auto from train freq
-RARE_FREQ_FRAC  = 0.5        # auto-rare threshold: freq < frac x median present freq
-RARE_TILE_PROB  = 0.25       # P(draw the next train tile from a rare-class tile)
+RARE_CLASSES    = None
+RARE_FREQ_FRAC  = 0.5
+RARE_TILE_PROB  = 0.25
 
-# FEAT_CHANNELS env: ordered csv; "" = [intensity, return_number].
-# The constant-1 bias channel is always first and not part of the spec.
 FEAT_CHANNELS = ""
 
-# geometry — train_S3DIS.py constants scaled to aerial LiDAR (like the KPConvX sibling)
-GRID          = 2.0          # layer-0 voxel grid (m)
-CONV_RADIUS   = 2.5          # conv radius in grid cells
-DEFORM_RADIUS = 5.0          # S3DIS deformable radius (6.0 is ModelNet40's)
+GRID          = 0.25
+CONV_RADIUS   = 2.5
+DEFORM_RADIUS = 5.0
 KP_EXTENT     = 1.2
 NUM_KP        = 15
-FIRST_FEAT    = 64           # 128 = released-S3DIS capacity, ~2x memory
-DEFORMABLE    = True         # False -> rigid resnetb; p2p regularizer self-zeroes
-CHUNK_XY      = 100.0        # tile size (m)
-STRIDE        = 50.0
-MAX_TILE_PTS  = 40000        # deformable tensors are heavier than KPConvX's 60000
+FIRST_FEAT    = 64
+DEFORMABLE    = True
+CHUNK_XY      = 25.0    # 100 x GRID: KPConv's in_radius = 50 x dl rule as a side
+STRIDE        = 12.5
+MAX_TILE_PTS  = 40000
 
-# neighborhood_limits calibration — KPConv's own 90%-untouched rule
 CALIB_TILES     = 100
 CALIB_UNTOUCHED = 0.9
-CALIB_MAX_PTS   = 20000      # probe runs uncropped by construction: keep small
+CALIB_MAX_PTS   = 20000
 
-AUG_COLOR     = 0.8          # per-channel keep prob (geometry aug = kp_augment defaults)
+AUG_COLOR     = 0.8
 
-# density domain-generalization (scripts/helper/density.py; DENSITY_DG.md)
-DG_DENSITY_AUG = False   # D1: per-tile coarsen to a jittered grid (train only)
+DG_DENSITY_AUG = False
 DG_COARSEN_MAX = 2.5
 DG_P_NATIVE    = 0.5
-DG_INFER_ADABN = False   # D2b: recompute BN stats on target tiles before predicting
-DG_INFER_TTA   = 0       # D5: extra density(scale) views at inference (0=off)
-DG_LOGDK_FEAT  = False   # D3b: +1 input channel (log k-th-NN distance) -> retrain
+DG_INFER_ADABN = False
+DG_INFER_TTA   = 0
+DG_LOGDK_FEAT  = False
 DG_LOGDK_K     = 8
 
-# optimizer — KPConv's native SGD recipe; resume refuses to cross recipes
 OPT_TYPE_STR  = "SGD"
 SGD_LR0       = 1e-2
 SGD_MOMENTUM  = 0.98
 SGD_WD        = 1e-3
-LR_DECAY      = 0.1 ** (1.0 / 150.0)   # per-epoch exponential decay
-DEFORM_LR_FACTOR = 0.1       # offset params train at 0.1x LR
+LR_DECAY      = 0.1 ** (1.0 / 150.0)
+DEFORM_LR_FACTOR = 0.1
 LABEL_SMOOTH  = 0.2
-GRAD_CLIP     = 100.0        # clip_grad_VALUE_, not norm
+GRAD_CLIP     = 100.0
 BN_MOMENTUM   = 0.02
 
 
@@ -127,7 +122,7 @@ def make_cfg(num_classes: int, in_features_dim: int, grid: float,
     """In-code KPConv Config. cfg.__init__() is re-called at the end to derive
     num_layers/deform_layers from the assigned architecture (Config.load()'s
     own pattern; the re-call is idempotent)."""
-    from utils.config import Config   # _kpconv_root() must be on sys.path
+    from utils.config import Config
     cfg = Config()
     cfg.dataset              = dataset_name
     cfg.dataset_task         = "cloud_segmentation"
@@ -151,10 +146,10 @@ def make_cfg(num_classes: int, in_features_dim: int, grid: float,
     cfg.deform_fitting_power = 1.0
     cfg.deform_lr_factor     = DEFORM_LR_FACTOR
     cfg.repulse_extent       = 1.0
-    cfg.class_w              = []    # class weights live in OUR seg_loss, not net.loss
+    cfg.class_w              = []
     cfg.saving               = False
     cfg.saving_path          = None
-    cfg.__init__()   # re-derive num_layers + deform_layers
+    cfg.__init__()
     return cfg
 
 
@@ -188,15 +183,14 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "helper"))
     import density as dg
     import train_common as tc
-    # GUI env-overridable knobs (train_common._ENV_KNOBS); closures capture these
     (DG_DENSITY_AUG, DG_COARSEN_MAX, DG_P_NATIVE, DG_LOGDK_FEAT, DG_LOGDK_K,
      DG_INFER_ADABN, DG_INFER_TTA, USE_FOCAL, FOCAL_GAMMA, CLASS_WEIGHTING,
      WEIGHT_BETA, RARE_OVERSAMPLE, VAL_EVERY,
-     FEAT_CHANNELS) = tc.env_overrides(globals(), [
+     FEAT_CHANNELS, PROXY_SAMPLING) = tc.env_overrides(globals(), [
         "DG_DENSITY_AUG", "DG_COARSEN_MAX", "DG_P_NATIVE", "DG_LOGDK_FEAT",
         "DG_LOGDK_K", "DG_INFER_ADABN", "DG_INFER_TTA", "USE_FOCAL",
         "FOCAL_GAMMA", "CLASS_WEIGHTING", "WEIGHT_BETA", "RARE_OVERSAMPLE",
-        "VAL_EVERY", "FEAT_CHANNELS"])
+        "VAL_EVERY", "FEAT_CHANNELS", "PROXY_SAMPLING"])
 
     sys.path.insert(0, _kpconv_root())
     EVAL_ONLY = (mode == "eval")
@@ -207,7 +201,6 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
                          "dataset name (train/val/test folders). The only "
                          "dataset-free path is --mode infer.")
 
-    # --- resolve run config: CLI flags override the module defaults ------------
     GRID        = grid if grid is not None else globals()["GRID"]
     CHUNK_XY    = chunk_xy if chunk_xy is not None else globals()["CHUNK_XY"]
     STRIDE      = CHUNK_XY / 2.0
@@ -215,22 +208,19 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
     EPOCH_STEPS = steps_per_epoch if steps_per_epoch is not None else globals()["EPOCH_STEPS"]
     PACK_N      = batch if batch is not None else globals()["PACK_N"]
     FEATURE_MODE = globals()["FEATURE_MODE"]
-    # scale LR_DECAY with N_EPOCHS so short runs complete the same /10 decay
     LR_DECAY    = 0.1 ** (1.0 / N_EPOCHS)
-    # "height" is dead for new runs (real HAG = feat_hag); FEAT_LEGACY keeps it
-    # ONLY so pre-spec checkpoints, whose weights expect that width, still infer.
-    FEAT_LEGACY = ["intensity", "return_number", "height"]   # infer-only reconstruction
+    # "height" is dead for new runs (real HAG = feat_hag); FEAT_LEGACY keeps it ONLY so pre-spec checkpoints, whose weights expect that width, still infer
+    FEAT_LEGACY = ["intensity", "return_number", "height"]
     FEAT_DEFAULT = ["intensity", "return_number"]
-    FEAT_SPEC = (list(FEAT_LEGACY) if INFER    # env ignored at infer
+    FEAT_SPEC = (list(FEAT_LEGACY) if INFER
                  else tc.parse_feat_spec(FEAT_CHANNELS, FEAT_DEFAULT))
-    # pyramid geometry: restored from run.json at infer to match the weights
     CONV_RADIUS   = globals()["CONV_RADIUS"]
     DEFORM_RADIUS = globals()["DEFORM_RADIUS"]
     KP_EXTENT     = globals()["KP_EXTENT"]
     NUM_KP        = globals()["NUM_KP"]
     FIRST_FEAT    = globals()["FIRST_FEAT"]
     DEFORMABLE    = globals()["DEFORMABLE"]
-    NEIGHBOR_LIMITS = None   # resolved below: run.json (infer/resume) or calibration
+    NEIGHBOR_LIMITS = None
 
     ds_root = tc.dataset_dir(dataset) if dataset else None
     if ds_root:
@@ -240,8 +230,6 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
                     f"{tc.feat_spec_tag(FEAT_SPEC, FEAT_LEGACY)}"
                     f"{tc.train_stride_tag()}")
     else:
-        # infer mode: geometry, class layout and neighbor_limits come from the
-        # run.json beside the weights; PREP_DIR is an unused placeholder
         NUM_CLASSES = 5
         CLASS_NAMES = [f"class {i}" for i in range(NUM_CLASSES)]
         PREP_DIR = f"{tc.OUTPUTS_ROOT}/_infer_unused"
@@ -254,7 +242,6 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
                 if rj.get("grid") is not None: GRID = float(rj["grid"])
                 if rj.get("chunk_xy") is not None: CHUNK_XY = float(rj["chunk_xy"])
                 STRIDE = CHUNK_XY / 2.0
-                # rebuild the identical net + pyramid the weights trained with
                 CONV_RADIUS   = float(rj.get("conv_radius", CONV_RADIUS))
                 DEFORM_RADIUS = float(rj.get("deform_radius", DEFORM_RADIUS))
                 KP_EXTENT     = float(rj.get("kp_extent", KP_EXTENT))
@@ -263,7 +250,6 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
                 DEFORMABLE    = bool(rj.get("deformable", DEFORMABLE))
                 if rj.get("neighbor_limits"):
                     NEIGHBOR_LIMITS = [int(x) for x in rj["neighbor_limits"]]
-                # rebuild the exact assembly from run.json; env ignored at infer
                 mf = rj.get("features")
                 try:
                     FEAT_SPEC = (tc.parse_feat_spec(",".join(mf), FEAT_LEGACY)
@@ -271,9 +257,6 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
                 except ValueError:
                     FEAT_SPEC = list(FEAT_LEGACY)
                 if rj.get("hag_source"):
-                    # ponytail: TEMPORARY shim (remove once legacy runs retire) —
-                    # the deleted --hag variant's 'height' was real HAG; feed
-                    # feat_hag in that slot (scenes must be converted with HAG on)
                     FEAT_SPEC = ["feat_hag" if n == "height" else n for n in FEAT_SPEC]
                     print(f"  [legacy-hag] weights from the removed --hag variant "
                           f"(hag_source={rj['hag_source']}): 'height' -> feat_hag; "
@@ -281,14 +264,12 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
                           flush=True)
 
     if "rgb" in FEAT_SPEC:
-        raise ValueError("the KPConv tile pipeline has no rgb channel — use "
+        raise ValueError("the KPConv tile pipeline has no rgb channel. Use "
                          "intensity (rgb is folded into it when a scene has "
                          "no intensity)")
-    IN_CH = 1 + len(FEAT_SPEC)   # bias + spec channels; kp names are width 1
+    IN_CH = 1 + len(FEAT_SPEC)
 
     def _cache_signature():
-        # everything that changes cached tile content, incl. pyramid geometry —
-        # neighbor_limits.json is keyed by this same signature
         sp = ds_meta.get("split", {})
         return {
             "format_version": 2,
@@ -301,7 +282,7 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
             "min_pts_mask": 64,
             "min_pts_sub": 32,
             "intensity_norm": "p95_clip2",
-            "num_classes": NUM_CLASSES,   # class reorder/merge invalidates the cache
+            "num_classes": NUM_CLASSES,
             "class_names": CLASS_NAMES,
             "feature_recipe": "bias," + ",".join(
                 "ret_num" if n == "return_number" else n
@@ -312,7 +293,6 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
         }
 
     def ensure_prep():
-        # train tiles at TT_TRAIN_STRIDE; val/test keep chunk/2 for the voted eval
         return tc.kp_ensure_prep(
             PREP_DIR, ds_root, _cache_signature(),
             lambda name, pc_path, out_dir, split: tc.kp_tile_and_save(
@@ -321,7 +301,6 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
                 GRID, NUM_CLASSES))
 
     def find_latest_checkpoint():
-        # same-recipe runs only: optimizer, feature spec and arch hash must match
         return tc.kp_find_latest_checkpoint(
             OPT_TYPE_STR, {FEATURE_MODE},
             arch_hash=arch_hash(_arch(DEFORMABLE)),
@@ -337,7 +316,6 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
           f"{torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'none'}")
 
     if not INFER:
-        # clear stale STOP before the slow prep; a stop clicked during startup survives
         tc.clear_stop()
     train_list, val_list, test_list = ([], [], []) if INFER else ensure_prep()
 
@@ -372,12 +350,12 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
         print(f"  train_tiles: {len(train_tiles)}   val_tiles: {len(val_tiles)}   "
               f"test_tiles: {len(test_tiles)}", flush=True)
     if not train_tiles and not INFER:
-        raise RuntimeError("No training tiles after preprocessing — check the dataset.")
+        raise RuntimeError("No training tiles after preprocessing. Check the dataset.")
 
     from models.architectures import KPFCNN, p2p_fitting_regularizer
-    from datasets.common import PointCloudDataset   # needs the compiled C++ wrappers
+    from datasets.common import PointCloudDataset
 
-    IN_DIM = IN_CH + (1 if DG_LOGDK_FEAT else 0)   # +log d_k (D3b)
+    IN_DIM = IN_CH + (1 if DG_LOGDK_FEAT else 0)
     cfg = make_cfg(NUM_CLASSES, IN_DIM, GRID,
                    conv_radius=CONV_RADIUS, deform_radius=DEFORM_RADIUS,
                    kp_extent=KP_EXTENT, num_kp=NUM_KP, first_feat=FIRST_FEAT,
@@ -396,11 +374,11 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
         list is 5*L+2 long (no scales/rots tail), so L=(len-2)//5."""
         def __init__(self, li, L, dev="cuda"):
             g = lambda a: torch.from_numpy(a).to(dev)
-            self.points    = [g(a) for a in li[0:L]]          # f32
-            self.neighbors = [g(a) for a in li[L:2 * L]]      # i64
-            self.pools     = [g(a) for a in li[2 * L:3 * L]]  # i64
-            self.upsamples = [g(a) for a in li[3 * L:4 * L]]  # i64
-            self.lengths   = [g(a) for a in li[4 * L:5 * L]]  # i32
+            self.points    = [g(a) for a in li[0:L]]
+            self.neighbors = [g(a) for a in li[L:2 * L]]
+            self.pools     = [g(a) for a in li[2 * L:3 * L]]
+            self.upsamples = [g(a) for a in li[3 * L:4 * L]]
+            self.lengths   = [g(a) for a in li[4 * L:5 * L]]
             self.features  = g(li[5 * L])
             self.labels    = g(li[5 * L + 1])
 
@@ -426,14 +404,38 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
         density_aug=DG_DENSITY_AUG, coarsen_max=DG_COARSEN_MAX,
         p_native=DG_P_NATIVE)
 
-    # neighborhood_limits: a train/infer mismatch silently changes the pyramid,
-    # so the limits travel in run.json and inference restores them above
+    proxy_samples = []
+    if not INFER and not EVAL_ONLY:
+        with tc.fixed_np_seed():
+            proxy_tiles, proxy_rep = tc.pick_proxy_tiles(
+                val_tiles, NUM_CLASSES, PROXY_TILES, mode=PROXY_SAMPLING,
+                class_names=CLASS_NAMES,
+                cache_path=f"{PREP_DIR}/val_class_balance_cache.npz",
+                viable=lambda p: sample_tile(p, training=False) is not None)
+            # subsampled ONCE here, before the prefetch threads exist: sample_tile draws from the global np.random, so re-sampling each val pass would race them and fork the scored point set
+            for tp in proxy_tiles:
+                s = sample_tile(tp, training=False)
+                if s is None:
+                    bn = os.path.basename(tp)
+                    why = ", ".join(proxy_rep["covers"].get(bn, [])) or "the stride base"
+                    raise RuntimeError(
+                        f"proxy val tile {bn} (curated for {why}) has fewer than "
+                        f"32 points: delete {PREP_DIR} and re-run the dataset prep")
+                proxy_samples.append((os.path.basename(tp), s))
+        print(proxy_rep["text"], flush=True)
+        if not tc.proxy_guard(run_dir, proxy_rep, tc.PROXY_PROTOCOL_TILES,
+                              CLASS_NAMES):
+            run_id, run_dir = tc.kp_make_run_dir("kpconv_native")
+            resume_info, resume_ckpt, start_epoch = None, None, 0
+            tc.proxy_guard(run_dir, proxy_rep, tc.PROXY_PROTOCOL_TILES, CLASS_NAMES)
+
+    # neighborhood_limits: a train/infer mismatch silently changes the pyramid, so the limits travel in run.json and inference restores them
     def calibrate_neighbors(tiles, k=CALIB_TILES, untouched=CALIB_UNTOUCHED):
         """Per-layer limits keeping `untouched` of neighborhoods uncropped —
         KPConv's own calibration rule. The probe runs uncropped by construction."""
         hist_n = int(np.ceil(4 / 3 * np.pi * (cfg.deform_radius + 1) ** 3))
         hists = np.zeros((cfg.num_layers, hist_n), np.int64)
-        probe = _Shim(cfg, [])                      # empty limits => uncropped
+        probe = _Shim(cfg, [])
         take = np.random.choice(tiles, min(k, len(tiles)), replace=False)
         for tp in take:
             s = sample_tile(tp, max_pts=CALIB_MAX_PTS, training=False)
@@ -442,8 +444,8 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
             li = probe.segmentation_inputs(s[0], s[1], s[2].astype(np.int64),
                                            np.array([len(s[0])], np.int32))
             L = (len(li) - 2) // 5
-            for layer, nb in enumerate(li[L:2 * L]):   # input_neighbors per layer
-                counts = np.sum(nb < nb.shape[0], axis=1)   # non-shadow neighbors
+            for layer, nb in enumerate(li[L:2 * L]):
+                counts = np.sum(nb < nb.shape[0], axis=1)
                 hists[layer] += np.bincount(counts, minlength=hist_n)[:hist_n]
         if not hists.sum():
             raise RuntimeError("neighbor calibration saw no usable tiles")
@@ -475,13 +477,10 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
 
     if INFER:
         if NEIGHBOR_LIMITS is None:
-            # legacy weights lack neighbor_limits: exact uncropped matrices are
-            # correct (just slower) — a deliberate fallback, not a warning
-            print("  [infer] no neighbor_limits in run.json — using exact "
+            print("  [infer] no neighbor_limits in run.json. Using exact "
                   "uncropped neighbor matrices (slower).", flush=True)
             NEIGHBOR_LIMITS = []
     elif resume_info:
-        # adopt the resumed run's limits so the pyramid matches its weights
         rj_prev = _run_json_beside(f"{run_dir}/final_model.pth")
         if rj_prev and rj_prev.get("neighbor_limits"):
             NEIGHBOR_LIMITS = [int(x) for x in rj_prev["neighbor_limits"]]
@@ -500,7 +499,7 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
                 "warm_start": False,
                 "feature_mode": FEATURE_MODE,
                 "input_channels": IN_CH,
-                "features": FEAT_SPEC,   # inference rebuilds this exact assembly
+                "features": FEAT_SPEC,
                 "dataset": dataset,
                 "n_epochs": N_EPOCHS, "epoch_steps": EPOCH_STEPS,
                 "pack_n": PACK_N, "accum": ACCUM,
@@ -536,7 +535,6 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
                 "test_scenes":  [n for n, _, _ in test_list],
             }, f, indent=2)
 
-    # built under the KPConv root — see _cwd
     with _cwd(_kpconv_root()):
         net = KPFCNN(cfg, lbl_values=list(range(NUM_CLASSES)), ign_lbls=[]).cuda()
     print(f"  Model params: {sum(p.numel() for p in net.parameters() if p.requires_grad):,}")
@@ -544,11 +542,10 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
           f"first_radius={GRID * CONV_RADIUS:.2f} m  grid={GRID:g} m  "
           f"neighbor_limits={NEIGHBOR_LIMITS}", flush=True)
 
-    # offset (deformable) params at DEFORM_LR_FACTOR x LR — KPConv's own split
     deform_params = [p for n, p in net.named_parameters() if "offset" in n]
     other_params  = [p for n, p in net.named_parameters() if "offset" not in n]
     groups = [{"params": other_params, "lr_mult": 1.0}]
-    if deform_params:                       # empty when DEFORMABLE=False
+    if deform_params:
         groups.append({"params": deform_params, "lr_mult": DEFORM_LR_FACTOR})
     optim = torch.optim.SGD(groups, lr=SGD_LR0, momentum=SGD_MOMENTUM,
                             weight_decay=SGD_WD)
@@ -589,7 +586,6 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
     if INFER:
         seg_loss = pick_train_tile = None
     else:
-        # --- class-balanced loss + rare-class oversampling ------------------
         class_counts, present_mask = tc.scan_class_balance(
             train_tiles, NUM_CLASSES,
             cache_path=f"{PREP_DIR}/class_balance_cache.npz")
@@ -624,7 +620,6 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
         build_feat, GRID, CHUNK_XY, NUM_CLASSES, DG_INFER_TTA,
         save_probs=SAVE_PROBS, exclude_idx=EXC_IDX)
 
-    # --- inference-only mode -------------------------------------------------
     if INFER:
         if not infer_input:
             raise ValueError("--mode infer requires --infer-input <job_id>")
@@ -645,7 +640,6 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
                      "exclude_classes": [CLASS_NAMES[i] for i in EXC_IDX],
                      "started_utc": datetime.now(timezone.utc).isoformat()}
         if DG_INFER_ADABN:
-            # D2b: re-estimate BN running stats on the target tiles (label-free).
             print("  [infer] AdaBN: recomputing BN stats on target tiles...", flush=True)
             dg.adabn_recalibrate(
                 net,
@@ -656,8 +650,8 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
 
         def _predict(pc_path):
             z = np.load(pc_path)
-            # scene-local frame for compute; deliverable keeps original coords
             raw = z["xyz"]
+            tc.require_finite_xyz(raw, os.path.basename(pc_path))
             xyz = (raw - np.floor(raw.min(0))).astype(np.float32)
             intensity_n, ret_num = tc.scene_arrays(z, len(xyz))
             extras = tc.feat_extras(z, FEAT_SPEC, os.path.basename(pc_path))
@@ -669,26 +663,22 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
         return
 
     metrics_csv = f"{run_dir}/metrics.csv"
-    if not os.path.exists(metrics_csv):     # keep prior rows when resuming
-        with open(metrics_csv, "w", newline="") as f:
+    if not os.path.exists(metrics_csv):
+        with open(metrics_csv, "w", newline="", encoding="utf-8") as f:
             csv.writer(f).writerow([
                 "epoch", "train_loss", "train_acc", "train_iou", "offset_loss",
                 "lr", "sec_per_epoch", "gpu_mem_mb",
             ])
 
     val_csv = f"{run_dir}/val_metrics.csv"
-    if not os.path.exists(val_csv):
-        with open(val_csv, "w", newline="") as f:
-            csv.writer(f).writerow(["epoch", "val_acc", "val_miou"] +
-                                   [f"iou_{n}" for n in CLASS_NAMES])
+    tc.init_val_csv(val_csv, CLASS_NAMES)
 
     val_items  = [(n, p, c, f"{PREP_DIR}/val")  for n, p, c in val_list]
     test_items = [(n, p, c, f"{PREP_DIR}/test") for n, p, c in test_list]
     print(f"  eval set: {len(val_items)} holdout(val) + {len(test_items)} test scenes",
           flush=True)
 
-    # voted eval on raw points (shared KP-family pipeline)
-    def _fwd_eval(tiles):     # [(cxyz, feat)] -> per-tile logits list
+    def _fwd_eval(tiles):
         b, _ = make_kp_batch([(c, f, None) for c, f in tiles])
         lg = net(b, cfg).cpu().numpy().astype(np.float32)
         return np.split(lg, np.cumsum([len(c) for c, _ in tiles])[:-1])
@@ -698,54 +688,81 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
     best = tc.BestCheckpoint(run_dir)
     tc.write_run_manifest(run_dir, "kpconv", dataset)
 
+    def _proxy_batches():
+        for bn, s in proxy_samples:
+            try:
+                b, lab_t = make_kp_batch([s])
+            except Exception as e:
+                why = ", ".join(proxy_rep["covers"].get(bn, [])) or "the stride base"
+                raise RuntimeError(
+                    f"proxy val tile {bn} (curated for {why}) could not build "
+                    f"a KPConv batch: delete {PREP_DIR} and re-run the dataset "
+                    f"prep. Original: {e}") from e
+            yield b, lab_t
+
     def run_eval(ep, write_json=False):
-        # val scores current weights; the final call scores TEST on the
-        # best-tracked checkpoint. PreciseBN: re-estimate BN stats with frozen
-        # weights before scoring. Both skipped in EVAL_ONLY.
+        if not write_json:
+            net.eval()
+            m = tc.proxy_val(_proxy_batches(), lambda b: net(b, cfg),
+                             NUM_CLASSES, CLASS_NAMES, f"val@ep{ep}",
+                             len(proxy_tiles), tc.PROXY_PROTOCOL_TILES,
+                             inventory=proxy_rep["inventory"])
+            net.train()
+            if best.update(m["present_classes_mIoU"]):
+                tc.atomic_torch_save({"model": net.state_dict(), "epoch": ep},
+                                     best.final)
+            tc.append_val_row(val_csv, ep, m, CLASS_NAMES)
+            return m
         if not EVAL_ONLY:
             def _bn_batches(n=48):
-                made = 0
+                made = fails = 0
                 while made < n:
+                    if fails >= 200:
+                        raise tc.DatasetExhausted(
+                            "PreciseBN: 200 consecutive tile failures — training "
+                            "tiles can't build batches; re-run dataset prep")
                     s = sample_tile(pick_train_tile(), training=False)
                     if s is None:
+                        fails += 1
                         continue
                     try:
                         b, _ = make_kp_batch([s])
                     except Exception:
+                        fails += 1
                         continue
+                    fails = 0
                     made += 1
                     yield b
             dg.adabn_recalibrate(net, _bn_batches(), forward=lambda mdl, b: mdl(b, cfg))
         net.eval()
         m = evaluate(val_items, f"val@ep{ep}")
         tc.append_val_row(val_csv, ep, m, CLASS_NAMES)
-        if not EVAL_ONLY and best.update(m["present_classes_mIoU"]):
-            torch.save({"model": net.state_dict(), "epoch": ep}, best.final)
-        if write_json:
-            swapped = not EVAL_ONLY and os.path.exists(best.final)
-            if swapped:
-                live_state = {k: v.clone() for k, v in net.state_dict().items()}
-                net.load_state_dict(torch.load(best.final, map_location="cuda",
-                                               weights_only=True)["model"])
-                net.eval()
-            mt = evaluate(test_items, f"test@ep{ep}")
-            if swapped:
-                net.load_state_dict(live_state)
-            with open(f"{run_dir}/test_metrics.json", "w") as fj:
-                json.dump({"val": m, "test": mt,
-                           "val_scenes": [n for n, _, _ in val_list],
-                           "test_scenes": [n for n, _, _ in test_list]}, fj, indent=2)
+        swapped = not EVAL_ONLY and os.path.exists(best.final)
+        if swapped:
+            live_state = {k: v.clone() for k, v in net.state_dict().items()}
+            net.load_state_dict(torch.load(best.final, map_location="cuda",
+                                           weights_only=True)["model"])
+            net.eval()
+        mt = evaluate(test_items, f"test@ep{ep}")
+        if swapped:
+            net.load_state_dict(live_state)
+        with open(f"{run_dir}/test_metrics.json", "w", encoding="utf-8") as fj:
+            json.dump({"val": m, "test": mt,
+                       "val_scenes": [n for n, _, _ in val_list],
+                       "test_scenes": [n for n, _, _ in test_list]}, fj, indent=2)
         net.train()
         return m
 
-    # --- train loop: EPOCH_STEPS steps of PACK_N tiles x ACCUM forwards ------
     LOG_EVERY = 50
-    AMP = os.environ.get("TT_AMP") == "1"   # opt-in bf16 autocast
+    AMP = os.environ.get("TT_AMP") == "1"
     def _draw():
-        while True:
+        for _ in range(1000):
             s = sample_tile(pick_train_tile(), training=True)
             if s is not None:
                 return s
+        raise tc.DatasetExhausted(
+            "1000 consecutive empty tile draws — training tiles are empty or "
+            "too small; re-run dataset prep")
     prefetch = (tc.make_prefetcher(
         lambda: make_kp_batch([_draw() for _ in range(PACK_N)]),
         depth=int(os.environ.get("TT_PREFETCH", "2")))
@@ -754,11 +771,11 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
           f"{EPOCH_STEPS} steps/epoch, pack {PACK_N} x accum {ACCUM}"
           f"{' [bf16 autocast]' if AMP else ''}", flush=True)
     t_run = time.time()
-    ep = N_EPOCHS - 1     # final-eval label when the loop never runs (EVAL_ONLY)
+    ep = N_EPOCHS - 1
     for ep in range(start_epoch, N_EPOCHS):
         cur_lr = lr_at(ep)
         for g in optim.param_groups:
-            g["lr"] = cur_lr * g["lr_mult"]     # deform offsets stay at 0.1x
+            g["lr"] = cur_lr * g["lr_mult"]
         net.train()
         ep_loss, ep_reg = 0.0, 0.0
         ep_conf = torch.zeros(NUM_CLASSES, NUM_CLASSES, dtype=torch.long,
@@ -775,7 +792,6 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
                     with torch.autocast("cuda", dtype=torch.bfloat16, enabled=AMP):
                         logits = net(batch, cfg)
                         loss_seg = seg_loss(logits, lab_t)
-                        # reads state the forward populates — must come after net(...)
                         reg = p2p_fitting_regularizer(net)
                         loss = (loss_seg + reg) / ACCUM
                     if not torch.isfinite(loss):
@@ -792,13 +808,25 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
                         minlength=NUM_CLASSES * NUM_CLASSES,
                     ).reshape(NUM_CLASSES, NUM_CLASSES)
                 except Exception as e:
+                    if isinstance(e, (tc.DatasetExhausted, tc.NonFiniteXYZ)):
+                        raise
+                    # a device-side assert poisons the CUDA context (every later forward fails too), so re-raise with the remedy instead of burning the epoch
+                    if (isinstance(e, RuntimeError)
+                            and "out of memory" not in str(e)
+                            and any(s in str(e) for s in
+                                    ("CUDA error", "device-side assert",
+                                     "illegal memory access"))):
+                        raise RuntimeError(
+                            "unrecoverable CUDA error in forward. If it is an "
+                            "index/scatter-gather assert, a scene likely has "
+                            "non-finite coords: re-ingest the data and delete the "
+                            f"prep cache. Original: {e}") from e
                     n_failed += 1
                     if n_failed == 1:
                         print(f"  forward failed (first occurrence, step {step}): {e}",
                               flush=True)
                         traceback.print_exc()
             if n_ok:
-                # KPConv's own clip: VALUE clip, not norm
                 torch.nn.utils.clip_grad_value_(net.parameters(), GRAD_CLIP)
                 optim.step()
                 n_steps += 1
@@ -806,7 +834,7 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
                     print(f"    ep {ep:3d} step {n_steps:4d}: "
                           f"loss={ep_loss/max(n_fwd,1):.4f}", flush=True)
         if n_steps == 0:
-            raise RuntimeError(f"epoch {ep}: 0 optimizer steps — {n_failed} failed forwards.")
+            raise RuntimeError(f"epoch {ep}: 0 optimizer steps ({n_failed} failed forwards).")
         if n_failed:
             print(f"  ep {ep:3d} note: {n_failed} failed forwards", flush=True)
         sec_per_epoch = time.time() - t_ep
@@ -817,7 +845,7 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
         with np.errstate(invalid="ignore"):
             train_iou = float(np.mean(ep_inter / np.maximum(ep_union, 1)))
         gpu_mem = torch.cuda.max_memory_allocated() / 1e6
-        with open(metrics_csv, "a", newline="") as f:
+        with open(metrics_csv, "a", newline="", encoding="utf-8") as f:
             csv.writer(f).writerow([
                 ep, f"{ep_loss/max(n_fwd,1):.6f}", f"{train_acc:.4f}",
                 f"{train_iou:.4f}", f"{ep_reg/max(n_fwd,1):.6f}",
@@ -826,24 +854,23 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
         print(f"  ep {ep:3d}: loss={ep_loss/max(n_fwd,1):.4f} acc={train_acc:.4f} "
               f"miou={train_iou:.4f} lr={cur_lr:.2e} s/epoch={sec_per_epoch:.1f}", flush=True)
         if (ep + 1) % CHECKPOINT_GAP == 0:
-            torch.save({"model": net.state_dict(), "optim": optim.state_dict(),
-                        "epoch": ep},
-                       f"{run_dir}/checkpoints/ep{ep:03d}.pth")
+            tc.atomic_torch_save({"model": net.state_dict(),
+                                  "optim": optim.state_dict(), "epoch": ep},
+                                 f"{run_dir}/checkpoints/ep{ep:03d}.pth")
         stop = tc.stop_requested(ep)
         if (ep + 1) % VAL_EVERY == 0 and ep != N_EPOCHS - 1 and not stop:
-            run_eval(ep)               # last epoch handled by the final eval below
+            run_eval(ep)
         if stop:
-            break                      # falls through to the final eval + finalize
+            break
 
     if prefetch:
-        prefetch.shutdown()      # stop background pack builds during the eval
+        prefetch.shutdown()
 
     print("  final evaluation over the combined eval set…", flush=True)
     run_eval(ep, write_json=True)
     if not EVAL_ONLY:
-        best.finalize(lambda p: torch.save(
+        best.finalize(lambda p: tc.atomic_torch_save(
             {"model": net.state_dict(), "epoch": ep}, p))
-        # DONE marker: AUTO_RESUME skips completed runs
         open(f"{run_dir}/DONE", "w").close()
     print(f"  total wall-clock: {(time.time() - t_run)/3600:.2f} h")
 
@@ -851,7 +878,7 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
 def _self_test():
     """Host wiring check (no GPU, no compiled C++, no /datasets): config
     derivation, CPU KPFCNN build, offset param-group split."""
-    os.environ.setdefault("MPLBACKEND", "Agg")   # kernel_points imports pyplot
+    os.environ.setdefault("MPLBACKEND", "Agg")
     sys.path.insert(0, _kpconv_root())
 
     for deformable in (True, False):
@@ -865,15 +892,15 @@ def _self_test():
 
     from models.architectures import KPFCNN
     cfg = make_cfg(num_classes=5, in_features_dim=4, grid=2.0, deformable=DEFORMABLE)
-    with _cwd(_kpconv_root()):      # kernel disposition cache is CWD-relative
-        net = KPFCNN(cfg, lbl_values=list(range(5)), ign_lbls=[])   # CPU build
+    with _cwd(_kpconv_root()):
+        net = KPFCNN(cfg, lbl_values=list(range(5)), ign_lbls=[])
     n_params = sum(p.numel() for p in net.parameters())
     assert n_params > 0
     deform_params = [n for n, _ in net.named_parameters() if "offset" in n]
     other_params  = [n for n, _ in net.named_parameters() if "offset" not in n]
     assert bool(deform_params) == DEFORMABLE, deform_params[:3]
     assert len(deform_params) + len(other_params) == len(list(net.parameters()))
-    print(f"ok — num_layers={cfg.num_layers} deform_layers={cfg.deform_layers} "
+    print(f"ok: num_layers={cfg.num_layers} deform_layers={cfg.deform_layers} "
           f"params={n_params:,} offset_params={len(deform_params)}")
 
 

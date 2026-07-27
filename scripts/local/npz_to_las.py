@@ -24,8 +24,7 @@ def npz_to_las(path):
     rgb = np.asarray(z["rgb"]) if "rgb" in z.files else None
 
     h = laspy.LasHeader(point_format=7 if rgb is not None else 6, version="1.4")
-    # npz_ prefix when shadowing a native LAS dim: the integer native slots
-    # would truncate the normalized floats
+    # npz_ prefix when shadowing a native LAS dim: the integer native slots would truncate the normalized floats
     taken = set(h.point_format.dimension_names)
     extras = {}
     for k in z.files:
@@ -42,22 +41,21 @@ def npz_to_las(path):
         # single source of truth for the inverse (D2 legacy block raises here)
         sys.path.insert(0, _REPO_ROOT)
         from trainer_gui.readers import restore_to_source
-        xyz = restore_to_source(xyz, proc_wkt, src_wkt)   # -> source frame
+        xyz = restore_to_source(xyz, proc_wkt, src_wkt)
         from pyproj import CRS                             # required; wrong-unit coords under a stale WKT is worse than erroring
-        h.add_crs(CRS.from_wkt(src_wkt or proc_wkt))       # coords now match this frame
+        h.add_crs(CRS.from_wkt(src_wkt or proc_wkt))
     h.offsets = xyz.min(0)
     h.scales = [0.001] * 3
     las = laspy.LasData(h)
     las.x, las.y, las.z = xyz[:, 0], xyz[:, 1], xyz[:, 2]
     if rgb is not None:
-        scale = 257 if rgb.max() <= 255 else 1      # las color is 16-bit
+        scale = 257 if rgb.max() <= 255 else 1
         las.red, las.green, las.blue = (rgb * scale).astype(np.uint16).T
     for k, v in extras.items():
         setattr(las, k, v)
     out = str(path)[: -len(".npz")] + ".las"
     las.write(out)
-    # ponytail: .format, not f-string -- keeps the file py2-parseable so the
-    # version guard above can fire instead of a bare SyntaxError.
+    # ponytail: .format, not f-string -- keeps the file py2-parseable so the version guard above can fire instead of a bare SyntaxError
     print("  {} -> {} ({:,} pts; fields: {})".format(
         path, out, len(xyz), ", ".join(extras) or "none"))
     return out
@@ -76,8 +74,8 @@ def self_test():
                  label=np.array([-1] * 5 + [2] * 5, np.int32))
         las = laspy.read(npz_to_las(p))
         assert np.allclose(np.asarray(las.feat_hag), np.linspace(0, 30, 10), atol=1e-5)
-        assert np.asarray(las.label).tolist() == [-1] * 5 + [2] * 5   # f32 keeps -1
-        assert np.asarray(las.red).max() > 255                        # 16-bit color
+        assert np.asarray(las.label).tolist() == [-1] * 5 + [2] * 5
+        assert np.asarray(las.red).max() > 255
         # native-name collision lands under npz_ with full float precision
         assert np.allclose(np.asarray(las.npz_intensity), np.linspace(0, 2, 10), atol=1e-6)
     print("self-test OK")

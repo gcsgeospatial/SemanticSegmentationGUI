@@ -9,10 +9,10 @@ from typing import Optional
 import modal
 
 APP_NAME      = "randlanet-cold"
-GPU_TYPE      = os.environ.get("TT_GPU", "A10G")   # RandLA is light, A10G handles it
+GPU_TYPE      = os.environ.get("TT_GPU", "A10G")
 TIMEOUT_HOURS = int(os.environ.get("TT_TIMEOUT_HOURS", "24"))
 
-DATASETS_ROOT = "/datasets"   # terminal-datasets volume
+DATASETS_ROOT = "/datasets"
 
 app = modal.App(APP_NAME)
 
@@ -44,8 +44,7 @@ image = image.run_commands(
     " && rm -rf /opt/randlanet/.git",
 )
 
-# upstream setup.py lists knn.pyx (newer Cython mangles it); build from the
-# shipped pre-cythonized knn.cpp instead
+# upstream setup.py lists knn.pyx (newer Cython mangles it); build from the shipped pre-cythonized knn.cpp instead
 _NN_SETUP = r"""
 from setuptools import setup, Extension
 import numpy
@@ -104,8 +103,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     """Shell out to the local trainer — local and cloud run identical code."""
     import sys
     sys.path.insert(0, "/root")
-    # resume only on Modal's OWN retries (call id stable across retries, new
-    # per `modal run`). ponytail: /outputs/.attempts markers never cleaned.
+    # resume only on Modal's OWN retries (the call id is stable across retries, new per `modal run`); ponytail: /outputs/.attempts markers are never cleaned
     fcid = modal.current_function_call_id()
     marker = f"/outputs/.attempts/{fcid}" if fcid else ""
     if not fcid or os.path.exists(marker):

@@ -12,7 +12,7 @@ class Recipe:
     def __init__(self):
         self.python_version: str | None = None
         self.base: tuple = ("debian_slim", None)
-        self.steps: list[tuple] = []   # (kind, payload) in call order
+        self.steps: list[tuple] = []
 
     @classmethod
     def debian_slim(cls, python_version=None, **_kw):
@@ -75,7 +75,7 @@ class Volume:
     def commit(self, *a, **k):
         return None
 
-    def __getattr__(self, _name):           # reload, batch_upload, listdir, ...
+    def __getattr__(self, _name):
         return lambda *a, **k: None
 
 
@@ -129,9 +129,8 @@ def _build_module() -> types.ModuleType:
     m.Volume = Volume
     m.Retries = _noop_factory
 
-    def __getattr__(name):            # PEP 562: any other modal.<x> -> no-op
-        # dunders MUST raise: inspect.getmodule (via torch import) reads
-        # __file__ on every sys.modules entry and chokes on a function
+    def __getattr__(name):
+        # dunders MUST raise: inspect.getmodule (via torch import) reads __file__ on every sys.modules entry and chokes on a function
         if name.startswith("__") and name.endswith("__"):
             raise AttributeError(name)
         return _noop_factory

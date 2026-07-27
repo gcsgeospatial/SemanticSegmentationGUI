@@ -53,13 +53,13 @@ def _stack(layout_cls, widgets, sizes, vertical: bool) -> QWidget:
     sizes = sizes or [1] * len(widgets)
     for child, size in zip(widgets, sizes):
         if vertical:
-            # clamp to the content-derived minimum: setMinimumHeight replaces it,
+            # clamp to the content-derived minimum: setMinimumHeight replaces it, and a bare `size` let dense forms squash until rows overlapped
             # and a bare `size` let dense forms squash until rows overlapped
             polish_forms(child)
             child.setMinimumHeight(max(int(size), child.minimumSizeHint().height()))
         else:
             child.setMinimumWidth(160)          # keep side panes usable
-        lay.addWidget(child, int(size))         # weight: grow proportionally
+        lay.addWidget(child, int(size))
     return host
 
 

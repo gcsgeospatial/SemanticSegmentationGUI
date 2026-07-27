@@ -17,18 +17,15 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog,
                                QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
 from .. import analysis, appstate, dataset, local_cli, modal_cli, theme, ui
-from ..backbones import BACKBONES, GPU_CHOICES
+from ..backbones import BACKBONES, GPU_CHOICES, GPU_VRAM_GB, batch_for_vram
 from ..jobs import FuncWorker, JobRunner, LogParser
 from ..logconsole import LogConsole
 
-# Channels each arch CAN consume — a capability filter. "height" is removed —
-# don't reintroduce it. The standard channels are pre-checked as a sensible,
-# reversible default (default_feature_checks); geo/hag extras stay opt-in.
+# Channels each arch CAN consume — a capability filter. "height" is removed, don't reintroduce it; standard channels are pre-checked as a reversible default (default_feature_checks), geo/hag extras stay opt-in.
 _FEAT_STANDARD = {
     "randlanet":    ["intensity", "return_number"],
     "kpconvx_cold": ["intensity", "return_number"],
     "kpconv":       ["intensity", "return_number"],
-    # ptv3 family: one 3-wide color slot (rgb OR intensity), no return_number
     "ptv3":         ["intensity", "rgb"],
     "concerto":     ["intensity", "rgb"],
     "sonata":       ["intensity", "rgb"],
@@ -52,7 +49,8 @@ def default_feature_checks(base: str, std: list[str]) -> set[str]:
         return set()
     return set(std)
 
-_TUNING_FLAGS = ("batch", "chunk-xy", "grid", "sub-grid")
+# form order for the inline param rows; anything unlisted trails in spec order
+_PARAM_ORDER = ("epochs", "batch", "steps-per-epoch", "grid", "sub-grid", "chunk-xy")
 
 
 class TrainPage(QWidget):
@@ -77,6 +75,10 @@ class TrainPage(QWidget):
         self._run_live = False
         self._run_t0: float | None = None
         self._run_epochs = 0
+        self._last_worst = ""
+        self._last_epoch_txt = ""
+        self._local_vram: float | None | str = "?"   # nvidia-smi is slow; probe once
+        self.batch_note: QLabel | None = None
 
         root = QVBoxLayout(self)
         title = QLabel("Train")
@@ -105,10 +107,6 @@ class TrainPage(QWidget):
         self.cfg_btn.clicked.connect(self._open_model_config)
         model_row.addWidget(self.cfg_btn)
         form.addRow("Model", ui.wrap(model_row))
-        self.star_hint = QLabel("★ = dataset recommendation")
-        theme.set_accent(self.star_hint, "muted")
-        form.addRow("", self.star_hint)
-        # Validation cadence (VAL_EVERY env; trainer default 10 emits nothing).
         self.val_every = QSpinBox()
         self.val_every.setRange(1, 100)
         self.val_every.setValue(10)
@@ -118,6 +116,16 @@ class TrainPage(QWidget):
             "picked among validated epochs only); higher N = faster, coarser.")
         self.val_every.valueChanged.connect(self._refresh_summaries)
         form.addRow("Validate every N epochs", self.val_every)
+        self.proxy_sampling = QComboBox()
+        self.proxy_sampling.addItem("Coverage (natural mix)", "coverage")
+        self.proxy_sampling.addItem("Density (rare-heavy)", "density")
+        self.proxy_sampling.setToolTip(
+            "How the mid-training validation subset is picked: coverage keeps the "
+            "natural class distribution and guarantees a floor of scored points for "
+            "every class; density spends the rest of the tile budget on rare classes "
+            "on top of that same floor — steadier rare-class IoU, but the overall "
+            "numbers no longer reflect the real class mix.")
+        form.addRow("Validation sampling", self.proxy_sampling)
         form.addRow("Input features", self._features_row())
         self.detach_chk = QCheckBox("Detach (return immediately — launch several models in parallel)")
         self.detach_chk.setToolTip("Runs in the cloud without streaming logs here. Reattach with "
@@ -132,10 +140,7 @@ class TrainPage(QWidget):
         form.addRow("GPU (Modal)", self.gpu_combo)
         self.backbone_combo.currentIndexChanged.connect(self._sync_gpu_default)
         self.gpu_combo.currentIndexChanged.connect(self._refresh_summaries)
-
-        self.warn_label = QLabel("")
-        self.warn_label.setWordWrap(True)
-        theme.set_accent(self.warn_label, "warn")
+        self.gpu_combo.currentIndexChanged.connect(self._apply_batch_prefill)
 
         run_row = QHBoxLayout()
         self.launch_btn = QPushButton("Launch training")
@@ -165,9 +170,7 @@ class TrainPage(QWidget):
 
         config_col = QVBoxLayout()
         config_col.addWidget(form_box)
-        config_col.addWidget(self._tuning_box())
         config_col.addWidget(self._advanced_box())
-        config_col.addWidget(self.warn_label)
         config_col.addWidget(self.summary_lbl)
         config_col.addLayout(run_row)
         config_col.addStretch()
@@ -191,8 +194,8 @@ class TrainPage(QWidget):
 
         metrics_col = QVBoxLayout()
         metrics_col.addWidget(QLabel("Live epoch metrics"))
-        self.metrics_table = QTableWidget(0, 4)
-        self.metrics_table.setHorizontalHeaderLabels(["Epoch", "Loss", "Acc", "mIoU"])
+        self.metrics_table = QTableWidget(0, 5)
+        self.metrics_table.setHorizontalHeaderLabels(["Epoch", "Loss", "Acc", "mIoU", "Worst class"])
         self.metrics_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.metrics_table.verticalHeader().setVisible(False)
         self.metrics_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
@@ -223,8 +226,7 @@ class TrainPage(QWidget):
     def apply_exec_mode(self, local: bool):
         """Re-scheme for the chosen backend: hide local-only / Modal-only rows."""
         self.sub.setText(
-            "Pick a dataset and model. Parameters are pre-filled from density analysis; "
-            "edit before launching. "
+            "Pick a dataset and model. Parameters are pre-filled; edit before launching. "
             + ("Runs locally in the model's pixi env on your GPU."
                if local else
                "Runs on a Modal cloud GPU — upload the dataset from the Datasets page "
@@ -234,6 +236,7 @@ class TrainPage(QWidget):
         self._set_run_live(self._run_live)
         self.form.setRowVisible(self.gpu_combo, not local)
         self.form.setRowVisible(self.detach_chk, not local)
+        self._apply_batch_prefill()
         self.reload_datasets()
 
     def _sync_gpu_default(self):
@@ -243,7 +246,6 @@ class TrainPage(QWidget):
             if i >= 0:
                 self.gpu_combo.setCurrentIndex(i)
 
-    # --------------------------------------------- per-model pixi-env popup
     def _open_model_config(self):
         b = self._backbone()
         if b is None:
@@ -277,7 +279,7 @@ class TrainPage(QWidget):
         dlg.finished.connect(lambda *_: setattr(self, "_cfg_dialog", None))
         self._update_cfg_dialog()
         self.refresh_images()
-        dlg.show()   # non-modal: install progress shows in the main log
+        dlg.show()
 
     @staticmethod
     def _status_text(s: dict | None):
@@ -338,7 +340,6 @@ class TrainPage(QWidget):
         self._append(f"\n[local] ✗ pixi install failed to start: {err}")
         self._update_cfg_dialog()
 
-    # ------------------------------------------------------------- datasets
     def reload_datasets(self):
         current = self.dataset_combo.currentText()
         self.dataset_combo.blockSignals(True)
@@ -403,7 +404,6 @@ class TrainPage(QWidget):
         self.backbone_combo.blockSignals(False)
         self._rebuild_params()
 
-    # ------------------------------------------------------------- params form
     def _backbone(self):
         key = self.backbone_combo.currentData()
         return BACKBONES.get(key) if key else None
@@ -412,7 +412,6 @@ class TrainPage(QWidget):
         b = self._backbone()
         sig = (b.key if b else None, self.dataset_combo.currentText())
         if sig == self._built_sig and self._param_widgets:
-            # same backbone + dataset: never clobber user-edited values
             self._update_cfg_dialog()
             self._refresh_summaries()
             return
@@ -422,26 +421,19 @@ class TrainPage(QWidget):
         for w in self._key_rows:
             self.form.removeRow(w)
         self._key_rows.clear()
-        while self.tuning_form.rowCount():
-            self.tuning_form.removeRow(0)
         self._param_widgets.clear()
+        self.batch_note = None
         if b is None:
-            self.warn_label.setText("")
-            self.form.setRowVisible(self.star_hint, False)
             self._rebuild_feat_list()
             self._update_cfg_dialog()
             self._refresh_summaries()
             return
-        recs = (self._meta or {}).get("recommendations", {}).get(b.key, {})
-        row = 3   # Job-form insert point: right after the Model row
-        for spec in b.params:
-            rec = recs.get(spec.recommend_key) if spec.recommend_key and \
-                spec.recommend_key in recs else None
-            # keep the user's value unless a fresh dataset rec supersedes it
-            if spec.flag in prev and ((same_bb and rec is None) or spec.flag == "epochs"):
+        row = 3
+        for spec in sorted(b.params, key=lambda s: (s.flag not in _PARAM_ORDER,
+                                                    _PARAM_ORDER.index(s.flag)
+                                                    if s.flag in _PARAM_ORDER else 0)):
+            if spec.flag in prev and (same_bb or spec.flag == "epochs"):
                 value = prev[spec.flag]
-            elif rec is not None:
-                value = rec
             else:
                 value = spec.default
             if spec.flag == "freeze-encoder":
@@ -452,7 +444,7 @@ class TrainPage(QWidget):
                 w = QDoubleSpinBox()
                 w.setDecimals(spec.decimals)
                 w.setSingleStep(spec.step)
-                w.setRange(spec.lo, 1_000_000.0)   # spec.hi is a reco band, not a cap
+                w.setRange(spec.lo, 1_000_000.0)
                 w.setValue(float(value))
                 w.valueChanged.connect(self._refresh_summaries)
             else:
@@ -460,26 +452,19 @@ class TrainPage(QWidget):
                 w.setRange(int(spec.lo), 100_000_000)
                 w.setValue(int(value))
                 w.valueChanged.connect(self._refresh_summaries)
-            label = spec.label + ("  ★" if rec is not None else "")
-            if spec.flag in _TUNING_FLAGS:
-                self.tuning_form.addRow(label, w)
-            elif spec.flag == "freeze-encoder":
-                self.form.insertRow(row, "", w)
-                self._key_rows.append(w)
-                row += 1
-            else:
-                self.form.insertRow(row, label, w)
-                self._key_rows.append(w)
-                row += 1
+            self.form.insertRow(row, "" if spec.flag == "freeze-encoder" else spec.label, w)
+            self._key_rows.append(w)
+            row += 1
             self._param_widgets[spec.flag] = w
-        self.form.setRowVisible(
-            self.star_hint,
-            any(s.recommend_key and s.recommend_key in recs for s in b.params))
-        if self._meta:
-            warns = analysis.warnings_for(self._meta)
-            self.warn_label.setText("\n".join("⚠ " + w for w in warns))
-        else:
-            self.warn_label.setText("")
+            if spec.flag == "batch":
+                self.batch_note = QLabel("")
+                theme.set_accent(self.batch_note, "muted")
+                self.form.insertRow(row, "", self.batch_note)
+                self._key_rows.append(self.batch_note)
+                row += 1
+        self._apply_batch_prefill()
+        if same_bb and "batch" in prev:   # dataset switch: keep the user's override
+            self._param_widgets["batch"].setValue(int(prev["batch"]))
         self._rebuild_feat_list()
         self._update_cfg_dialog()
         self._refresh_summaries()
@@ -498,39 +483,33 @@ class TrainPage(QWidget):
         else:
             w.setValue(float(v))
 
-    # ------------------------------------------- tuning fold (collapsed default)
-    def _tuning_box(self) -> QGroupBox:
-        box = QGroupBox("Tuning")
-        box.setCheckable(True)
-        box.setChecked(False)
-        outer = QVBoxLayout(box)
-        inner = QWidget()
-        lay = QVBoxLayout(inner)
-        lay.setContentsMargins(0, 0, 0, 0)
-        outer.addWidget(inner)
-        box.toggled.connect(inner.setVisible)
-        inner.setVisible(False)
-        self.tuning_box = box
-        self.tuning_form = QFormLayout()
-        lay.addLayout(self.tuning_form)
-        return box
+    def _vram_gb(self) -> tuple[float | None, str]:
+        """(VRAM, source label) of the device this run would land on."""
+        if appstate.get_exec_mode() != "local":
+            g = self.gpu_combo.currentText()
+            return GPU_VRAM_GB.get(g), g
+        if self._local_vram == "?":
+            self._local_vram = local_cli.local_vram_gb()
+        return self._local_vram, "local GPU"
+
+    def _apply_batch_prefill(self):
+        """Prefill (never clamp) Batch from the target device's VRAM."""
+        w = self._param_widgets.get("batch")
+        b = self._backbone()
+        if w is None or b is None or self.batch_note is None:
+            return
+        vram, src = self._vram_gb()
+        if vram is None:
+            w.setValue(b.batch_default)
+            self.batch_note.setText("Batch: hardware not detected, using default.")
+        else:
+            w.setValue(batch_for_vram(b, vram))
+            self.batch_note.setText(f"Batch prefilled for {vram:g} GB ({src}).")
 
     def _refresh_summaries(self):
-        """Echo current values into the Tuning fold title + launch summary bar."""
-        if not hasattr(self, "summary_lbl"):   # during early construction
+        """Echo the run's headline settings into the launch summary bar."""
+        if not hasattr(self, "summary_lbl"):
             return
-        parts = []
-        w = self._param_widgets.get("batch")
-        if w is not None:
-            parts.append(f"batch {w.value()}")
-        w = (self._param_widgets.get("grid")
-             or self._param_widgets.get("sub-grid"))
-        if w is not None:
-            parts.append(f"grid {w.value():g} m")
-        w = self._param_widgets.get("chunk-xy")
-        if w is not None:
-            parts.append(f"tile {w.value():g} m")
-        self.tuning_box.setTitle("Tuning — " + " · ".join(parts))
         b = self._backbone()
         name = self.dataset_combo.currentText()
         if b is None or not name:
@@ -545,7 +524,6 @@ class TrainPage(QWidget):
         self.summary_lbl.setText(
             f"▶ {b.label} · {name} · {ep} ep × {steps} steps · {mode}")
 
-    # --------------- advanced (loss / class balance / density, one box per run)
     def _advanced_box(self) -> QGroupBox:
         box = QGroupBox("Advanced")
         box.setCheckable(True)
@@ -626,7 +604,7 @@ class TrainPage(QWidget):
         return box
 
     def _loss_collect(self) -> dict:
-        if not self.adv_box.isChecked():        # off -> script defaults
+        if not self.adv_box.isChecked():
             return {}
         return {"focal": self.loss_focal.isChecked(),
                 "focal_gamma": round(self.loss_gamma.value(), 2),
@@ -698,7 +676,6 @@ class TrainPage(QWidget):
                 "logdk": self.dg_logdk.isChecked(),
                 "logdk_k": self.dg_k.value()}
 
-    # -------------------------------------------- input features (per run)
     def _features_row(self) -> QWidget:
         """Wrapping chip list: the checked chips are the run's feature spec."""
         self.feat_list = QListWidget()
@@ -707,7 +684,7 @@ class TrainPage(QWidget):
         self.feat_list.setResizeMode(QListWidget.Adjust)
         self.feat_list.setDragDropMode(QAbstractItemView.InternalMove)
         self.feat_list.setDefaultDropAction(Qt.MoveAction)
-        self.feat_list.setMaximumHeight(58)   # ~2 chip rows, then scrolls
+        self.feat_list.setMaximumHeight(58)
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
         row.addWidget(self.feat_list, 1)
@@ -724,24 +701,20 @@ class TrainPage(QWidget):
             return
         base = b.key
         meta = self._meta or {}
-        # offered = arch capability ∩ channels the dataset was built with
         std = [n for n in _FEAT_STANDARD.get(base, []) if meta.get(f"has_{n}")]
         extra = ((meta.get("source") or {}).get("feature_channels")
                  if isinstance(meta.get("source"), dict) else None) or []
         extra_names = [c.get("name") if isinstance(c, dict) else str(c)
                        for c in extra]
-        # older datasets may carry feat_ duplicates of canonical channels — drop them
         extra_names = [n for n in extra_names if n
                        and (dataset.canonical_channel(
                             n[5:] if n.startswith("feat_") else n) or n) not in std]
         names = std + [n if n.startswith("feat_") else f"feat_{n}"
                        for n in extra_names]
-        # feat_hag never appears in feature_channels; offered via has_hag
         if meta.get("has_hag") and "feat_hag" not in names:
             names.append("feat_hag")
         checked = default_feature_checks(base, std)
         for n in names:
-            # display strips the feat_ prefix; the real channel name rides in UserRole
             it = QListWidgetItem(n[5:] if n.startswith("feat_") else str(n))
             it.setData(Qt.UserRole, str(n))
             it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
@@ -760,10 +733,9 @@ class TrainPage(QWidget):
                  if self.feat_list.item(i).checkState() == Qt.Checked]
         b = self._backbone()
         if b is not None and b.key in _XYZ_IMPLICIT:
-            names = ["x", "y", "z"] + names   # coords: always in, never a chip
+            names = ["x", "y", "z"] + names
         return ",".join(names)
 
-    # ------------------------------------------------------------- launch
     def _launch(self):
         b = self._backbone()
         if b is None:
@@ -790,22 +762,22 @@ class TrainPage(QWidget):
         dg_env = analysis.dg_config_to_env(self._dg_collect())
         env = dict(loss_env)
         env.update(dg_env)
-        if self.val_every.value() != 10:   # default emits nothing (script default)
+        if self.val_every.value() != 10:
             env["VAL_EVERY"] = str(self.val_every.value())
+        if self.proxy_sampling.currentData() != "coverage":
+            env["PROXY_SAMPLING"] = self.proxy_sampling.currentData()
         feat_csv = self._feat_collect()
         if not feat_csv:
             # never silently fall back to the trainers' built-in specs
-            self._append("No input features checked — check at least one on "
+            self._append("No input features checked. Check at least one on "
                          "the Input features row.")
             return
         if b.key in _PTV3_LIKE and {"intensity", "rgb"} <= set(feat_csv.split(",")):
-            # ptv3 has one 3-wide color slot; both set = server-side ValueError
-            self._append("ptv3-family models have a single color slot — check "
+            self._append("ptv3-family models have a single color slot. Check "
                          "intensity OR rgb, not both.")
             return
         env["FEAT_CHANNELS"] = feat_csv
-        # forward only when actually set — a default would freeze the Modal
-        # container's own defaults; AUTO_RESUME rides along for deliberate resumes
+        # forward only when actually set: a default would freeze the Modal container's own defaults (AUTO_RESUME rides along for deliberate resumes)
         for k in ("TT_TRAIN_STRIDE", "TT_AMP", "TT_PREFETCH", "AUTO_RESUME",
                   "EVAL_BATCH"):
             if os.environ.get(k):
@@ -815,6 +787,7 @@ class TrainPage(QWidget):
             "dataset": name, "backbone": b.key,
             "params": params,
             "val_every": self.val_every.value(),
+            "proxy_sampling": self.proxy_sampling.currentData(),
             "loss": self._loss_collect(),
             "dg": self._dg_collect(),
             "features": feat_csv,
@@ -845,7 +818,6 @@ class TrainPage(QWidget):
     def _start_local_run(self, p):
         b, flags, name, info = p["backbone"], p["flags"], p["dataset"], p["info"]
         staged = info.get("staged_dir", "")
-        # runs nest per dataset: TT_OUTPUTS_ROOT = <workspace>/<dataset>
         base = str(appstate.workspace_dir())
         out_root = str(Path(base) / name)
         os.makedirs(out_root, exist_ok=True)
@@ -854,7 +826,6 @@ class TrainPage(QWidget):
             self._append(f"[local] ⚠ No staged copy of '{name}' - "
                          f"the trainer won't find the dataset.")
         elif Path(staged).parent != Path(appstate.local_config()["datasets_root"]):
-            # dataset outside the workspace: point TT_DATASET_DIR straight at it
             dataset_dir = staged
         prog, args, run_env = local_cli.run_script(
             b.script, flags, b, repo_root=self.repo_root,
@@ -872,17 +843,16 @@ class TrainPage(QWidget):
         if not ok:
             self.launch_btn.setEnabled(True)
             return
-        self._out_root = out_root   # anchor for the graceful-stop sentinel
+        self._out_root = out_root
         self.runner.start(prog, args, cwd=self.repo_root, extra_env=run_env)
         self._set_run_live(True)
 
-    # ------------------------------------------------------------- modal path
     def _preflight_modal_run(self, p):
         """Verify the dataset is on the volume (off-thread) before paying for
         a GPU container."""
         import shutil as _sh
         if _sh.which("modal") is None:
-            self._append("[modal] 'modal' CLI not found on PATH — `pip install modal`, "
+            self._append("[modal] 'modal' CLI not found on PATH. `pip install modal`, "
                          "then `modal setup` to authenticate, and launch again.")
             self.launch_btn.setEnabled(True)
             return
@@ -910,7 +880,7 @@ class TrainPage(QWidget):
         p, self._pending = self._pending, None
         if p is None:
             return
-        self._append("[modal] (couldn't verify the dataset on the volume — "
+        self._append("[modal] (couldn't verify the dataset on the volume; "
                      "proceeding anyway.)")
         self._start_modal_run(p)
 
@@ -922,10 +892,10 @@ class TrainPage(QWidget):
                                           env=p.get("env") or None)
         self._append(f"\n[modal] $ TT_GPU={gpu} modal {' '.join(args)}\n")
         self._append(f"[modal] Training on {gpu}; the run is written to the "
-                     f"'{b.outputs_volume}' volume as runs/<id> — pick it on the "
+                     f"'{b.outputs_volume}' volume as runs/<id>. Pick it on the "
                      "Inference page (Training run) when it finishes.")
         if detach:
-            self._append("[modal] Detached: this returns once the cloud app starts — "
+            self._append("[modal] Detached: this returns once the cloud app starts; "
                          "no logs/metrics stream here. Reattach with "
                          f"`modal app logs {b.app_name}`; then launch the next model.")
         self.runner.start(prog, args, cwd=self.repo_root, extra_env={"TT_GPU": gpu})
@@ -946,7 +916,6 @@ class TrainPage(QWidget):
         return f"{dur // 60}m{dur % 60:02d}s"
 
     def _on_runner_failed(self, err: str):
-        # FailedToStart fires failed, not finished; re-enable here
         self.launch_btn.setEnabled(True)
         self._clear_stop_sentinel()
         if self._run_live:
@@ -960,7 +929,7 @@ class TrainPage(QWidget):
             self._append("\n[stopped]")
             if appstate.get_exec_mode() != "local":
                 self._append("[modal] note: killing the local client can leave the "
-                             "cloud app running — `modal app list` to check, "
+                             "cloud app running. `modal app list` to check, "
                              "`modal app stop <app>` to stop it.")
         else:
             self._append("\n[no process running]")
@@ -972,13 +941,13 @@ class TrainPage(QWidget):
             self._append("\n[no process running]")
             return
         if appstate.get_exec_mode() != "local" or not self._out_root:
-            self._append("\n[stop] graceful stop works for local runs only — use Kill "
+            self._append("\n[stop] graceful stop works for local runs only. Use Kill "
                          "(and `modal app stop <app>` for a cloud run).")
             return
         try:
             (Path(self._out_root) / "STOP").touch()
         except OSError as e:
-            self._append(f"\n[stop] couldn't write the STOP sentinel: {e} — use Kill.")
+            self._append(f"\n[stop] couldn't write the STOP sentinel: {e}. Use Kill.")
             return
         self._append("\n[stop] Stopping after the current epoch… the run finishes its "
                      "final evaluation and checkpoint finalize, then exits. "
@@ -994,7 +963,6 @@ class TrainPage(QWidget):
                 pass
             self._out_root = None
 
-    # ------------------------------------------------------------- stream
     def _on_output(self, text: str):
         self._append(text, newline=False)
         self.parser.feed(text)
@@ -1011,17 +979,23 @@ class TrainPage(QWidget):
         else:
             self._append(f"\n✗ Exited with code {code}.")
 
+    def _set_progress_lbl(self):
+        self.progress_lbl.setText(
+            self._last_epoch_txt
+            + (f" · {self._last_worst}" if self._last_worst else ""))
+
     def _on_epoch(self, m: dict):
         total = self._run_epochs
         if total:
             self.progress_bar.setRange(0, total)
             self.progress_bar.setValue(min(m["epoch"], total))
-        self.progress_lbl.setText(f"epoch {m['epoch']}/{total or '?'} · "
-                                  f"loss {m['loss']:.2f} · miou {m['miou']:.2f}")
+        self._last_epoch_txt = (f"epoch {m['epoch']}/{total or '?'} · "
+                                f"loss {m['loss']:.2f} · miou {m['miou']:.2f}")
+        self._set_progress_lbl()
         r = self.metrics_table.rowCount()
         self.metrics_table.insertRow(r)
         for col, val in enumerate((str(m["epoch"]), f"{m['loss']:.4f}",
-                                   f"{m['acc']:.4f}", f"{m['miou']:.4f}")):
+                                   f"{m['acc']:.4f}", f"{m['miou']:.4f}", "—")):
             item = QTableWidgetItem(val)
             item.setTextAlignment(Qt.AlignCenter)
             self.metrics_table.setItem(r, col, item)
@@ -1031,10 +1005,15 @@ class TrainPage(QWidget):
         """Grey starred row for a held-out val pass: no train loss, val acc/mIoU
         (present-classes). Colored at insert time from the current theme."""
         grey = QBrush(QColor(theme.colors(appstate.get("ui_theme", "system"))["muted"]))
+        worst = (f"{m['worst_class']} {m['worst_iou']:.3f}"
+                 if m.get("worst_class") and m.get("worst_iou") is not None else "—")
+        if worst != "—":
+            self._last_worst = f"worst {worst}"
+            self._set_progress_lbl()
         r = self.metrics_table.rowCount()
         self.metrics_table.insertRow(r)
         for col, val in enumerate((f"{m['epoch']}★", "—",
-                                   f"{m['acc']:.4f}", f"{m['miou']:.4f}")):
+                                   f"{m['acc']:.4f}", f"{m['miou']:.4f}", worst)):
             item = QTableWidgetItem(val)
             item.setTextAlignment(Qt.AlignCenter)
             item.setForeground(grey)
@@ -1072,13 +1051,16 @@ class TrainPage(QWidget):
             self.val_every.setValue(int(cfg.get("val_every", 10)))
         except (TypeError, ValueError):
             pass
+        i = self.proxy_sampling.findData(cfg.get("proxy_sampling", "coverage"))
+        if i >= 0:
+            self.proxy_sampling.setCurrentIndex(i)
         i = self.gpu_combo.findText(cfg.get("gpu", ""))
         if i >= 0:
             self.gpu_combo.setCurrentIndex(i)
         self.detach_chk.setChecked(bool(cfg.get("detach")))
         loss = cfg.get("loss") if isinstance(cfg.get("loss"), dict) else {}
         dg = cfg.get("dg") if isinstance(cfg.get("dg"), dict) else {}
-        self.adv_box.setChecked(bool(loss) or bool(dg))  # {}+{} = box off (defaults)
+        self.adv_box.setChecked(bool(loss) or bool(dg))
         if loss:
             try:
                 self.loss_focal.setChecked(bool(loss.get("focal", False)))
@@ -1097,7 +1079,6 @@ class TrainPage(QWidget):
                 self.dg_k.setValue(int(dg.get("logdk_k", 8)))
             except (TypeError, ValueError):
                 pass
-        # features not restored from last config — chips seed a per-arch default
 
     def _append(self, text: str, newline: bool = True):
         ui.append_log(self.log, text, newline)

@@ -16,20 +16,21 @@ from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, Signal
 # trainer log shape: ep  12: loss=0.4321 acc=0.9123 miou=0.7012 s/iter=0.123 s/ep=61.4
 EPOCH_RE = re.compile(
     r"ep\s+(\d+):\s+loss=([\d.]+)\s+acc=([\d.]+)\s+miou=([\d.]+)"
-    r"(?:\s+lr=[\d.eE+-]+)?"   # PTv3 prints lr= here
+    r"(?:\s+lr=[\d.eE+-]+)?"
     r"(?:\s+s/iter=([\d.]+))?(?:\s+s/ep=([\d.]+))?")
 # [val@ep9] acc=... mIoU(5-way)=... mIoU(present 4)=...; test@epN deliberately doesn't match
 VAL_RE = re.compile(
     r"\[(?:val|eval)@ep(\d+)\]\s+acc=([\d.]+)\s+"
-    r"mIoU\(\d+-way\)=([\d.]+)\s+mIoU\(present \d+\)=([\d.]+)")
+    r"mIoU\(\d+-way\)=([\d.]+)\s+mIoU\(present \d+\)=([\d.]+)"
+    r"(?:\s+worst\((.+?)\)=([\d.]+))?")
 RUN_DIR_RE = re.compile(r"/outputs/runs/(\S+)")
 
 
 class LogParser(QObject):
     """Feeds on raw log text; emits structured epoch metrics and the run id."""
 
-    epoch = Signal(dict)        # {epoch, loss, acc, miou, sec_per_iter, sec_per_epoch}
-    val_metrics = Signal(dict)  # {epoch, acc, miou (present-classes), miou_all (N-way)}
+    epoch = Signal(dict)
+    val_metrics = Signal(dict)
     run_id = Signal(str)
 
     def __init__(self, parent=None):
@@ -57,7 +58,9 @@ class LogParser(QObject):
                     "epoch": int(v.group(1)),
                     "acc": float(v.group(2)),
                     "miou_all": float(v.group(3)),
-                    "miou": float(v.group(4)),   # headline: present-classes mIoU
+                    "miou": float(v.group(4)),
+                    "worst_class": v.group(5),
+                    "worst_iou": float(v.group(6)) if v.group(6) else None,
                 })
             if not self._run_id_seen:
                 r = RUN_DIR_RE.search(line)
@@ -70,8 +73,8 @@ class JobRunner(QObject):
     """One external process: merged stdout/stderr streamed line-ish, UTF-8 safe."""
 
     output = Signal(str)
-    finished = Signal(int)   # exit code
-    failed = Signal(str)     # QProcess error description
+    finished = Signal(int)
+    failed = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -105,11 +108,9 @@ class JobRunner(QObject):
         env.insert("PYTHONUNBUFFERED", "1")
         for k, v in (self._extra_env or {}).items():
             env.insert(k, str(v))
-        # incremental decoder: multi-byte chars split across chunks must not become U+FFFD
         self._dec = codecs.getincrementaldecoder("utf-8")("replace")
         self.proc = QProcess(self)
-        # own process group (unix) so Kill reaches grandchildren (pixi -> python),
-        # not just the launcher; windows uses taskkill /T in terminate() instead
+        # own process group (unix) so Kill reaches grandchildren (pixi -> python), not just the launcher; windows uses taskkill /T in terminate() instead
         if hasattr(self.proc, "setChildProcessModifier"):
             self.proc.setChildProcessModifier(os.setsid)
         self.proc.setProcessEnvironment(env)
@@ -134,14 +135,13 @@ class JobRunner(QObject):
         else:
             try:
                 pgid = os.getpgid(pid)
-                if pgid != os.getpgid(0):   # never group-kill the GUI itself
+                if pgid != os.getpgid(0):
                     os.killpg(pgid, signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
                 pass
-        self.proc.kill()   # reaps the direct child; no-op if already dead
+        self.proc.kill()
 
     def _on_output(self):
-        # read from the emitting process, not self.proc — the next stage may already own it
         proc = self.sender()
         if proc is not None:
             text = self._dec.decode(bytes(proc.readAllStandardOutput()))
@@ -167,9 +167,9 @@ class FuncWorker(QObject):
     Cancellation is cooperative: the next progress() call raises Stopped."""
 
     output = Signal(str)
-    done = Signal(object)    # return value
+    done = Signal(object)
     error = Signal(str)
-    stopped = Signal()       # user cancelled; job unwound cleanly
+    stopped = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
