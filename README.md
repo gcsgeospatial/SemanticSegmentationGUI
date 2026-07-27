@@ -232,9 +232,3 @@ conda-recipes/   trainer-src-* recipes + README (rattler-build / prefix.dev)
 tools/           check_env_sync.py (modal↔pixi drift), package_weights.py
 ```
 
-## Tests
-
-```powershell
-cd trainer_gui
-python smoke_test.py           # or: pixi run test
-```

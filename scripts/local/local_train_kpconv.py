@@ -209,10 +209,8 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
     PACK_N      = batch if batch is not None else globals()["PACK_N"]
     FEATURE_MODE = globals()["FEATURE_MODE"]
     LR_DECAY    = 0.1 ** (1.0 / N_EPOCHS)
-    # "height" is dead for new runs (real HAG = feat_hag); FEAT_LEGACY keeps it ONLY so pre-spec checkpoints, whose weights expect that width, still infer
-    FEAT_LEGACY = ["intensity", "return_number", "height"]
     FEAT_DEFAULT = ["intensity", "return_number"]
-    FEAT_SPEC = (list(FEAT_LEGACY) if INFER
+    FEAT_SPEC = (list(FEAT_DEFAULT) if INFER
                  else tc.parse_feat_spec(FEAT_CHANNELS, FEAT_DEFAULT))
     CONV_RADIUS   = globals()["CONV_RADIUS"]
     DEFORM_RADIUS = globals()["DEFORM_RADIUS"]
@@ -227,7 +225,7 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
         ds_meta, NUM_CLASSES, CLASS_NAMES = tc.load_dataset_meta(dataset)
         PREP_DIR = (f"{ds_root}/prep/kpconv"
                     f"_grid{GRID:g}_c{int(CHUNK_XY)}"
-                    f"{tc.feat_spec_tag(FEAT_SPEC, FEAT_LEGACY)}"
+                    f"{tc.feat_spec_tag(FEAT_SPEC, FEAT_DEFAULT)}"
                     f"{tc.train_stride_tag()}")
     else:
         NUM_CLASSES = 5
@@ -250,18 +248,14 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
                 DEFORMABLE    = bool(rj.get("deformable", DEFORMABLE))
                 if rj.get("neighbor_limits"):
                     NEIGHBOR_LIMITS = [int(x) for x in rj["neighbor_limits"]]
-                mf = rj.get("features")
-                try:
-                    FEAT_SPEC = (tc.parse_feat_spec(",".join(mf), FEAT_LEGACY)
-                                 if mf else list(FEAT_LEGACY))
-                except ValueError:
-                    FEAT_SPEC = list(FEAT_LEGACY)
-                if rj.get("hag_source"):
-                    FEAT_SPEC = ["feat_hag" if n == "height" else n for n in FEAT_SPEC]
-                    print(f"  [legacy-hag] weights from the removed --hag variant "
-                          f"(hag_source={rj['hag_source']}): 'height' -> feat_hag; "
-                          f"input scenes must carry a baked feat_hag channel",
-                          flush=True)
+                # LEGACY (delete before production): every pre-current weight
+                # era routes through legacy_weights - translated tokens, z-min
+                # slot, hag_source manifests, era-0 spec-less run_configs
+                import legacy_weights as lw
+                lspec, lnote = lw.kp_legacy_spec(tc.resolve_weights_path(weights))
+                if lnote:
+                    print(f"  [legacy] {lnote}", flush=True)
+                FEAT_SPEC = lspec if lspec is not None else list(FEAT_DEFAULT)
 
     if "rgb" in FEAT_SPEC:
         raise ValueError("the KPConv tile pipeline has no rgb channel. Use "
@@ -304,7 +298,7 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
         return tc.kp_find_latest_checkpoint(
             OPT_TYPE_STR, {FEATURE_MODE},
             arch_hash=arch_hash(_arch(DEFORMABLE)),
-            features=FEAT_SPEC, legacy_features=FEAT_LEGACY,
+            features=FEAT_SPEC, legacy_features=FEAT_DEFAULT,
             skip_done=not EVAL_ONLY)
 
     print("=" * 70)
@@ -399,6 +393,9 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
         return b, (b.labels if has_lab else None)
 
     build_feat = tc.kp_make_build_feat(DG_LOGDK_FEAT, DG_LOGDK_K, FEAT_SPEC)
+    if INFER:   # LEGACY (delete before production): z-min / extinct-token columns
+        import legacy_weights as lw
+        build_feat = lw.wrap_build_feat(build_feat)
     sample_tile = tc.kp_make_sample_tile(
         build_feat, GRID, max_pts=MAX_TILE_PTS, aug_color=AUG_COLOR,
         density_aug=DG_DENSITY_AUG, coarsen_max=DG_COARSEN_MAX,

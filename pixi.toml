@@ -35,4 +35,3 @@ PYTHONDONTWRITEBYTECODE = "1"
 
 [tasks]
 gui = "trainer-gui"                    # launch the desktop app
-test = "python smoke_test.py"          # drift checks (no Modal calls)

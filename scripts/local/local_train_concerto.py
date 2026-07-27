@@ -297,6 +297,9 @@ def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
                 GRID_SIZE = float(meta["grid"])
         FEAT_LEGACY = ["x", "y", "z", "rgb" if color_src == "rgb" else "intensity"]
         mf = (meta or {}).get("features")
+        if mf:   # LEGACY (delete before production): era feature tokens
+            import legacy_weights as lw
+            mf = lw.translate_features(mf, hag_source=(meta or {}).get("hag_source"))
         if not mf:
             FEAT_SPEC = list(FEAT_LEGACY)
         else:

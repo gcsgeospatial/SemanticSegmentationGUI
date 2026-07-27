@@ -8,7 +8,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import QApplication, QStyleFactory
 
-# ---- palettes (contrast-checked in tests/smoke_test) ----
+# ---- palettes ----
 LIGHT = {
     "bg": "#ffffff", "panel": "#ffffff", "text": "#1b1f27", "muted": "#5b6273",
     "border": "#d4d8e0", "disabled_text": "#767d8b",

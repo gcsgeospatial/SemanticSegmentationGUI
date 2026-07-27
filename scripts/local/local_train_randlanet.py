@@ -529,16 +529,25 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                 cfg.num_points = int(meta["num_points"])
                 cfg.num_sub_points = [cfg.num_points // r
                                       for r in (4, 16, 64, 256)]
+        fc0_key = next((k for k in sd if k.startswith("fc0.") and sd[k].dim() >= 2), None)
+        ckpt_in_dim = int(sd[fc0_key].shape[1]) if fc0_key is not None else 3
         mf = (meta or {}).get("features") or []
-        FEAT_SPEC = (tc.parse_feat_spec(",".join(mf), FEAT_LEGACY)
-                     if mf else list(FEAT_LEGACY))
+        # LEGACY (delete before production): translate era tokens; spec-less
+        # era-0 manifests derive the spec from the checkpoint's fc0 width
+        import legacy_weights as lw
+        if mf:
+            FEAT_SPEC = tc.parse_feat_spec(",".join(lw.translate_features(
+                mf, hag_source=(meta or {}).get("hag_source"))), FEAT_LEGACY)
+        else:
+            FEAT_SPEC, lnote = lw.randlanet_spec_from_width(ckpt_in_dim)
+            if FEAT_SPEC is None:
+                FEAT_SPEC = list(FEAT_LEGACY)
+            elif lnote:
+                print(f"  [legacy] {lnote}", flush=True)
         NONXYZ = [n for n in FEAT_SPEC if n not in ("x", "y", "z")]
         IN_DIM = len(FEAT_SPEC) + (1 if DG_LOGDK_FEAT else 0)
         collate_fn = Collater(cfg.num_layers, cfg.k_n, cfg.sub_sampling_ratio,
                               FEAT_SPEC, NONXYZ)
-
-        fc0_key = next((k for k in sd if k.startswith("fc0.") and sd[k].dim() >= 2), None)
-        ckpt_in_dim = int(sd[fc0_key].shape[1]) if fc0_key is not None else 3
         net = build_net(num_classes, in_dim=ckpt_in_dim)
         if ckpt_in_dim != IN_DIM:
             raise ValueError(

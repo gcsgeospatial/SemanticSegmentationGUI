@@ -128,14 +128,28 @@ _CANON_SPELLINGS = {
 
 
 def canonical_channel(field: str) -> str | None:
-    """Field name -> canonical channel name, or None for an ordinary feat_* field."""
-    return _CANON_SPELLINGS.get((field or "").strip().lower().replace(" ", "_"))
+    """Field name -> canonical channel name, or None for an ordinary feat_*
+    field. feat_intensity/feat_return_number ARE the canonical channels (old
+    datasets baked the raw column under a feat_ alias) - no distinction."""
+    s = (field or "").strip().lower().replace(" ", "_")
+    if s.startswith("feat_") and s[len("feat_"):] in _CANON_SPELLINGS:
+        return _CANON_SPELLINGS[s[len("feat_"):]]
+    return _CANON_SPELLINGS.get(s)
 
 
-def split_feature_fields(fields: list[str] | None) -> tuple[set[str], list[str]]:
-    """Prep selection -> (canonical channels wanted, remaining feat_* fields)."""
-    canon = {c for c in (canonical_channel(f) for f in (fields or [])) if c}
-    rest = [f for f in (fields or []) if canonical_channel(f) is None]
+def split_feature_fields(fields: list[str] | None) -> tuple[dict, list[str]]:
+    """Prep selection -> ({canonical channel: explicit source column | None},
+    remaining feat_* entries). 'name=Column' binds a source column (Infer page
+    channel mapping); the first binding for a canonical channel wins."""
+    canon: dict[str, str | None] = {}
+    rest: list[str] = []
+    for f in (fields or []):
+        tgt, _, src = f.partition("=")
+        c = canonical_channel(tgt)
+        if c:
+            canon.setdefault(c, src or None)
+        else:
+            rest.append(f)
     return canon, rest
 
 
@@ -417,17 +431,39 @@ def _convert_one(cloud: Cloud, raw: np.ndarray | None, value_to_index: dict[int,
     if cloud.rgb is not None:
         out["rgb"] = cloud.rgb
     canon_wanted, feature_fields = split_feature_fields(feature_fields)
+
+    def _column(src: str) -> np.ndarray:
+        key = next((k for k in cloud.fields if k.lower() == src.lower()), None)
+        if key is None:
+            raise ValueError(f"{out_path.stem}: feature field '{src}' not found "
+                             f"(have: {sorted(cloud.fields)})")
+        v = np.asarray(cloud.fields[key])
+        if v.ndim != 1 or not np.issubdtype(v.dtype, np.number):
+            raise ValueError(f"{out_path.stem}: feature field '{src}' is not numeric 1-D "
+                             f"(dtype {v.dtype}, shape {v.shape})")
+        return v.astype(np.float32)
+
+    def _canon_source(name, attr):
+        """The channel's array: an explicitly bound column wins over the
+        format-standard field (Infer page 'name=Column' mapping)."""
+        src = canon_wanted.get(name)
+        return _column(src) if src else attr
+
     raw_imax = None
-    if "intensity" in canon_wanted and cloud.intensity is not None:
+    cloud_intensity = _canon_source("intensity", cloud.intensity) \
+        if "intensity" in canon_wanted else None
+    if cloud_intensity is not None:
         if intensity_norm == "p95":
-            denom = max(float(np.percentile(cloud.intensity, 95)), 1.0)
-            out["intensity"] = np.clip(cloud.intensity / denom, 0.0, 2.0).astype(np.float32)
+            denom = max(float(np.percentile(cloud_intensity, 95)), 1.0)
+            out["intensity"] = np.clip(cloud_intensity / denom, 0.0, 2.0).astype(np.float32)
             raw_imax = denom
         else:
-            raw_imax = max(float(cloud.intensity.max()), 1.0)
-            out["intensity"] = (cloud.intensity / raw_imax).astype(np.float32)
-    if "return_number" in canon_wanted and cloud.return_number is not None:
-        out["return_number"] = cloud.return_number.astype(np.float32)
+            raw_imax = max(float(cloud_intensity.max()), 1.0)
+            out["intensity"] = (cloud_intensity / raw_imax).astype(np.float32)
+    cloud_retnum = _canon_source("return_number", cloud.return_number) \
+        if "return_number" in canon_wanted else None
+    if cloud_retnum is not None:
+        out["return_number"] = cloud_retnum.astype(np.float32)
     source_hag = _hag_from_cloud(cloud)
     if source_hag is not None:
         out["feat_hag"] = source_hag.astype(np.float32)
@@ -455,18 +491,15 @@ def _convert_one(cloud: Cloud, raw: np.ndarray | None, value_to_index: dict[int,
 
     feature_scales: dict[str, float] = {}
     for fld in (feature_fields or []):
-        key = next((k for k in cloud.fields if k.lower() == fld.lower()), None)
-        if key is None:
-            raise ValueError(f"{out_path.stem}: feature field '{fld}' not found "
-                             f"(have: {sorted(cloud.fields)})")
-        v = np.asarray(cloud.fields[key])
-        if v.ndim != 1 or not np.issubdtype(v.dtype, np.number):
-            raise ValueError(f"{out_path.stem}: feature field '{fld}' is not numeric 1-D "
-                             f"(dtype {v.dtype}, shape {v.shape})")
-        v = v.astype(np.float32)
+        # verbatim-first: a real column literally named 'a=b' wins over the
+        # 'target=Source' remap parse (Infer page channel mapping)
+        tgt, src = fld, fld
+        if "=" in fld and not any(k.lower() == fld.lower() for k in cloud.fields):
+            tgt, _, src = fld.partition("=")
+        v = _column(src or tgt)
         scale = max(float(np.percentile(np.abs(v), 95)), 1e-6)
-        out[f"feat_{feat_key(fld)}"] = np.clip(v / scale, -2.0, 2.0).astype(np.float32)
-        feature_scales[feat_key(fld)] = scale
+        out[f"feat_{feat_key(tgt)}"] = np.clip(v / scale, -2.0, 2.0).astype(np.float32)
+        feature_scales[feat_key(tgt)] = scale
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     _savez_fast(out_path, out)
@@ -863,7 +896,9 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
             "hag_ground_value": (int(ground_value) if ground_value is not None else None),
             "hag_ground_method": (ground_method if compute_hag else None),
             # source_field "@geo:<name>"/"@hag:<method>" = computed channels, recomputed at inference; canonical intensity/return_number ride the has_* flags instead
-            "feature_channels": ([{"name": feat_key(f), "source_field": f, "norm": "p95abs"}
+            "feature_channels": ([{"name": feat_key(f.partition("=")[0]),
+                                   "source_field": f.partition("=")[2] or f,
+                                   "norm": "p95abs"}
                                   for f in split_feature_fields(feature_fields)[1]]
                                  + [{"name": f"geo_{nm.lower()}",
                                      "source_field": f"@geo:{nm}", "norm": "raw",

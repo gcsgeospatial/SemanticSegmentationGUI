@@ -153,6 +153,13 @@ class BestCheckpoint:
     it every eval; finalize(save_last) saves last epoch only if val never ran."""
 
     def __init__(self, run_dir, protocol="proxy"):
+        # every trainer builds one at train start, so this is the shared gate
+        # keeping the inference-only channel kill out of training batches
+        if zero_channels():
+            raise RuntimeError(
+                "TT_ZERO_CHANNELS is an inference-only control (set by the Infer "
+                "page's Input channels table); unset it before training - a "
+                "zeroed channel would silently poison every training batch.")
         self.protocol = protocol
         self.final = os.path.join(run_dir, "final_model.pth")
         self.best = best_val_miou(os.path.join(run_dir, "val_metrics.csv"),
@@ -1090,19 +1097,33 @@ def proxy_val(batches, forward, num_classes, class_names, label, n_units,
     return m
 
 
+def zero_channels() -> set:
+    """Channels the user chose to feed as constant zeros (TT_ZERO_CHANNELS,
+    comma-separated - set by the Infer page channel table)."""
+    return {c.strip() for c in os.environ.get("TT_ZERO_CHANNELS", "").split(",")
+            if c.strip()}
+
+
 def scene_arrays(z, n):
     """(intensity, ret_num) from a scene npz - the ONE place missing-channel
-    fallbacks are decided (intensity -> rgb gray -> zeros; ret_num -> zeros)."""
+    fallbacks are decided (intensity -> rgb gray -> zeros; ret_num -> zeros).
+    TT_ZERO_CHANNELS entries are zeroed even when the data exists."""
     import numpy as np
-    if "intensity" in z:
+    zc = zero_channels()
+    if "intensity" in zc:
+        intensity = np.zeros(n, np.float32)
+    elif "intensity" in z:
         intensity = z["intensity"].astype(np.float32)
-    elif "rgb" in z:
+    elif "rgb" in z and "rgb" not in zc:   # a killed rgb never leaks through the fallback
         intensity = z["rgb"].astype(np.float32).mean(1) / 255.0
     else:
         intensity = np.zeros(n, np.float32)
-    ret_num = (z["return_number"].astype(np.float32) if "return_number" in z
-               else (z["ret_num"].astype(np.float32) if "ret_num" in z
-                     else np.zeros(n, np.float32)))
+    if "return_number" in zc:
+        ret_num = np.zeros(n, np.float32)
+    else:
+        ret_num = (z["return_number"].astype(np.float32) if "return_number" in z
+                   else (z["ret_num"].astype(np.float32) if "ret_num" in z
+                         else np.zeros(n, np.float32)))
     return intensity, ret_num
 
 
@@ -1111,6 +1132,9 @@ def run_infer_scenes(scenes, predict, pred_dir, run_dir, infer_cfg, cls_txt=Fals
     probs), written as <name>_pred.npz (+ _pred_CLS.txt) with the crash-safe
     per-scene infer_run.json rewrite."""
     import numpy as np
+    zc = zero_channels()
+    if zc:   # permanent provenance: these predictions ran without these inputs
+        infer_cfg = {**infer_cfg, "zeroed_channels": sorted(zc)}
     print(f"  [infer] labeling {len(scenes)} scene(s) -> {pred_dir}", flush=True)
     scene_stats = []
     for pc_path in scenes:
@@ -1410,15 +1434,14 @@ def kp_make_build_feat(logdk_feat, logdk_k,
                        spec=("intensity", "return_number")):
     """build_feat(xyz, intensity, ret_num, drop=(), extras=None) -> [1, *spec]
     (+ log d_k). Bias always first, never dropped; every spec channel IS
-    droppable. "height" is legacy-only (old run.json specs); real HAG = feat_hag."""
+    droppable."""
     import numpy as np
     import density as dg
     spec = list(spec)
 
     def build_feat(xyz, intensity, ret_num, drop=(), extras=None):
         bias = np.ones((len(xyz), 1), np.float32)
-        height = (xyz[:, 2] - xyz[:, 2].min()).astype(np.float32)
-        src = {"x": xyz[:, 0], "y": xyz[:, 1], "z": xyz[:, 2], "height": height,
+        src = {"x": xyz[:, 0], "y": xyz[:, 1], "z": xyz[:, 2],
                "intensity": intensity, "return_number": ret_num,
                **(extras or {})}
         missing = [n for n in spec if n not in src]
@@ -1778,14 +1801,28 @@ def ptv3_load_canonical(npz_path, color_src):
     xyz = (raw - np.floor(raw.min(0))).astype(np.float32)
     def _itn():
         return np.repeat((z["intensity"].astype(np.float32) * 255.0)[:, None], 3, axis=1)
+    # pick the source over REAL presence first; a zeroed pick DISABLES the color
+    # input (neutral mid-gray, parity with scene_arrays' true zeros) - never
+    # substitute the other live source for a channel the user killed
     if color_src != "rgb" and "intensity" in z:
-        rgb = _itn()
+        src = "intensity"
     elif "rgb" in z:
-        rgb = z["rgb"].astype(np.float32)
+        src = "rgb"
     elif "intensity" in z:
-        rgb = _itn()
+        src = "intensity"
     else:
+        src = None
+    zc = zero_channels()
+    if src in zc and not getattr(ptv3_load_canonical, "_zc_logged", False):
+        ptv3_load_canonical._zc_logged = True
+        print(f"  [channels] color input '{src}' zeroed -> neutral mid-gray constant",
+              flush=True)
+    if src is None or src in zc:
         rgb = np.full((len(xyz), 3), 128.0, dtype=np.float32)
+    elif src == "rgb":
+        rgb = z["rgb"].astype(np.float32)
+    else:
+        rgb = _itn()
     lab = z["label"].astype(np.int64) if "label" in z \
         else np.full(len(xyz), -1, np.int64)
     # clip here: an unclipped uint8 cast WRAPS the p95 bright tail (306 -> 50)
@@ -2137,7 +2174,7 @@ def ptv3_make_evaluate(forward, build_feat, feat_spec, grid, chunk_xy,
     return evaluate
 
 
-FEAT_VOCAB = ("x", "y", "z", "height", "intensity", "return_number", "rgb")
+FEAT_VOCAB = ("x", "y", "z", "intensity", "return_number", "rgb")
 
 
 def parse_feat_spec(env_value, legacy_default):
@@ -2147,6 +2184,11 @@ def parse_feat_spec(env_value, legacy_default):
     names = [s.strip() for s in (env_value or "").split(",") if s.strip()]
     if not names:
         return list(legacy_default)
+    # feat_intensity/feat_return_number ARE the canonical channels (old datasets
+    # baked the raw column under a feat_ alias); collapse the distinction
+    fix = {"feat_intensity": "intensity", "feat_return_number": "return_number",
+           "feat_returnnumber": "return_number", "feat_ret_num": "return_number"}
+    names = [fix.get(n.lower(), n) for n in names]
     bad = [n for n in names if n not in FEAT_VOCAB
            and not re.fullmatch(r"feat_[A-Za-z0-9_]+", n)]
     if bad:
@@ -2167,11 +2209,16 @@ def feat_spec_tag(spec, legacy):
 
 def feat_extras(z, spec, where):
     """The feat_* arrays `spec` needs from an npz; missing key raises naming
-    what IS available."""
+    what IS available. TT_ZERO_CHANNELS entries are fed as zeros instead
+    (user-disabled input), present or not."""
     import numpy as np
+    zc = zero_channels()
     out = {}
     for n in spec:
         if not n.startswith("feat_"):
+            continue
+        if n in zc:
+            out[n] = np.zeros(len(z["xyz"]), np.float32)
             continue
         if n not in z.files:
             if n == "feat_hag" and "hag" in z.files:
@@ -2287,6 +2334,13 @@ def _demo():
     assert row_protocol(px(0.5)) == "proxy" and row_protocol(fu(0.5)) == "full"
     assert ranking_protocol("full") == "full"
     assert ranking_protocol("coverage") == "proxy"
+    os.environ["TT_ZERO_CHANNELS"] = "intensity"
+    try:
+        BestCheckpoint(d)
+        raise AssertionError("training with TT_ZERO_CHANNELS set must refuse")
+    except RuntimeError as e:
+        assert "inference-only" in str(e)
+    del os.environ["TT_ZERO_CHANNELS"]
     b = BestCheckpoint(d)
     assert b.update(px(0.5)) and not b.update(px(0.4)) and b.update(px(0.6))
     # a full-protocol metric never crowns a proxy-ranked run, however high
@@ -2311,7 +2365,7 @@ def _demo():
     with open(os.path.join(d, "run_config.json"), "w") as f:
         json.dump({"num_classes": 7, "class_names": list("abcdefg"),
                    "grid_m": 2.0, "chunk_xy_m": 100.0,
-                   "features": ["intensity", "return_number", "height", "feat_hag"]}, f)
+                   "features": ["intensity", "return_number", "feat_hag"]}, f)
     m = write_run_manifest(d, "kpconvx_cold")
     assert m["backbone"] == "kpconvx_cold" and m["weights"] == "final_model.pth"
     assert m["grid"] == 2.0 and m["chunk_xy"] == 100.0 and m["num_classes"] == 7
@@ -2335,7 +2389,7 @@ def _demo():
 
     im = infer_meta(os.path.join(d, "final_model.pth"))
     assert im and im["num_classes"] == 7 and im["grid"] == 2.0
-    assert im["features"] == ["intensity", "return_number", "height", "feat_hag"]
+    assert im["features"] == ["intensity", "return_number", "feat_hag"]
     assert im["hag_source"] is None and im["class_names"] == list("abcdefg")
     assert infer_meta(os.path.join(tempfile.mkdtemp(), "bare.pth")) is None
 
@@ -2644,9 +2698,11 @@ def _demo():
     assert len(sx) == 2 and abs(sa[0, 0] - 0.5) < 1e-6 and list(sl) == [1, 0]
     assert kp_augment(sx).shape == sx.shape
 
-    assert parse_feat_spec("", ["intensity", "return_number", "height"]) \
-        == ["intensity", "return_number", "height"]
+    assert parse_feat_spec("", ["intensity", "return_number"]) \
+        == ["intensity", "return_number"]
     assert parse_feat_spec(" intensity , feat_ndvi ", []) == ["intensity", "feat_ndvi"]
+    assert parse_feat_spec("feat_intensity,feat_return_number,feat_geo_q", []) \
+        == ["intensity", "return_number", "feat_geo_q"]
     try:
         parse_feat_spec("bogus", [])
         raise AssertionError("unknown spec name must raise")
@@ -2660,18 +2716,19 @@ def _demo():
     fd = bf(xyz10, np.ones(10, np.float32), np.ones(10, np.float32), drop=[0])
     assert np.all(fd[:, 1] == 0.0) and np.all(fd[:, 2] == 1.0)
     assert np.all(fd[:, 0] == 1.0)
-    bfl = kp_make_build_feat(False, 8, spec=["intensity", "return_number", "height"])
-    fl = bfl(xyz10, np.ones(10, np.float32), np.ones(10, np.float32))
-    assert np.allclose(fl[:, 3], xyz10[:, 2] - xyz10[:, 2].min())
-    fh = bfl(xyz10, np.ones(10, np.float32), np.ones(10, np.float32), drop=[2])
-    assert np.all(fh[:, 3] == 0.0) and np.all(fh[:, 1] == 1.0)
-    bfs = kp_make_build_feat(False, 8, spec=["height", "intensity", "feat_q"])
     fq = np.arange(10, dtype=np.float32)
+    bfl = kp_make_build_feat(False, 8, spec=["intensity", "return_number", "feat_q"])
+    fl = bfl(xyz10, np.ones(10, np.float32), np.ones(10, np.float32),
+             extras={"feat_q": fq})
+    assert np.array_equal(fl[:, 3], fq)
+    fh = bfl(xyz10, np.ones(10, np.float32), np.ones(10, np.float32), drop=[2],
+             extras={"feat_q": fq})
+    assert np.all(fh[:, 3] == 0.0) and np.all(fh[:, 1] == 1.0)
+    bfs = kp_make_build_feat(False, 8, spec=["feat_q", "intensity"])
     fs = bfs(xyz10, np.full(10, 0.5, np.float32), np.zeros(10, np.float32),
              extras={"feat_q": fq})
-    assert fs.shape == (10, 4) and np.all(fs[:, 0] == 1.0)
-    assert np.allclose(fs[:, 1], xyz10[:, 2] - xyz10[:, 2].min())
-    assert np.all(fs[:, 2] == 0.5) and np.array_equal(fs[:, 3], fq)
+    assert fs.shape == (10, 3) and np.all(fs[:, 0] == 1.0)
+    assert np.array_equal(fs[:, 1], fq) and np.all(fs[:, 2] == 0.5)
     try:
         bfs(xyz10, fq, fq)
         raise AssertionError("missing extras must raise")
@@ -2723,6 +2780,10 @@ def _demo():
         raise AssertionError("absent feat_* must raise")
     except ValueError as e:
         assert "feat_nope" in str(e) and "feat_demo" in str(e)
+    os.environ["TT_ZERO_CHANNELS"] = "feat_demo, feat_nope"
+    zx = feat_extras(zt, ["feat_demo", "feat_nope"], "t0")
+    assert (zx["feat_demo"] == 0).all() and (zx["feat_nope"] == 0).all()
+    del os.environ["TT_ZERO_CHANNELS"]
 
     fwd = lambda tiles: [np.tile([5.0, 0.0, 0.0], (len(c), 1)).astype(np.float32)
                          for c, _ in tiles]
@@ -2782,6 +2843,23 @@ def _demo():
 
     zi, zr = scene_arrays({"files": []} and np.load(f"{ds}/val/s0.npz"), 4000)
     assert zi.shape == (4000,) and np.all(zr == 0.0)
+    os.environ["TT_ZERO_CHANNELS"] = "intensity,return_number"
+    zi0, zr0 = scene_arrays(np.load(f"{ds}/val/s0.npz"), 4000)
+    assert np.all(zi0 == 0.0) and np.all(zr0 == 0.0)   # present column killed
+    os.environ["TT_ZERO_CHANNELS"] = "rgb"
+    zi1, _ = scene_arrays(np.load(f"{pd_}/pv.npz"), 20_000)
+    assert np.all(zi1 == 0.0)   # killed rgb must not leak in as the intensity proxy
+    np.savez(f"{pd_}/zc0.npz", xyz=pxyz[:100],
+             intensity=np.full(100, 0.5, np.float32), rgb=prgb[:100])
+    os.environ["TT_ZERO_CHANNELS"] = "intensity"
+    _, zrgb, _ = ptv3_load_canonical(f"{pd_}/zc0.npz", "intensity")
+    assert np.all(zrgb == 128.0)   # zeroed color pick -> constant, never live rgb
+    os.environ["TT_ZERO_CHANNELS"] = "rgb"
+    _, zrgb2, _ = ptv3_load_canonical(f"{pd_}/zc0.npz", "rgb")
+    assert np.all(zrgb2 == 128.0)
+    del os.environ["TT_ZERO_CHANNELS"]
+    _, zrgb3, _ = ptv3_load_canonical(f"{pd_}/zc0.npz", "rgb")
+    assert not np.all(zrgb3 == 128.0)   # kill lifted -> real rgb again
     ij = tempfile.mkdtemp()
     os.makedirs(f"{ij}/predictions")
     run_infer_scenes([f"{ds}/val/s0.npz"],

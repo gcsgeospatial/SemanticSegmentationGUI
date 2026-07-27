@@ -235,6 +235,9 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                 GRID_SIZE = float(meta["grid"])
         FEAT_LEGACY = ["x", "y", "z", "rgb" if color_src == "rgb" else "intensity"]
         mf = (meta or {}).get("features")
+        if mf:   # LEGACY (delete before production): era-1 rgb_r/g/b + HAG tokens
+            import legacy_weights as lw
+            mf = lw.translate_features(mf, hag_source=(meta or {}).get("hag_source"))
         try:
             FEAT_SPEC = (tc.parse_feat_spec(",".join(mf), FEAT_LEGACY)
                          if mf and len(set(mf)) == len(mf) else list(FEAT_LEGACY))

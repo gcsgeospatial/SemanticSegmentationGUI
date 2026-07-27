@@ -15,8 +15,8 @@ from pathlib import Path
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QCursor
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout,
-                               QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget,
-                               QListWidgetItem, QMenu, QPushButton, QRadioButton,
+                               QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
+                               QListWidget, QListWidgetItem, QMenu, QPushButton, QRadioButton,
                                QSpinBox, QVBoxLayout, QWidget)
 
 from .. import analysis, appstate, dataset, local_cli, modal_cli, plots, pretrain, ui
@@ -60,6 +60,11 @@ class InferPage(QWidget):
         self._crs_probe_name = ""
         self._crs_probe_path = ""
         self._declared_crs_epsg: int | None = None
+        self._input_fields: list[str] = []   # extra columns in the probed input cloud
+        self._input_std: set = set()         # standard channels it carries
+        self._chan_combos: dict[str, QComboBox] = {}
+        self._active_zeroed: list | None = None   # launch snapshots (frozen per run)
+        self._active_cols: dict | None = None
 
         root = QVBoxLayout(self)
         title = QLabel("Inference")
@@ -277,6 +282,21 @@ class InferPage(QWidget):
         dg_row.addWidget(self.probs_chk)
         dg_row.addStretch()
         iform.addRow("Domain adaptation", ui.wrap(dg_row))
+
+        # per-channel source policy: calculated channels (feat_hag / feat_geo_*)
+        # recompute or zero; found channels bind to a probed input column or zero
+        self.chan_grid_host = QWidget()
+        cg = QGridLayout(self.chan_grid_host)
+        cg.setContentsMargins(0, 0, 0, 0)
+        cg.setColumnStretch(1, 1)
+        self.chan_hint = QLabel("")
+        self.chan_hint.setObjectName("pageSub")
+        self.chan_hint.setWordWrap(True)
+        chan_col = QVBoxLayout()
+        chan_col.addWidget(self.chan_grid_host)
+        chan_col.addWidget(self.chan_hint)
+        iform.addRow("Input channels", ui.wrap(chan_col))
+        self._rebuild_chan_table()
 
         self.class_list = QListWidget()
         self.class_list.setMaximumHeight(96)
@@ -496,6 +516,125 @@ class InferPage(QWidget):
                 f"masking {len(exc)} of {total}: {', '.join(exc)} - next-best class wins")
 
     @staticmethod
+    def _chan_kind(name: str) -> str:
+        """'found' = a custom feat_* column read from the input data; 'std' = a
+        format-standard field readers fill. Calculated channels (feat_hag /
+        feat_geo_*) are always recomputed at convert time and never listed."""
+        return "found" if name.startswith("feat_") else "std"
+
+    def _table_channels(self) -> list:
+        """The run's DATA channels - the only inputs this table governs."""
+        return [n for n in (self._run_features() or [])
+                if n in ("intensity", "return_number", "rgb")
+                or (n.startswith("feat_") and n != "feat_hag"
+                    and not n.startswith("feat_geo_"))]
+
+    def _meta_source_fields(self) -> dict:
+        """channel name -> train-time source column, from the dataset meta."""
+        chans = ((self._dataset_meta() or {}).get("source") or {}).get("feature_channels") or []
+        return {f"feat_{c.get('name')}": str(c.get("source_field") or "")
+                for c in chans if isinstance(c, dict) and c.get("name")}
+
+    def _rebuild_chan_table(self):
+        """One combo per DATA input: where it comes from in THESE clouds.
+        auto = the standard/train-time source when present, zeros when the
+        clouds don't carry it - missing data never blocks a run. Calculated
+        channels are always recomputed and don't appear here."""
+        if not hasattr(self, "chan_grid_host"):
+            return
+        prev = {n: c.currentData() for n, c in self._chan_combos.items()}
+        grid = self.chan_grid_host.layout()
+        while grid.count():
+            it = grid.takeAt(0)
+            if it.widget():
+                it.widget().deleteLater()
+        self._chan_combos = {}
+        feats = self._table_channels()
+        self.chan_grid_host.setVisible(bool(feats))
+        if not feats:
+            self.chan_hint.setText("(load a run to list its input channels)")
+            return
+        meta_src = self._meta_source_fields()
+        probed = bool(self._crs_probe_name)
+        cols_lower = {f.lower() for f in self._input_fields}
+        for row, name in enumerate(feats):
+            grid.addWidget(QLabel(name), row, 0)
+            combo = QComboBox()
+            if self._chan_kind(name) == "std":
+                if probed and name not in self._input_std:
+                    fb = {"intensity": "rgb-derived gray, else zeros",
+                          "rgb": "a neutral mid-gray constant",
+                          "return_number": "zeros"}[name]
+                    combo.addItem(f"auto - missing here; model sees {fb}",
+                                  ("auto", None))
+                else:
+                    combo.addItem("from the file's standard field", ("auto", None))
+                if name != "rgb":   # rgb is 3-channel; column binding is 1-D only
+                    for f in self._input_fields:
+                        combo.addItem(f"column '{f}'", ("col", f))
+            else:
+                src = meta_src.get(name, "")
+                lbl = (f"auto (train-time source: '{src}')" if src
+                       else "auto (input column of the same name)")
+                want = (src or name[len("feat_"):]).lower()
+                if probed and not want.startswith("@") and want not in cols_lower:
+                    lbl += " - missing here; model receives zeros"
+                combo.addItem(lbl, ("auto", None))
+                for f in self._input_fields:
+                    combo.addItem(f"column '{f}'", ("col", f))
+            combo.addItem("zeros (disable this input)", ("zeros", None))
+            i = combo.findData(prev.get(name))
+            combo.setCurrentIndex(i if i >= 0 else 0)
+            grid.addWidget(combo, row, 1)
+            self._chan_combos[name] = combo
+        probe = (f"columns found in {self._crs_probe_name}: "
+                 + (", ".join(self._input_fields) or "none")
+                 if probed else "pick the input clouds to list their columns")
+        self.chan_hint.setText(
+            f"Where each data input comes from in these clouds ({probe}). "
+            f"Missing data is fed as zeros; calculated channels (HAG, geometric "
+            f"features) are always recomputed and not listed.")
+
+    def _zeroed_channels(self) -> list[str]:
+        """Channels the trainer must feed as zeros: user-disabled combos plus
+        auto rows whose source column is absent from the probed input (missing
+        data passes through as a zero field instead of blocking). Snapshot
+        while a run is live: conversion, the post-convert report, the
+        (possibly minutes-later) Modal env and every ensemble member must see
+        ONE channel configuration, not live combo state."""
+        if self._active_zeroed is not None:
+            return self._active_zeroed
+        zeroed = {n for n, c in self._chan_combos.items()
+                  if (c.currentData() or ("auto",))[0] == "zeros"}
+        meta_src = self._meta_source_fields()
+        if self._crs_probe_name:
+            cols = {f.lower() for f in self._input_fields}
+            for n, c in self._chan_combos.items():
+                if (not n.startswith("feat_")
+                        or (c.currentData() or ("auto",))[0] != "auto"):
+                    continue
+                src = (meta_src.get(n) or n[len("feat_"):]).lower()
+                if not src.startswith("@") and src not in cols:
+                    zeroed.add(n)
+        # geo channels the current engine can't compute anymore run as zeros
+        geo_ok = {g.lower() for g in pretrain.GEO_FEATURES}
+        for n in (self._run_features() or []):
+            if not n.startswith("feat_geo_"):
+                continue
+            src = meta_src.get(n) or ""
+            nm = src[len("@geo:"):] if src.startswith("@geo:") else n[len("feat_geo_"):]
+            if nm.lower() not in geo_ok:
+                zeroed.add(n)
+        return sorted(zeroed)
+
+    def _mapped_columns(self) -> dict:
+        """channel -> user-bound input column (combos on 'column ...')."""
+        if self._active_cols is not None:
+            return self._active_cols
+        return {n: c.currentData()[1] for n, c in self._chan_combos.items()
+                if (c.currentData() or ("auto",))[0] == "col"}
+
+    @staticmethod
     def _names_from_manifest(m: dict) -> list | None:
         """Class names from a manifest: class_names, else 'class 0..n-1', else None."""
         names = m.get("class_names")
@@ -601,7 +740,9 @@ class InferPage(QWidget):
         self._dg = {}
         self._modal_cfg_run = ""
         self._apply_manifest_lock(False)
+        self.hag_chk.setEnabled(True)
         self._set_run_classes(None)
+        self._rebuild_chan_table()
 
     def _infer_dg_env(self, dg: dict | None = None) -> dict:
         """DG_* env for inference; logdk must be recomputed (it changed the
@@ -625,6 +766,12 @@ class InferPage(QWidget):
             env["EXCLUDE_CLASSES"] = ",".join(exc)
             self._append("[mask] excluding: " + ", ".join(exc)
                          + "; masked points fall to their next-best class")
+        # channel kills ride the env like the class mask: local, modal, ensemble alike
+        zc = self._zeroed_channels()
+        if zc:
+            env["TT_ZERO_CHANNELS"] = ",".join(zc)
+            self._append("[channels] zero-filled inputs (missing or disabled): "
+                         + ", ".join(zc) + " - the model runs without these signals")
         return env
 
     def _load_run_manifest(self):
@@ -659,6 +806,9 @@ class InferPage(QWidget):
         """Arch/grid/tile/HAG/DG/classes from a run manifest; False when the
         run's model can't be used here."""
         bkey = m.get("backbone")
+        # LEGACY (delete before production): era-0 manifests used display names
+        bkey = {"RandLA-Net": "randlanet", "KPConvX-L": "kpconvx_cold",
+                "PTv3": "ptv3", "KPConv": "kpconv"}.get(bkey, bkey)
         legacy_hag = bool(m.get("hag_source"))
         if isinstance(bkey, str) and bkey.endswith("_hag"):
             bkey = bkey[: -len("_hag")]
@@ -671,16 +821,24 @@ class InferPage(QWidget):
                          f"Train page, then reload this run.")
             return False
         self.backbone_combo.setCurrentIndex(i)
-        if m.get("grid") is not None:
-            self.grid_spin.setValue(float(m["grid"]))
-        if m.get("chunk_xy") is not None and self.chunk_spin.isEnabled():
-            self.chunk_spin.setValue(float(m["chunk_xy"]))
+        # LEGACY key spellings (delete before production): grid_m/sub_grid_size/
+        # grid_size + chunk_xy_m from era-0/1 manifests
+        grid = next((m[k] for k in ("grid", "grid_m", "sub_grid_size", "grid_size")
+                     if m.get(k) is not None), None)
+        if grid is not None:
+            self.grid_spin.setValue(float(grid))
+        chunk = next((m[k] for k in ("chunk_xy", "chunk_xy_m")
+                      if m.get(k) is not None), None)
+        if chunk is not None and self.chunk_spin.isEnabled():
+            self.chunk_spin.setValue(float(chunk))
         self._dg = m.get("dg") or {}
         feats = m.get("features")
         if legacy_hag and feats:
             feats = ["feat_hag" if n == "height" else n for n in feats]
         need_hag = "feat_hag" in (feats or []) or legacy_hag
         self.hag_chk.setChecked(need_hag)
+        # a feat_hag run ALWAYS recomputes HAG; the user owns only ground/method
+        self.hag_chk.setEnabled(not need_hag)
         if need_hag:
             chans = ((self._dataset_meta(m) or {}).get("source") or {}) \
                 .get("feature_channels") or []
@@ -705,8 +863,10 @@ class InferPage(QWidget):
         custom = [n for n in (self._manifest_features or []) if n.startswith("feat_")]
         if custom:
             self._append(f"[feat] run trained with custom channel(s): {', '.join(custom)}. "
-                         f"Input clouds must carry the matching source field(s).")
+                         f"Input clouds must carry the matching source field(s) - "
+                         f"bind or disable each one under 'Input channels'.")
         self._set_run_classes(self._names_from_manifest(m))
+        self._rebuild_chan_table()
         return True
 
     def _on_run_id_typed(self):
@@ -780,6 +940,8 @@ class InferPage(QWidget):
         self._apply_manifest_lock(use_run)
         self._set_run_classes(
             self._names_from_manifest(self._manifest) if use_run else None)
+        # a stale table must not keep exporting kills for a model it wasn't built for
+        self._rebuild_chan_table()
 
     def _apply_manifest_lock(self, locked: bool):
         """Grey out what a run.json dictates (arch, grid, tile); while a manifest
@@ -889,20 +1051,29 @@ class InferPage(QWidget):
         file, like the scene-channel check; reuses readers, no reprojection here)."""
         path = self.input_edit.text().strip()
         self._crs_probe, self._crs_probe_name, self._crs_probe_path = None, "", path
+        self._input_fields, self._input_std = [], set()
         files = dataset.expand_inputs(path) if path and os.path.exists(path) else []
         if not files:
             self._render_crs()
+            self._rebuild_chan_table()
             return
         try:
             cloud = read_points(files[0])
         except Exception as e:
             self._append(f"Could not read CRS from {files[0].name}: {e}")
             self._render_crs()
+            self._rebuild_chan_table()
             return
         self._crs_probe = crs_probe(cloud)
         self._crs_probe_name = (files[0].name if len(files) == 1
                                 else f"{files[0].name} (+{len(files) - 1} more)")
+        self._input_fields = sorted(cloud.fields.keys())
+        self._input_std = {c for c, a in (("intensity", cloud.intensity),
+                                          ("rgb", cloud.rgb),
+                                          ("return_number", cloud.return_number))
+                           if a is not None}
         self._render_crs()
+        self._rebuild_chan_table()
 
     def _render_crs(self, *_):
         """Show the probed input's detected CRS + auto action (or the D1 block)."""
@@ -1201,6 +1372,10 @@ class InferPage(QWidget):
                          "for the input scenes.")
         job_root = self._infer_out_dir()
         fields, geo, geo_k = self._infer_feature_fields()
+        mapped = self._mapped_columns()
+        if mapped:
+            self._append("[channels] bound inputs: "
+                         + ", ".join(f"{k} <- '{v}'" for k, v in sorted(mapped.items())))
         if geo:
             self._append(f"[1/4] Recomputing geometric feature(s) "
                          f"{', '.join(geo)} (pgeof optimal, k≤{geo_k}) per scene.")
@@ -1218,30 +1393,51 @@ class InferPage(QWidget):
 
     def _run_features(self) -> list | None:
         """The run's ordered input spec (run.json "features"), or None (loose
-        .pth / legacy run). Ensemble: the union of every member's features."""
+        .pth / legacy run). Ensemble: the union of every member's features.
+        feat_intensity/feat_return_number aliases collapse to the canonical
+        channel (mirrors parse_feat_spec trainer-side)."""
         if self._ens_running:
             feats: list = []
             for m in self._ens_members:
                 for f in (m.get("manifest") or {}).get("features") or []:
                     if f not in feats:
                         feats.append(f)
-            return feats or None
-        return self._manifest_features \
-            if (self.from_run_radio.isChecked() and self._manifest) else None
+        else:
+            feats = list(self._manifest_features or []) \
+                if (self.from_run_radio.isChecked() and self._manifest) else []
+        feats = [dataset.canonical_channel(n) or n for n in feats]
+        # LEGACY (delete before production): era-1 rgb_r/g/b + HAG tokens
+        fixed: list = []
+        for n in feats:
+            low = str(n).lower()
+            n = ("rgb" if low in ("rgb_r", "rgb_g", "rgb_b")
+                 else "feat_hag" if low == "hag" else n)
+            if n not in fixed:
+                fixed.append(n)
+        return fixed or None
 
     def _infer_feature_fields(self) -> tuple:
         """(raw source fields, pgeof geo names, geo_k) for the run's custom
         feat_* channels, resolved through the dataset meta; unresolved names
-        fall back with a logged warning."""
+        fall back with a logged warning. Channel-table overrides win: zeroed
+        channels are skipped entirely (nothing computed for a dead input) and
+        user-bound columns ride as 'target=Column' entries."""
+        zeroed = set(self._zeroed_channels())
+        mapped = self._mapped_columns()
         custom = [n for n in (self._run_features() or [])
-                  if n.startswith("feat_") and n != "feat_hag"]
+                  if n.startswith("feat_") and n != "feat_hag" and n not in zeroed]
+        fields = [f"{c}={mapped[c]}" for c in ("intensity", "return_number")
+                  if c in mapped]
         if not custom:
-            return None, None, 100
+            return fields or None, None, 100
         geo_by_lower = {n.lower(): n for n in pretrain.GEO_FEATURES}
         chans = ((self._dataset_meta() or {}).get("source") or {}).get("feature_channels") or []
         by_name = {c.get("name"): c for c in chans if isinstance(c, dict)}
-        fields, geo, geo_k = [], [], None
+        geo, geo_k = [], None
         for n in custom:
+            if n in mapped:
+                fields.append(f"{n[len('feat_'):]}={mapped[n]}")
+                continue
             c = by_name.get(n[len("feat_"):]) or {}
             src = c.get("source_field") or ""
             if src.startswith("@geo:"):
@@ -1299,13 +1495,15 @@ class InferPage(QWidget):
     def _on_converted(self, staged: Path):
         self._staged = staged
         lines, blocked = _scene_channel_report(staged,
-                                               features=self._run_features())
+                                               features=self._run_features(),
+                                               zeroed=self._zeroed_channels())
         for line in lines:
             self._append(line)
         if blocked:
-            self._append("✗ Aborting: the input clouds lack channel(s) this run was "
-                         "trained on (see above). Re-export the inputs with those "
-                         "fields, or pick a run that doesn't need them.")
+            self._append("✗ Aborting: calculated channel(s) this run needs failed to "
+                         "appear during conversion (see above). Check the HAG / "
+                         "geometric-feature settings and the conversion log, then "
+                         "run again.")
             self._ens_running = False
             self.run_btn.setEnabled(True)
             self._end_run("✗ inputs lack required channel(s)")
@@ -1597,13 +1795,19 @@ class InferPage(QWidget):
         self._append("\n".join(lines))
 
     def _begin_run(self, title: str):
-        """Run header; earlier runs stay scrollable above the divider."""
+        """Run header; earlier runs stay scrollable above the divider. Also
+        freezes the channel table: the run uses this snapshot everywhere."""
         self._run_open = True
+        self._active_zeroed = self._zeroed_channels()
+        self._active_cols = self._mapped_columns()
+        self.chan_grid_host.setEnabled(False)
         self.log.begin_run(title)
 
     def _end_run(self, summary: str):
         """Close the current run header exactly once (terminal points can
         overlap, e.g. export error after a stage failure)."""
+        self._active_zeroed = self._active_cols = None
+        self.chan_grid_host.setEnabled(True)
         if self._run_open:
             self._run_open = False
             self.log.end_run(summary)
@@ -1647,21 +1851,29 @@ def _localize_paths(text: str, job_id: str, pred_dir, staged) -> str:
     return text
 
 
-def _scene_channel_report(staged,
-                          features: list | None = None) -> tuple[list[str], bool]:
+def _scene_channel_report(staged, features: list | None = None,
+                          zeroed=()) -> tuple[list[str], bool]:
     """(log lines, blocking) - verify the converted scenes carry what the run
-    needs: rgb / feat_* are hard requirements (blocking); missing intensity /
-    return_number only warns; features None = legacy, never blocking."""
+    needs. Only CALCULATED channels (feat_hag / feat_geo_*) can block: they are
+    always recomputed, so their absence means the conversion itself failed.
+    Data channels (intensity / return_number / rgb / custom feat_*) pass
+    through as zeros or a documented fallback when missing; `zeroed` lists the
+    ones already riding TT_ZERO_CHANNELS."""
     import numpy as np
+    zeroed = set(zeroed)
     scenes = sorted(Path(staged).glob("scenes/*.npz"))
     if not scenes:
         return [f"⚠ no converted scenes under {staged} to check."], False
     hard = [n for n in (features or [])
-            if n == "rgb" or n.startswith("feat_")]
-    want_i = features is None or "intensity" in features
-    want_r = features is not None and "return_number" in features
+            if (n == "feat_hag" or n.startswith("feat_geo_")) and n not in zeroed]
+    soft = [n for n in (features or [])
+            if n.startswith("feat_") and n not in hard and n not in zeroed]
+    want_i = "intensity" not in zeroed and (features is None or "intensity" in features)
+    want_r = (features is not None and "return_number" in features
+              and "return_number" not in zeroed)
     missing_i, missing_r, keys0 = [], [], []
     missing_hard: dict[str, list[str]] = {}
+    missing_soft: dict[str, list[str]] = {}
     for p in scenes:
         with np.load(p) as z:
             names = set(z.files)
@@ -1674,8 +1886,19 @@ def _scene_channel_report(staged,
         for ch in hard:
             if ch not in names:
                 missing_hard.setdefault(ch, []).append(p.stem)
+        for ch in soft:
+            if ch not in names:
+                missing_soft.setdefault(ch, []).append(p.stem)
     lines = [f"[check] {len(scenes)} scene(s) carry: {', '.join(keys0)}; this npz "
              f"is exactly what the model reads."]
+    if zeroed:
+        lines.append(f"○ fed as zeros (missing or disabled): "
+                     f"{', '.join(sorted(zeroed))} - the model runs without "
+                     f"these signals.")
+    for ch, lost in missing_soft.items():
+        lines.append(f"⚠ '{ch}' missing in: {', '.join(lost)} and not set to "
+                     f"zeros - the run will abort naming it. Set the channel to "
+                     f"'zeros' under Input channels, or re-probe the inputs.")
     if want_i and missing_i:
         lines.append(f"⚠ no intensity channel in: {', '.join(missing_i)}. The source "
                      f"file(s) had no intensity field. The trainer substitutes a "
@@ -1696,9 +1919,9 @@ def _scene_channel_report(staged,
     for ch, lost in missing_hard.items():
         hint = (" Tick 'Compute Height-Above-Ground' in the conversion box and "
                 "run again." if ch == "feat_hag" else "")
-        lines.append(f"✗ required channel '{ch}' missing in: {', '.join(lost)}. "
-                     f"This run was trained with it; predicting without it would "
-                     f"be garbage.{hint}")
+        lines.append(f"✗ calculated channel '{ch}' missing in: {', '.join(lost)} - "
+                     f"its computation failed during conversion; check the log "
+                     f"above, then run again.{hint}")
     return lines, bool(missing_hard)
 
 

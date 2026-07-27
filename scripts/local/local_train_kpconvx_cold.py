@@ -124,10 +124,8 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
     CYC_RAISE      = max(1, round(globals()["CYC_RAISE"] * _cyc_scale))
     CYC_PLATEAU    = round(globals()["CYC_PLATEAU"] * _cyc_scale)
     CYC_DECREASE10 = globals()["CYC_DECREASE10"] * _cyc_scale
-    # "height" is dead for new runs (real HAG = feat_hag); FEAT_LEGACY keeps it ONLY so pre-spec checkpoints, whose weights expect that width, still infer
-    FEAT_LEGACY = ["intensity", "return_number", "height"]
     FEAT_DEFAULT = ["intensity", "return_number"]
-    FEAT_SPEC = (list(FEAT_LEGACY) if INFER
+    FEAT_SPEC = (list(FEAT_DEFAULT) if INFER
                  else tc.parse_feat_spec(FEAT_CHANNELS, FEAT_DEFAULT))
 
     ds_root = tc.dataset_dir(dataset) if dataset else None
@@ -135,7 +133,7 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
         ds_meta, NUM_CLASSES, CLASS_NAMES = tc.load_dataset_meta(dataset)
         PREP_DIR = (f"{ds_root}/prep/kpconvx_cold"
                     f"_grid{GRID:g}_c{int(CHUNK_XY)}"
-                    f"{tc.feat_spec_tag(FEAT_SPEC, FEAT_LEGACY)}"
+                    f"{tc.feat_spec_tag(FEAT_SPEC, FEAT_DEFAULT)}"
                     f"{tc.train_stride_tag()}")
     else:
         NUM_CLASSES = 5
@@ -150,15 +148,14 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
                 if meta.get("grid") is not None: GRID = float(meta["grid"])
                 if meta.get("chunk_xy") is not None: CHUNK_XY = float(meta["chunk_xy"])
                 STRIDE = CHUNK_XY / 2.0
-                mf = meta.get("features")
-                FEAT_SPEC = (tc.parse_feat_spec(",".join(mf), FEAT_LEGACY)
-                             if mf else list(FEAT_LEGACY))
-                if meta.get("hag_source"):
-                    FEAT_SPEC = ["feat_hag" if n == "height" else n for n in FEAT_SPEC]
-                    print(f"  [legacy-hag] weights from the removed --hag variant "
-                          f"(hag_source={meta['hag_source']}): 'height' -> feat_hag; "
-                          f"input scenes must carry a baked feat_hag channel",
-                          flush=True)
+                # LEGACY (delete before production): every pre-current weight
+                # era routes through legacy_weights - translated tokens, z-min
+                # slot, hag_source manifests, era-0 spec-less run_configs
+                import legacy_weights as lw
+                lspec, lnote = lw.kp_legacy_spec(tc.resolve_weights_path(weights))
+                if lnote:
+                    print(f"  [legacy] {lnote}", flush=True)
+                FEAT_SPEC = lspec if lspec is not None else list(FEAT_DEFAULT)
 
     if "rgb" in FEAT_SPEC:
         raise ValueError("the KPConvX tile pipeline has no rgb channel. Use "
@@ -198,7 +195,7 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
     def find_latest_checkpoint():
         return tc.kp_find_latest_checkpoint("AdamW", {FEATURE_MODE},
                                             features=FEAT_SPEC,
-                                            legacy_features=FEAT_LEGACY,
+                                            legacy_features=FEAT_DEFAULT,
                                             skip_done=not EVAL_ONLY)
 
     print("=" * 70)
@@ -238,6 +235,9 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
         resume_ckpt, start_epoch = None, 0
 
     build_feat = tc.kp_make_build_feat(DG_LOGDK_FEAT, DG_LOGDK_K, FEAT_SPEC)
+    if INFER:   # LEGACY (delete before production): z-min / extinct-token columns
+        import legacy_weights as lw
+        build_feat = lw.wrap_build_feat(build_feat)
     sample_tile = tc.kp_make_sample_tile(
         build_feat, GRID, max_pts=60000, aug_color=AUG_COLOR,
         density_aug=DG_DENSITY_AUG, coarsen_max=DG_COARSEN_MAX,
