@@ -117,15 +117,23 @@ class TrainPage(QWidget):
         self.val_every.valueChanged.connect(self._refresh_summaries)
         form.addRow("Validate every N epochs", self.val_every)
         self.proxy_sampling = QComboBox()
-        self.proxy_sampling.addItem("Coverage (natural mix)", "coverage")
-        self.proxy_sampling.addItem("Density (rare-heavy)", "density")
+        self.proxy_sampling.addItem("Full (same as the test pass)", "full")
+        self.proxy_sampling.addItem("Proxy — coverage (natural mix)", "coverage")
+        self.proxy_sampling.addItem("Proxy — density (rare-heavy)", "density")
         self.proxy_sampling.setToolTip(
-            "How the mid-training validation subset is picked: coverage keeps the "
-            "natural class distribution and guarantees a floor of scored points for "
-            "every class; density spends the rest of the tile budget on rare classes "
-            "on top of that same floor — steadier rare-class IoU, but the overall "
-            "numbers no longer reflect the real class mix.")
-        form.addRow("Validation sampling", self.proxy_sampling)
+            "Full scores every val scene on its original points, exactly like the "
+            "final test pass — the mIoU you see mid-training is the number you get "
+            "at the end, and it picks the best checkpoint on that. Costs a full "
+            "eval every N epochs; raise 'Validate every N epochs' if that is too "
+            "slow.\n"
+            "The proxy modes score a fixed 48-tile subset at voxel resolution "
+            "instead: much faster, but the numbers run high and are not comparable "
+            "to the test result. Coverage keeps the natural class mix; density "
+            "spends its tile budget on rare classes, which steadies rare-class IoU "
+            "but inflates it further.\n"
+            "Fixed for the life of a run — resuming with a different setting is "
+            "refused, because the two score on different scales.")
+        form.addRow("Validation scoring", self.proxy_sampling)
         form.addRow("Input features", self._features_row())
         self.detach_chk = QCheckBox("Detach (return immediately — launch several models in parallel)")
         self.detach_chk.setToolTip("Runs in the cloud without streaming logs here. Reattach with "
@@ -753,7 +761,7 @@ class TrainPage(QWidget):
         env.update(dg_env)
         if self.val_every.value() != 10:
             env["VAL_EVERY"] = str(self.val_every.value())
-        if self.proxy_sampling.currentData() != "coverage":
+        if self.proxy_sampling.currentData() != "full":
             env["PROXY_SAMPLING"] = self.proxy_sampling.currentData()
         feat_csv = self._feat_collect()
         if not feat_csv:
@@ -776,7 +784,8 @@ class TrainPage(QWidget):
             "dataset": name, "backbone": b.key,
             "params": params,
             "val_every": self.val_every.value(),
-            "proxy_sampling": self.proxy_sampling.currentData(),
+            # renamed from proxy_sampling: a saved 'coverage' predates the full-eval default and must not silently win
+            "val_scoring": self.proxy_sampling.currentData(),
             "loss": self._loss_collect(),
             "dg": self._dg_collect(),
             "features": feat_csv,
@@ -1040,7 +1049,7 @@ class TrainPage(QWidget):
             self.val_every.setValue(int(cfg.get("val_every", 10)))
         except (TypeError, ValueError):
             pass
-        i = self.proxy_sampling.findData(cfg.get("proxy_sampling", "coverage"))
+        i = self.proxy_sampling.findData(cfg.get("val_scoring", "full"))
         if i >= 0:
             self.proxy_sampling.setCurrentIndex(i)
         i = self.gpu_combo.findText(cfg.get("gpu", ""))

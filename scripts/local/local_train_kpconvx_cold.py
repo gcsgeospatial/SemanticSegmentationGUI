@@ -46,7 +46,7 @@ RARE_FREQ_FRAC  = 0.5
 RARE_TILE_PROB  = 0.25
 
 PROXY_TILES     = 48
-PROXY_SAMPLING  = "coverage"
+PROXY_SAMPLING  = "full"
 
 FEAT_CHANNELS = ""
 
@@ -245,10 +245,12 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
     # curated proxy subset + protocol stamp BEFORE run.json: a pre-signature resume falls through to a fresh run dir, which run.json must then describe
     proxy_tiles = proxy_rep = best = val_tiles = None
     proxy_samples = []
+    VAL_RANK = tc.ranking_protocol(PROXY_SAMPLING)
+    VAL_FULL = VAL_RANK == "full"
     if not INFER:
         val_tiles = sorted(glob.glob(f"{PREP_DIR}/val/*.npz"))
         tc.init_val_csv(f"{run_dir}/val_metrics.csv", CLASS_NAMES)
-        best = tc.BestCheckpoint(run_dir)
+        best = tc.BestCheckpoint(run_dir, VAL_RANK)
     if not INFER and not EVAL_ONLY:
         with tc.fixed_np_seed():
             proxy_tiles, proxy_rep = tc.pick_proxy_tiles(
@@ -266,15 +268,15 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
                         f"proxy val tile {bn} (curated for {why}) has fewer than "
                         f"32 points: delete {PREP_DIR} and re-run the dataset prep")
                 proxy_samples.append((os.path.basename(p), s))
-        print(proxy_rep["text"], flush=True)
+        print(tc.VAL_FULL_NOTE if VAL_FULL else proxy_rep["text"], flush=True)
         if not tc.proxy_guard(run_dir, proxy_rep, tc.PROXY_PROTOCOL_TILES,
-                              CLASS_NAMES):
+                              CLASS_NAMES, VAL_RANK):
             run_id, run_dir = tc.kp_make_run_dir("kpconvx_cold_native")
             resume_ckpt, start_epoch = None, 0
             tc.init_val_csv(f"{run_dir}/val_metrics.csv", CLASS_NAMES)
-            best = tc.BestCheckpoint(run_dir)
+            best = tc.BestCheckpoint(run_dir, VAL_RANK)
             tc.proxy_guard(run_dir, proxy_rep, tc.PROXY_PROTOCOL_TILES,
-                           CLASS_NAMES)
+                           CLASS_NAMES, VAL_RANK)
 
     if resume_ckpt is None and not INFER:
         with open(f"{run_dir}/run.json", "w") as f:
@@ -561,12 +563,13 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
     def run_eval(ep, write_json=False):
         if not write_json:
             net.eval()
-            m = tc.proxy_val(_proxy_batches(), lambda b: net(b),
-                             NUM_CLASSES, CLASS_NAMES, f"val@ep{ep}",
-                             len(proxy_tiles), tc.PROXY_PROTOCOL_TILES,
-                             inventory=proxy_rep["inventory"])
+            m = (evaluate(val_items, f"val@ep{ep}") if VAL_FULL else
+                 tc.proxy_val(_proxy_batches(), lambda b: net(b),
+                              NUM_CLASSES, CLASS_NAMES, f"val@ep{ep}",
+                              len(proxy_tiles), tc.PROXY_PROTOCOL_TILES,
+                              inventory=proxy_rep["inventory"]))
             net.train()
-            if best.update(m["present_classes_mIoU"]):
+            if best.update(m):
                 tc.atomic_torch_save({"model": net.state_dict(), "epoch": ep},
                                      best.final)
             tc.append_val_row(val_csv, ep, m, CLASS_NAMES)
@@ -594,6 +597,7 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
             dg.adabn_recalibrate(net, _bn_batches(), forward=lambda mdl, b: mdl(b))
         net.eval()
         m = evaluate(val_items, f"val@ep{ep}")
+        # deliberately no best.update, even in full mode: AdaBN above recalibrates BN, so this row is not comparable to the mid-training ones
         tc.append_val_row(val_csv, ep, m, CLASS_NAMES)
         swapped = not EVAL_ONLY and os.path.exists(best.final)
         if swapped:

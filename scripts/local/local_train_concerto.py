@@ -66,7 +66,7 @@ RARE_CENTER_PROB = 0.25
 
 VAL_EVERY        = 10
 PROXY_TILES      = 48
-PROXY_SAMPLING   = "coverage"
+PROXY_SAMPLING   = "full"
 CHECKPOINT_GAP   = 3
 RESUME           = False
 AUTO_RESUME      = os.environ.get("AUTO_RESUME", "0") == "1"
@@ -365,11 +365,13 @@ def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
         return int(_in_bounds(xyz).sum()) >= 64
 
     val_tiles = sorted(glob.glob(f"{PREP_DIR}/val/*.npz"))
+    VAL_RANK = tc.ranking_protocol(PROXY_SAMPLING)
+    VAL_FULL = VAL_RANK == "full"
     proxy_tiles, proxy_rep = tc.pick_proxy_tiles(
         val_tiles, NUM_CLASSES, PROXY_TILES, mode=PROXY_SAMPLING,
         class_names=names, viable=_viable,
         cache_path=f"{PREP_DIR}/val_class_balance_cache.npz")
-    print(proxy_rep["text"], flush=True)
+    print(tc.VAL_FULL_NOTE if VAL_FULL else proxy_rep["text"], flush=True)
 
     tag = dataset
     _pt = BB_KEY
@@ -380,7 +382,8 @@ def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
     resume_info = (tc.find_latest_unfinished_run(f"{tag}_{_pt}", _recipe)
                    if (RESUME or AUTO_RESUME) else None)
     if resume_info and not tc.proxy_guard(resume_info[0], proxy_rep,
-                                          tc.PROXY_PROTOCOL_TILES, names):
+                                          tc.PROXY_PROTOCOL_TILES, names,
+                                          VAL_RANK):
         resume_info = None
     if resume_info:
         run_dir, resume_ckpt, resume_epoch = resume_info
@@ -589,8 +592,8 @@ def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
     val_csv = f"{run_dir}/val_metrics.csv"
     tc.init_val_csv(val_csv, names)
 
-    best = tc.BestCheckpoint(run_dir)
-    tc.proxy_guard(run_dir, proxy_rep, tc.PROXY_PROTOCOL_TILES, names)
+    best = tc.BestCheckpoint(run_dir, VAL_RANK)
+    tc.proxy_guard(run_dir, proxy_rep, tc.PROXY_PROTOCOL_TILES, names, VAL_RANK)
     tc.write_run_manifest(run_dir, _pt, dataset)
 
     def _proxy_batches():
@@ -608,22 +611,28 @@ def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
                     f"Delete {PREP_DIR} and relaunch to re-prep the val tiles.")
             yield batch, lab
 
+    def _save_best(ep):
+        tc.atomic_torch_save({"backbone": backbone.state_dict(),
+                              "head": head.state_dict(), "epoch": ep,
+                              "config": model_cfg}, best.final)
+
     def run_eval(ep, write_json=False):
         backbone.eval(); head.eval()
         if not write_json:
-            m = tc.proxy_val(_proxy_batches(),
-                             lambda batch: head(_upcast_feat(backbone(batch))),
-                             NUM_CLASSES, names, f"val@ep{ep}",
-                             len(proxy_tiles), tc.PROXY_PROTOCOL_TILES,
-                             inventory=proxy_rep["inventory"])
-            if best.update(m["present_classes_mIoU"]):
-                tc.atomic_torch_save({"backbone": backbone.state_dict(),
-                                      "head": head.state_dict(), "epoch": ep,
-                                      "config": model_cfg}, best.final)
+            m = (evaluate(val_items, f"val@ep{ep}") if VAL_FULL else
+                 tc.proxy_val(_proxy_batches(),
+                              lambda batch: head(_upcast_feat(backbone(batch))),
+                              NUM_CLASSES, names, f"val@ep{ep}",
+                              len(proxy_tiles), tc.PROXY_PROTOCOL_TILES,
+                              inventory=proxy_rep["inventory"]))
+            # weights before the csv row: a kill between them must not seed a best final_model.pth can never match
+            if best.update(m):
+                _save_best(ep)
             tc.append_val_row(val_csv, ep, m, names)
             _set_backbone_mode(); head.train()
             return m
         m = evaluate(val_items, f"val@ep{ep}")
+        # deliberately no best.update: the last epoch is never a crown candidate, matching the AdaBN trainers
         tc.append_val_row(val_csv, ep, m, names)
         swapped = os.path.exists(best.final)
         if swapped:
@@ -738,9 +747,7 @@ def train_pcssl(dataset: Optional[str] = None, grid: Optional[float] = None,
 
     print("  final evaluation over the combined eval set…", flush=True)
     run_eval(ep, write_json=True)
-    best.finalize(lambda p: tc.atomic_torch_save(
-        {"backbone": backbone.state_dict(), "head": head.state_dict(),
-         "epoch": ep, "config": model_cfg}, p))
+    best.finalize(lambda p: _save_best(ep))
     print(f"  total wall-clock {(time.time() - t_run)/3600:.2f} h")
 
     open(f"{run_dir}/DONE", "w").close()

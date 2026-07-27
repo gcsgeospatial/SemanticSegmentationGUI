@@ -49,7 +49,7 @@ RARE_OVERSAMPLE  = True
 RARE_FREQ_THRESH = 0.02
 RARE_CENTER_PROB = 0.25
 VAL_EVERY        = 10
-PROXY_SAMPLING   = "coverage"
+PROXY_SAMPLING   = "full"
 PROXY_TILES      = 48
 PROXY_ANCHORS    = 3
 
@@ -639,6 +639,8 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     val_files   = sorted(glob.glob(f"{PREP_DIR}/val/*.npz"))
     test_files  = sorted(glob.glob(f"{PREP_DIR}/test/*.npz"))
 
+    VAL_RANK = tc.ranking_protocol(PROXY_SAMPLING)
+    VAL_FULL = VAL_RANK == "full"
     proxy_files, proxy_rep = tc.pick_proxy_tiles(
         val_files, NUM_CLASSES, PROXY_TILES, mode=PROXY_SAMPLING,
         class_names=CLASS_NAMES,
@@ -647,7 +649,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     proxy_rep["tiles"].append(f"anchors={PROXY_ANCHORS} "
                               f"slots={cfg.val_steps * VAL_BATCH} "
                               f"num_points={cfg.num_points}")
-    print(proxy_rep["text"], flush=True)
+    print(tc.VAL_FULL_NOTE if VAL_FULL else proxy_rep["text"], flush=True)
 
     tag = dataset
     _recipe = {"features": FEAT_SPEC, "n_epochs": N_EPOCHS,
@@ -655,7 +657,8 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     resume_info = (tc.find_latest_unfinished_run(f"{tag}_randlanet_cold", _recipe)
                    if (RESUME or AUTO_RESUME) else None)
     if resume_info and not tc.proxy_guard(resume_info[0], proxy_rep,
-                                          tc.PROXY_PROTOCOL_SPHERES, CLASS_NAMES):
+                                          tc.PROXY_PROTOCOL_SPHERES, CLASS_NAMES,
+                                          VAL_RANK):
         resume_info = None
     if resume_info:
         run_dir, resume_ckpt, resume_epoch = resume_info
@@ -861,8 +864,9 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
 
     val_src = {n: (p, c) for n, p, c in val_list}
 
-    best = tc.BestCheckpoint(run_dir)
-    tc.proxy_guard(run_dir, proxy_rep, tc.PROXY_PROTOCOL_SPHERES, CLASS_NAMES)
+    best = tc.BestCheckpoint(run_dir, VAL_RANK)
+    tc.proxy_guard(run_dir, proxy_rep, tc.PROXY_PROTOCOL_SPHERES, CLASS_NAMES,
+                   VAL_RANK)
     tc.write_run_manifest(run_dir, "randlanet", dataset)
 
     SLOTS = cfg.val_steps * VAL_BATCH
@@ -917,14 +921,16 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     def run_eval(ep, write_json=False):
         if not write_json:
             net.eval()
-            m = tc.proxy_val(
-                _proxy_batches(np.random.RandomState(20260724)),
-                lambda b: net(b)["logits"].transpose(1, 2).reshape(-1, NUM_CLASSES),
-                NUM_CLASSES, CLASS_NAMES, f"eval@ep{ep}",
-                cfg.val_steps, tc.PROXY_PROTOCOL_SPHERES, inventory=inv)
+            # no AdaBN here: it would mutate BN running stats mid-training
+            m = (evaluate(val_ds, val_src, f"eval@ep{ep}") if VAL_FULL else
+                 tc.proxy_val(
+                     _proxy_batches(np.random.RandomState(20260724)),
+                     lambda b: net(b)["logits"].transpose(1, 2).reshape(-1, NUM_CLASSES),
+                     NUM_CLASSES, CLASS_NAMES, f"eval@ep{ep}",
+                     cfg.val_steps, tc.PROXY_PROTOCOL_SPHERES, inventory=inv))
             net.train()
             # weights before the csv row: a kill between them must not seed a phantom best that final_model.pth can never match
-            if best.update(m["present_classes_mIoU"]):
+            if best.update(m):
                 tc.atomic_torch_save({"model": net.state_dict(), "epoch": ep},
                                      best.final)
             tc.append_val_row(val_csv, ep, m, CLASS_NAMES)
@@ -945,7 +951,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         net.eval()
         m = evaluate(val_ds, val_src, f"eval@ep{ep}")
         tc.append_val_row(val_csv, ep, m, CLASS_NAMES)
-        # deliberately no best.update: full-protocol numbers would always beat the proxy rows and spuriously crown the last epoch
+        # deliberately no best.update: in proxy mode these numbers are another scale, and in full mode AdaBN above has already moved the weights
         swapped = os.path.exists(best.final)
         if swapped:
             live_state = {k: v.clone() for k, v in net.state_dict().items()}

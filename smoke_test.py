@@ -1196,11 +1196,22 @@ def main():
               f"({len(_own)} own env_overrides lists + {len(_wrap)} concerto wrappers)",
               len(_wrap) == 2 and len(_own) == 5
               and all(m and "PROXY_SAMPLING" in m.group(1) for m in _optin)
-              and all(importlib.import_module(n).PROXY_SAMPLING == "coverage" for n in _own)
+              and all(importlib.import_module(n).PROXY_SAMPLING == "full" for n in _own)
               and all("PROXY_SAMPLING" not in importlib.import_module(n)._CFG for n in _wrap))
         check("proxy: every trainer picks its subset and guards the protocol at startup",
               all("tc.pick_proxy_tiles(" in s and "tc.proxy_guard(" in s
                   for s in (_psrc[n] for n in _own)))
+        check("val: every trainer resolves VAL_RANK and threads it into "
+              "BestCheckpoint + proxy_guard",
+              all(re.search(r"VAL_RANK = tc\.ranking_protocol\(PROXY_SAMPLING\)", s)
+                  and re.search(r"tc\.BestCheckpoint\([^)]*VAL_RANK", s)
+                  and re.search(r"tc\.proxy_guard\([^)]*VAL_RANK", s, re.S)
+                  for s in (_psrc[n] for n in _own)))
+        check("val: every trainer runs the FULL eval mid-training when VAL_FULL",
+              all(re.search(r"m = \(evaluate\([^)]*\) if VAL_FULL else", s)
+                  for s in (_psrc[n] for n in _own)))
+        check("val: the final eval never crowns — AdaBN/scale makes it incomparable",
+              all(re.search(r"no best\.update", s) for s in (_psrc[n] for n in _own)))
         infer_gate_ok = True
         for nm in LOCAL:
             lm = importlib.import_module(nm)

@@ -110,16 +110,34 @@ def validated_latest_ckpt(ckpts, ep_of):
     return None
 
 
-def best_val_miou(val_csv):
-    """Max val_miou over PROXY rows only (resume-safe seed). -1.0 if none.
-    Full-protocol rows score on another scale and would freeze final_model.pth
-    forever; pre-protocol-column rows have no protocol and never seed."""
+VAL_FULL_NOTE = ("  val: full raw-scored eval over every val scene, same protocol "
+                 "as the test pass (PROXY_SAMPLING=full — slower than a proxy "
+                 "pass, but directly comparable to the final numbers)")
+
+
+def row_protocol(m):
+    """Which val_metrics.csv scale a metrics dict belongs to. proxy_val stamps
+    m['protocol']; the raw-scored full evals don't."""
+    return "proxy" if "protocol" in m else "full"
+
+
+def ranking_protocol(sampling):
+    """PROXY_SAMPLING -> the row protocol that crowns final_model.pth.
+    'full' ranks on the same raw-scored eval as the test pass (slow, directly
+    comparable); 'coverage'/'density' rank on the fixed-budget proxy."""
+    return "full" if sampling == "full" else "proxy"
+
+
+def best_val_miou(val_csv, protocol="proxy"):
+    """Max val_miou over rows of `protocol` only (resume-safe seed). -1.0 if
+    none. The other protocol scores on another scale and would freeze
+    final_model.pth forever; pre-protocol-column rows never seed."""
     if not os.path.exists(val_csv):
         return -1.0
     best = -1.0
     with open(val_csv, newline="", encoding="utf-8", errors="replace") as f:
         for row in csv.DictReader(f):
-            if row.get("protocol") != "proxy":
+            if row.get("protocol") != protocol:
                 continue
             try:
                 best = max(best, float(row["val_miou"]))
@@ -129,14 +147,20 @@ def best_val_miou(val_csv):
 
 
 class BestCheckpoint:
-    """Track best val mIoU (seeded from val_metrics.csv); update() is True on
-    a new best; finalize(save_last) saves last epoch only if val never ran."""
+    """Track best val mIoU (seeded from val_metrics.csv); update(m) is True on
+    a new best and ignores metrics from the other protocol, so callers can hand
+    it every eval; finalize(save_last) saves last epoch only if val never ran."""
 
-    def __init__(self, run_dir):
+    def __init__(self, run_dir, protocol="proxy"):
+        self.protocol = protocol
         self.final = os.path.join(run_dir, "final_model.pth")
-        self.best = best_val_miou(os.path.join(run_dir, "val_metrics.csv"))
+        self.best = best_val_miou(os.path.join(run_dir, "val_metrics.csv"),
+                                  protocol)
 
-    def update(self, miou):
+    def update(self, m):
+        if row_protocol(m) != self.protocol:
+            return False
+        miou = m["present_classes_mIoU"]
         if miou > self.best:
             self.best = miou
             return True
@@ -613,11 +637,13 @@ def pick_proxy_tiles(val_tiles, num_classes, budget, mode="coverage",
     _PROXY_FLOOR_TILES per class) until every val-present class clears a point
     floor; 'density' drops the stride, takes the same floor first, then splits
     the rest by inverse-frequency^beta. viable(path)->bool pre-filters tiles the
-    batch path would drop. Returns (tile_paths, report)."""
+    batch path would drop. Returns (tile_paths, report).
+    'full' picks like coverage; the run ranks on the raw-scored full eval
+    instead, so the result goes unused (kept so a switch back is cheap)."""
     import numpy as np
-    if mode not in ("coverage", "density"):
-        raise ValueError(f"PROXY_SAMPLING={mode!r} is not a sampling mode. "
-                         "Set PROXY_SAMPLING to 'coverage' or 'density'.")
+    if mode not in ("coverage", "density", "full"):
+        raise ValueError(f"PROXY_SAMPLING={mode!r} is not a sampling mode. Set "
+                         "PROXY_SAMPLING to 'full', 'coverage' or 'density'.")
     if not val_tiles:
         raise RuntimeError("no val tiles to proxy-score — re-run prep with a "
                            "non-empty val split")
@@ -666,7 +692,7 @@ def pick_proxy_tiles(val_tiles, num_classes, budget, mode="coverage",
                 break
             _add(i)
 
-    if mode == "coverage":
+    if mode in ("coverage", "full"):
         _fill(budget)
     counts = (per_tile[picked].sum(0) if picked else np.zeros(num_classes, np.int64))
     rarest = sorted(inventory, key=lambda c: (int(total[c]), cname(c)))
@@ -948,14 +974,14 @@ def init_val_csv(val_csv, class_names):
 
 def append_val_row(val_csv, ep, m, class_names):
     """One val_metrics.csv row: epoch, acc, present-class mIoU, per-class IoUs,
-    protocol. proxy_val stamps m['protocol']; the full raw-scored evals don't,
-    and only 'proxy' rows seed BestCheckpoint."""
+    protocol. Only rows matching the run's ranking protocol seed
+    BestCheckpoint — see row_protocol/ranking_protocol."""
     ious = [m["per_class_iou"][n] for n in class_names]
     with open(val_csv, "a", newline="", encoding="utf-8") as f:
         csv.writer(f).writerow([ep, f"{m['overall_acc']:.4f}",
                                 f"{m['present_classes_mIoU']:.4f}"]
                                + [f"{x:.4f}" for x in ious]
-                               + ["proxy" if "protocol" in m else "full"])
+                               + [row_protocol(m)])
 
 
 def _proxy_remedy(run_dir):
@@ -969,22 +995,26 @@ def _proxy_remedy(run_dir):
             f"open and the delete fails with WinError 32.")
 
 
-def proxy_guard(run_dir, report, protocol, class_names):
+def proxy_guard(run_dir, report, protocol, class_names, ranking="proxy"):
     """Stamp/verify the checkpoint-ranking protocol of run_dir — call ONCE at
     startup right after BestCheckpoint (VAL_EVERY would leave epochs unguarded).
     Hashes tile BASENAMES only: absolute paths differ across win/linux/Modal and
     would falsely wedge a cross-backend resume. Returns False when run_dir must
-    be abandoned for a fresh one (pre-upgrade run: v1 rows, or proxy rows with
-    no signature); raises RuntimeError when its proxy rows were ranked under
-    another protocol or the checkpoint they crowned is gone."""
+    be abandoned for a fresh one (pre-upgrade run: v1 rows, or ranking rows with
+    no signature); raises RuntimeError when its rows were ranked under another
+    protocol or the checkpoint they crowned is gone.
+    ranking='full' stores a bare marker — the full eval covers the whole val
+    split, so there is no tile subset to pin. A proxy-mode signature keeps its
+    exact pre-'full' shape so in-flight proxy runs still resume."""
     import hashlib
-    sig = {"protocol": protocol, "mode": report["mode"],
-           "floor_points": report["floor_points"],
-           "inventory": [class_names[c] for c in report["inventory"]],
-           "tiles_sha1": hashlib.sha1(
-               "\n".join(sorted(report["tiles"])).encode("utf-8")).hexdigest()[:16]}
+    sig = ({"ranking": "full"} if ranking == "full" else
+           {"protocol": protocol, "mode": report["mode"],
+            "floor_points": report["floor_points"],
+            "inventory": [class_names[c] for c in report["inventory"]],
+            "tiles_sha1": hashlib.sha1(
+                "\n".join(sorted(report["tiles"])).encode("utf-8")).hexdigest()[:16]})
     path = f"{run_dir}/proxy_val.json"
-    rows = pre = 0
+    rows = pre = other = 0
     val_csv = f"{run_dir}/val_metrics.csv"
     if os.path.exists(val_csv):
         with open(val_csv, newline="", encoding="utf-8", errors="replace") as f:
@@ -996,25 +1026,42 @@ def proxy_guard(run_dir, report, protocol, class_names):
                 continue
             if v1 or len(r) < len(hdr):
                 pre += 1
-            elif r[-1] == "proxy":
+            elif r[-1] == ranking:
                 rows += 1
+            else:
+                other += 1
     if pre:
         print(f"  resume: skipping {os.path.basename(run_dir)} "
               f"({pre} val row(s) from a pre-protocol-column run)", flush=True)
         return False
-    if not rows:
+    old = None
+    if os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                old = json.load(f)
+        except (OSError, ValueError):
+            old = None
+    # rows on the other scale under a signature that NAMES that scale = a mid-run
+    # switch; an unreadable signature stays lenient, as it was before 'full' existed
+    switched = (bool(other) and isinstance(old, dict)
+                and old.get("ranking", "proxy") != ranking)
+    if not rows and not switched:
         atomic_json_save(sig, path)
         return True
     if not os.path.exists(path):
         print(f"  resume: skipping {os.path.basename(run_dir)} "
-              f"(proxy rows from a pre-signature run)", flush=True)
+              f"({ranking}-protocol rows from a pre-signature run)", flush=True)
         return False
-    try:
-        with open(path, encoding="utf-8") as f:
-            old = json.load(f)
-    except (OSError, ValueError):
-        old = None
     if old != sig:
+        was = old.get("ranking", "proxy") if isinstance(old, dict) else None
+        if was is not None and was != ranking:
+            back = old.get("mode", "coverage") if was == "proxy" else "full"
+            raise RuntimeError(
+                f"{run_dir} ranks checkpoints on the {was} validation protocol "
+                f"but PROXY_SAMPLING now asks for {ranking}; the two score on "
+                f"different scales, so the resumed run would chase a seed it can "
+                f"never match. Set PROXY_SAMPLING={back!r} to continue this run. "
+                f"{_proxy_remedy(run_dir)}")
         bad = ("unreadable proxy_val.json" if not isinstance(old, dict) else
                {k: [old.get(k), sig[k]] for k in sig if old.get(k) != sig[k]})
         raise RuntimeError(
@@ -1022,9 +1069,9 @@ def proxy_guard(run_dir, report, protocol, class_names):
             f"proxy protocol (changed: {bad}). Resuming would rank checkpoints "
             f"on two scales at once. {_proxy_remedy(run_dir)} (A run whose only "
             f"rows come from EVAL_ONLY is full-protocol and never trips this.)")
-    if not os.path.exists(f"{run_dir}/final_model.pth"):
+    if rows and not os.path.exists(f"{run_dir}/final_model.pth"):
         raise RuntimeError(
-            f"{run_dir} holds {rows} proxy val row(s) but no final_model.pth: "
+            f"{run_dir} holds {rows} {ranking} val row(s) but no final_model.pth: "
             f"the resume seed already sits above the crowned checkpoint, which "
             f"is gone, so the run would publish last-epoch weights instead. "
             f"Delete {run_dir}/val_metrics.csv (this wipes the run's GUI plot "
@@ -2276,8 +2323,15 @@ def modal_shell_run(script, flag_vals, env_json, volumes):
 def _demo():
     import tempfile
     d = tempfile.mkdtemp()
+    px = lambda v: {"present_classes_mIoU": v, "protocol": "proxy_tiles_v2"}
+    fu = lambda v: {"present_classes_mIoU": v}
+    assert row_protocol(px(0.5)) == "proxy" and row_protocol(fu(0.5)) == "full"
+    assert ranking_protocol("full") == "full"
+    assert ranking_protocol("coverage") == ranking_protocol("density") == "proxy"
     b = BestCheckpoint(d)
-    assert b.update(0.5) and not b.update(0.4) and b.update(0.6)
+    assert b.update(px(0.5)) and not b.update(px(0.4)) and b.update(px(0.6))
+    # a full-protocol metric never crowns a proxy-ranked run, however high
+    assert not b.update(fu(0.99)) and abs(b.best - 0.6) < 1e-9
     csv_path = os.path.join(d, "val_metrics.csv")
     with open(csv_path, "w", newline="") as f:
         w = csv.writer(f)
@@ -2286,7 +2340,12 @@ def _demo():
         w.writerow([1, 0.9, 0.65, "proxy"])
         w.writerow([1, 0.9, 0.95, "full"])
     assert abs(best_val_miou(csv_path) - 0.7) < 1e-9
-    assert not BestCheckpoint(d).update(0.69)
+    assert abs(best_val_miou(csv_path, "full") - 0.95) < 1e-9
+    assert not BestCheckpoint(d).update(px(0.69))
+    # a full-ranked run seeds off the full rows and ignores the proxy ones
+    bf = BestCheckpoint(d, "full")
+    assert abs(bf.best - 0.95) < 1e-9 and not bf.update(px(0.99))
+    assert bf.update(fu(0.96)) and not bf.update(fu(0.94))
     open(b.final, "w").close()
     b.finalize(lambda p: (_ for _ in ()).throw(AssertionError("should not save_last")))
 
@@ -2526,6 +2585,45 @@ def _demo():
     init_val_csv(f"{ur}/val_metrics.csv", ["a", "b"])
     assert not proxy_guard(ur, rep, PROXY_PROTOCOL_TILES, ["a", "b"])
     assert not os.path.exists(f"{ur}/proxy_val.json")
+
+    # ranking='full': no tile subset to pin, and the two scales must not mix
+    fd = tempfile.mkdtemp()
+    fcsv = f"{fd}/val_metrics.csv"
+    init_val_csv(fcsv, ["a", "b"])
+    assert proxy_guard(fd, rep, PROXY_PROTOCOL_TILES, ["a", "b"], "full")
+    assert json.load(open(f"{fd}/proxy_val.json")) == {"ranking": "full"}
+    append_val_row(fcsv, 0, m_ev, ["a", "b"])            # m_ev has no protocol -> a 'full' row
+    open(f"{fd}/final_model.pth", "w").close()
+    assert proxy_guard(fd, rep, PROXY_PROTOCOL_TILES, ["a", "b"], "full")
+    for mode in ("coverage", "density"):
+        try:
+            proxy_guard(fd, {**rep, "mode": mode}, PROXY_PROTOCOL_TILES, ["a", "b"])
+            raise AssertionError(f"full -> {mode} must block")
+        except RuntimeError as e:
+            # the remedy names the setting that CONTINUES this run, not the new one
+            assert "PROXY_SAMPLING='full'" in str(e) and "different scales" in str(e)
+    # and the reverse: a proxy-ranked run (readable signature) may not go full
+    pd_ = tempfile.mkdtemp()
+    init_val_csv(f"{pd_}/val_metrics.csv", ["a", "b"])
+    proxy_guard(pd_, rep, PROXY_PROTOCOL_TILES, ["a", "b"])
+    append_val_row(f"{pd_}/val_metrics.csv", 0,
+                   dict(m_ev, protocol=PROXY_PROTOCOL_TILES), ["a", "b"])
+    open(f"{pd_}/final_model.pth", "w").close()
+    try:
+        proxy_guard(pd_, rep, PROXY_PROTOCOL_TILES, ["a", "b"], "full")
+        raise AssertionError("proxy -> full must block")
+    except RuntimeError as e:
+        assert "PROXY_SAMPLING='coverage'" in str(e) and "different scales" in str(e)
+    # a full-ranked run with rows but no crowned checkpoint blocks like a proxy one
+    fd2 = tempfile.mkdtemp()
+    init_val_csv(f"{fd2}/val_metrics.csv", ["a", "b"])
+    proxy_guard(fd2, rep, PROXY_PROTOCOL_TILES, ["a", "b"], "full")
+    append_val_row(f"{fd2}/val_metrics.csv", 0, m_ev, ["a", "b"])
+    try:
+        proxy_guard(fd2, rep, PROXY_PROTOCOL_TILES, ["a", "b"], "full")
+        raise AssertionError("full rows with no final_model.pth must block")
+    except RuntimeError as e:
+        assert "final_model.pth" in str(e) and "full val row" in str(e)
 
     import ntpath
     import posixpath
