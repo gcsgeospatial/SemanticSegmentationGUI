@@ -537,13 +537,6 @@ class TrainPage(QWidget):
         inner.setVisible(False)
         self.adv_box = box
 
-        hint = QLabel("Loss & class balance — defaults already handle imbalance "
-                      "(rare classes weighted up + oversampled). Everything set "
-                      "here is recorded in run.json.")
-        hint.setWordWrap(True)
-        theme.set_accent(hint, "muted")
-        lay.addWidget(hint)
-
         self.loss_focal = QCheckBox("Use focal loss instead of weighted cross-entropy")
         self.loss_focal.setToolTip("Down-weights easy points to focus on hard/rare ones. "
                                    "Off by default (weighted CE + Lovász).\n"
@@ -587,19 +580,15 @@ class TrainPage(QWidget):
         r2.addStretch(1)
         lay.addLayout(r2)
 
-        self.loss_rare = QCheckBox("Oversample rare-class tiles (auto-detected)")
+        self.loss_rare = QCheckBox("Oversample rare-class tiles")
         self.loss_rare.setChecked(True)
         self.loss_rare.setToolTip("On = tiles containing rare classes are drawn more "
-                                  "often; off = uniform tile sampling.")
+                                  "often; off = uniform tile sampling.\n"
+                                  "Rare = present but below RARE_FREQ_FRAC x the median "
+                                  "present-class count; the trainer picks the set and "
+                                  "prints it as 'rare classes: [...]'.")
         lay.addWidget(self.loss_rare)
 
-        dg_hint = QLabel("Density robustness — train the model to tolerate point "
-                         "clouds sparser than the training data. Costs a little "
-                         "accuracy at native density; inference reads these "
-                         "settings back from run.json automatically.")
-        dg_hint.setWordWrap(True)
-        theme.set_accent(dg_hint, "muted")
-        lay.addWidget(dg_hint)
         self._dg_rows(lay)
         return box
 
