@@ -127,12 +127,9 @@ class DatasetsPage(QWidget):
             b.clicked.connect(slot)
             in_row.addWidget(b)
         form.addRow("Input", ui.wrap(in_row))
-        self.crs_status = QLabel("Pick an input - its CRS and the reprojection action appear here.")
-        self.crs_status.setWordWrap(True)
-        theme.set_accent(self.crs_status, "muted")
-        form.addRow("CRS", self.crs_status)
-        self.declare_epsg = ui.declare_epsg_edit(self._render_crs, max_width=150)
-        form.addRow("Declare CRS (EPSG)", self.declare_epsg)
+        form.addRow("CRS", ui.crs_row(
+            self, self._render_crs,
+            "Pick an input; its CRS and the reprojection action appear here."))
         self.field_combo = QComboBox()
         self.field_combo.setEditable(True)
         form.addRow("Label field", self.field_combo)
@@ -141,7 +138,7 @@ class DatasetsPage(QWidget):
     def _features_box(self) -> QWidget:
         """Only checked fields are baked into scenes - no implicit channels.
         intensity starts checked as a default, not a requirement."""
-        box = QGroupBox("3 · Feature channels - input fields the model trains on")
+        box = QGroupBox("3 · Feature channels")
         self.feat_group = box
         box.setToolTip("Per-point fields baked into every scene. ONLY what's "
                        "checked here ends up in the dataset - nothing is "
@@ -156,7 +153,7 @@ class DatasetsPage(QWidget):
         self.feat_list = QListWidget()
         self.feat_list.setMaximumHeight(110)
         lay.addWidget(self.feat_list)
-        self.rgb_box = QGroupBox("RGB color (rare)")
+        self.rgb_box = QGroupBox("RGB color")
         self.rgb_box.setCheckable(True)
         self.rgb_box.setChecked(False)
         self.rgb_box.setToolTip(
@@ -181,12 +178,19 @@ class DatasetsPage(QWidget):
         return box
 
     def _calculated_box(self) -> QWidget:
-        """Channels computed from xyz at build time - not fields of the input."""
-        box = QGroupBox("4 · Calculated features - computed at build time")
-        lay = QVBoxLayout(box)
-        self.hag_box = QGroupBox(ui.hag_title("Compute Height-Above-Ground (HAG)"))
-        self.hag_box.setCheckable(True)
-        self.hag_box.setChecked(False)
+        """Channels computed from xyz at build time - not fields of the input.
+        The box checkbox is a pure expander; build reads hag_box/geo_list."""
+        box = QGroupBox("4 · Calculated features")
+        box.setCheckable(True)
+        box.setChecked(False)
+        outer = QVBoxLayout(box)
+        content = QWidget()
+        box.toggled.connect(content.setVisible)
+        content.setVisible(False)
+        outer.addWidget(content)
+        lay = QVBoxLayout(content)
+        lay.setContentsMargins(0, 0, 0, 0)
+        self.hag_box = QCheckBox(ui.hag_title("Compute Height-Above-Ground (HAG)"))
         self.hag_box.setToolTip("Bakes a per-point feat_hag channel into every scene. Pick "
                                 "the ground source and interpolation below. Select feat_hag "
                                 "in the Train page's feature list to feed it to any model.")
@@ -200,15 +204,12 @@ class DatasetsPage(QWidget):
             ground_tip=("Source value that means ground (from the Classes table, "
                         "e.g. 2). Required for 'Base off ground layer'; those "
                         "labels are the ground source (gaps are nearest-filled)."))
-        hag_lay = QVBoxLayout(self.hag_box)
-        hag_lay.addWidget(self.hag_opts_w)
-        self.hag_box.toggled.connect(self.hag_opts_w.setVisible)
-        self.hag_opts_w.setVisible(False)
         self._on_hag_method()
         lay.addWidget(self.hag_box)
-        geo_lbl = QLabel("Geometric features (pgeof) - max neighbors (k)"
+        lay.addWidget(self.hag_opts_w)
+        geo_lbl = QLabel("Geometric features (pgeof); max neighbors (k)"
                          + ("" if pretrain.pgeof_available()
-                            else "  (pgeof not installed - the build will fail)"))
+                            else "  (pgeof not installed; the build will fail)"))
         self.geo_k = QSpinBox()
         self.geo_k.setRange(10, 500)
         self.geo_k.setSingleStep(10)
@@ -238,7 +239,7 @@ class DatasetsPage(QWidget):
         ui.sync_hag_method(self)
 
     def _classes_box(self) -> QWidget:
-        box = QGroupBox("2 · Classes - uncheck 'Train' to ignore a value; select rows + "
+        box = QGroupBox("2 · Classes; uncheck 'Train' to ignore a value; select rows + "
                         "Combine to merge into one class")
         cl = QVBoxLayout(box)
         btn_row = QHBoxLayout()
@@ -297,7 +298,7 @@ class DatasetsPage(QWidget):
         self.train_label = QLabel("Train: 70%")
         form.addRow("", self.train_label)
         self.mode_combo = QComboBox()
-        self.mode_combo.addItems(["Balanced (mirror class mix)", "Random"])
+        self.mode_combo.addItems(["Balanced", "Random"])
         form.addRow("Split mode", self.mode_combo)
         self.split_provided_chk = QCheckBox("Separate train/val/test folders (use as-is)")
         self.split_provided_chk.toggled.connect(self._on_split_changed)

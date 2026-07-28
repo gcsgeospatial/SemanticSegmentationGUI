@@ -162,7 +162,7 @@ def crs_story(source_wkt, proc_wkt, looks_degrees, declared_epsg):
 def declare_epsg_edit(on_change, max_width: int | None = None) -> QLineEdit:
     """The 'Declare CRS (EPSG)' box; every edit re-renders the CRS line."""
     e = QLineEdit()
-    e.setPlaceholderText("blank = auto-detect from the file")
+    e.setPlaceholderText("EPSG (blank = auto)")
     if max_width is not None:
         e.setMaximumWidth(max_width)
     e.setToolTip("EPSG code to assume for clouds that carry no CRS. Ignored "
@@ -170,6 +170,18 @@ def declare_epsg_edit(on_change, max_width: int | None = None) -> QLineEdit:
                  "no-CRS cloud's coordinates look like lat/lon degrees.")
     e.textChanged.connect(on_change)
     return e
+
+
+def crs_row(page, on_change, empty_text: str = "") -> QWidget:
+    """One-line CRS surface: the EPSG override box + the status text beside it."""
+    page.declare_epsg = declare_epsg_edit(on_change, max_width=150)
+    page.crs_status = QLabel(empty_text)
+    page.crs_status.setObjectName("pageSub")
+    page.crs_status.setWordWrap(True)
+    row = QHBoxLayout()
+    row.addWidget(page.declare_epsg)
+    row.addWidget(page.crs_status, 1)
+    return wrap(row)
 
 
 def stamp_crs_probe(page, files, error_fmt: str):

@@ -78,7 +78,6 @@ class TrainPage(QWidget):
         self._run_t0: float | None = None
         self._run_epochs = 0
         self._local_vram: float | None | str = "?"   # nvidia-smi is slow; probe once
-        self.batch_note: QLabel | None = None
 
         root = QVBoxLayout(self)
         title = QLabel("Train")
@@ -456,7 +455,6 @@ class TrainPage(QWidget):
             self.form.removeRow(w)
         self._key_rows.clear()
         self._param_widgets.clear()
-        self.batch_note = None
         if b is None:
             self._rebuild_feat_list()
             self._update_cfg_dialog()
@@ -494,12 +492,6 @@ class TrainPage(QWidget):
             self._key_rows.append(w)
             row += 1
             self._param_widgets[spec.flag] = w
-            if spec.flag == "batch":
-                self.batch_note = QLabel("")
-                theme.set_accent(self.batch_note, "muted")
-                self.form.insertRow(row, "", self.batch_note)
-                self._key_rows.append(self.batch_note)
-                row += 1
         self._apply_batch_prefill()
         if same_bb and "batch" in prev:   # dataset switch: keep the user's override
             self._param_widgets["batch"].setValue(int(prev["batch"]))
@@ -534,15 +526,10 @@ class TrainPage(QWidget):
         """Prefill (never clamp) Batch from the target device's VRAM."""
         w = self._param_widgets.get("batch")
         b = self._backbone()
-        if w is None or b is None or self.batch_note is None:
+        if w is None or b is None:
             return
-        vram, src = self._vram_gb()
-        if vram is None:
-            w.setValue(b.batch_default)
-            self.batch_note.setText("Batch: hardware not detected, using default.")
-        else:
-            w.setValue(batch_for_vram(b, vram))
-            self.batch_note.setText(f"Batch prefilled for {vram:g} GB ({src}).")
+        vram, _src = self._vram_gb()
+        w.setValue(b.batch_default if vram is None else batch_for_vram(b, vram))
 
     def _refresh_summaries(self):
         """Echo the run's headline settings into the launch summary bar."""
