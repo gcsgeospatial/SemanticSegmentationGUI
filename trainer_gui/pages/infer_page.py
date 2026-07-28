@@ -141,7 +141,13 @@ class InferPage(QWidget):
         self.ens_box = QGroupBox("Ensemble (vote over several runs)")
         self.ens_box.setCheckable(True)
         self.ens_box.setChecked(False)
-        ecol = QVBoxLayout(self.ens_box)
+        ens_outer = QVBoxLayout(self.ens_box)
+        ens_content = QWidget()
+        self.ens_box.toggled.connect(ens_content.setVisible)
+        ens_content.setVisible(False)
+        ens_outer.addWidget(ens_content)
+        ecol = QVBoxLayout(ens_content)
+        ecol.setContentsMargins(0, 0, 0, 0)
         self.ens_list = QListWidget()
         self.ens_list.setMaximumHeight(96)
         ecol.addWidget(self.ens_list)
@@ -154,20 +160,7 @@ class InferPage(QWidget):
         erow.addWidget(ens_del)
         erow.addStretch()
         ecol.addLayout(erow)
-        ens_hint = QLabel("3+ models recommended; runtime scales with model count.")
-        ens_hint.setObjectName("pageSub")
-        ecol.addWidget(ens_hint)
         wf.addRow(self.ens_box)
-        ens_modal_hint = QLabel("Ensembles run locally - switch to Local mode to enable")
-        ens_modal_hint.setObjectName("pageSub")
-        self.ens_switch_btn = QPushButton("Switch to Local")
-        self.ens_switch_btn.clicked.connect(self._switch_to_local)
-        eh_row = QHBoxLayout()
-        eh_row.addWidget(ens_modal_hint)
-        eh_row.addWidget(self.ens_switch_btn)
-        eh_row.addStretch()
-        self.ens_hint_w = ui.wrap(eh_row)
-        wf.addRow(self.ens_hint_w)
         self.input_edit = QLineEdit()
         self.input_edit.editingFinished.connect(self._probe_crs)
         in_row = QHBoxLayout()
@@ -369,27 +362,12 @@ class InferPage(QWidget):
             + ("Pick a run.json (or a local .pth), a folder of clouds, and run locally."
                if local else
                "Pick a run (or a local .pth), a folder of clouds, and run on Modal."))
-        self.ens_box.setEnabled(local)
-        self.ens_box.setToolTip(
-            "" if local else "Ensemble runs on the LOCAL backend only - the "
-            "per-member Modal download loop isn't wired. Switch execution to "
-            "local on the Settings page to use it.")
+        # ensembles are local-only; on Modal the box simply doesn't exist
         if not local:
             self.ens_box.setChecked(False)
-        self.wf.setRowVisible(self.ens_hint_w, not local)
+        self.wf.setRowVisible(self.ens_box, local)
         self._sync_source_rows()
         self.reload_backbones()
-
-    def _switch_to_local(self):
-        """Flip the backend to local, via the sidebar combo when present."""
-        combo = getattr(self.window(), "mode_combo", None)
-        if isinstance(combo, QComboBox):
-            i = combo.findData("local")
-            if i >= 0:
-                combo.setCurrentIndex(i)
-                return
-        appstate.set_exec_mode("local")
-        self.apply_exec_mode(True)
 
     def _sync_source_rows(self):
         """Show only the weights inputs that match the source radio + backend:
