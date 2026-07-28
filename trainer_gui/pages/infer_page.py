@@ -209,10 +209,15 @@ class InferPage(QWidget):
         self.hag_opts_w.setVisible(False)
         iform.addRow("", self.hag_opts_w)
         self._on_hag_method()
-        self.adabn_chk = QCheckBox("AdaBN - recalibrate BatchNorm on these scenes")
-        self.adabn_chk.setToolTip(
-            "Recomputes BatchNorm statistics on the target tiles (label-free) before "
-            "predicting. KPConvX / RandLA only - the PTv3 family ignores it.\n"
+        self.adapt_combo = QComboBox()
+        self.adapt_combo.addItems(["Off", "AdaBN", "APCoTTA"])
+        self.adapt_combo.setToolTip(
+            "Label-free adaptation to these scenes before predicting. "
+            "KPConvX / RandLA only - the PTv3 family ignores it.\n"
+            "AdaBN: recomputes BatchNorm statistics on the target tiles.\n"
+            "APCoTTA (arXiv:2505.09971): AdaBN plus entropy-minimization steps "
+            "on the BN scale/shift params, with stochastic restore toward the "
+            "source weights. Slightly slower; can help on larger domain gaps.\n"
             "Output depends on this job's density and class mix, so the same model "
             "can score differently per area; note it when comparing runs.")
         self.tta_spin = QSpinBox()
@@ -228,7 +233,8 @@ class InferPage(QWidget):
             "prediction npz (TT_SAVE_PROBS). Needed for soft ensemble voting and "
             "offline confidence/mask analysis; costs ~2 bytes x classes per point.")
         dg_row = QHBoxLayout()
-        dg_row.addWidget(self.adabn_chk)
+        dg_row.addWidget(QLabel("Adapt"))
+        dg_row.addWidget(self.adapt_combo)
         dg_row.addWidget(QLabel("TTA"))
         dg_row.addWidget(self.tta_spin)
         dg_row.addWidget(self.probs_chk)
@@ -303,6 +309,10 @@ class InferPage(QWidget):
         self.run_btn.setObjectName("primary")
         self.run_btn.clicked.connect(self._run)
         run_row.addWidget(self.run_btn)
+        self.kill_btn = QPushButton("Kill")
+        self.kill_btn.setVisible(False)
+        self.kill_btn.clicked.connect(self._kill)
+        run_row.addWidget(self.kill_btn)
         self.compare_btn = QPushButton("Compare to ground truth…")
         self.compare_btn.setToolTip("Pick a prediction + its ground truth; accuracy, "
                                     "mIoU and per-class IoU print to the log.")
@@ -681,8 +691,11 @@ class InferPage(QWidget):
         if dg.get("logdk"):
             env["DG_LOGDK_FEAT"] = "1"
             env["DG_LOGDK_K"] = str(int(dg.get("logdk_k", 8)))
-        if self.adabn_chk.isChecked():
+        adapt = self.adapt_combo.currentText()
+        if adapt == "AdaBN":
             env["DG_INFER_ADABN"] = "1"
+        elif adapt == "APCoTTA":
+            env["DG_INFER_APCOTTA"] = "1"
         if self.tta_spin.value() > 0:
             env["DG_INFER_TTA"] = str(self.tta_spin.value())
         if self.probs_chk.isChecked():
@@ -1669,6 +1682,27 @@ class InferPage(QWidget):
             lines.append(f"  (couldn't update stats csv: {e})")
         self._append("\n".join(lines))
 
+    def _kill(self):
+        """Hard-kill the live job: the subprocess tree plus any worker stage
+        (conversion / vote / export), local and Modal alike."""
+        killed = False
+        if self.runner.running:
+            self.runner.terminate()
+            killed = True
+        for w in (self.converter, self.preflight, self.voter, self.exporter):
+            if w.running:
+                w.cancel()
+                killed = True
+        if not killed:
+            self._append("\n[no process running]")
+            return
+        self._append("\n[killed]")
+        if appstate.get_exec_mode() != "local":
+            self._append("[modal] note: killing the local client can leave the "
+                         "cloud app running. `modal app list` to check, "
+                         "`modal app stop <app>` to stop it.")
+        self._end_run("✗ killed")
+
     def _begin_run(self, title: str):
         """Run header; earlier runs stay scrollable above the divider. Also
         freezes the channel table: the run uses this snapshot everywhere."""
@@ -1676,6 +1710,7 @@ class InferPage(QWidget):
         self._active_zeroed = self._zeroed_channels()
         self._active_cols = self._mapped_columns()
         self.chan_grid_host.setEnabled(False)
+        self.kill_btn.setVisible(True)
         self.log.begin_run(title)
 
     def _end_run(self, summary: str):
@@ -1683,6 +1718,7 @@ class InferPage(QWidget):
         overlap, e.g. export error after a stage failure)."""
         self._active_zeroed = self._active_cols = None
         self.chan_grid_host.setEnabled(True)
+        self.kill_btn.setVisible(False)
         if self._run_open:
             self._run_open = False
             self.log.end_run(summary)

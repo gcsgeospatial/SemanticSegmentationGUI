@@ -187,7 +187,7 @@ Reads a run's `run.json` + weights, writes predictions to a host folder.
   trained with `feat_hag`; when on, pick the **ground source** (labeled ground
   class / CSF / SMRF / Z-min proxy; the ground-class field appears only for the
   labeled option, default is CSF). Optional label-free
-  **density adapt (AdaBN)** / **density TTA** for inference at a different density
+  **density adapt (AdaBN or APCoTTA)** / **density TTA** for inference at a different density
   than training. Set the **Output folder** for predictions.
 - **Run inference** converts the input to canonical scenes, then `pixi run …
   --mode infer` with scenes and predictions pointed at your host folders via

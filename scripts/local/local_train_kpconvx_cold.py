@@ -62,6 +62,7 @@ DG_DENSITY_AUG = False
 DG_COARSEN_MAX = 2.5
 DG_P_NATIVE    = 0.5
 DG_INFER_ADABN = False
+DG_INFER_APCOTTA = False
 DG_INFER_TTA   = 0
 DG_LOGDK_FEAT  = False
 DG_LOGDK_K     = 8
@@ -91,15 +92,15 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "helper"))
     import train_common as tc
     (DG_DENSITY_AUG, DG_COARSEN_MAX, DG_P_NATIVE, DG_LOGDK_FEAT, DG_LOGDK_K,
-     DG_INFER_ADABN, DG_INFER_TTA, USE_FOCAL, FOCAL_GAMMA, CLASS_WEIGHTING,
-     WEIGHT_BETA, RARE_OVERSAMPLE, KP_AGGREGATION, KP_NORM,
+     DG_INFER_ADABN, DG_INFER_APCOTTA, DG_INFER_TTA, USE_FOCAL, FOCAL_GAMMA,
+     CLASS_WEIGHTING, WEIGHT_BETA, RARE_OVERSAMPLE, KP_AGGREGATION, KP_NORM,
      VAL_EVERY, FEAT_CHANNELS, PROXY_SAMPLING) = tc.env_overrides(
         globals(), [
         "DG_DENSITY_AUG", "DG_COARSEN_MAX", "DG_P_NATIVE", "DG_LOGDK_FEAT",
-        "DG_LOGDK_K", "DG_INFER_ADABN", "DG_INFER_TTA", "USE_FOCAL",
-        "FOCAL_GAMMA", "CLASS_WEIGHTING", "WEIGHT_BETA", "RARE_OVERSAMPLE",
-        "KP_AGGREGATION", "KP_NORM", "VAL_EVERY", "FEAT_CHANNELS",
-        "PROXY_SAMPLING"])
+        "DG_LOGDK_K", "DG_INFER_ADABN", "DG_INFER_APCOTTA", "DG_INFER_TTA",
+        "USE_FOCAL", "FOCAL_GAMMA", "CLASS_WEIGHTING", "WEIGHT_BETA",
+        "RARE_OVERSAMPLE", "KP_AGGREGATION", "KP_NORM", "VAL_EVERY",
+        "FEAT_CHANNELS", "PROXY_SAMPLING"])
 
     sys.path.insert(0, _kpconvx_root())
     EVAL_ONLY = (mode == "eval")
@@ -430,7 +431,7 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
                         _predict_points, "KPConvX-L", "KPConvX", weights,
                         infer_input, GRID, CHUNK_XY, grid, chunk_xy,
                         NUM_CLASSES, CLASS_NAMES, FEAT_SPEC, EXC_IDX,
-                        DG_INFER_ADABN)
+                        DG_INFER_ADABN, infer_apcotta=DG_INFER_APCOTTA)
         return
 
     metrics_csv = tc.init_metrics_csv(run_dir)

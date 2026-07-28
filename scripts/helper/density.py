@@ -7,7 +7,7 @@ import numpy as np
 
 __all__ = [
     "effective_grid", "voxel_first_idx",
-    "local_density_logdk", "adabn_recalibrate",
+    "local_density_logdk", "adabn_recalibrate", "apcotta_adapt",
     "env_bool", "env_float", "env_int", "env_str",
 ]
 
@@ -79,20 +79,112 @@ def adabn_recalibrate(model, batches, forward, momentum=None, reset=True):
                              nn.SyncBatchNorm))]
     saved = []
     for bn in bns:
-        saved.append((bn.training, bn.momentum))
+        # stats snapshot: zero batches must not leave zeroed running stats
+        stats = ((bn.running_mean.clone(), bn.running_var.clone(),
+                  bn.num_batches_tracked.clone())
+                 if bn.track_running_stats else None)
+        saved.append((bn.training, bn.momentum, stats))
         if reset and bn.track_running_stats:
-            if bn.running_mean is not None:
-                bn.running_mean.zero_()
-            if bn.running_var is not None:
-                bn.running_var.fill_(1.0)
+            bn.running_mean.zero_()
+            bn.running_var.fill_(1.0)
             bn.num_batches_tracked.zero_()
         bn.momentum = momentum
         bn.train()
+    n = 0
     with torch.no_grad():
         for batch in batches:
             forward(model, batch)
-    for bn, (was_training, mom) in zip(bns, saved):
+            n += 1
+    for bn, (was_training, mom, stats) in zip(bns, saved):
         bn.momentum = mom
         bn.train(was_training)
+        if n == 0 and stats is not None:
+            bn.running_mean.copy_(stats[0])
+            bn.running_var.copy_(stats[1])
+            bn.num_batches_tracked.copy_(stats[2])
     model.eval()
+    if n == 0:
+        raise RuntimeError(
+            "AdaBN got zero target batches (every chunk was under the minimum "
+            "point count); rerun with adaptation Off or infer on larger scenes")
+    return model
+
+
+# D2c - APCoTTA (arXiv:2505.09971) reduced to the offline one-shot job shape:
+# AdaBN stats refresh + entropy-filtered entropy minimization on BN affine
+# params + stochastic restore toward source weights (their RPI).
+def apcotta_adapt(model, batches, logits_fn, lr=1e-3, ent_frac=0.4,
+                  restore_p=0.01):
+    """Adapt over target `batches` via logits_fn(model, batch) -> (N, C).
+    Only points with entropy < ent_frac*ln(C) contribute loss (official code
+    uses 0.8 nats absolute ~= 0.36*ln C at their 9 classes; 0.4 scales with C);
+    each step restores every trainable element to its source value with prob
+    restore_p. Strict superset of adabn_recalibrate. Leaves model.eval()."""
+    # ponytail: BN-affine-only updates, cumulative running stats (paper keeps
+    # per-batch stats), no gradient layer selection or weak/strong consistency
+    # views; add the full recipe if a survey still underperforms plain AdaBN.
+    import torch
+    import torch.nn as nn
+    bns = [m for m in model.modules()
+           if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d,
+                             nn.SyncBatchNorm))]
+    params = [p for bn in bns for p in (bn.weight, bn.bias) if p is not None]
+    if not params:
+        raise RuntimeError(
+            "APCoTTA needs BatchNorm layers with affine params; this model has "
+            "none - use plain inference (or AdaBN on a BN-based backbone)")
+    source = [p.detach().clone() for p in params]
+    grad_state = [(p, p.requires_grad) for p in model.parameters()]
+    for p, _ in grad_state:
+        p.requires_grad_(False)
+    for p in params:
+        p.requires_grad_(True)
+    saved = []
+    for bn in bns:
+        # stats snapshot: zero batches must not leave zeroed running stats
+        stats = ((bn.running_mean.clone(), bn.running_var.clone(),
+                  bn.num_batches_tracked.clone())
+                 if bn.track_running_stats else None)
+        saved.append((bn.training, bn.momentum, stats))
+        if bn.track_running_stats:
+            bn.running_mean.zero_()
+            bn.running_var.fill_(1.0)
+            bn.num_batches_tracked.zero_()
+        bn.momentum = None
+        bn.train()
+    opt = torch.optim.SGD(params, lr=lr, momentum=0.9)
+    n_step = n_skip = 0
+    with torch.enable_grad():
+        for batch in batches:
+            logits = logits_fn(model, batch).float()
+            logp = torch.log_softmax(logits, -1)
+            ent = -(logp.exp() * logp).sum(-1)
+            keep = ent < ent_frac * float(np.log(logits.shape[-1]))
+            if not keep.any():
+                n_skip += 1
+                continue
+            opt.zero_grad()
+            ent[keep].mean().backward()
+            opt.step()
+            with torch.no_grad():
+                for p, s in zip(params, source):
+                    m = torch.rand_like(p) < restore_p
+                    p[m] = s[m]
+            n_step += 1
+    for p, req in grad_state:
+        p.requires_grad_(req)
+    for bn, (was_training, mom, stats) in zip(bns, saved):
+        bn.momentum = mom
+        bn.train(was_training)
+        if n_step + n_skip == 0 and stats is not None:
+            bn.running_mean.copy_(stats[0])
+            bn.running_var.copy_(stats[1])
+            bn.num_batches_tracked.copy_(stats[2])
+    model.eval()
+    if n_step + n_skip == 0:
+        raise RuntimeError(
+            "APCoTTA got zero target batches (every chunk was under the minimum "
+            "point count); rerun with adaptation Off or infer on larger scenes")
+    print(f"  [infer] APCoTTA: {n_step} adaptation step(s), "
+          f"{n_skip} batch(es) skipped as all-high-entropy", flush=True)
     return model

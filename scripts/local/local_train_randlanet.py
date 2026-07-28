@@ -30,6 +30,7 @@ DG_DENSITY_AUG = False
 DG_COARSEN_MAX = 2.0
 DG_P_NATIVE    = 0.5
 DG_INFER_ADABN = False
+DG_INFER_APCOTTA = False
 DG_INFER_TTA   = 0
 EVAL_VOTES     = 2
 DG_LOGDK_FEAT  = False
@@ -239,15 +240,15 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     import time, json, csv, glob
     from datetime import datetime, timezone
     (DG_DENSITY_AUG, DG_COARSEN_MAX, DG_P_NATIVE, DG_LOGDK_FEAT, DG_LOGDK_K,
-     DG_INFER_ADABN, DG_INFER_TTA, EVAL_VOTES, USE_FOCAL, FOCAL_GAMMA,
-     CLASS_WEIGHTING, WEIGHT_BETA, RARE_OVERSAMPLE,
+     DG_INFER_ADABN, DG_INFER_APCOTTA, DG_INFER_TTA, EVAL_VOTES, USE_FOCAL,
+     FOCAL_GAMMA, CLASS_WEIGHTING, WEIGHT_BETA, RARE_OVERSAMPLE,
      RARE_CENTER_PROB, VAL_EVERY, FEAT_CHANNELS,
      PROXY_SAMPLING) = tc.env_overrides(globals(), [
         "DG_DENSITY_AUG", "DG_COARSEN_MAX", "DG_P_NATIVE", "DG_LOGDK_FEAT",
-        "DG_LOGDK_K", "DG_INFER_ADABN", "DG_INFER_TTA", "EVAL_VOTES",
-        "USE_FOCAL", "FOCAL_GAMMA", "CLASS_WEIGHTING", "WEIGHT_BETA",
-        "RARE_OVERSAMPLE", "RARE_CENTER_PROB", "VAL_EVERY", "FEAT_CHANNELS",
-        "PROXY_SAMPLING"])
+        "DG_LOGDK_K", "DG_INFER_ADABN", "DG_INFER_APCOTTA", "DG_INFER_TTA",
+        "EVAL_VOTES", "USE_FOCAL", "FOCAL_GAMMA", "CLASS_WEIGHTING",
+        "WEIGHT_BETA", "RARE_OVERSAMPLE", "RARE_CENTER_PROB", "VAL_EVERY",
+        "FEAT_CHANNELS", "PROXY_SAMPLING"])
     import torch.nn as nn
     import torch.optim as optim
     from torch.utils.data import DataLoader, Dataset
@@ -564,8 +565,10 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                      "started_utc": datetime.now(timezone.utc).isoformat()}
 
         predict_scene = make_predict_scene(net, num_classes, exclude_idx=exc_idx)
-        if DG_INFER_ADABN:
-            print("  [infer] AdaBN: recomputing BN stats on target tiles...", flush=True)
+        if DG_INFER_ADABN and DG_INFER_APCOTTA:
+            raise ValueError("DG_INFER_ADABN and DG_INFER_APCOTTA are both set; "
+                             "unset one - they are alternative adaptation modes")
+        if DG_INFER_ADABN or DG_INFER_APCOTTA:
 
             def _target_batches(cap=30):
                 seen = 0
@@ -620,8 +623,16 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                             batch[k] = [t.to(device) for t in batch[k]]
                         seen += 1
                         yield batch
-            dg.adabn_recalibrate(net, _target_batches(), forward=lambda m, b: m(b))
-            net.eval()
+            if DG_INFER_APCOTTA:
+                print("  [infer] APCoTTA: adapting BN on target tiles...", flush=True)
+                dg.apcotta_adapt(
+                    net, _target_batches(),
+                    logits_fn=lambda m, b: m(b)["logits"].transpose(1, 2)
+                                               .reshape(-1, num_classes))
+            else:
+                print("  [infer] AdaBN: recomputing BN stats on target tiles...", flush=True)
+                dg.adabn_recalibrate(net, _target_batches(), forward=lambda m, b: m(b))
+                net.eval()
         tc.run_infer_scenes(scenes, predict_scene, pred_dir, run_dir, infer_cfg)
         return
 

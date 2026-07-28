@@ -358,6 +358,7 @@ def write_infer_run(run_dir, config, scene_stats):
     rewritten after every scene so a crash keeps completed numbers."""
     doc = dict(config)
     doc["adabn"] = os.environ.get("DG_INFER_ADABN") == "1"
+    doc["apcotta"] = os.environ.get("DG_INFER_APCOTTA") == "1"
     doc["tta_views"] = int(os.environ.get("DG_INFER_TTA", "0") or 0)
     doc["save_probs"] = os.environ.get("TT_SAVE_PROBS") == "1"
     doc["scenes"] = scene_stats
@@ -1896,9 +1897,9 @@ def kp_make_run_eval(net, forward, evaluate, make_batch, sample_tile,
 def kp_run_infer(run_dir, net, forward, kp_batch, build_feat, predict_points,
                  backbone, note_name, weights, infer_input, grid, chunk_xy,
                  grid_cli, chunk_cli, num_classes, class_names, feat_spec,
-                 exc_idx, infer_adabn, neighbor_limits=None):
-    """Dataset-free inference over <run_dir>/scenes: optional AdaBN then
-    per-scene predict via run_infer_scenes. neighbor_limits goes into the
+                 exc_idx, infer_adabn, neighbor_limits=None, infer_apcotta=False):
+    """Dataset-free inference over <run_dir>/scenes: optional AdaBN or APCoTTA
+    then per-scene predict via run_infer_scenes. neighbor_limits goes into the
     infer config only when given (kpconv restores its pyramid crop)."""
     import glob
     from datetime import datetime, timezone
@@ -1925,7 +1926,17 @@ def kp_run_infer(run_dir, net, forward, kp_batch, build_feat, predict_points,
     infer_cfg.update({"features": feat_spec, "gpu": gpu_name(),
                       "exclude_classes": [class_names[i] for i in exc_idx],
                       "started_utc": datetime.now(timezone.utc).isoformat()})
-    if infer_adabn:
+    if infer_adabn and infer_apcotta:
+        raise ValueError("DG_INFER_ADABN and DG_INFER_APCOTTA are both set; "
+                         "unset one - they are alternative adaptation modes")
+    if infer_apcotta:
+        print("  [infer] APCoTTA: adapting BN on target tiles...", flush=True)
+        dg.apcotta_adapt(
+            net,
+            kp_make_target_batches(scenes, kp_batch, build_feat,
+                                   grid, chunk_xy, num_classes),
+            logits_fn=lambda m, b: forward(b))
+    elif infer_adabn:
         print("  [infer] AdaBN: recomputing BN stats on target tiles...", flush=True)
         dg.adabn_recalibrate(
             net,
@@ -2904,6 +2915,7 @@ _ENV_KNOBS = {
     "DG_LOGDK_FEAT":    ("DG_LOGDK_FEAT",        "env_bool"),
     "DG_LOGDK_K":       ("DG_LOGDK_K",           "env_int"),
     "DG_INFER_ADABN":   ("DG_INFER_ADABN",       "env_bool"),
+    "DG_INFER_APCOTTA": ("DG_INFER_APCOTTA",     "env_bool"),
     "DG_INFER_TTA":     ("DG_INFER_TTA",         "env_int"),
     "EVAL_VOTES":       ("EVAL_VOTES",           "env_int"),
     "VAL_EVERY":        ("VAL_EVERY",            "env_int"),
