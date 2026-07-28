@@ -13,16 +13,14 @@ below is the local path.
 
 ```powershell
 cd trainer_gui
-pixi install     # one-time: builds .pixi env (python 3.11 + open3d + pdal + qt)
+pixi install     # one-time: builds .pixi env (python 3.13 + pdal + qt)
 pixi run gui     # launch
-pixi run test    # smoke checks, no GPU/Modal needed
 ```
 
-Python is pinned to 3.11 (Open3D has no 3.13 wheels). [pixi](https://pixi.sh)
-does the rest on win-64 and linux-64. In the sidebar, set **Execution backend →
-Local (pixi)**.
+[pixi](https://pixi.sh) does the rest on win-64 and linux-64. In the sidebar,
+set **Execution backend → Local (pixi)**.
 
-<details><summary>pip alternative (Python 3.10–3.12)</summary>
+<details><summary>pip alternative (Python 3.10+)</summary>
 
 ```powershell
 cd trainer_gui
@@ -50,11 +48,11 @@ No container, no mounts: the GUI passes host dirs via env vars (the
 | `TT_DATASETS_ROOT` | staging root | canonical datasets + `_infer/<job>` inputs |
 | `TT_OUTPUTS_ROOT` | your chosen folder | `runs/<id>/` weights + predictions |
 | `TT_DATASET_DIR` / `TT_INFER_DIR` / `TT_PRED_DIR` | overrides | out-of-workspace datasets / infer jobs |
-| `TT_TRAIN_STRIDE` | - | train-tile stride as a fraction of chunk_xy (default 0.75; 0.5 = legacy 4× overlap, 1.0 = none). Val/test always keep chunk/2 for eval voting. Changing it re-tiles into a fresh `_ts*` prep dir. |
+| `TT_TRAIN_STRIDE` | - | train-tile stride as a fraction of chunk_xy (default 0.75; 0.5 = 4× overlap, 1.0 = none). Val/test always keep chunk/2 for eval voting. Changing it re-tiles into a fresh `_ts*` prep dir. |
 
 Code lives in `trainer_gui/local_cli.py`. **No pixi on PATH (or not a
 Linux/CUDA host) → the GUI prints the exact command instead of running it**
-(dry-run - this dev box is Intel Arc, no CUDA).
+(dry-run).
 
 ## The scripts
 
@@ -74,7 +72,7 @@ Each `local_train_<model>.py` takes the same kebab-case flags the GUI fills in
 
 One pixi environment per model in `envs/pixi.toml` (env name = backbone key,
 `_` → `-`), locked in `envs/pixi.lock` - solvable from any OS, installable on
-the Linux GPU box:
+any Linux or Windows GPU host:
 
 ```bash
 pixi install --manifest-path envs/pixi.toml -e <model>    # or the GUI's Install button
@@ -92,7 +90,7 @@ pixi run --manifest-path envs/pixi.toml -e pkg upload
 
 and installed `trainer-weights-*` packages show up in the Infer page's
 **Installed…** picker. The modal recipes stay the dependency source of truth -
-`tools/check_env_sync.py` (run by the smoke test) fails on any drift between
+`python tools/check_env_sync.py` fails on any drift between
 them, `envs/pixi.toml`, and the recipe SHAs. Full details:
 `conda-recipes/README.md`.
 
@@ -115,12 +113,13 @@ two are thin wrappers). Their HuggingFace **weights are CC-BY-NC 4.0
 
 **HeightAboveGround** is an ordinary feature channel (`feat_hag`), not a model
 variant: bake it on the Datasets page with **Compute Height-Above-Ground**
-(ground = the file's ground class when set, else PDAL CSF detection;
-interpolated by grid / `hag_nn` / `hag_delaunay`), then tick `feat_hag` in the
-Train page's feature list to feed it to any model. Runs trained with `feat_hag`
-record it in `run.json "features"`; the Inference page auto-enables the HAG
-conversion for them, and a scene missing the channel is a hard error, not a
-silent fallback.
+(ground source = a dropdown: your labeled ground class, CSF or SMRF detection
+via PDAL, or a Z-min proxy raster; interpolated by grid / `hag_nn` /
+`hag_delaunay` — Z-min is self-contained and ignores interpolation), then tick
+`feat_hag` in the Train page's feature list to feed it to any model. Runs
+trained with `feat_hag` record it in `run.json "features"`; the Inference page
+auto-enables the HAG conversion for them and recomputes the channel from the
+input clouds (it is never read from stored scenes).
 
 ## The normal path: Datasets → Train → Inference
 
@@ -141,14 +140,15 @@ top to bottom:
    Rename classes, **uncheck** any value that means "unknown" (→ ignore-label,
    dropped from loss + mIoU), select rows + **Combine** to merge several values
    into one class. **Analyze density** prints pts/m², spacing and a suggested tile
-   size, and pre-computes the per-model param recommendations the Train page uses.
+   size.
 3. **Train / val / test split** - set **Validation** and **Test** fractions
-   (train = the remainder), **Split mode** (Balanced mirrors the class mix /
-   Random fills by point count), and the **seed** (default 42). Already have
+   (train = the remainder) and **Split mode** (Balanced mirrors the class mix /
+   Random fills by point count). The split seed is drawn randomly per dataset
+   and recorded in `dataset_meta.json`. Already have
    split folders? Tick **Separate train/val/test folders (use as-is)**. Optional
    **Compute Height-Above-Ground (HAG)** bakes a per-point `feat_hag` channel
-   (ground = your labeled ground class when set, else CSF detection; never a
-   mix) - select it in the Train page's feature list to use it.
+   (ground source picked from a dropdown: labeled ground class / CSF / SMRF /
+   Z-min proxy; never a mix) - select it in the Train page's feature list to use it.
 
 Hit **Build dataset**. It writes `train/ val/ test/` `.npz` to staging; progress
 streams in the console. Done → the dataset appears under **Saved Datasets** and is
@@ -161,9 +161,9 @@ Writes `/outputs/runs/<id>/` (weights + logs + `run.json`).
 - Pick the **Dataset** (the status line confirms *✓ train/val/test standard met*)
   and a **Model**. **Configure model…** opens a popup showing that model's pixi
   env status and an **Install / update env** button.
-- **Parameters** are pre-filled from the density analysis (**★** = recommended) -
-  grid/sub-grid, epochs, batch, steps/epoch, tile size. All editable.
-- **Smoke run** (2 epochs × 50 steps) validates a new dataset end-to-end fast.
+- **Parameters** are pre-filled with per-model defaults (batch is prefilled
+  from the target device's VRAM) - grid/sub-grid, epochs, batch, steps/epoch,
+  tile size. All editable.
 - Optional: per-run **Domain generalization** (train robust to a different
   inference density) and **Loss & class balance** knobs.
 - Set the **Output folder** (becomes `TT_OUTPUTS_ROOT`), hit **Launch training**.
@@ -184,8 +184,9 @@ Reads a run's `run.json` + weights, writes predictions to a host folder.
   pick **Local .pth file** and choose the architecture yourself.)
 - **Input**: a folder or single cloud to label. Grid/tile come from the run.
   **Compute Height-Above-Ground** is off by default and auto-enables for runs
-  trained with `feat_hag`; when on, name the **ground class** (e.g. `2`) if your
-  clouds already carry a ground classification, else ground is detected. Optional label-free
+  trained with `feat_hag`; when on, pick the **ground source** (labeled ground
+  class / CSF / SMRF / Z-min proxy; the ground-class field appears only for the
+  labeled option, default is CSF). Optional label-free
   **density adapt (AdaBN)** / **density TTA** for inference at a different density
   than training. Set the **Output folder** for predictions.
 - **Run inference** converts the input to canonical scenes, then `pixi run …
@@ -215,7 +216,8 @@ Reads a run's `run.json` + weights, writes predictions to a host folder.
   when the source has them.
 
 The Datasets page carves all three splits **once** (val % / test % sliders each
-≥ 5 %, train takes the rest; balanced or random; seeded, default 42). A folder
+≥ 5 %, train takes the rest; balanced or random; seed drawn randomly and
+recorded in `dataset_meta.json`). A folder
 splits by whole scenes; a single cloud is tiled and reassembled per split with a
 seam buffer discarded to limit leakage. Trainers read the three folders verbatim
 and never re-split.

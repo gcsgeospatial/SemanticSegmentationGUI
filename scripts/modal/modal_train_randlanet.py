@@ -12,8 +12,6 @@ APP_NAME      = "randlanet-cold"
 GPU_TYPE      = os.environ.get("TT_GPU", "A10G")
 TIMEOUT_HOURS = int(os.environ.get("TT_TIMEOUT_HOURS", "24"))
 
-DATASETS_ROOT = "/datasets"
-
 app = modal.App(APP_NAME)
 
 image = (
@@ -79,7 +77,8 @@ image = image.add_local_file("scripts/local/local_train_randlanet.py", "/root/lo
 image = image.add_local_file("scripts/helper/train_common.py", "/root/train_common.py")
 image = image.add_local_file("scripts/helper/density.py", "/root/density.py")
 
-outputs_volume  = modal.Volume.from_name(f"{APP_NAME}-outputs",  create_if_missing=True)
+outputs_volume  = modal.Volume.from_name(
+    os.environ.get("TT_OUTPUTS_VOLUME") or f"{APP_NAME}-outputs", create_if_missing=True)
 datasets_volume = modal.Volume.from_name(
     os.environ.get("TT_DATASET_VOLUME", "terminal-datasets"), create_if_missing=True)
 
@@ -87,7 +86,7 @@ datasets_volume = modal.Volume.from_name(
 @app.function(
     image=image,
     gpu=GPU_TYPE,
-    volumes={"/outputs": outputs_volume, DATASETS_ROOT: datasets_volume},
+    volumes={"/outputs": outputs_volume, "/datasets": datasets_volume},
     cpu=8,
     memory=32768,
     timeout=TIMEOUT_HOURS * 3600,
@@ -99,21 +98,14 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                     batch: Optional[int] = None, steps_per_epoch: Optional[int] = None,
                     mode: str = "train", weights: Optional[str] = None,
                     infer_input: Optional[str] = None,
-               env_json: Optional[str] = None):
+                    env_json: Optional[str] = None):
     """Shell out to the local trainer - local and cloud run identical code."""
     import sys
     sys.path.insert(0, "/root")
-    # resume only on Modal's OWN retries (the call id is stable across retries, new per `modal run`); ponytail: /outputs/.attempts markers are never cleaned
-    fcid = modal.current_function_call_id()
-    marker = f"/outputs/.attempts/{fcid}" if fcid else ""
-    if not fcid or os.path.exists(marker):
-        os.environ["TT_MODAL_RETRY"] = os.environ["AUTO_RESUME"] = "1"
-    else:
-        os.makedirs("/outputs/.attempts", exist_ok=True)
-        open(marker, "w").close()
-        outputs_volume.commit()
-
     import train_common
+    # resume only on Modal's own retries; markers accumulate on the outputs volume
+    train_common.modal_retry_marker(modal.current_function_call_id(),
+                                    "/outputs/.attempts", outputs_volume.commit)
     train_common.modal_shell_run(
         "/root/local_train_randlanet.py",
         [
@@ -129,6 +121,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         ],
         env_json,
         [outputs_volume, datasets_volume],
+        reload=outputs_volume.reload,
     )
 
 
@@ -138,7 +131,7 @@ def main(dataset: Optional[str] = None, sub_grid: Optional[float] = None,
          batch: Optional[int] = None, steps_per_epoch: Optional[int] = None,
          mode: str = "train", weights: Optional[str] = None,
          infer_input: Optional[str] = None,
-               env_json: Optional[str] = None):
+         env_json: Optional[str] = None):
     # .remote() streams logs; `modal run --detach` + `modal app logs` to detach
     what = f"infer({weights})" if mode == "infer" else f"train({dataset})"
     print(f"Launching {APP_NAME} [{what}] on {GPU_TYPE} for up to {TIMEOUT_HOURS}h.")

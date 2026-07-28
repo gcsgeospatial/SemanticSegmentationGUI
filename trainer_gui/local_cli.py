@@ -112,7 +112,7 @@ def gpu_preflight() -> tuple[bool, str]:
 def run_env(*, outputs_root: str = "", dataset_dir: str = "", infer_dir: str = "",
             pred_dir: str = "", gpu: str = "", env: "dict | None" = None) -> dict:
     """The extra_env dict for JobRunner: the TT_* path contract + CUDA device
-    selection (replaces docker's -v mounts and --gpus)."""
+    selection."""
     cfg = appstate.local_config()
     out = {"TT_DATASETS_ROOT": str(cfg["datasets_root"]),
            "TT_OUTPUTS_ROOT": str(outputs_root or cfg["outputs_root"])}
@@ -140,11 +140,8 @@ def run_script(script: str, flags: dict, backbone, *, repo_root: str = "",
     `script` (the modal_train_*.py name) is accepted for call-site parity with
     modal_cli but unused: locally we run the decoupled local_train_<key>.py
     directly, and the return is (program, args, env) - pass env to JobRunner
-    extra_env. `--frozen` = the committed pixi.lock is the contract: install
-    exactly what it says, never re-solve (it was `--locked`, but pixi's
-    up-to-date check false-positives on multi-env pypi index attribution -
-    pandas flagged as cu124 in every env, still broken in pixi 0.73 - so revisit
-    when prefix-dev/pixi fixes the satisfiability check)."""
+    extra_env. --frozen installs exactly what pixi.lock says (--locked
+    false-positives on multi-env pypi index attribution in pixi <= 0.73)."""
     args = ["run", "--manifest-path", manifest_path(repo_root), "--frozen",
             "-e", env_name(backbone),
             "python", f"scripts/local/local_train_{backbone.key}.py"]
@@ -158,9 +155,8 @@ def run_script(script: str, flags: dict, backbone, *, repo_root: str = "",
 
 
 def install(backbone, repo_root: str = "") -> tuple[str, list[str]]:
-    """`pixi install -e <env>` for a backbone's environment - the 'build/pull'
-    action of the env manager UI (streamed by the same runner that ran
-    docker pull)."""
+    """pixi install -e <env> for a backbone's environment - the install action
+    of the env manager UI."""
     return pixi_exe(), ["install", "--manifest-path", manifest_path(repo_root),
                         "--frozen", "-e", env_name(backbone)]
 
@@ -188,7 +184,7 @@ def all_statuses(progress=None) -> list[dict]:
 
 
 def preview(program: str, args: list[str], env: "dict | None" = None) -> str:
-    """One-line shell preview for the log (the exact command JobRunner will
-    run, with the TT_* env prefix that docker -v mounts used to express)."""
+    """One-line shell preview for the log: the exact command JobRunner will
+    run, with its TT_* env prefix."""
     pre = " ".join(f"{k}={v}" for k, v in (env or {}).items())
     return (pre + " " if pre else "") + program + " " + " ".join(args)

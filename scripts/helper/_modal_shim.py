@@ -33,14 +33,6 @@ class Recipe:
                                    "find_links": find_links, "pre": bool(pre)}))
         return self
 
-    def pip_install_from_requirements(self, path, **_kw):
-        self.steps.append(("pip_req", str(path)))
-        return self
-
-    def add_local_dir(self, src, remote_path, copy=False, **_kw):
-        self.steps.append(("copy_dir", {"src": str(src), "dst": str(remote_path)}))
-        return self
-
     def add_local_file(self, src, remote_path, copy=False, **_kw):
         self.steps.append(("copy_file", {"src": str(src), "dst": str(remote_path)}))
         return self
@@ -51,10 +43,6 @@ class Recipe:
 
     def env(self, mapping, **_kw):
         self.steps.append(("env", dict(mapping)))
-        return self
-
-    def workdir(self, path, **_kw):
-        self.steps.append(("workdir", str(path)))
         return self
 
     # unenumerated builder methods: chain, record nothing
@@ -95,11 +83,10 @@ def _is_bare(dargs, dkw):
 
 
 class App:
-    last: "App | None" = None   # most-recently constructed app (launcher/gen find it here)
+    last: "App | None" = None   # most-recently constructed app (check_env_sync reads .image here)
 
     def __init__(self, name=None, **_kw):
         self.name = name
-        self.entrypoint = None      # the @app.local_entrypoint function
         self.image = None           # image passed to the (first) @app.function
         App.last = self
 
@@ -113,7 +100,6 @@ class App:
 
     def local_entrypoint(self, *dargs, **dkw):
         def deco(fn):
-            self.entrypoint = fn
             return fn
         return deco(dargs[0]) if _is_bare(dargs, dkw) else deco
 

@@ -10,12 +10,8 @@ from types import SimpleNamespace
 from typing import Optional
 
 import numpy as np
-try:
-    import torch
-    from torch.utils.data import Dataset
-except ImportError:
-    torch = None
-    Dataset = object
+import torch
+from torch.utils.data import Dataset
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "helper"))
 import density as dg
@@ -55,8 +51,6 @@ PROXY_ANCHORS    = 3
 
 RESUME           = False
 AUTO_RESUME      = os.environ.get("AUTO_RESUME", "0") == "1"
-
-DATASETS_ROOT = os.environ.get("TT_DATASETS_ROOT", "/datasets")
 
 
 def _randlanet_root() -> str:
@@ -259,14 +253,14 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     from torch.utils.data import DataLoader, Dataset
 
     SUB_GRID_SIZE = sub_grid if sub_grid is not None else globals()["SUB_GRID_SIZE"]
-    FEAT_LEGACY = ["x", "y", "z", "intensity", "return_number"]
-    FEAT_SPEC = (list(FEAT_LEGACY) if mode == "infer"
-                 else tc.parse_feat_spec(FEAT_CHANNELS, FEAT_LEGACY))
+    FEAT_DEFAULT = ["x", "y", "z", "intensity", "return_number"]
+    FEAT_SPEC = (list(FEAT_DEFAULT) if mode == "infer"
+                 else tc.parse_feat_spec(FEAT_CHANNELS, FEAT_DEFAULT))
     bad = [n for n in FEAT_SPEC
-           if n not in FEAT_LEGACY and not n.startswith("feat_")]
+           if n not in FEAT_DEFAULT and not n.startswith("feat_")]
     if bad:
         raise ValueError(f"RandLA-Net can't feed {bad}; supported: "
-                         f"{FEAT_LEGACY} plus dataset feat_* channels")
+                         f"{FEAT_DEFAULT} plus dataset feat_* channels")
     NONXYZ = [n for n in FEAT_SPEC if n not in ("x", "y", "z")]
     IN_DIM = len(FEAT_SPEC) + (1 if DG_LOGDK_FEAT else 0)
     NUM_POINTS    = num_points if num_points is not None else globals()["NUM_POINTS"]
@@ -278,10 +272,11 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         ds_meta, NUM_CLASSES, CLASS_NAMES = tc.load_dataset_meta(dataset)
         PREP_DIR = (f"{ds_root}/prep/randlanet"
                     f"_grid{int(round(SUB_GRID_SIZE * 100))}_p95"
-                    f"{tc.feat_spec_tag(FEAT_SPEC, FEAT_LEGACY)}")
+                    f"{tc.feat_spec_tag(FEAT_SPEC, FEAT_DEFAULT)}")
     else:
         ds_meta, NUM_CLASSES, CLASS_NAMES, PREP_DIR = {}, 0, [], None
 
+    # pinned upstream calls confusion_matrix(y, p, labels) positionally; newer sklearn made labels keyword-only
     import sklearn.metrics as _skm
     _orig_cm = _skm.confusion_matrix
     def _cm_compat(y_true, y_pred, labels=None, **kwargs):
@@ -385,14 +380,11 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         for split in ("train", "val", "test"):
             os.makedirs(f"{PREP_DIR}/{split}", exist_ok=True)
         train_list, val_list, test_list = tc.split_scenes(ds_root)
-        any_new = tc.validate_cache(
-            PREP_DIR, _cache_signature(),
-            [("train", train_list), ("val", val_list), ("test", test_list)],
-            lambda d, name: (f"{d}/{name}.npz", f"{d}/{name}.npz.done"))
+        any_new = tc.validate_cache(PREP_DIR, _cache_signature())
         for split, items in (("train", train_list), ("val", val_list),
                              ("test", test_list)):
             print(f"  [{split}] {len(items)} scenes", flush=True)
-            for i, (name, pc_path, cls_path) in enumerate(items):
+            for i, (name, pc_path) in enumerate(items):
                 out = f"{PREP_DIR}/{split}/{name}.npz"
                 if os.path.exists(out + ".done"):
                     continue
@@ -424,7 +416,6 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
 
     device = torch.device("cuda")
 
-    import traceback
     from scipy.spatial import cKDTree
 
     def make_predict_scene(net, num_classes, exclude_idx=None):
@@ -516,9 +507,14 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         if not os.path.exists(wpath):
             raise FileNotFoundError(f"weights not found: {wpath}")
         ckpt = tc.load_ckpt_safe(wpath, map_location=device)
-        sd = ckpt.get("model", ckpt.get("model_state_dict", ckpt.get("state_dict", ckpt)))
+        # accept wrapped ('model'/'model_state_dict'/'state_dict') and bare state dicts
+        sd = (ckpt.get("model", ckpt.get("model_state_dict",
+                                         ckpt.get("state_dict", ckpt)))
+              if isinstance(ckpt, dict) else ckpt)
         fc3_key = next((k for k in sd if k.startswith("fc3.") and k.endswith("weight")), None)
-        num_classes = int(sd[fc3_key].shape[0]) if fc3_key else NUM_CLASSES
+        if fc3_key is None:
+            raise ValueError(f"{weights}: fc3/fc0 layers missing - not a RandLA-Net state dict from this trainer")
+        num_classes = int(sd[fc3_key].shape[0])
         class_names = [f"class_{i}" for i in range(num_classes)]
         meta = tc.infer_meta(wpath)
         if meta:
@@ -530,20 +526,12 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                 cfg.num_sub_points = [cfg.num_points // r
                                       for r in (4, 16, 64, 256)]
         fc0_key = next((k for k in sd if k.startswith("fc0.") and sd[k].dim() >= 2), None)
-        ckpt_in_dim = int(sd[fc0_key].shape[1]) if fc0_key is not None else 3
+        if fc0_key is None:
+            raise ValueError(f"{weights}: fc3/fc0 layers missing - not a RandLA-Net state dict from this trainer")
+        ckpt_in_dim = int(sd[fc0_key].shape[1])
         mf = (meta or {}).get("features") or []
-        # LEGACY (delete before production): translate era tokens; spec-less
-        # era-0 manifests derive the spec from the checkpoint's fc0 width
-        import legacy_weights as lw
-        if mf:
-            FEAT_SPEC = tc.parse_feat_spec(",".join(lw.translate_features(
-                mf, hag_source=(meta or {}).get("hag_source"))), FEAT_LEGACY)
-        else:
-            FEAT_SPEC, lnote = lw.randlanet_spec_from_width(ckpt_in_dim)
-            if FEAT_SPEC is None:
-                FEAT_SPEC = list(FEAT_LEGACY)
-            elif lnote:
-                print(f"  [legacy] {lnote}", flush=True)
+        FEAT_SPEC = (tc.parse_feat_spec(",".join(mf), FEAT_DEFAULT) if mf
+                     else list(FEAT_DEFAULT))
         NONXYZ = [n for n in FEAT_SPEC if n not in ("x", "y", "z")]
         IN_DIM = len(FEAT_SPEC) + (1 if DG_LOGDK_FEAT else 0)
         collate_fn = Collater(cfg.num_layers, cfg.k_n, cfg.sub_sampling_ratio,
@@ -565,14 +553,13 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         if not scenes:
             raise FileNotFoundError(f"No scenes under {run_dir}/scenes")
 
-        run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_infer")
         pred_dir = os.environ.get("TT_PRED_DIR") or f"{run_dir}/predictions"
         os.makedirs(pred_dir, exist_ok=True)
         exc_idx = tc.exclude_class_idx(class_names)
         infer_cfg = {"backbone": "RandLA-Net", "mode": "infer", "weights": weights,
                      "infer_input": infer_input, "num_classes": num_classes,
                      "class_names": class_names, "sub_grid_size": SUB_GRID_SIZE,
-                     "gpu": tc.gpu_name(),
+                     "features": FEAT_SPEC, "gpu": tc.gpu_name(),
                      "exclude_classes": [class_names[i] for i in exc_idx],
                      "started_utc": datetime.now(timezone.utc).isoformat()}
 
@@ -684,7 +671,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     if resume_ckpt is None:
         with open(f"{run_dir}/run.json", "w") as f:
             json.dump({
-                "backbone": "RandLA-Net", "warm_start": False,
+                "backbone": "RandLA-Net",
                 "dataset": dataset,
                 "mode": mode, "gpu": tc.gpu_name(),
                 "n_epochs": N_EPOCHS,
@@ -704,9 +691,9 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                          "lovasz_softmax_weight": LOVASZ_WEIGHT},
                 "num_classes": NUM_CLASSES,
                 "class_names": CLASS_NAMES,
-                "train_scenes": [n for n, _, _ in train_list],
-                "val_scenes":   [n for n, _, _ in val_list],
-                "test_scenes":  [n for n, _, _ in test_list],
+                "train_scenes": [n for n, _ in train_list],
+                "val_scenes":   [n for n, _ in val_list],
+                "test_scenes":  [n for n, _ in test_list],
             }, f, indent=2)
 
     dso = SimpleNamespace(
@@ -757,14 +744,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
               f"at epoch {start_epoch}", flush=True)
     sched = optim.lr_scheduler.ExponentialLR(opt, 0.95)
 
-    metrics_csv = f"{run_dir}/metrics.csv"
-    if not os.path.exists(metrics_csv):
-        with open(metrics_csv, "w", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow([
-                "epoch", "train_loss", "val_loss", "train_acc", "val_acc",
-                "train_iou", "val_iou", "sec_per_iter", "sec_per_epoch",
-                "gpu_mem_mb",
-            ])
+    metrics_csv = tc.init_metrics_csv(run_dir)
 
     def _to_device(batch):
         for k in ("features", "labels", "input_inds", "cloud_inds"):
@@ -852,7 +832,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                     print(f"  [{label}] skip {name}: no votes", flush=True)
                     n_skipped += 1; continue
                 try:
-                    raw_xyz, raw_lab = tc.load_xyz_label(raw_src[0])
+                    raw_xyz, raw_lab = tc.load_xyz_label(raw_src)
                 except tc.NonFiniteXYZ:
                     raise
                 except Exception as ex:
@@ -871,7 +851,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                    "full_coverage": True,
                    "reprojection": "nearest_subsampled_point_to_raw"})
 
-    val_src = {n: (p, c) for n, p, c in val_list}
+    val_src = {n: p for n, p in val_list}
 
     best = tc.BestCheckpoint(run_dir, VAL_RANK)
     tc.proxy_guard(run_dir, proxy_rep, tc.PROXY_PROTOCOL_SPHERES, CLASS_NAMES,
@@ -962,13 +942,13 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
             net.load_state_dict(torch.load(best.final, map_location=device,
                                            weights_only=True)["model"])
             net.eval()
-        m_test = evaluate(test_ds, {n: (p, c) for n, p, c in test_list}, "test")
+        m_test = evaluate(test_ds, {n: p for n, p in test_list}, "test")
         if swapped:
             net.load_state_dict(live_state)
         with open(f"{run_dir}/test_metrics.json", "w", encoding="utf-8") as fj:
             json.dump({"val": m, "test": m_test,
-                       "val_scenes": [n for n, _, _ in val_list],
-                       "test_scenes": [n for n, _, _ in test_list]}, fj, indent=2)
+                       "val_scenes": [n for n, _ in val_list],
+                       "test_scenes": [n for n, _ in test_list]}, fj, indent=2)
         net.train()
         return m
 
@@ -1015,6 +995,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                       f"{LOG_EVERY/dt:.2f} it/s", flush=True)
                 t_chunk = time.time()
         mean_iou, _ = iou_calc.compute_iou()
+        cur_lr = opt.param_groups[0]["lr"]
         sched.step()
         sec_per_iter = (time.time() - t_ep) / max(n_steps, 1)
         sec_per_epoch = time.time() - t_ep
@@ -1022,8 +1003,8 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         gpu_mem = torch.cuda.max_memory_allocated() / 1e6
         with open(metrics_csv, "a", newline="", encoding="utf-8") as f:
             csv.writer(f).writerow([
-                ep, f"{ep_loss/max(n_steps,1):.4f}", "", f"{train_acc:.4f}", "",
-                f"{mean_iou:.4f}", "", f"{sec_per_iter:.4f}",
+                ep, f"{ep_loss/max(n_steps,1):.4f}", f"{train_acc:.4f}",
+                f"{mean_iou:.4f}", f"{cur_lr:.6e}", f"{sec_per_iter:.4f}",
                 f"{sec_per_epoch:.2f}", f"{gpu_mem:.1f}",
             ])
         print(f"  ep {ep:3d}: loss={ep_loss/max(n_steps,1):.4f} "

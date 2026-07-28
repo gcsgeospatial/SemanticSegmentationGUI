@@ -3,7 +3,7 @@ canonical trainer_gui dataset, cold start; native SGD recipe + the shared
 trainer_gui enhancements, reusing only Config, KPFCNN, p2p_fitting_regularizer
 and segmentation_inputs from the upstream repo. neighborhood_limits
 are calibrated once per prep cache and travel in run.json (inference restores
-them). Modes: train | eval | infer | --self-test (host check, no GPU/C++).
+them). Modes: train | eval | infer.
 """
 
 import contextlib
@@ -14,9 +14,8 @@ from typing import Optional
 
 
 def _kpconv_root() -> str:
-    """KPConv-PyTorch source root: KPCONV_SRC, /opt/kpconv, or the dev-box clone."""
-    for p in (os.environ.get("KPCONV_SRC"), "/opt/kpconv",
-              os.path.join(os.path.expanduser("~"), "Desktop", "KPConv-PyTorch")):
+    """KPConv-PyTorch source root: KPCONV_SRC or /opt/kpconv."""
+    for p in (os.environ.get("KPCONV_SRC"), "/opt/kpconv"):
         if p and os.path.isdir(p):
             return p
     raise FileNotFoundError(
@@ -68,8 +67,7 @@ KP_EXTENT     = 1.2
 NUM_KP        = 15
 FIRST_FEAT    = 64
 DEFORMABLE    = True
-CHUNK_XY      = 25.0    # 100 x GRID: KPConv's in_radius = 50 x dl rule as a side
-STRIDE        = 12.5
+CHUNK_XY      = 25.0    # 100 x GRID as the tile side = KPConv's in_radius = 50 x dl rule
 MAX_TILE_PTS  = 40000
 
 CALIB_TILES     = 100
@@ -174,14 +172,12 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
                  infer_input: Optional[str] = None, grid: Optional[float] = None,
                  chunk_xy: Optional[float] = None, epochs: Optional[int] = None,
                  batch: Optional[int] = None, steps_per_epoch: Optional[int] = None):
-    import os, sys, time, json, csv, glob, traceback
-    from datetime import datetime, timezone
+    import os, sys, time, json, glob
     import numpy as np
     import torch
 
 
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "helper"))
-    import density as dg
     import train_common as tc
     (DG_DENSITY_AUG, DG_COARSEN_MAX, DG_P_NATIVE, DG_LOGDK_FEAT, DG_LOGDK_K,
      DG_INFER_ADABN, DG_INFER_TTA, USE_FOCAL, FOCAL_GAMMA, CLASS_WEIGHTING,
@@ -248,14 +244,8 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
                 DEFORMABLE    = bool(rj.get("deformable", DEFORMABLE))
                 if rj.get("neighbor_limits"):
                     NEIGHBOR_LIMITS = [int(x) for x in rj["neighbor_limits"]]
-                # LEGACY (delete before production): every pre-current weight
-                # era routes through legacy_weights - translated tokens, z-min
-                # slot, hag_source manifests, era-0 spec-less run_configs
-                import legacy_weights as lw
-                lspec, lnote = lw.kp_legacy_spec(tc.resolve_weights_path(weights))
-                if lnote:
-                    print(f"  [legacy] {lnote}", flush=True)
-                FEAT_SPEC = lspec if lspec is not None else list(FEAT_DEFAULT)
+                mf = rj.get("features")
+                FEAT_SPEC = list(mf) if mf else list(FEAT_DEFAULT)
 
     if "rgb" in FEAT_SPEC:
         raise ValueError("the KPConv tile pipeline has no rgb channel. Use "
@@ -298,7 +288,7 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
         return tc.kp_find_latest_checkpoint(
             OPT_TYPE_STR, {FEATURE_MODE},
             arch_hash=arch_hash(_arch(DEFORMABLE)),
-            features=FEAT_SPEC, legacy_features=FEAT_DEFAULT,
+            features=FEAT_SPEC,
             skip_done=not EVAL_ONLY)
 
     print("=" * 70)
@@ -313,29 +303,9 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
         tc.clear_stop()
     train_list, val_list, test_list = ([], [], []) if INFER else ensure_prep()
 
-    resume_info = (find_latest_checkpoint()
-                   if (RESUME or AUTO_RESUME or EVAL_ONLY) else None)
-    if INFER:
-        run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_infer")
-        run_dir = tc.infer_dir(infer_input)
-        os.makedirs(os.environ.get("TT_PRED_DIR") or f"{run_dir}/predictions",
-                    exist_ok=True)
-        resume_ckpt, start_epoch = None, 0
-    elif resume_info:
-        run_dir, resume_ckpt, resume_epoch = resume_info
-        run_id = os.path.basename(run_dir)
-        os.makedirs(f"{run_dir}/checkpoints", exist_ok=True)
-        start_epoch = resume_epoch + 1
-        verb = "EVAL-ONLY on" if EVAL_ONLY else "RESUMING"
-        print(f"  {verb} {run_id} from {os.path.basename(resume_ckpt)}"
-              + ("" if EVAL_ONLY else f" -> starting at epoch {start_epoch}/{N_EPOCHS}"),
-              flush=True)
-    else:
-        if EVAL_ONLY:
-            raise RuntimeError(f"eval mode: no {OPT_TYPE_STR}-recipe run with "
-                               f"checkpoints found under /outputs")
-        run_id, run_dir = tc.kp_make_run_dir("kpconv_native")
-        resume_ckpt, start_epoch = None, 0
+    run_dir, resume_ckpt, start_epoch = tc.kp_resume_ladder(
+        INFER, EVAL_ONLY, RESUME or AUTO_RESUME, find_latest_checkpoint,
+        infer_input, "kpconv_native", OPT_TYPE_STR, N_EPOCHS)
 
     train_tiles = sorted(glob.glob(f"{PREP_DIR}/train/*.npz"))
     val_tiles   = sorted(glob.glob(f"{PREP_DIR}/val/*.npz"))
@@ -393,9 +363,6 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
         return b, (b.labels if has_lab else None)
 
     build_feat = tc.kp_make_build_feat(DG_LOGDK_FEAT, DG_LOGDK_K, FEAT_SPEC)
-    if INFER:   # LEGACY (delete before production): z-min / extinct-token columns
-        import legacy_weights as lw
-        build_feat = lw.wrap_build_feat(build_feat)
     sample_tile = tc.kp_make_sample_tile(
         build_feat, GRID, max_pts=MAX_TILE_PTS, aug_color=AUG_COLOR,
         density_aug=DG_DENSITY_AUG, coarsen_max=DG_COARSEN_MAX,
@@ -403,6 +370,7 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
 
     VAL_RANK = tc.ranking_protocol(PROXY_SAMPLING)
     VAL_FULL = VAL_RANK == "full"
+    proxy_tiles = proxy_rep = None
     proxy_samples = []
     if not INFER and not EVAL_ONLY:
         with tc.fixed_np_seed():
@@ -425,7 +393,7 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
         if not tc.proxy_guard(run_dir, proxy_rep, tc.PROXY_PROTOCOL_TILES,
                               CLASS_NAMES, VAL_RANK):
             run_id, run_dir = tc.kp_make_run_dir("kpconv_native")
-            resume_info, resume_ckpt, start_epoch = None, None, 0
+            resume_ckpt, start_epoch = None, 0
             tc.proxy_guard(run_dir, proxy_rep, tc.PROXY_PROTOCOL_TILES,
                            CLASS_NAMES, VAL_RANK)
 
@@ -480,7 +448,7 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
             print("  [infer] no neighbor_limits in run.json. Using exact "
                   "uncropped neighbor matrices (slower).", flush=True)
             NEIGHBOR_LIMITS = []
-    elif resume_info:
+    elif resume_ckpt is not None:
         rj_prev = _run_json_beside(f"{run_dir}/final_model.pth")
         if rj_prev and rj_prev.get("neighbor_limits"):
             NEIGHBOR_LIMITS = [int(x) for x in rj_prev["neighbor_limits"]]
@@ -496,7 +464,6 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
         with open(f"{run_dir}/run.json", "w") as f:
             json.dump({
                 "backbone": "KPConv",
-                "warm_start": False,
                 "feature_mode": FEATURE_MODE,
                 "input_channels": IN_CH,
                 "features": FEAT_SPEC,
@@ -530,9 +497,9 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
                          "label_smoothing": 0.0 if USE_FOCAL else LABEL_SMOOTH,
                          "lovasz_softmax_weight": LOVASZ_WEIGHT,
                          "deform_reg": "p2p_fitting" if DEFORMABLE else None},
-                "train_scenes": [n for n, _, _ in train_list],
-                "val_scenes":   [n for n, _, _ in val_list],
-                "test_scenes":  [n for n, _, _ in test_list],
+                "train_scenes": [n for n, _ in train_list],
+                "val_scenes":   [n for n, _ in val_list],
+                "test_scenes":  [n for n, _ in test_list],
             }, f, indent=2)
 
     with _cwd(_kpconv_root()):
@@ -554,34 +521,9 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
         """Closed-form exponential decay - resume lands on the right lr."""
         return SGD_LR0 * (LR_DECAY ** ep)
 
-    if resume_ckpt is not None:
-        ckpt = torch.load(resume_ckpt, map_location="cuda", weights_only=True)
-        net.load_state_dict(ckpt["model"])
-        if "optim" in ckpt:
-            optim.load_state_dict(ckpt["optim"])
-        print(f"  resumed weights{' + optimizer' if 'optim' in ckpt else ''} "
-              f"at epoch {start_epoch}", flush=True)
-
-    if EVAL_ONLY:
-        fm = (tc.resolve_weights_path(weights)
-              if weights else f"{run_dir}/final_model.pth")
-        if weights and not os.path.exists(fm):
-            raise FileNotFoundError(f"--weights not found: {fm}")
-        if os.path.exists(fm):
-            net.load_state_dict(torch.load(fm, map_location="cuda", weights_only=True)["model"])
-            print(f"  EVAL-ONLY: loaded {fm}", flush=True)
-        start_epoch = N_EPOCHS
-
-    if INFER:
-        fm = (tc.resolve_weights_path(weights)
-              if weights else None)
-        if not fm or not os.path.exists(fm):
-            raise FileNotFoundError(f"--mode infer requires --weights; not found: {fm}")
-        ck = tc.load_ckpt_safe(fm, map_location="cuda")
-        net.load_state_dict(ck["model"] if isinstance(ck, dict) and "model" in ck else ck)
-        print(f"  [infer] loaded {weights} (final_model = best-val epoch "
-              f"{ck.get('epoch', '?') if isinstance(ck, dict) else '?'})", flush=True)
-        start_epoch = N_EPOCHS
+    start_epoch = tc.kp_load_mode_weights(net, optim, resume_ckpt, start_epoch,
+                                          EVAL_ONLY, INFER, weights, run_dir,
+                                          N_EPOCHS)
 
     if INFER:
         seg_loss = pick_train_tile = None
@@ -612,6 +554,7 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
     def _kp_batch(cxyz, feat):
         return make_kp_batch([(cxyz, feat, None)])[0]
 
+    _forward = lambda b: net(b, cfg)
     SAVE_PROBS = os.environ.get("TT_SAVE_PROBS") == "1"
     EXC_IDX = tc.exclude_class_idx(CLASS_NAMES) if INFER else []
     _predict_points = tc.kp_make_predict_points(
@@ -621,60 +564,20 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
         save_probs=SAVE_PROBS, exclude_idx=EXC_IDX)
 
     if INFER:
-        if not infer_input:
-            raise ValueError("--mode infer requires --infer-input <job_id>")
-        if (grid is not None and grid != GRID) or (chunk_xy is not None and chunk_xy != CHUNK_XY):
-            print(f"  [infer] note: KPConv uses its trained geometry "
-                  f"(grid={GRID}, chunk={CHUNK_XY}); --grid/--chunk-xy ignored.", flush=True)
-        net.eval()
-        scenes = sorted(glob.glob(f"{run_dir}/scenes/*.npz"))
-        if not scenes:
-            raise FileNotFoundError(f"No scenes under {run_dir}/scenes")
-        pred_dir = os.environ.get("TT_PRED_DIR") or f"{run_dir}/predictions"
-        infer_cfg = {"backbone": "KPConv", "mode": "infer",
-                     "weights": weights,
-                     "infer_input": infer_input, "num_classes": NUM_CLASSES,
-                     "class_names": CLASS_NAMES, "grid": GRID, "chunk_xy": CHUNK_XY,
-                     "neighbor_limits": NEIGHBOR_LIMITS,
-                     "gpu": tc.gpu_name(),
-                     "exclude_classes": [CLASS_NAMES[i] for i in EXC_IDX],
-                     "started_utc": datetime.now(timezone.utc).isoformat()}
-        if DG_INFER_ADABN:
-            print("  [infer] AdaBN: recomputing BN stats on target tiles...", flush=True)
-            dg.adabn_recalibrate(
-                net,
-                tc.kp_make_target_batches(scenes, _kp_batch, build_feat,
-                                          GRID, CHUNK_XY, NUM_CLASSES),
-                forward=lambda m, b: m(b, cfg))
-            net.eval()
-
-        def _predict(pc_path):
-            z = np.load(pc_path)
-            raw = z["xyz"]
-            tc.require_finite_xyz(raw, os.path.basename(pc_path))
-            xyz = (raw - np.floor(raw.min(0))).astype(np.float32)
-            intensity_n, ret_num = tc.scene_arrays(z, len(xyz))
-            extras = tc.feat_extras(z, FEAT_SPEC, os.path.basename(pc_path))
-            pred, conf, probs = _predict_points(xyz, intensity_n, ret_num,
-                                                extras=extras)
-            return raw, pred, intensity_n, conf, probs
-
-        tc.run_infer_scenes(scenes, _predict, pred_dir, run_dir, infer_cfg, cls_txt=True)
+        tc.kp_run_infer(run_dir, net, _forward, _kp_batch, build_feat,
+                        _predict_points, "KPConv", "KPConv", weights,
+                        infer_input, GRID, CHUNK_XY, grid, chunk_xy,
+                        NUM_CLASSES, CLASS_NAMES, FEAT_SPEC, EXC_IDX,
+                        DG_INFER_ADABN, neighbor_limits=NEIGHBOR_LIMITS)
         return
 
-    metrics_csv = f"{run_dir}/metrics.csv"
-    if not os.path.exists(metrics_csv):
-        with open(metrics_csv, "w", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow([
-                "epoch", "train_loss", "train_acc", "train_iou", "offset_loss",
-                "lr", "sec_per_epoch", "gpu_mem_mb",
-            ])
+    metrics_csv = tc.init_metrics_csv(run_dir)
 
     val_csv = f"{run_dir}/val_metrics.csv"
     tc.init_val_csv(val_csv, CLASS_NAMES)
 
-    val_items  = [(n, p, c, f"{PREP_DIR}/val")  for n, p, c in val_list]
-    test_items = [(n, p, c, f"{PREP_DIR}/test") for n, p, c in test_list]
+    val_items  = [(n, p, f"{PREP_DIR}/val")  for n, p in val_list]
+    test_items = [(n, p, f"{PREP_DIR}/test") for n, p in test_list]
     print(f"  eval set: {len(val_items)} holdout(val) + {len(test_items)} test scenes",
           flush=True)
 
@@ -688,222 +591,26 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
     best = tc.BestCheckpoint(run_dir, VAL_RANK)
     tc.write_run_manifest(run_dir, "kpconv", dataset)
 
-    def _proxy_batches():
-        for bn, s in proxy_samples:
-            try:
-                b, lab_t = make_kp_batch([s])
-            except Exception as e:
-                why = ", ".join(proxy_rep["covers"].get(bn, [])) or "the stride base"
-                raise RuntimeError(
-                    f"proxy val tile {bn} (curated for {why}) could not build "
-                    f"a KPConv batch: delete {PREP_DIR} and re-run the dataset "
-                    f"prep. Original: {e}") from e
-            yield b, lab_t
+    run_eval = tc.kp_make_run_eval(
+        net, _forward, evaluate, make_kp_batch, sample_tile, pick_train_tile,
+        best, val_csv, run_dir, val_items, test_items, val_list, test_list,
+        NUM_CLASSES, CLASS_NAMES, VAL_FULL, EVAL_ONLY,
+        proxy_batches=lambda: tc.kp_proxy_batches(
+            proxy_samples, make_kp_batch, proxy_rep,
+            lambda bn, why, e: (
+                f"proxy val tile {bn} (curated for {why}) could not build "
+                f"a KPConv batch: delete {PREP_DIR} and re-run the dataset "
+                f"prep. Original: {e}")),
+        proxy_tiles=proxy_tiles, proxy_rep=proxy_rep)
 
-    def run_eval(ep, write_json=False):
-        if not write_json:
-            net.eval()
-            m = (evaluate(val_items, f"val@ep{ep}") if VAL_FULL else
-                 tc.proxy_val(_proxy_batches(), lambda b: net(b, cfg),
-                              NUM_CLASSES, CLASS_NAMES, f"val@ep{ep}",
-                              len(proxy_tiles), tc.PROXY_PROTOCOL_TILES,
-                              inventory=proxy_rep["inventory"]))
-            net.train()
-            if best.update(m):
-                tc.atomic_torch_save({"model": net.state_dict(), "epoch": ep},
-                                     best.final)
-            tc.append_val_row(val_csv, ep, m, CLASS_NAMES)
-            return m
-        if not EVAL_ONLY:
-            def _bn_batches(n=48):
-                made = fails = 0
-                while made < n:
-                    if fails >= 200:
-                        raise tc.DatasetExhausted(
-                            "PreciseBN: 200 consecutive tile failures - training "
-                            "tiles can't build batches; re-run dataset prep")
-                    s = sample_tile(pick_train_tile(), training=False)
-                    if s is None:
-                        fails += 1
-                        continue
-                    try:
-                        b, _ = make_kp_batch([s])
-                    except Exception:
-                        fails += 1
-                        continue
-                    fails = 0
-                    made += 1
-                    yield b
-            dg.adabn_recalibrate(net, _bn_batches(), forward=lambda mdl, b: mdl(b, cfg))
-        net.eval()
-        m = evaluate(val_items, f"val@ep{ep}")
-        # deliberately no best.update, even in full mode: AdaBN above recalibrates BN, so this row is not comparable to the mid-training ones
-        tc.append_val_row(val_csv, ep, m, CLASS_NAMES)
-        swapped = not EVAL_ONLY and os.path.exists(best.final)
-        if swapped:
-            live_state = {k: v.clone() for k, v in net.state_dict().items()}
-            net.load_state_dict(torch.load(best.final, map_location="cuda",
-                                           weights_only=True)["model"])
-            net.eval()
-        mt = evaluate(test_items, f"test@ep{ep}")
-        if swapped:
-            net.load_state_dict(live_state)
-        with open(f"{run_dir}/test_metrics.json", "w", encoding="utf-8") as fj:
-            json.dump({"val": m, "test": mt,
-                       "val_scenes": [n for n, _, _ in val_list],
-                       "test_scenes": [n for n, _, _ in test_list]}, fj, indent=2)
-        net.train()
-        return m
-
-    LOG_EVERY = 50
-    AMP = os.environ.get("TT_AMP") == "1"
-    def _draw():
-        for _ in range(1000):
-            s = sample_tile(pick_train_tile(), training=True)
-            if s is not None:
-                return s
-        raise tc.DatasetExhausted(
-            "1000 consecutive empty tile draws - training tiles are empty or "
-            "too small; re-run dataset prep")
-    prefetch = (tc.make_prefetcher(
-        lambda: make_kp_batch([_draw() for _ in range(PACK_N)]),
-        depth=int(os.environ.get("TT_PREFETCH", "2")))
-        if start_epoch < N_EPOCHS else None)
-    print(f"  starting at epoch {start_epoch}, up to {N_EPOCHS}, "
-          f"{EPOCH_STEPS} steps/epoch, pack {PACK_N} x accum {ACCUM}"
-          f"{' [bf16 autocast]' if AMP else ''}", flush=True)
-    t_run = time.time()
-    ep = N_EPOCHS - 1
-    for ep in range(start_epoch, N_EPOCHS):
-        cur_lr = lr_at(ep)
-        for g in optim.param_groups:
-            g["lr"] = cur_lr * g["lr_mult"]
-        net.train()
-        ep_loss, ep_reg = 0.0, 0.0
-        ep_conf = torch.zeros(NUM_CLASSES, NUM_CLASSES, dtype=torch.long,
-                              device="cuda")
-        t_ep = time.time()
-        n_steps = n_fwd = n_failed = 0
-        print(f"  ep {ep:3d} starting (lr={cur_lr:.2e})…", flush=True)
-        for step in range(EPOCH_STEPS):
-            optim.zero_grad()
-            n_ok = 0
-            for _ in range(ACCUM):
-                try:
-                    batch, lab_t = prefetch()
-                    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=AMP):
-                        logits = net(batch, cfg)
-                        loss_seg = seg_loss(logits, lab_t)
-                        reg = p2p_fitting_regularizer(net)
-                        loss = (loss_seg + reg) / ACCUM
-                    if not torch.isfinite(loss):
-                        n_failed += 1
-                        continue
-                    loss.backward()
-                    n_ok += 1; n_fwd += 1
-                    ep_loss += loss.item() * ACCUM
-                    ep_reg  += float(reg.detach()) if torch.is_tensor(reg) else 0.0
-                    pred = logits.argmax(-1)
-                    m = lab_t >= 0
-                    ep_conf += torch.bincount(
-                        lab_t[m] * NUM_CLASSES + pred[m],
-                        minlength=NUM_CLASSES * NUM_CLASSES,
-                    ).reshape(NUM_CLASSES, NUM_CLASSES)
-                except Exception as e:
-                    if isinstance(e, (tc.DatasetExhausted, tc.NonFiniteXYZ)):
-                        raise
-                    # a device-side assert poisons the CUDA context (every later forward fails too), so re-raise with the remedy instead of burning the epoch
-                    if (isinstance(e, RuntimeError)
-                            and "out of memory" not in str(e)
-                            and any(s in str(e) for s in
-                                    ("CUDA error", "device-side assert",
-                                     "illegal memory access"))):
-                        raise RuntimeError(
-                            "unrecoverable CUDA error in forward. If it is an "
-                            "index/scatter-gather assert, a scene likely has "
-                            "non-finite coords: re-ingest the data and delete the "
-                            f"prep cache. Original: {e}") from e
-                    n_failed += 1
-                    if n_failed == 1:
-                        print(f"  forward failed (first occurrence, step {step}): {e}",
-                              flush=True)
-                        traceback.print_exc()
-            if n_ok:
-                torch.nn.utils.clip_grad_value_(net.parameters(), GRAD_CLIP)
-                optim.step()
-                n_steps += 1
-                if n_steps % LOG_EVERY == 0:
-                    print(f"    ep {ep:3d} step {n_steps:4d}: "
-                          f"loss={ep_loss/max(n_fwd,1):.4f}", flush=True)
-        if n_steps == 0:
-            raise RuntimeError(f"epoch {ep}: 0 optimizer steps ({n_failed} failed forwards).")
-        if n_failed:
-            print(f"  ep {ep:3d} note: {n_failed} failed forwards", flush=True)
-        sec_per_epoch = time.time() - t_ep
-        conf = ep_conf.cpu().numpy()
-        ep_inter = np.diag(conf)
-        ep_union = conf.sum(0) + conf.sum(1) - ep_inter
-        train_acc = int(np.trace(conf)) / max(int(conf.sum()), 1)
-        with np.errstate(invalid="ignore"):
-            train_iou = float(np.mean(ep_inter / np.maximum(ep_union, 1)))
-        gpu_mem = torch.cuda.max_memory_allocated() / 1e6
-        with open(metrics_csv, "a", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow([
-                ep, f"{ep_loss/max(n_fwd,1):.6f}", f"{train_acc:.4f}",
-                f"{train_iou:.4f}", f"{ep_reg/max(n_fwd,1):.6f}",
-                f"{cur_lr:.6e}", f"{sec_per_epoch:.2f}", f"{gpu_mem:.1f}",
-            ])
-        print(f"  ep {ep:3d}: loss={ep_loss/max(n_fwd,1):.4f} acc={train_acc:.4f} "
-              f"miou={train_iou:.4f} lr={cur_lr:.2e} s/epoch={sec_per_epoch:.1f}", flush=True)
-        if (ep + 1) % CHECKPOINT_GAP == 0:
-            tc.atomic_torch_save({"model": net.state_dict(),
-                                  "optim": optim.state_dict(), "epoch": ep},
-                                 f"{run_dir}/checkpoints/ep{ep:03d}.pth")
-        stop = tc.stop_requested(ep)
-        if (ep + 1) % VAL_EVERY == 0 and ep != N_EPOCHS - 1 and not stop:
-            run_eval(ep)
-        if stop:
-            break
-
-    if prefetch:
-        prefetch.shutdown()
-
-    print("  final evaluation over the combined eval set…", flush=True)
-    run_eval(ep, write_json=True)
-    if not EVAL_ONLY:
-        best.finalize(lambda p: tc.atomic_torch_save(
-            {"model": net.state_dict(), "epoch": ep}, p))
-        open(f"{run_dir}/DONE", "w").close()
-    print(f"  total wall-clock: {(time.time() - t_run)/3600:.2f} h")
-
-
-def _self_test():
-    """Host wiring check (no GPU, no compiled C++, no /datasets): config
-    derivation, CPU KPFCNN build, offset param-group split."""
-    os.environ.setdefault("MPLBACKEND", "Agg")
-    sys.path.insert(0, _kpconv_root())
-
-    for deformable in (True, False):
-        cfg = make_cfg(num_classes=5, in_features_dim=4, grid=2.0,
-                       deformable=deformable)
-        assert cfg.num_layers == 5, cfg.num_layers
-        want = [False, False, False, True, True] if deformable else [False] * 5
-        assert cfg.deform_layers == want, cfg.deform_layers
-    # split identity: segmentation_inputs returns 5*L+2 items -> L == num_layers
-    assert (5 * cfg.num_layers + 2 - 2) // 5 == cfg.num_layers
-
-    from models.architectures import KPFCNN
-    cfg = make_cfg(num_classes=5, in_features_dim=4, grid=2.0, deformable=DEFORMABLE)
-    with _cwd(_kpconv_root()):
-        net = KPFCNN(cfg, lbl_values=list(range(5)), ign_lbls=[])
-    n_params = sum(p.numel() for p in net.parameters())
-    assert n_params > 0
-    deform_params = [n for n, _ in net.named_parameters() if "offset" in n]
-    other_params  = [n for n, _ in net.named_parameters() if "offset" not in n]
-    assert bool(deform_params) == DEFORMABLE, deform_params[:3]
-    assert len(deform_params) + len(other_params) == len(list(net.parameters()))
-    print(f"ok: num_layers={cfg.num_layers} deform_layers={cfg.deform_layers} "
-          f"params={n_params:,} offset_params={len(deform_params)}")
+    tc.kp_train_loop(
+        net, optim, _forward, seg_loss, make_kp_batch, sample_tile,
+        pick_train_tile, lr_at, run_eval, best, run_dir, metrics_csv,
+        NUM_CLASSES, start_epoch, N_EPOCHS, EPOCH_STEPS, PACK_N, ACCUM,
+        CHECKPOINT_GAP, VAL_EVERY, EVAL_ONLY,
+        grad_clip_fn=lambda: torch.nn.utils.clip_grad_value_(net.parameters(),
+                                                             GRAD_CLIP),
+        reg_fn=lambda: p2p_fitting_regularizer(net))
 
 
 def main():
@@ -919,13 +626,7 @@ def main():
     ap.add_argument('--epochs', type=int, default=None)
     ap.add_argument('--batch', type=int, default=None)
     ap.add_argument('--steps-per-epoch', type=int, default=None)
-    ap.add_argument('--self-test', action='store_true',
-                    help='host wiring check: config derivation + CPU model build; '
-                         'no GPU, no compiled C++, no dataset')
     args = vars(ap.parse_args())
-    if args.pop('self_test'):
-        _self_test()
-        return
     if args['dataset'] is None and args['mode'] != 'infer':
         ap.error('--dataset is required (a canonical trainer_gui dataset name); '
                  'only --mode infer may omit it.')

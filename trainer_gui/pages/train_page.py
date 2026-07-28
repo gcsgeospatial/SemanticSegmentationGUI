@@ -5,10 +5,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog, QDoubleSpinBox,
                                QFormLayout, QGroupBox, QHBoxLayout, QHeaderView,
@@ -17,11 +18,11 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog,
                                QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
 from .. import analysis, appstate, dataset, local_cli, modal_cli, theme, ui
-from ..backbones import BACKBONES, GPU_CHOICES, GPU_VRAM_GB, batch_for_vram
+from ..backbones import BACKBONES, GPU_CHOICES, GPU_VRAM_GB, PARAM_TIPS, batch_for_vram
 from ..jobs import FuncWorker, JobRunner, LogParser
 from ..logconsole import LogConsole
 
-# Channels each arch CAN consume - a capability filter. "height" is removed, don't reintroduce it; standard channels are pre-checked as a reversible default (default_feature_checks), geo/hag extras stay opt-in.
+# Channels each arch CAN consume - a capability filter; standard channels are pre-checked as a reversible default (default_feature_checks), geo/hag extras stay opt-in.
 _FEAT_STANDARD = {
     "randlanet":    ["intensity", "return_number"],
     "kpconvx_cold": ["intensity", "return_number"],
@@ -61,6 +62,7 @@ class TrainPage(QWidget):
         self.pull_runner = JobRunner(self)
         self.status_worker = FuncWorker(self)
         self.modal_worker = FuncWorker(self)
+        self.stop_worker = FuncWorker(self)
         self.parser = LogParser(self)
         self._param_widgets: dict[str, QWidget] = {}
         self._meta: dict | None = None
@@ -142,6 +144,33 @@ class TrainPage(QWidget):
         self.gpu_combo.setToolTip("Cloud GPU for this run (Modal only). Defaults to the "
                                   "model's recommendation when you switch models.")
         form.addRow("GPU (Modal)", self.gpu_combo)
+        self.outvol_edit = QLineEdit(appstate.modal_outputs_volume())
+        self.outvol_edit.setPlaceholderText("<model>-outputs (per-model default)")
+        self.outvol_edit.setToolTip(
+            "Modal volume runs are written to (created if missing). Empty = one "
+            "volume per model, '<model>-outputs'. The Inference and Plotting "
+            "pages read the same setting, so pick one scheme and stay on it.")
+        form.addRow("Outputs volume (Modal)", self.outvol_edit)
+        self.timeout_spin = QSpinBox()
+        self.timeout_spin.setRange(1, 168)
+        self.timeout_spin.setValue(24)
+        self.timeout_spin.setSuffix(" h")
+        self.timeout_spin.setToolTip(
+            "Ceiling on one training run. Modal: the container is killed at the "
+            "limit (TT_TIMEOUT_HOURS), then Modal's retry relaunches it and "
+            "auto-resume continues from the last checkpoint. Local: the run gets "
+            "a graceful stop at the nearest checkpoint instead - final "
+            "evaluation and finalize still complete.")
+        form.addRow("Timeout", self.timeout_spin)
+        self.resume_chk = QCheckBox("Auto-resume latest matching run")
+        self.resume_chk.setChecked(True)
+        self.resume_chk.setToolTip(
+            "On by default (Modal containers can be preempted; local runs can "
+            "be killed). At launch the trainer scans for the newest run matching "
+            "this exact recipe (optimizer, features, architecture) and continues "
+            "from its last checkpoint; no match starts fresh. Uncheck to always "
+            "start a fresh run.")
+        form.addRow("", self.resume_chk)
         self.backbone_combo.currentIndexChanged.connect(self._sync_gpu_default)
         self.gpu_combo.currentIndexChanged.connect(self._refresh_summaries)
         self.gpu_combo.currentIndexChanged.connect(self._apply_batch_prefill)
@@ -153,9 +182,11 @@ class TrainPage(QWidget):
         run_row.addWidget(self.launch_btn)
         self.stop_ckpt_btn = QPushButton("⏹ Stop at nearest checkpoint")
         self.stop_ckpt_btn.setToolTip(
-            "Cooperative stop (local runs): the trainer finishes the current epoch, "
-            "then runs its normal final evaluation and best-checkpoint finalize "
-            "(test_metrics.json, final_model.pth). Kill stays available meanwhile.")
+            "Cooperative stop: the trainer finishes the current epoch, then runs "
+            "its normal final evaluation and best-checkpoint finalize "
+            "(test_metrics.json, final_model.pth). On Modal the STOP sentinel is "
+            "uploaded to the outputs volume and lands within ~2 minutes. Kill "
+            "stays available meanwhile.")
         self.stop_ckpt_btn.clicked.connect(self._stop_graceful)
         run_row.addWidget(self.stop_ckpt_btn)
         self.stop_btn = QPushButton("Kill")
@@ -221,6 +252,12 @@ class TrainPage(QWidget):
         self.parser.run_id.connect(self._on_run_id)
         self.modal_worker.done.connect(self._on_modal_preflight)
         self.modal_worker.error.connect(self._on_modal_preflight_error)
+        self.stop_worker.done.connect(self._on_stop_sent)
+        self._timeout_timer = QTimer(self)
+        self._timeout_timer.setSingleShot(True)
+        self._timeout_timer.timeout.connect(self._on_local_timeout)
+        self.stop_worker.error.connect(
+            lambda tb: self._append(f"\n[stop] STOP upload failed to run: {tb}"))
 
         self.apply_exec_mode(appstate.get_exec_mode() == "local")
         self._rebuild_params()
@@ -236,10 +273,10 @@ class TrainPage(QWidget):
                "Runs on a Modal cloud GPU - upload the dataset from the Datasets page "
                "first; the finished run lands on the model's outputs volume."))
         self.cfg_btn.setVisible(local)
-        # graceful stop is local-only: the sentinel rides the /outputs bind mount
         self._set_run_live(self._run_live)
         self.form.setRowVisible(self.gpu_combo, not local)
         self.form.setRowVisible(self.detach_chk, not local)
+        self.form.setRowVisible(self.outvol_edit, not local)
         self._apply_batch_prefill()
         self.reload_datasets()
 
@@ -397,15 +434,8 @@ class TrainPage(QWidget):
 
     def _reload_backbones(self):
         """Populate the model dropdown with every backbone."""
-        prev = self.backbone_combo.currentData()
-        self.backbone_combo.blockSignals(True)
-        self.backbone_combo.clear()
-        for key, b in BACKBONES.items():
-            self.backbone_combo.addItem(b.label, key)
-        i = self.backbone_combo.findData(prev)
-        if i >= 0:
-            self.backbone_combo.setCurrentIndex(i)
-        self.backbone_combo.blockSignals(False)
+        ui.repopulate_combo(self.backbone_combo,
+                            [(b.label, key) for key, b in BACKBONES.items()])
         self._rebuild_params()
 
     def _backbone(self):
@@ -457,6 +487,10 @@ class TrainPage(QWidget):
                 w.setValue(int(value))
                 w.valueChanged.connect(self._refresh_summaries)
             self.form.insertRow(row, "" if spec.flag == "freeze-encoder" else spec.label, w)
+            if tip := PARAM_TIPS.get(spec.flag):
+                w.setToolTip(tip)
+                if lab := self.form.labelForField(w):
+                    lab.setToolTip(tip)
             self._key_rows.append(w)
             row += 1
             self._param_widgets[spec.flag] = w
@@ -775,6 +809,12 @@ class TrainPage(QWidget):
                   "EVAL_BATCH"):
             if os.environ.get(k):
                 env[k] = os.environ[k]
+        # the visible checkbox wins over an exported AUTO_RESUME; unchecked
+        # only skips the deliberate resume - Modal's own retries still resume
+        if self.resume_chk.isChecked():
+            env["AUTO_RESUME"] = "1"
+        else:
+            env.pop("AUTO_RESUME", None)
         params = {f: self._wvalue(w) for f, w in self._param_widgets.items()}
         appstate.put("train_last_config", {
             "dataset": name, "backbone": b.key,
@@ -787,6 +827,8 @@ class TrainPage(QWidget):
             "features": feat_csv,
             "gpu": self.gpu_combo.currentText(),
             "detach": self.detach_chk.isChecked(),
+            "timeout_h": self.timeout_spin.value(),
+            "auto_resume": self.resume_chk.isChecked(),
         })
         self.log.begin_run(f"{b.label} · {name}")
         self._run_t0 = time.time()
@@ -840,6 +882,8 @@ class TrainPage(QWidget):
         self._out_root = out_root
         self.runner.start(prog, args, cwd=self.repo_root, extra_env=run_env)
         self._set_run_live(True)
+        # local timeout = graceful stop at the nearest checkpoint, not a kill
+        self._timeout_timer.start(self.timeout_spin.value() * 3600 * 1000)
 
     def _preflight_modal_run(self, p):
         """Verify the dataset is on the volume (off-thread) before paying for
@@ -850,13 +894,23 @@ class TrainPage(QWidget):
                          "then `modal setup` to authenticate, and launch again.")
             self.launch_btn.setEnabled(True)
             return
+        ov = self.outvol_edit.text().strip()
+        if ov and not re.fullmatch(r"[A-Za-z0-9._-]+", ov):
+            self._append(f"✗ Invalid outputs volume name '{ov}': use letters, "
+                         f"digits, '.', '_' or '-' (no spaces), or clear the "
+                         f"field for the per-model default, then launch again.")
+            self.launch_btn.setEnabled(True)
+            return
+        appstate.set_modal_outputs_volume(ov)
         self._pending = p
         name = p["dataset"]
-        self._append(f"[modal] checking '{name}' on the "
-                     f"'{modal_cli.DATASETS_VOLUME}' volume…")
+        # the volume the dataset was uploaded to wins over the current setting
+        vol = (appstate.known_datasets().get(name, {}).get("volume")
+               or appstate.modal_datasets_volume())
+        p["volume"] = vol
+        self._append(f"[modal] checking '{name}' on the '{vol}' volume…")
         self.modal_worker.start(
-            lambda progress=None: modal_cli.list_volume_entries(
-                modal_cli.DATASETS_VOLUME, f"/{name}"))
+            lambda progress=None: modal_cli.list_volume_entries(vol, f"/{name}"))
 
     def _on_modal_preflight(self, entries):
         p, self._pending = self._pending, None
@@ -864,7 +918,7 @@ class TrainPage(QWidget):
             return
         if not entries:
             self._append(f"✗ Dataset '{p['dataset']}' isn't on the "
-                         f"'{modal_cli.DATASETS_VOLUME}' volume. Upload it from the "
+                         f"'{p['volume']}' volume. Upload it from the "
                          "Datasets page (Upload to Modal) and launch again.")
             self.launch_btn.setEnabled(True)
             return
@@ -882,9 +936,13 @@ class TrainPage(QWidget):
         b, flags = p["backbone"], p["flags"]
         gpu = self.gpu_combo.currentText()
         detach = self.detach_chk.isChecked()
+        vol = p.get("volume") or appstate.modal_datasets_volume()
+        hours = self.timeout_spin.value()
+        self._live_outputs_volume = b.outputs_volume
         prog, args = modal_cli.run_script(b.script, flags, detach=detach,
                                           env=p.get("env") or None)
-        self._append(f"\n[modal] $ TT_GPU={gpu} modal {' '.join(args)}\n")
+        self._append(f"\n[modal] $ TT_GPU={gpu} TT_DATASET_VOLUME={vol} "
+                     f"TT_TIMEOUT_HOURS={hours} modal {' '.join(args)}\n")
         self._append(f"[modal] Training on {gpu}; the run is written to the "
                      f"'{b.outputs_volume}' volume as runs/<id>. Pick it on the "
                      "Inference page (Training run) when it finishes.")
@@ -892,14 +950,19 @@ class TrainPage(QWidget):
             self._append("[modal] Detached: this returns once the cloud app starts; "
                          "no logs/metrics stream here. Reattach with "
                          f"`modal app logs {b.app_name}`; then launch the next model.")
-        self.runner.start(prog, args, cwd=self.repo_root, extra_env={"TT_GPU": gpu})
+        self.runner.start(prog, args, cwd=self.repo_root,
+                          extra_env={"TT_GPU": gpu, "TT_DATASET_VOLUME": vol,
+                                     "TT_TIMEOUT_HOURS": str(hours),
+                                     "TT_OUTPUTS_VOLUME": b.outputs_volume})
         self._set_run_live(True)
 
     def _set_run_live(self, live: bool):
         """Stop/kill buttons + progress strip only exist while a run is live."""
         self._run_live = live
+        if not live:
+            self._timeout_timer.stop()
         self.stop_btn.setVisible(live)
-        self.stop_ckpt_btn.setVisible(live and appstate.get_exec_mode() == "local")
+        self.stop_ckpt_btn.setVisible(live)
         self.progress_row.setVisible(live)
         if not live:
             self.progress_lbl.setText("")
@@ -929,14 +992,37 @@ class TrainPage(QWidget):
             self._append("\n[no process running]")
 
     def _stop_graceful(self):
-        """Drop the STOP sentinel at the run's /outputs root; the trainer consumes
-        it at epoch end, breaks, and runs its normal final eval + finalize."""
+        """Drop the STOP sentinel at the run's /outputs root (local: touch the
+        bind mount; Modal: upload to the outputs volume, visible in the container
+        after its next reload pass). The trainer consumes it at epoch end, breaks,
+        and runs its normal final eval + finalize."""
         if not self.runner.running:
             self._append("\n[no process running]")
             return
-        if appstate.get_exec_mode() != "local" or not self._out_root:
-            self._append("\n[stop] graceful stop works for local runs only. Use Kill "
-                         "(and `modal app stop <app>` for a cloud run).")
+        if appstate.get_exec_mode() != "local":
+            vol = getattr(self, "_live_outputs_volume", None)
+            if not vol:
+                self._append("\n[stop] no live Modal run registered here. Use Kill "
+                             "(and `modal app stop <app>` for the cloud side).")
+                return
+            self._append(f"\n[stop] Uploading STOP -> {vol}:/STOP … the trainer sees "
+                         "it within ~2 minutes, stops after that epoch, runs the "
+                         "final evaluation and finalize, then exits. (Kill remains "
+                         "available if you can't wait.)")
+            def _put(progress=None):
+                import subprocess
+                import tempfile
+                with tempfile.TemporaryDirectory() as td:
+                    p = os.path.join(td, "STOP")
+                    open(p, "w").close()
+                    prog, args = modal_cli.volume_put(vol, p, "/STOP")
+                    out = subprocess.run([prog] + args, capture_output=True,
+                                         text=True, timeout=120)
+                    return out.returncode
+            self.stop_worker.start(_put)
+            return
+        if not self._out_root:
+            self._append("\n[stop] no live local run registered here. Use Kill.")
             return
         try:
             (Path(self._out_root) / "STOP").touch()
@@ -946,6 +1032,21 @@ class TrainPage(QWidget):
         self._append("\n[stop] Stopping after the current epoch… the run finishes its "
                      "final evaluation and checkpoint finalize, then exits. "
                      "(Kill remains available if you can't wait.)")
+
+    def _on_local_timeout(self):
+        if not self.runner.running:
+            return
+        self._append(f"\n[timeout] {self.timeout_spin.value()}h limit reached - "
+                     f"requesting a graceful stop at the nearest checkpoint.")
+        self._stop_graceful()
+
+    def _on_stop_sent(self, code):
+        if code == 0:
+            self._append("[stop] STOP uploaded to the outputs volume.")
+        else:
+            self._append(f"[stop] ✗ STOP upload failed (exit {code}). Modal CLI on "
+                         f"PATH and authenticated? (modal token new) Kill remains "
+                         f"available.")
 
     def _clear_stop_sentinel(self):
         """Remove a leftover sentinel (killed after a graceful request, or the
@@ -969,7 +1070,7 @@ class TrainPage(QWidget):
             self._set_run_live(False)
         if code == 0:
             extra = (f" Run id: {self._last_run_id}." if self._last_run_id else "")
-            self._append(f"\n✓ Done.{extra} See the Runs/Plotting page for artifacts.")
+            self._append(f"\n✓ Done.{extra} See the Plotting page for artifacts.")
         else:
             self._append(f"\n✗ Exited with code {code}.")
 
@@ -1041,6 +1142,11 @@ class TrainPage(QWidget):
         if i >= 0:
             self.gpu_combo.setCurrentIndex(i)
         self.detach_chk.setChecked(bool(cfg.get("detach")))
+        try:
+            self.timeout_spin.setValue(int(cfg.get("timeout_h", 24)))
+        except (TypeError, ValueError):
+            pass
+        self.resume_chk.setChecked(bool(cfg.get("auto_resume", True)))
         loss = cfg.get("loss") if isinstance(cfg.get("loss"), dict) else {}
         dg = cfg.get("dg") if isinstance(cfg.get("dg"), dict) else {}
         self.adv_box.setChecked(bool(loss) or bool(dg))

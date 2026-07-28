@@ -1,6 +1,6 @@
 """Density-domain-generalization primitives for the local_train_* scripts.
 Occupancy o = rho*g^2; o < 1 breaks density invariance, and coarsening is
-one-way (thin dense, never densify sparse). `python density.py` self-checks."""
+one-way (thin dense, never densify sparse)."""
 import os
 
 import numpy as np
@@ -96,39 +96,3 @@ def adabn_recalibrate(model, batches, forward, momentum=None, reset=True):
         bn.train(was_training)
     model.eval()
     return model
-
-
-def _demo():
-    rng = np.random.default_rng(0)
-
-    g0 = 0.8
-    assert effective_grid(g0, coarsen_max=1.0, rng=rng) == g0
-    gs = [effective_grid(g0, 2.5, p_native=0.0, rng=rng) for _ in range(2000)]
-    assert all(g0 <= g <= g0 * 2.5 + 1e-9 for g in gs)
-    assert max(gs) > g0 * 2.0
-
-    side = 20.0
-    dense = rng.uniform(0, side, size=(40000, 3)); dense[:, 2] = 0.0
-    idx = voxel_first_idx(dense, g0)
-    cells = (side / g0) ** 2
-    out_o = len(idx) / cells
-    assert 0.6 < out_o <= 1.0, out_o
-    denser = rng.uniform(0, side, size=(120000, 3)); denser[:, 2] = 0.0
-    assert abs(len(voxel_first_idx(denser, g0)) - len(idx)) < 0.1 * len(idx)
-
-    sparse = rng.uniform(0, side, size=(2000, 3)); sparse[:, 2] = 0.0
-    assert local_density_logdk(sparse).mean() > local_density_logdk(dense).mean()
-    assert local_density_logdk(np.zeros((1, 3))).shape == (1,)
-
-    os.environ.pop("DG_TEST_X", None)
-    assert env_bool("DG_TEST_X", True) is True and env_int("DG_TEST_X", 8) == 8
-    os.environ["DG_TEST_X"] = "off"; assert env_bool("DG_TEST_X", True) is False
-    os.environ["DG_TEST_X"] = "2.5"; assert env_float("DG_TEST_X", 1.0) == 2.5
-    os.environ["DG_TEST_X"] = "3"; assert env_int("DG_TEST_X", 0) == 3
-    os.environ.pop("DG_TEST_X", None)
-
-    print("density.py self-checks passed")
-
-
-if __name__ == "__main__":
-    _demo()

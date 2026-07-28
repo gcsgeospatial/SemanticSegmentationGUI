@@ -22,7 +22,9 @@ EPOCH_RE = re.compile(
 VAL_RE = re.compile(
     r"\[(?:val|eval)@ep(\d+)\]\s+acc=([\d.]+)\s+"
     r"mIoU\(\d+-way\)=([\d.]+)\s+mIoU\(present \d+\)=([\d.]+)")
-RUN_DIR_RE = re.compile(r"/outputs/runs/(\S+)")
+# the id lines every trainer actually prints: "run complete -> <id>" at the end
+# (train_common + randlanet's copy), "RESUMING/EVAL-ONLY on <id> ..." at start
+RUN_DIR_RE = re.compile(r"(?:run complete -> |RESUMING |EVAL-ONLY on )(\S+)")
 
 
 class LogParser(QObject):
@@ -165,7 +167,8 @@ class FuncWorker(QObject):
 
     output = Signal(str)
     done = Signal(object)
-    error = Signal(str)
+    # (traceback, message): tb first so existing one-arg slots keep getting it
+    error = Signal(str, str)
     stopped = Signal()
 
     def __init__(self, parent=None):
@@ -192,8 +195,9 @@ class FuncWorker(QObject):
                 result = fn(*args, progress=progress, **kwargs)
             except Stopped:
                 self.stopped.emit()
-            except Exception:
-                self.error.emit(traceback.format_exc())
+            except Exception as e:
+                self.error.emit(traceback.format_exc(),
+                                str(e).strip() or type(e).__name__)
             else:
                 self.done.emit(result)
 

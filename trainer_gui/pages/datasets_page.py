@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 
 from PySide6.QtCore import Qt
@@ -19,7 +20,6 @@ from .. import analysis, appstate, dataset, modal_cli, pretrain, theme, ui
 from ..dataset import LabelSpec, SplitConfig
 from ..jobs import FuncWorker, JobRunner
 from ..logconsole import LogConsole
-from ..readers import read_points
 
 
 class DatasetsPage(QWidget):
@@ -65,6 +65,12 @@ class DatasetsPage(QWidget):
         self.add_existing_btn = QPushButton("Add existing dataset…")
         self.add_existing_btn.clicked.connect(self._add_existing)
         sd_col.addWidget(self.add_existing_btn)
+        self.volume_edit = QLineEdit(appstate.modal_datasets_volume())
+        self.volume_edit.setPlaceholderText("Modal datasets volume")
+        self.volume_edit.setToolTip(
+            "Modal volume datasets upload to (created if missing). Training and "
+            "inference use the same volume, so any naming scheme works.")
+        sd_col.addWidget(self.volume_edit)
         self.upload_saved_btn = QPushButton("Upload selected to Modal")
         self.upload_saved_btn.clicked.connect(self._upload_saved)
         sd_col.addWidget(self.upload_saved_btn)
@@ -96,6 +102,7 @@ class DatasetsPage(QWidget):
     def apply_exec_mode(self, local: bool):
         """Local mode never uploads to Modal; hide the upload button, reword the copy."""
         self.upload_saved_btn.setVisible(not local)
+        self.volume_edit.setVisible(not local)
         self.sub.setText(
             "Point at clouds (las/laz, ply, txt/csv, pcd, npy/npz), name classes, "
             "split train/val, Build."
@@ -124,13 +131,7 @@ class DatasetsPage(QWidget):
         self.crs_status.setWordWrap(True)
         theme.set_accent(self.crs_status, "muted")
         form.addRow("CRS", self.crs_status)
-        self.declare_epsg = QLineEdit()
-        self.declare_epsg.setPlaceholderText("blank = auto-detect from the file")
-        self.declare_epsg.setMaximumWidth(150)
-        self.declare_epsg.setToolTip("EPSG code to assume for clouds that carry no CRS. Ignored "
-                                     "for files that declare their own CRS. Required when a "
-                                     "no-CRS cloud's coordinates look like lat/lon degrees.")
-        self.declare_epsg.textChanged.connect(self._render_crs)
+        self.declare_epsg = ui.declare_epsg_edit(self._render_crs, max_width=150)
         form.addRow("Declare CRS (EPSG)", self.declare_epsg)
         self.field_combo = QComboBox()
         self.field_combo.setEditable(True)
@@ -183,43 +184,22 @@ class DatasetsPage(QWidget):
         """Channels computed from xyz at build time - not fields of the input."""
         box = QGroupBox("4 · Calculated features - computed at build time")
         lay = QVBoxLayout(box)
-        self.hag_box = QGroupBox("Compute Height-Above-Ground (HAG)"
-                                 + ("" if pretrain.pdal_available()
-                                    else " - grid only, PDAL not installed"))
+        self.hag_box = QGroupBox(ui.hag_title("Compute Height-Above-Ground (HAG)"))
         self.hag_box.setCheckable(True)
         self.hag_box.setChecked(False)
         self.hag_box.setToolTip("Bakes a per-point feat_hag channel into every scene. Pick "
                                 "the ground source and interpolation below. Select feat_hag "
                                 "in the Train page's feature list to feed it to any model.")
         # ground SOURCE - orthogonal to interpolation (any source × any filter)
-        self.hag_ground_method = QComboBox()
-        for _k in pretrain.GROUND_METHODS:
-            self.hag_ground_method.addItem(pretrain.GROUND_LABELS[_k], _k)
-        self.hag_ground_method.setToolTip(
-            "Where ground comes from. Base off ground layer: your labeled ground "
-            "class. CSF / SMRF: PDAL ground detection (needs PDAL). Z-min proxy: "
-            "percentile-Z raster HAG, no classification (ignores interpolation).")
-        self.hag_ground_method.currentIndexChanged.connect(self._on_hag_method)
-        self.hag_filter = QComboBox()
-        self.hag_filter.addItems(list(pretrain.HAG_METHODS))
-        self.hag_filter.setToolTip("How HAG is interpolated from the ground points. "
-                                   "grid: fast raster approximation, no PDAL needed. "
-                                   "hag_nn / hag_delaunay: accurate PDAL filters.")
-        self.hag_ground = QLineEdit()
-        self.hag_ground.setMaximumWidth(90)
-        self.hag_ground.setToolTip("Source value that means ground (from the Classes table, "
-                                   "e.g. 2). Required for 'Base off ground layer'; those "
-                                   "labels are the ground source (gaps are nearest-filled).")
-        self._hag_ground_lbl = QLabel("ground class")
-        hag_row = QHBoxLayout()
-        hag_row.addWidget(QLabel("ground source"))
-        hag_row.addWidget(self.hag_ground_method)
-        hag_row.addWidget(self._hag_ground_lbl)
-        hag_row.addWidget(self.hag_ground)
-        hag_row.addWidget(QLabel("interpolation"))
-        hag_row.addWidget(self.hag_filter)
-        hag_row.addStretch()
-        self.hag_opts_w = ui.wrap(hag_row)
+        self.hag_opts_w = ui.build_hag_options(
+            self,
+            ground_method_tip=(
+                "Where ground comes from. Base off ground layer: your labeled ground "
+                "class. CSF / SMRF: PDAL ground detection (needs PDAL). Z-min proxy: "
+                "percentile-Z raster HAG, no classification (ignores interpolation)."),
+            ground_tip=("Source value that means ground (from the Classes table, "
+                        "e.g. 2). Required for 'Base off ground layer'; those "
+                        "labels are the ground source (gaps are nearest-filled)."))
         hag_lay = QVBoxLayout(self.hag_box)
         hag_lay.addWidget(self.hag_opts_w)
         self.hag_box.toggled.connect(self.hag_opts_w.setVisible)
@@ -255,12 +235,7 @@ class DatasetsPage(QWidget):
         return box
 
     def _on_hag_method(self):
-        """Ground-class field only for 'Base off ground layer'; zmin (percentile-Z
-        raster) needs no interpolation, so grey the filter out."""
-        key = self.hag_ground_method.currentData()
-        self._hag_ground_lbl.setVisible(key == "labels")
-        self.hag_ground.setVisible(key == "labels")
-        self.hag_filter.setEnabled(key != "zmin")
+        ui.sync_hag_method(self)
 
     def _classes_box(self) -> QWidget:
         box = QGroupBox("2 · Classes - uncheck 'Train' to ignore a value; select rows + "
@@ -324,7 +299,6 @@ class DatasetsPage(QWidget):
         self.mode_combo = QComboBox()
         self.mode_combo.addItems(["Balanced (mirror class mix)", "Random"])
         form.addRow("Split mode", self.mode_combo)
-        # TODO(not ready): split-seed UI hidden; seed fixed at 42 in _split_config
         self.split_provided_chk = QCheckBox("Separate train/val/test folders (use as-is)")
         self.split_provided_chk.toggled.connect(self._on_split_changed)
         form.addRow("", self.split_provided_chk)
@@ -332,7 +306,6 @@ class DatasetsPage(QWidget):
         form.addRow("Validation folder", self.val_row_w)
         self.test_edit, self.test_row_w = self._dir_row(self._pick_test)
         form.addRow("Test folder", self.test_row_w)
-        # TODO(not ready): parallel-worker UI hidden; max_workers=1 forced in _conversion_plan
         self.tile_btn = QPushButton("Build dataset")
         self.tile_btn.setObjectName("primary")
         self.tile_btn.clicked.connect(self._start_tiling)
@@ -463,10 +436,8 @@ class DatasetsPage(QWidget):
             self._append(f"No supported point clouds in {path}")
             self._render_crs()
             return
-        try:
-            cloud = read_points(files[0])
-        except Exception as e:
-            self._append(f"Could not probe {files[0].name}: {e}")
+        cloud = ui.stamp_crs_probe(self, files, "Could not probe {name}: {err}")
+        if cloud is None:
             self._render_crs()
             return
         fields = sorted(cloud.fields.keys())
@@ -494,35 +465,22 @@ class DatasetsPage(QWidget):
             combo.clear()
             combo.addItem("none")
             combo.addItems(fields)
-        self._crs_probe = crs_probe(cloud)
-        self._crs_probe_name = (files[0].name if len(files) == 1
-                                else f"{files[0].name} (+{len(files) - 1} more)")
         self._render_crs()
 
     def _render_crs(self, *_):
-        """Show the probed input's detected CRS + the auto action (or the D1 block)."""
-        if not self._crs_probe:
-            self.crs_status.setText("Pick an input - its CRS and the reprojection "
-                                    "action appear here.")
-            return
-        declared = parse_epsg(self.declare_epsg.text())
-        detected, action, block = crs_story(
-            *self._crs_probe, declared if type(declared) is int else None)
-        if block:
-            self.crs_status.setText(f"⚠ {self._crs_probe_name}: {detected}. "
-                                    f"Blocks Build - {block}.")
-        else:
-            self.crs_status.setText(f"{self._crs_probe_name}: detected {detected} · {action}.")
+        ui.render_crs_status(self, "Build",
+                             empty_text="Pick an input - its CRS and the reprojection "
+                                        "action appear here.")
 
     def _spec(self) -> LabelSpec:
-        return LabelSpec(kind="field", field=self.field_combo.currentText().strip())
+        return LabelSpec(field=self.field_combo.currentText().strip())
 
     def _split_config(self) -> SplitConfig:
         mode = "balanced" if self.mode_combo.currentIndex() == 0 else "random"
         return SplitConfig(
             val_frac=float(self.val_spin.value()),
             test_frac=float(self.test_spin.value()),
-            mode=mode, seed=42,
+            mode=mode,
             strategy="provided" if self.split_provided_chk.isChecked() else "auto")
 
     def _copy_settings_menu(self):
@@ -612,9 +570,6 @@ class DatasetsPage(QWidget):
             self.hag_box.setChecked(bool(hag_src))
             if hag_src:
                 gm = src.get("hag_ground_method")
-                if not gm:
-                    gm = (hag_src.split("+", 1)[1] if "+" in hag_src
-                          else (hag_src if hag_src == "zmin" else ""))
                 k = self.hag_ground_method.findData(gm)
                 if k >= 0:
                     self.hag_ground_method.setCurrentIndex(k)
@@ -759,19 +714,9 @@ class DatasetsPage(QWidget):
         if not name or not os.path.exists(in_path):
             self._append("Need a name and an input file or folder.")
             return None
-        declared = parse_epsg(self.declare_epsg.text())
-        if declared is False:
-            self._append("Declare CRS: enter an EPSG integer (e.g. 6539), or leave blank "
-                         "to auto-detect from the file.")
+        ok, declared = ui.crs_launch_gate(self, "Build", degrees_sep=":")
+        if not ok:
             return None
-        if self._crs_probe:
-            _, _, block = crs_story(*self._crs_probe,
-                                    declared if type(declared) is int else None)
-            if block:
-                self._append(f"✗ '{self._crs_probe_name}' carries no CRS and its "
-                             f"coordinates look like lat/lon degrees: {block} to "
-                             f"reproject it, then Build.")
-                return None
         split = self._split_config()
         val_inputs = test_inputs = None
         if split.strategy == "provided":
@@ -828,7 +773,7 @@ class DatasetsPage(QWidget):
             "geo_features": geo or None,
             "geo_k": int(self.geo_k.value()),
             "rgb_fields": rgb_sel if len(mapped) == 3 else None,
-            "declared_crs_epsg": declared if type(declared) is int else None,
+            "declared_crs_epsg": declared,
             "max_workers": 1,
         }
 
@@ -988,17 +933,24 @@ class DatasetsPage(QWidget):
                          f"runs/ + infer/ under {staged or 'nothing on disk'} for records.")
 
     def _start_upload(self, staged: Path):
+        vol = self.volume_edit.text().strip()
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", vol or ""):
+            self._append(f"✗ Invalid Modal volume name '{vol}': use letters, "
+                         f"digits, '.', '_' or '-' (no spaces), then upload again.")
+            return
+        appstate.set_modal_datasets_volume(vol)
+        self._upload_vol = vol
         self._uploading = staged
         name = staged.name
         self.upload_saved_btn.setEnabled(False)
         self._begin_run(f"upload '{name}'")
-        self._append(f"\nUploading -> {modal_cli.DATASETS_VOLUME}:/{name} …\n"
+        self._append(f"\nUploading -> {vol}:/{name} …\n"
                      f"(first ensuring the volume exists: a \"Volume "
-                     f"'{modal_cli.DATASETS_VOLUME}' already exists\" error here is "
+                     f"'{vol}' already exists\" error here is "
                      f"EXPECTED and harmless; the upload continues right after)")
-        prog, args = modal_cli.volume_put(modal_cli.DATASETS_VOLUME, str(staged), f"/{name}")
+        prog, args = modal_cli.volume_put(vol, str(staged), f"/{name}")
         self.uploader.start(prog, args, cwd=self.repo_root,
-                            pre=modal_cli.volume_create(modal_cli.DATASETS_VOLUME))
+                            pre=modal_cli.volume_create(vol))
 
     def _on_upload_failed(self, err: str):
         self.upload_saved_btn.setEnabled(True)
@@ -1019,19 +971,21 @@ class DatasetsPage(QWidget):
             "staged_dir": str(staged),
             "meta_path": str(staged / "dataset_meta.json"),
             "uploaded": True,
-            "volume": modal_cli.DATASETS_VOLUME,
+            "volume": self._upload_vol,
         })
         self._reload_known()
-        self._append(f"\n✓ Uploaded '{name}' -> {modal_cli.DATASETS_VOLUME}:/{name}. "
+        self._append(f"\n✓ Uploaded '{name}' -> {self._upload_vol}:/{name}. "
                      "Go to the Train page.")
         self._end_run(f"uploaded '{name}'")
 
-    def _on_worker_error(self, tb: str):
+    def _on_worker_error(self, tb: str, msg: str):
         self._done_cb = None
         self._set_busy(False)
         self._append("✗ Error - see the dialog.")
         self._end_run("failed")
-        QMessageBox.critical(self, "Dataset error", tb)
+        box = QMessageBox(QMessageBox.Critical, "Dataset error", msg, parent=self)
+        box.setDetailedText(tb)
+        box.exec()
 
     def _reload_known(self):
         """Rows are '<name>   <badge>'; the bare name rides in UserRole."""
@@ -1099,58 +1053,3 @@ class DatasetsPage(QWidget):
 def _parse_values(text: str) -> list[int]:
     """Source-value cell -> ints. Handles one value ("5") or a list ("5,6" / "5 6")."""
     return [int(t) for t in text.replace(",", " ").split() if t]
-
-
-# --- CRS surface: labels readers' reprojection outcome; infer_page imports crs_probe/crs_story/parse_epsg so the two pages share one impl.
-
-def parse_epsg(text):
-    """Declare-CRS field -> int, None (blank = auto-detect), or False (not an integer)."""
-    t = (text or "").strip().upper()
-    if t.startswith("EPSG:"):
-        t = t[len("EPSG:"):].strip()
-    if not t:
-        return None
-    try:
-        return int(t)
-    except ValueError:
-        return False
-
-
-def _looks_like_degrees(xyz) -> bool:
-    """No-CRS coords sitting in lon/lat bounds with a small span - the D1 trigger.
-    The span guard keeps small projected-metre local clouds from false-blocking."""
-    import numpy as np
-    if len(xyz) == 0:
-        return False
-    x, y = xyz[:, 0], xyz[:, 1]
-    if not (x.min() >= -180 and x.max() <= 180 and y.min() >= -90 and y.max() <= 90):
-        return False
-    return max(float(x.max() - x.min()), float(y.max() - y.min())) <= 10.0
-
-
-def _crs_name(wkt) -> str:
-    try:
-        from pyproj import CRS
-        return CRS.from_wkt(wkt).name
-    except Exception:
-        return "custom CRS"
-
-
-def crs_probe(cloud):
-    """(source_wkt, proc_wkt, looks_degrees) pulled from an already-read Cloud."""
-    return cloud.source_crs_wkt, cloud.crs_wkt, _looks_like_degrees(cloud.xyz)
-
-
-def crs_story(source_wkt, proc_wkt, looks_degrees, declared_epsg):
-    """(detected, action, block) for the CRS surface + D1 preflight. block is a
-    remedy string (degree-looking no-CRS input with no declared EPSG) or None."""
-    if source_wkt:
-        return _crs_name(source_wkt), f"reproject → {_crs_name(proc_wkt)}", None
-    if proc_wkt:
-        return _crs_name(proc_wkt), "keep as-is (already metre-projected)", None
-    if declared_epsg is not None:
-        return "none in file", f"declared EPSG:{declared_epsg} → reproject", None
-    if looks_degrees:
-        return ("none - coordinates look like lat/lon degrees", None,
-                "declare its EPSG in the 'Declare CRS (EPSG)' box")
-    return "none", "keep as-is (assumed projected metres)", None

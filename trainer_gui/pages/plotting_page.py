@@ -30,8 +30,9 @@ class PlottingPage(QWidget):
         title = QLabel("Plotting")
         title.setObjectName("pageTitle")
         root.addWidget(title)
-        sub = QLabel("Chart per-epoch validation metrics across runs. The bold line is their "
-                     "average (± std). Use the toolbar to zoom or save a PNG.")
+        sub = QLabel("Chart runs four ways: metric curves (stars = raw full evals), a "
+                     "training-dynamics dashboard, per-class final IoU, or a leaderboard. "
+                     "Use the toolbar to zoom or save a PNG.")
         sub.setWordWrap(True)
         sub.setObjectName("pageSub")
         root.addWidget(sub)
@@ -52,6 +53,13 @@ class PlottingPage(QWidget):
         self.run_list.setMinimumHeight(220)
         self.run_list.itemSelectionChanged.connect(self._on_selection)
         left.addWidget(self.run_list, 1)
+
+        self.view_combo = QComboBox()
+        for label in ("Metric curves", "Dashboard", "Per-class IoU", "Leaderboard"):
+            self.view_combo.addItem(label)
+        self.view_combo.currentIndexChanged.connect(self._on_view)
+        left.addWidget(QLabel("View"))
+        left.addWidget(self.view_combo)
 
         self.metric_combo = QComboBox()
         self.metric_combo.currentIndexChanged.connect(self._redraw)
@@ -192,10 +200,24 @@ class PlottingPage(QWidget):
                 break
 
     # ------------------------------------------------------------- draw
+    def _on_view(self):
+        curves = self.view_combo.currentIndex() == 0
+        for w in (self.metric_combo, self.show_runs_chk, self.show_avg_chk):
+            w.setEnabled(curves)
+        self._redraw()
+
     def _redraw(self):
-        metric = self.metric_combo.currentData() or "val_miou"
-        plots.multi_run_figure(self._selected_dirs(), metric,
-                               show_runs=self.show_runs_chk.isChecked(),
-                               show_avg=self.show_avg_chk.isChecked(),
-                               fig=self.fig)
+        dirs = self._selected_dirs()
+        view = self.view_combo.currentIndex()
+        if view == 1:
+            plots.dashboard_figure(dirs, fig=self.fig)
+        elif view == 2:
+            plots.class_iou_figure(dirs, fig=self.fig)
+        elif view == 3:
+            plots.leaderboard_figure(dirs, fig=self.fig)
+        else:
+            plots.multi_run_figure(dirs, self.metric_combo.currentData() or "val_miou",
+                                   show_runs=self.show_runs_chk.isChecked(),
+                                   show_avg=self.show_avg_chk.isChecked(),
+                                   fig=self.fig)
         self.canvas.draw_idle()

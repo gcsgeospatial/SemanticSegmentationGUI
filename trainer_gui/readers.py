@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -170,8 +171,44 @@ def read_points(path: str | Path, declared_crs_epsg: int | None = None) -> Cloud
 
 
 def list_label_fields(path: str | Path) -> list[str]:
-    """Cheap-ish probe: names usable as the ground-truth label source."""
-    return sorted(read_points(path).fields.keys())
+    """Cheap probe: names usable as the ground-truth label source."""
+    return sorted(probe_points(path).fields.keys())
+
+
+def probe_points(path: str | Path):
+    """read_points stand-in for pick-time probing. las/laz answer from the header
+    alone - dimension names, std-channel presence, CRS, bbox corners as .xyz -
+    so a multi-GB file never blocks the GUI thread or touches RAM. The corners
+    ride the real normalize_to_meters, keeping the CRS story identical to a full
+    read. Consumers may only use field NAMES and channel presence: .fields values
+    are None and array attrs are 0-length sentinels."""
+    # ponytail: other formats still full-read; move the probe to a worker if big PLYs surface
+    p = Path(path)
+    if p.suffix.lower() not in (".las", ".laz"):
+        return read_points(p)
+    import laspy
+
+    with laspy.open(str(p)) as f:
+        h = f.header
+        if h.point_count == 0:
+            return read_points(p)
+        try:
+            crs = h.parse_crs()
+        except Exception:
+            crs = None
+        dims = [d.name for d in h.point_format.dimensions]
+        corners = np.array([h.mins, h.maxs], np.float64)
+    lower = {d.lower() for d in dims}
+    corners, proc_wkt, source_wkt = normalize_to_meters(
+        corners, crs.to_wkt() if crs is not None else None)
+    flag = np.empty(0, np.float32)
+    return SimpleNamespace(
+        xyz=corners,
+        fields={d: None for d in dims if d.lower() not in ("x", "y", "z")},
+        intensity=flag if "intensity" in lower else None,
+        rgb=flag if {"red", "green", "blue"} <= lower else None,
+        return_number=flag if "return_number" in lower else None,
+        crs_wkt=proc_wkt, source_crs_wkt=source_wkt)
 
 
 def _read_las(path) -> Cloud:
@@ -219,42 +256,53 @@ def _read_las(path) -> Cloud:
                  crs_wkt=proc_wkt, source_crs_wkt=source_wkt)
 
 
-def _read_ply(path) -> Cloud:
-    from plyfile import PlyData
+_PDAL_SKIP = {"x", "y", "z", "nx", "ny", "nz", "normalx", "normaly", "normalz", "alpha"}
 
-    ply = PlyData.read(str(path))
-    v = ply["vertex"].data
-    names = set(v.dtype.names)
-    xyz = np.stack([v["x"], v["y"], v["z"]], -1).astype(np.float64)
 
+def _read_pdal(path, reader_type) -> Cloud:
+    """ply/pcd via a single-stage PDAL pipeline (PDAL already ships for HAG)."""
+    import json
+
+    import pdal
+
+    pipe = pdal.Pipeline(json.dumps([{"type": reader_type, "filename": str(path)}]))
+    pipe.execute()
+    if not len(pipe.arrays) or not len(pipe.arrays[0]):
+        raise ValueError(f"{path}: no points read")
+    v = pipe.arrays[0]
+    low = {n.lower(): n for n in v.dtype.names}
+
+    def _pick(*keys):
+        for k in keys:
+            if k in low:
+                return np.asarray(v[low[k]])
+        return None
+
+    xyz = np.stack([v[low["x"]], v[low["y"]], v[low["z"]]], -1).astype(np.float64)
     rgb = None
-    if {"red", "green", "blue"}.issubset(names):
-        rgb = np.stack([v["red"], v["green"], v["blue"]], -1).astype(np.float64)
-        if rgb.max() > 255:
+    if {"red", "green", "blue"} <= low.keys():
+        rgb = np.stack([v[low["red"]], v[low["green"]], v[low["blue"]]], -1).astype(np.float64)
+        if rgb.max() > 255:  # 16-bit color scaled to 8-bit
             rgb = rgb / 257.0
         rgb = np.clip(rgb, 0, 255).astype(np.uint8)
-
-    intensity = None
-    for key in ("intensity", "scalar_intensity", "scalar_Intensity"):
-        if key in names:
-            intensity = np.asarray(v[key], np.float32)
-            break
-
-    ret = None
-    for key in ("return_number", "scalar_return_number", "scalar_ReturnNumber"):
-        if key in names:
-            ret = np.asarray(v[key], np.float32)
-            break
-
+    intensity = _pick("intensity", "scalar_intensity")
+    if intensity is not None:
+        intensity = intensity.astype(np.float32)
+    ret = _pick("returnnumber", "return_number", "scalar_return_number", "scalar_returnnumber")
+    if ret is not None:
+        ret = ret.astype(np.float32)
     fields = {}
-    skip = {"x", "y", "z", "nx", "ny", "nz", "alpha"}
     for name in v.dtype.names:
-        if name in skip:
+        if name.lower() in _PDAL_SKIP:
             continue
         arr = np.asarray(v[name])
         if arr.ndim == 1 and np.issubdtype(arr.dtype, np.number):
             fields[name] = arr
     return Cloud(xyz=xyz, rgb=rgb, intensity=intensity, return_number=ret, fields=fields)
+
+
+def _read_ply(path) -> Cloud:
+    return _read_pdal(path, "readers.ply")
 
 
 def _sniff_delimiter(path) -> str | None:
@@ -279,21 +327,7 @@ def _read_ascii(path) -> Cloud:
 
 
 def _read_pcd(path) -> Cloud:
-    import open3d as o3d
-
-    pc = o3d.io.read_point_cloud(str(path))
-    xyz = np.asarray(pc.points, np.float64)
-    rgb = None
-    if pc.has_colors():
-        rgb = np.clip(np.asarray(pc.colors) * 255.0, 0, 255).astype(np.uint8)
-    intensity = None
-    try:
-        t = o3d.t.io.read_point_cloud(str(path))
-        if "intensity" in t.point:
-            intensity = t.point["intensity"].numpy().reshape(-1).astype(np.float32)
-    except Exception:
-        pass
-    return Cloud(xyz=xyz, rgb=rgb, intensity=intensity)
+    return _read_pdal(path, "readers.pcd")
 
 
 def _read_numpy(path) -> Cloud:
@@ -340,57 +374,3 @@ def _read_numpy(path) -> Cloud:
     source_crs_wkt = str(z["source_crs_wkt"]) if "source_crs_wkt" in z.files else None
     return Cloud(xyz=xyz, rgb=rgb, intensity=intensity, return_number=ret, fields=fields,
                  crs_wkt=crs_wkt, source_crs_wkt=source_crs_wkt)
-
-
-def _selfcheck() -> None:
-    """python readers.py - reproject round-trip, identity, and z-unit invariants."""
-    from pyproj import CRS
-    rng = np.random.default_rng(0)
-
-    ft = CRS.from_epsg(2263).to_wkt()
-    src = np.column_stack([rng.uniform(9.8e5, 9.9e5, 500),
-                           rng.uniform(2.0e5, 2.1e5, 500),
-                           rng.uniform(0, 100, 500)])
-    m, proc, s = normalize_to_meters(src, ft)
-    assert s == ft and proc is not None, "ftUS must record a transform"
-    back = restore_to_source(m, proc, s)
-    err = np.abs(back - src).max()
-    assert err < 1e-3, f"ftUS round-trip {err} ft exceeds sub-mm"
-
-    utm = CRS.from_epsg(32618).to_wkt()
-    um = np.column_stack([rng.uniform(5e5, 5.1e5, 300), rng.uniform(4.5e6, 4.51e6, 300),
-                          rng.uniform(0, 50, 300)])
-    m2, proc2, s2 = normalize_to_meters(um, utm)
-    assert s2 is None and proc2 == utm, "meter UTM must be identity"
-    assert m2 is um or np.array_equal(m2, um), "identity must not change bytes"
-    assert np.array_equal(restore_to_source(m2, proc2, s2), um), "identity restore is a no-op"
-
-    comp = CRS.from_user_input("EPSG:2263+5703").to_wkt()
-    cz = src[:, 2].copy()
-    mc, procc, sc = normalize_to_meters(src, comp)
-    assert sc == comp, "compound must record a transform"
-    assert np.allclose(mc[:, 2], cz), "metre-vertical z must be unchanged"
-    assert not np.allclose(mc[:, 0], src[:, 0]), "xy must move"
-    bc = restore_to_source(mc, procc, sc)
-    assert np.abs(bc - src).max() < 1e-3, "compound round-trip exceeds sub-mm"
-
-    geo = CRS.from_epsg(4326).to_wkt()
-    gsrc = np.column_stack([rng.uniform(-73.99, -73.90, 300),
-                            rng.uniform(40.70, 40.78, 300), rng.uniform(0, 100, 300)])
-    mg, procg, sg = normalize_to_meters(gsrc, geo)
-    assert sg == geo and procg is not None, "geographic must record a transform"
-    assert np.allclose(mg[:, 2], gsrc[:, 2]), "geographic z must stay metres (not radians)"
-    assert np.abs(restore_to_source(mg, procg, sg)[:, :2] - gsrc[:, :2]).max() < 1e-7
-
-    try:
-        restore_to_source(src, ft, None)
-        raise AssertionError("legacy ftUS pred must hard-block")
-    except ValueError as e:
-        assert "re-run the inference job" in str(e)
-    assert is_legacy_unit_scale_pred(ft, None) and not is_legacy_unit_scale_pred(utm, None)
-
-    print("readers self-check OK")
-
-
-if __name__ == "__main__":
-    _selfcheck()

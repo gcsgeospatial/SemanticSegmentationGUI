@@ -58,7 +58,8 @@ image = image.add_local_file("scripts/local/local_train_kpconvx_cold.py", "/root
 image = image.add_local_file("scripts/helper/train_common.py", "/root/train_common.py")
 image = image.add_local_file("scripts/helper/density.py", "/root/density.py")
 
-outputs_volume  = modal.Volume.from_name(f"{APP_NAME}-outputs",  create_if_missing=True)
+outputs_volume  = modal.Volume.from_name(
+    os.environ.get("TT_OUTPUTS_VOLUME") or f"{APP_NAME}-outputs", create_if_missing=True)
 datasets_volume = modal.Volume.from_name(
     os.environ.get("TT_DATASET_VOLUME", "terminal-datasets"), create_if_missing=True)
 
@@ -81,18 +82,10 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
     """Shell out to the local trainer - local and cloud run identical code."""
     import sys
     sys.path.insert(0, "/root")
-    # resume only on Modal's OWN retries (call id stable across retries, new
-    # per `modal run`). ponytail: /outputs/.attempts markers never cleaned.
-    fcid = modal.current_function_call_id()
-    marker = f"/outputs/.attempts/{fcid}" if fcid else ""
-    if not fcid or os.path.exists(marker):
-        os.environ["TT_MODAL_RETRY"] = os.environ["AUTO_RESUME"] = "1"
-    else:
-        os.makedirs("/outputs/.attempts", exist_ok=True)
-        open(marker, "w").close()
-        outputs_volume.commit()
-
     import train_common
+    # resume only on Modal's own retries; markers accumulate on the outputs volume
+    train_common.modal_retry_marker(modal.current_function_call_id(),
+                                    "/outputs/.attempts", outputs_volume.commit)
     train_common.modal_shell_run(
         "/root/local_train_kpconvx_cold.py",
         [
@@ -108,6 +101,7 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
         ],
         env_json,
         [outputs_volume, datasets_volume],
+        reload=outputs_volume.reload,
     )
 
 
@@ -116,7 +110,7 @@ def main(dataset: Optional[str] = None, mode: str = "train", weights: Optional[s
          infer_input: Optional[str] = None, grid: Optional[float] = None,
          chunk_xy: Optional[float] = None, epochs: Optional[int] = None,
          batch: Optional[int] = None, steps_per_epoch: Optional[int] = None,
-                  env_json: Optional[str] = None):
+         env_json: Optional[str] = None):
     what = {"eval": "eval-only re-score", "infer": f"infer({weights})"}.get(
         mode, f"train({dataset})")
     print(f"Launching {APP_NAME} [{what}] on {GPU_TYPE} for up to {TIMEOUT_HOURS}h.")

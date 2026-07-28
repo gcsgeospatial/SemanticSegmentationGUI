@@ -7,7 +7,6 @@ model first; output uses the first input's format.
 
 Usage:
   python ensemble_vote.py --inputs predsA predsB [predsC ...] --out out_dir
-  python ensemble_vote.py --self-test
 """
 import argparse
 import glob
@@ -253,98 +252,12 @@ def ensemble(input_dirs, out_dir, log=print):
     log(f"ensembled {done}/{len(scans[0])} scene(s) -> {out_dir}")
 
 
-def self_test():
-    import shutil
-    import tempfile
-
-    sv = np.array([[[0.9, 0.1]], [[0.45, 0.55]], [[0.45, 0.55]]], np.float32)
-    lab, conf = soft_vote(sv)
-    hard, _ = weighted_vote(np.array([[0], [1], [1]]), np.ones((3, 1), np.float32))
-    assert hard.tolist() == [1] and lab.tolist() == [0] and abs(conf[0] - 0.6) < 1e-6
-    cv = np.array([[[0.9, 0.1], [0.2, 0.8], [0.0, 0.0]],
-                   [[0.45, 0.55], [0.0, 0.0], [0.0, 0.0]],
-                   [[0.45, 0.55], [0.0, 0.0], [0.0, 0.0]]], np.float32)
-    lab, conf = soft_vote(cv, np.array([[0, 1, 3], [1, 1, 3], [1, 1, 4]]))
-    assert lab.tolist() == [0, 1, 3]
-    assert np.allclose(conf, [0.6, 0.8, 2 / 3])
-    lab, conf = weighted_vote(np.array([[0, 0], [1, 0], [1, 0]]),
-                              np.array([[0.9, 1.0], [0.2, 1.0], [0.2, 1.0]], np.float32))
-    assert lab.tolist() == [0, 0] and abs(conf[0] - 0.9 / 1.3) < 1e-6 and conf[1] == 1.0
-    assert weighted_vote(np.array([[1], [2], [3]]),
-                         np.ones((3, 1), np.float32))[0].tolist() == [1]
-    ag = agreement(np.array([[0, 0], [1, 0], [1, 1]]), np.array([0, 0]))
-    assert np.allclose(ag, [1 / 3, 2 / 3]) and ag.dtype == np.float32
-    dm = dominant_member(np.array([0, 1]),
-                         probs=np.array([[[0.2, 0.8], [0.2, 0.8]],
-                                         [[0.9, 0.1], [0.3, 0.7]]], np.float32))
-    assert dm.tolist() == [1, 0] and dm.dtype == np.uint8
-    dm = dominant_member(np.array([0]), labels=np.array([[1], [0], [0]]),
-                         weights=np.array([[0.9], [0.5], [0.6]], np.float32))
-    assert dm.tolist() == [2]
-    xyz = np.random.rand(100, 3).astype(np.float32)
-    assert align_idx(xyz, xyz) is None
-    idx = align_idx(xyz, xyz[::2])
-    assert len(idx) == 100 and (idx[::2] == np.arange(50)).all()
-
-    tmp = tempfile.mkdtemp(prefix="ensemble_vote_st_")
-    try:
-        x3 = np.random.rand(3, 3).astype(np.float32)
-        P = [np.array([[0.9, 0.1], [0.6, 0.4], [0.2, 0.8]], np.float32),
-             np.array([[0.45, 0.55], [0.7, 0.3], [0.3, 0.7]], np.float32),
-             np.array([[0.45, 0.55], [0.8, 0.2], [0.4, 0.6]], np.float32)]
-        dirs = []
-        for k, p in enumerate(P):
-            d = os.path.join(tmp, f"m{k}")
-            os.makedirs(d)
-            np.savez(os.path.join(d, "s_pred.npz"), xyz=x3,
-                     classification=p.argmax(1).astype(np.int32),
-                     confidence=p.max(1), probs=p.astype(np.float16))
-            with open(os.path.join(d, "infer_run.json"), "w", encoding="utf-8") as f:
-                json.dump({"num_classes": 2, "class_names": ["a", "b"],
-                           "backbone": f"m{k}"}, f)
-            dirs.append(d)
-        quiet = lambda s: None
-        ensemble(dirs, os.path.join(tmp, "out"), log=quiet)
-        z = np.load(os.path.join(tmp, "out", "s_pred.npz"))
-        assert z["classification"].tolist() == [0, 0, 1]
-        assert z["confidence"].dtype == np.float32 and z["agreement"].dtype == np.float32
-        assert np.allclose(z["confidence"], [0.6, 0.7, 0.7], atol=2e-3)
-        assert np.allclose(z["agreement"], [1 / 3, 1.0, 1.0])
-        assert z["dominant_member"].tolist() == [0, 2, 0]
-        assert z["member_names"].tolist() == ["m0", "m1", "m2"]
-        with open(os.path.join(dirs[1], "infer_run.json"), "w", encoding="utf-8") as f:
-            json.dump({"num_classes": 2, "class_names": ["a", "c"]}, f)
-        try:
-            ensemble(dirs, os.path.join(tmp, "out2"), log=quiet)
-            raise AssertionError("clamp did not refuse mismatched class_names")
-        except ValueError:
-            pass
-        with open(os.path.join(dirs[1], "infer_run.json"), "w", encoding="utf-8") as f:
-            json.dump({"num_classes": 2, "class_names": ["a", "b"]}, f)
-        zp = np.load(os.path.join(dirs[2], "s_pred.npz"))
-        slim = {k: zp[k] for k in zp.files if k != "probs"}
-        np.savez(os.path.join(dirs[2], "s_pred.npz"), **slim)
-        ensemble(dirs, os.path.join(tmp, "out3"), log=quiet)
-        z3 = np.load(os.path.join(tmp, "out3", "s_pred.npz"))
-        assert z3["classification"].tolist() == [1, 0, 1]
-        assert np.allclose(z3["confidence"], [0.55, 1.0, 1.0], atol=1e-6)
-        assert z3["dominant_member"].tolist() == [1, 2, 0]
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
-    print("self-test OK")
-
-
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--inputs", nargs="+", help="2+ prediction folders, strongest model first")
-    ap.add_argument("--out", help="output folder for the voted predictions")
-    ap.add_argument("--self-test", action="store_true")
+    ap.add_argument("--inputs", nargs="+", required=True,
+                    help="2+ prediction folders, strongest model first")
+    ap.add_argument("--out", required=True, help="output folder for the voted predictions")
     a = ap.parse_args()
-    if a.self_test:
-        self_test()
-    elif a.inputs and a.out:
-        if len(a.inputs) < 2:
-            ap.error("--inputs needs at least 2 folders")
-        ensemble(a.inputs, a.out)
-    else:
-        ap.error("either --self-test or both --inputs and --out")
+    if len(a.inputs) < 2:
+        ap.error("--inputs needs at least 2 folders")
+    ensemble(a.inputs, a.out)

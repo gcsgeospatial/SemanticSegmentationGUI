@@ -46,7 +46,8 @@ class Backbone:
 
     @property
     def outputs_volume(self) -> str:
-        return f"{self.app_name}-outputs"
+        from . import appstate
+        return appstate.modal_outputs_volume() or f"{self.app_name}-outputs"
 
     @property
     def grid_flag(self) -> str:
@@ -78,6 +79,18 @@ def _common(epochs_default: int, batch_default: int, steps_default: int = 500,
                                10.0, 200.0, step=5.0, decimals=0))
     return specs
 
+
+# hover help for the per-model parameter rows, keyed by ParamSpec.flag
+PARAM_TIPS = {
+    "grid": "Voxel size (m) the cloud is thinned to. Smaller keeps more detail but costs memory.",
+    "sub-grid": "Voxel size (m) the cloud is thinned to. Smaller keeps more detail but costs memory.",
+    "num-points": "Points fed to the model per sample.",
+    "epochs": "Full passes over the training set.",
+    "batch": "Samples per training step. Higher needs more GPU memory.",
+    "steps-per-epoch": "Batches trained per epoch.",
+    "chunk-xy": "Square tile size (m) the cloud is cut into for training.",
+    "freeze-encoder": "Train only the classifier head (linear probe). Cheaper, less accurate.",
+}
 
 BACKBONES: dict[str, Backbone] = {b.key: b for b in [
     Backbone(

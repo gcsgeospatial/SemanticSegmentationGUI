@@ -8,8 +8,6 @@ import shutil
 import subprocess
 import tempfile
 
-DATASETS_VOLUME = "terminal-datasets"
-
 
 def modal_exe() -> str:
     return shutil.which("modal") or "modal"
@@ -54,25 +52,24 @@ def run_script(script: str, flags: dict, detach: bool = False,
 # ---- thin synchronous helpers (background threads only - they block) ----
 
 def fetch_run_manifest(volume: str, run_id: str, timeout: int = 60) -> dict | None:
-    """Blocking: read runs/<run_id>/run.json (legacy run_config.json) off an
-    outputs volume; None if absent/unreadable."""
+    """Blocking: read runs/<run_id>/run.json off an outputs volume; None if
+    absent/unreadable."""
     env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
-    for fn in ("run.json", "run_config.json"):
-        with tempfile.TemporaryDirectory() as td:
-            prog, args = volume_get(volume, f"runs/{run_id}/{fn}", td)
+    with tempfile.TemporaryDirectory() as td:
+        prog, args = volume_get(volume, f"runs/{run_id}/run.json", td)
+        try:
+            out = subprocess.run([prog] + args, capture_output=True, text=True,
+                                 timeout=timeout, encoding="utf-8",
+                                 errors="replace", env=env)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        dest = os.path.join(td, "run.json")
+        if out.returncode == 0 and os.path.isfile(dest):
             try:
-                out = subprocess.run([prog] + args, capture_output=True, text=True,
-                                     timeout=timeout, encoding="utf-8",
-                                     errors="replace", env=env)
-            except (OSError, subprocess.TimeoutExpired):
+                with open(dest, encoding="utf-8") as f:
+                    return json.load(f)
+            except (OSError, json.JSONDecodeError):
                 return None
-            dest = os.path.join(td, fn)
-            if out.returncode == 0 and os.path.isfile(dest):
-                try:
-                    with open(dest, encoding="utf-8") as f:
-                        return json.load(f)
-                except (OSError, json.JSONDecodeError):
-                    return None
     return None
 
 

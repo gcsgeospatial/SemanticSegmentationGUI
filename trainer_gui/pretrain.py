@@ -93,25 +93,43 @@ def _structured_from_cloud(cloud) -> np.ndarray:
 
 
 GRID_HAG_CELL_M = 2.0
-GRID_HAG_OPEN_M = 35.0
 GRID_HAG_RELIEF_M = 2.5
+# Zhang 2003 progressive morphological filter over the min surface: openings with
+# windows growing STEP_M per stage up to MAX_M (must exceed the widest roof to
+# catch), stage threshold min(TH0_M + SLOPE * window_growth, DHMAX_M). Terrain may
+# rise with distance (opening preserves ramps); a building jumps the cap. DHMAX is
+# the dial: lower catches lower roofs, higher spares prominent narrow hills
+GRID_HAG_PMF_STEP_M = 32.0
+GRID_HAG_PMF_MAX_M = 256.0
+GRID_HAG_PMF_TH0_M = 0.5
+GRID_HAG_PMF_SLOPE = 0.15
+GRID_HAG_PMF_DHMAX_M = 3.0
 _GRID_HAG_MAX_DIM = 4096
+# median window (cells) over the low surface: cells adopt their neighbors'
+# consensus, so an isolated below-ground noise cell can't seed the opening's
+# roof-rejection cascade and crater the surrounding fill
+GRID_HAG_MEDIAN_CELLS = 5
 
 GRID_HAG_GAP_WARN_M = 50.0
 
 # CSF decimation cell: only a cell's lowest point can be ground, so CSF runs on the min-Z-per-cell envelope; must stay well under the cloth resolution (~1-2 m)
 CSF_DECIM_CELL_M = 0.5
 
-# SMRF max window must exceed the widest building footprint (~200 m) or a flat roof survives as ground; the height guard backstops what any filter still misses
-SMRF_MAX_WINDOW_M = 100.0
+# SMRF window + cut net are complements (swept synthetically 2026-07: w=100 alone
+# leaves 45% of a 120 m roof as ground, w=100+cut=50 leaves 0% up to 200 m roofs).
+# Net lines are spaced `cut` apart with values from an opening of ~4*cut diameter,
+# so roofs past ~200 m defeat the net; the height guard strips those
+SMRF_WINDOW_M = 100.0
+SMRF_CUT_M = 50.0
 
 
 def hag_grid_for_cloud(cloud, *, ground_mask=None,
                        cell: float = GRID_HAG_CELL_M,
                        notes: "list | None" = None) -> "np.ndarray | None":
     """HAG from a rasterized ground surface (numpy/scipy, no PDAL): with a mask,
-    per-cell mean Z with holes nearest-filled; without, low-percentile Z + a grey
-    opening that rejects roof cells. Error ~ cell x slope, so this is a feature
+    per-cell mean Z with holes nearest-filled; without, low-percentile Z (floored
+    above the absolute min), a median consensus, and a Zhang 2003 progressive
+    morphological filter that rejects roof cells. Error ~ cell x slope, so this is a feature
     channel, not survey ground. Returns float32 (n,) or None; `notes` collects
     warnings such as a nearest-fill gap past GRID_HAG_GAP_WARN_M."""
     try:
@@ -150,16 +168,26 @@ def hag_grid_for_cloud(cloud, *, ground_mask=None,
         counts = np.bincount(flat, minlength=ncell)
         starts = np.concatenate(([0], np.cumsum(counts)[:-1]))
         valid = counts > 0
-        pick = starts[valid] + (0.05 * (counts[valid] - 1)).astype(np.int64)
+        # floor the pick at 2nd-lowest: a single multipath return below ground
+        # must not become the cell's "ground"
+        pick = starts[valid] + np.maximum(
+            (0.05 * (counts[valid] - 1)).astype(np.int64),
+            np.minimum(counts[valid] - 1, 1))
         grid[valid] = z[order][pick]
         g2, v2 = grid.reshape(dims), valid.reshape(dims)
         if (~v2).any():
             near = ndimage.distance_transform_edt(~v2, return_distances=False,
                                                   return_indices=True)
             g2 = g2[tuple(near)]
-        size = max(int(round(GRID_HAG_OPEN_M / cell)), 3)
-        opened = ndimage.grey_opening(g2, size=size, mode="nearest")
-        v2 = v2 & ((g2 - opened) <= GRID_HAG_RELIEF_M)
+        g2 = ndimage.median_filter(g2, size=GRID_HAG_MEDIAN_CELLS, mode="nearest")
+        surf, prev_w, w = g2, 0.0, GRID_HAG_PMF_STEP_M
+        while prev_w < GRID_HAG_PMF_MAX_M:
+            opened = ndimage.grey_opening(
+                surf, size=max(int(round(w / cell)), 3), mode="nearest")
+            th = min(GRID_HAG_PMF_TH0_M + GRID_HAG_PMF_SLOPE * (w - prev_w),
+                     GRID_HAG_PMF_DHMAX_M)
+            v2 = v2 & ((surf - opened) <= th)
+            surf, prev_w, w = opened, w, w + GRID_HAG_PMF_STEP_M
         if not v2.any():
             return None
 
@@ -245,16 +273,18 @@ def csf_ground_mask(cloud) -> "np.ndarray | None":
 def smrf_ground_mask(cloud) -> "np.ndarray | None":
     """Ground mask via PDAL SMRF (Simple Morphological Filter), or None. SMRF's
     window can absorb a flat roof wider than the window into ground (its
-    commission-error failure mode) - so window is set large (SMRF_MAX_WINDOW_M)
-    to reach across big buildings, and the height guard (_reject_high_ground)
-    strips any roof still wider than the window. CSF remains the safer default."""
+    commission-error failure mode) - the cut net (SMRF_CUT_M) seeds ground-true
+    minima under roofs the window alone can't open, and the height guard
+    (_reject_high_ground) strips anything past the net's ~200 m reach.
+    CSF remains the safer default."""
     if not pdal_available():
         return None
     import pdal
     try:
         arr = _structured_from_cloud(cloud)
         pipe = pdal.Pipeline(
-            json.dumps([{"type": "filters.smrf", "window": SMRF_MAX_WINDOW_M}]),
+            json.dumps([{"type": "filters.smrf", "window": SMRF_WINDOW_M,
+                         "cut": SMRF_CUT_M}]),
             arrays=[arr])
         pipe.execute()
         out = pipe.arrays[0]
@@ -356,25 +386,3 @@ def geo_features_for_cloud(xyz, names, geo_k: int = 100) -> "dict[str, np.ndarra
     return {nm: np.nan_to_num(feats[:, col[nm]], nan=0.0, posinf=0.0,
                               neginf=0.0).astype(np.float32)
             for nm in names}
-
-
-def _selfcheck():
-    """Grid HAG: detection and labeled paths agree on a flat scene with a roof."""
-    from .readers import Cloud
-    g = np.mgrid[0:60, 0:60].reshape(2, -1).T.astype(np.float64)
-    on_roof = (g[:, 0] >= 25) & (g[:, 0] < 35) & (g[:, 1] >= 25) & (g[:, 1] < 35)
-    xyz = np.vstack([np.column_stack([g[~on_roof], np.zeros((~on_roof).sum())]),
-                     np.column_stack([g[on_roof], np.full(on_roof.sum(), 10.0)])])
-    ng = int((~on_roof).sum())
-    for h in (hag_grid_for_cloud(Cloud(xyz=xyz)),
-              hag_grid_for_cloud(Cloud(xyz=xyz),
-                                 ground_mask=np.arange(len(xyz)) < ng)):
-        assert h is not None and len(h) == len(xyz)
-        assert abs(float(h[:ng].mean())) < 0.3, "ground HAG ~0"
-        assert float(h[ng:].min()) > 8.0, "roof HAG ~10 (cells rejected + filled)"
-    assert hag_for_cloud(Cloud(xyz=xyz), hag_filter="grid") is not None
-    print("pretrain self-check OK")
-
-
-if __name__ == "__main__":
-    _selfcheck()

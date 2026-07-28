@@ -60,7 +60,7 @@ index-url = "https://download.pytorch.org/whl/cu118"
 extra-index-urls = ["https://pypi.org/simple"]
 index-strategy = "unsafe-best-match"   # pip-like: +cuXXX pins only exist on the torch index
 find-links = [{ url = "https://data.pyg.org/whl/torch-2.1.0+cu118.html" }]
-no-build = true    # wheels only -> lockable from the Windows dev box
+no-build = true    # wheels only -> lockable from any platform
 
 [feature.ptv3.pypi-dependencies]
 torch = { version = "==2.1.0+cu118" }
@@ -183,7 +183,7 @@ index-url = "https://download.pytorch.org/whl/cu121"
 extra-index-urls = ["https://pypi.org/simple"]
 index-strategy = "unsafe-best-match"   # pip-like: +cuXXX pins only exist on the torch index
 find-links = [{ url = "https://data.pyg.org/whl/torch-2.3.0+cu121.html" }]
-no-build = true    # wheels only -> lockable from the Windows dev box
+no-build = true    # wheels only -> lockable from any platform
 
 [feature.kpconvx-cold.pypi-dependencies]
 torch = { version = "==2.3.0+cu121" }

@@ -8,8 +8,8 @@ backbone:
   - the pinned model-source git SHA
 
 and diffs them against the pixi feature's pypi-dependencies / pypi-options
-and the trainer-src recipe's context sha. Run by the smoke test, it exits
-non-zero listing every mismatch on drift.
+and the trainer-src recipe's context sha. It exits non-zero listing every
+mismatch on drift.
 
     python tools/check_env_sync.py
 """

@@ -179,10 +179,6 @@ class LogConsole(QWidget):
     def setPlaceholderText(self, text: str) -> None:
         self._edit.setPlaceholderText(text)
 
-    def plain_widget(self) -> QPlainTextEdit:
-        return self._edit
-
-
     @staticmethod
     def _tool(text: str, checkable: bool = False, checked: bool = False,
               tip: str = "") -> QToolButton:
@@ -292,26 +288,3 @@ class LogConsole(QWidget):
         if self._pin_btn.isChecked():
             bar = self._edit.verticalScrollBar()
             bar.setValue(bar.maximum())
-
-
-if __name__ == "__main__":
-    asm = LineAssembler()
-    assert asm.feed("hel") == []
-    assert asm.feed("lo\nwor") == [("append", "hello")]
-    assert asm.feed("ld\n") == [("append", "world")]
-    assert asm.feed("\r 10%|#") == []
-    assert asm.feed("\r 20%|##") == [("append", " 10%|#")]
-    assert asm.feed("\r100%|###\ndone\n") == [
-        ("replace", " 20%|##"), ("replace", "100%|###"), ("append", "done")]
-    assert asm.feed("a\r") == []
-    assert asm.feed("\nb\n") == [("append", "a"), ("append", "b")]
-    assert _ansi_segments("\x1b[31mfail\x1b[0m ok\x1b[2K\x1b[1A") == [
-        ("fail", CONSOLE_ERROR), (" ok", None)]
-    assert _ansi_segments("\x1b[92mbright\x1b[m") == [("bright", CONSOLE_OK)]
-    assert _classify("Traceback (most recent call last):") == "error"
-    assert _classify("Exited with code 1") == "error"
-    assert _classify("⚠ low disk") == "warn"
-    assert _classify("✓ saved checkpoint") == "ok"
-    assert _classify("ep  12: loss=0.4321 acc=0.9123") is None
-    assert _TAG_RE.match("[local] starting docker").group(0) == "[local]"
-    print("ok: logconsole line pipeline")

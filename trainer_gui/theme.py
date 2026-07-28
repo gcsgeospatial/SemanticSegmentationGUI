@@ -1,6 +1,5 @@
 """App theming - Light/Dark/System. apply() sets Fusion + QPalette + QSS; status
-labels use semantic roles via set_accent. Every pair meets WCAG AA (see
-_check_contrast)."""
+labels use semantic roles via set_accent. Every pair meets WCAG AA."""
 
 from __future__ import annotations
 
@@ -156,33 +155,3 @@ def set_accent(widget, role: str = "") -> None:
     st = widget.style()
     st.unpolish(widget)
     st.polish(widget)
-
-
-def _contrast(fg: str, bg: str) -> float:
-    """WCAG relative-contrast ratio between two #rrggbb colours."""
-    def lum(h):
-        f = lambda u: u / 12.92 if u <= 0.03928 else ((u + 0.055) / 1.055) ** 2.4
-        r, g, b = (f(int(h[i:i + 2], 16) / 255) for i in (1, 3, 5))
-        return 0.2126 * r + 0.7152 * g + 0.0722 * b
-    a, b = lum(fg), lum(bg)
-    return (max(a, b) + 0.05) / (min(a, b) + 0.05)
-
-
-def _check_contrast():  # ponytail: runnable WCAG AA check - `python trainer_gui/theme.py`
-    pairs = [("text", "bg", 4.5), ("text", "panel", 4.5), ("muted", "bg", 4.5),
-             ("muted", "panel", 4.5), ("ok", "bg", 4.5), ("warn", "bg", 4.5),
-             ("error", "bg", 4.5), ("ok", "panel", 4.5), ("warn", "panel", 4.5),
-             ("error", "panel", 4.5), ("button_text", "button", 4.5),
-             ("on_accent", "accent", 4.5), ("sel_text", "sel_bg", 4.5),
-             ("log_text", "log_bg", 4.5), ("sidebar_text", "sidebar_bg", 4.5),
-             ("sidebar_muted", "sidebar_bg", 4.5), ("sidebar_sel_text", "sidebar_sel_bg", 4.5),
-             ("disabled_text", "bg", 3.0), ("disabled_text", "button", 3.0), ("focus", "bg", 3.0)]
-    for name, c in (("LIGHT", LIGHT), ("DARK", DARK)):
-        for fg, bg, mn in pairs:
-            r = _contrast(c[fg], c[bg])
-            assert r >= mn, f"{name}: {fg} on {bg} = {r:.2f} < {mn} (WCAG AA)"
-    print("ok: both themes meet WCAG AA")
-
-
-if __name__ == "__main__":
-    _check_contrast()

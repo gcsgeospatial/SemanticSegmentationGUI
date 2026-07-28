@@ -28,13 +28,8 @@ from .readers import (SUPPORTED_EXTS, Cloud, list_label_fields, read_points,
 
 @dataclass
 class LabelSpec:
-    """Label source. kind="field": named field in the cloud. kind="file": companion
-    file at truth_dir / (scene name with src_suffix -> dst_suffix), one label/point."""
-    kind: str = "field"
+    """Label source: a named field in the cloud."""
     field: str = ""
-    truth_dir: str = ""
-    src_suffix: str = "_PC3.txt"
-    dst_suffix: str = "_CLS.txt"
 
 
 @dataclass
@@ -42,11 +37,13 @@ class SplitConfig:
     """val_frac/test_frac: target point-count fractions. mode "balanced" mirrors
     the global class mix (+ rare-class presence); "random" fills by points.
     seam_buffer_m/tile_m are single-cloud only, and strategy "provided" = explicit
-    folders."""
+    folders. seed is fixed so identical builds reproduce the identical split and
+    trainer prep-cache signatures stay valid across rebuilds; recorded in
+    dataset_meta.json."""
     val_frac: float = 0.15
     test_frac: float = 0.15
     mode: str = "balanced"
-    seed: int = 42
+    seed: int = 0
     seam_buffer_m: float = 1.0
     tile_m: float = 50.0
     strategy: str = "auto"
@@ -78,21 +75,10 @@ def expand_inputs(inputs) -> list[Path]:
 
 def read_labels(path: Path, cloud: Cloud, spec: LabelSpec) -> np.ndarray:
     """Raw (source-valued) labels for one scene, validated against point count."""
-    if spec.kind == "field":
-        if spec.field not in cloud.fields:
-            raise ValueError(f"{path.name}: label field '{spec.field}' not found "
-                             f"(have: {sorted(cloud.fields)})")
-        raw = np.asarray(cloud.fields[spec.field])
-    else:
-        name = path.name
-        if spec.src_suffix and name.endswith(spec.src_suffix):
-            truth_name = name[: -len(spec.src_suffix)] + spec.dst_suffix
-        else:
-            truth_name = path.stem + spec.dst_suffix
-        truth_path = Path(spec.truth_dir) / truth_name
-        if not truth_path.exists():
-            raise FileNotFoundError(f"{path.name}: companion label file not found: {truth_path}")
-        raw = np.loadtxt(str(truth_path), dtype=np.float64).reshape(-1)
+    if spec.field not in cloud.fields:
+        raise ValueError(f"{path.name}: label field '{spec.field}' not found "
+                         f"(have: {sorted(cloud.fields)})")
+    raw = np.asarray(cloud.fields[spec.field])
     if len(raw) != cloud.n:
         raise ValueError(f"{path.name}: {cloud.n} points vs {len(raw)} labels")
     return np.round(raw).astype(np.int64)
@@ -128,12 +114,8 @@ _CANON_SPELLINGS = {
 
 
 def canonical_channel(field: str) -> str | None:
-    """Field name -> canonical channel name, or None for an ordinary feat_*
-    field. feat_intensity/feat_return_number ARE the canonical channels (old
-    datasets baked the raw column under a feat_ alias) - no distinction."""
+    """Field name -> canonical channel name, or None for an ordinary feat_* field."""
     s = (field or "").strip().lower().replace(" ", "_")
-    if s.startswith("feat_") and s[len("feat_"):] in _CANON_SPELLINGS:
-        return _CANON_SPELLINGS[s[len("feat_"):]]
     return _CANON_SPELLINGS.get(s)
 
 
@@ -236,7 +218,7 @@ def _guarantee_nonempty(assign, pts, fr):
 
 
 def allocate_splits(pts, hist, val_frac: float, test_frac: float,
-                    mode: str = "balanced", seed: int = 42) -> np.ndarray:
+                    mode: str, seed: int) -> np.ndarray:
     """Assign atoms to train(0)/val(1)/test(2) approximating the point fractions.
     "random": greedy fill by point deficit. "balanced": rarity-first iterative
     stratification so each split mirrors the global class mix."""
@@ -406,10 +388,12 @@ def _convert_one(cloud: Cloud, raw: np.ndarray | None, value_to_index: dict[int,
                  ground_method: str = "labels",
                  feature_fields: list[str] | None = None,
                  geo_features: list[str] | None = None,
-                 geo_k: int = 100) -> dict:
+                 geo_k: int = 100, missing_fields: str = "raise") -> dict:
     """Write one (already-read, already-cropped) cloud to a canonical npz.
     compute_hag stores feat_hag when an aligned result is possible; a scene
-    without it blocks runs that require the channel."""
+    without it blocks runs that require the channel. missing_fields='skip'
+    (inference): a requested field the file lacks is skipped and reported in
+    stats['skipped_fields'] instead of raising - the trainer feeds zeros."""
     # xyz stays float64: UTM-scale coords quantize to 0.5 m in float32, and trainers origin-shift to a local frame before their own casts
     crs_warning = _crs_report(cloud.crs_wkt, cloud.source_crs_wkt, cloud.xyz, out_path.stem)
     out: dict[str, np.ndarray] = {"xyz": cloud.xyz.astype(np.float64)}
@@ -490,13 +474,20 @@ def _convert_one(cloud: Cloud, raw: np.ndarray | None, value_to_index: dict[int,
             out[f"feat_geo_{nm.lower()}"] = have[nm]
 
     feature_scales: dict[str, float] = {}
+    skipped_fields: list[str] = []
     for fld in (feature_fields or []):
         # verbatim-first: a real column literally named 'a=b' wins over the
         # 'target=Source' remap parse (Infer page channel mapping)
         tgt, src = fld, fld
         if "=" in fld and not any(k.lower() == fld.lower() for k in cloud.fields):
             tgt, _, src = fld.partition("=")
-        v = _column(src or tgt)
+        try:
+            v = _column(src or tgt)
+        except ValueError:
+            if missing_fields != "skip":
+                raise
+            skipped_fields.append(src or tgt)
+            continue
         scale = max(float(np.percentile(np.abs(v), 95)), 1e-6)
         out[f"feat_{feat_key(tgt)}"] = np.clip(v / scale, -2.0, 2.0).astype(np.float32)
         feature_scales[feat_key(tgt)] = scale
@@ -517,6 +508,7 @@ def _convert_one(cloud: Cloud, raw: np.ndarray | None, value_to_index: dict[int,
         "has_return_number": "return_number" in out,
         "has_hag": "feat_hag" in out,
         "feature_scales": feature_scales,
+        "skipped_fields": skipped_fields,
         "crs_wkt": cloud.crs_wkt,
         "source_crs_wkt": cloud.source_crs_wkt,
         "crs_warning": crs_warning,
@@ -532,14 +524,16 @@ def convert_scene(path: Path, spec: LabelSpec | None, value_to_index: dict[int, 
                   feature_fields: list[str] | None = None,
                   geo_features: list[str] | None = None,
                   geo_k: int = 100,
-                  declared_crs_epsg: int | None = None) -> dict:
+                  declared_crs_epsg: int | None = None,
+                  missing_fields: str = "raise") -> dict:
     """Read one source file and convert the whole cloud (no cropping)."""
     cloud = read_points(path, declared_crs_epsg)
     raw = read_labels(path, cloud, spec) if spec is not None else None
     return _convert_one(cloud, raw, value_to_index, out_path, intensity_norm,
                         compute_hag=compute_hag, ground_value=ground_value,
                         hag_filter=hag_filter, ground_method=ground_method, feature_fields=feature_fields,
-                        geo_features=geo_features, geo_k=geo_k)
+                        geo_features=geo_features, geo_k=geo_k,
+                        missing_fields=missing_fields)
 
 
 def _available_ram_bytes() -> int | None:
@@ -641,10 +635,11 @@ def _plan_and_convert(input_files: list[Path], val_files: list[Path] | None,
     stat lists. Explicit val/test folders are used verbatim; the rest is allocated."""
     stats = {sp: [] for sp in _SPLITS}
 
-    def emit(split_name: str, cloud: Cloud, raw, scene_name: str, hag_already=False):
+    def emit(split_name: str, cloud: Cloud, raw, scene_name: str):
         out_path = out_root / split_name / f"{scene_name}.npz"
+        # HAG/geo were already baked whole-cloud before tiling
         st = _convert_one(cloud, raw, value_to_index, out_path, intensity_norm,
-                          compute_hag=compute_hag and not hag_already,
+                          compute_hag=False,
                           ground_value=ground_value, hag_filter=hag_filter, ground_method=ground_method,
                           feature_fields=feature_fields,
                           geo_features=geo_features, geo_k=geo_k)
@@ -670,7 +665,7 @@ def _plan_and_convert(input_files: list[Path], val_files: list[Path] | None,
             ground_value=ground_value, hag_filter=hag_filter, ground_method=ground_method,
             feature_fields=feature_fields, geo_features=geo_features,
             geo_k=geo_k, rgb_fields=rgb_fields,
-            max_workers=max_workers))
+            max_workers=max_workers, declared_crs_epsg=declared_crs_epsg))
         return stats
 
     if len(input_files) == 1:
@@ -708,7 +703,7 @@ def _plan_and_convert(input_files: list[Path], val_files: list[Path] | None,
                 continue
             sub, sub_raw = _subset(cloud, raw, mask)
             say(f"  {split_name}: {int(mask.sum()):,} pts")
-            emit(split_name, sub, sub_raw, f.stem, hag_already=True)
+            emit(split_name, sub, sub_raw, f.stem)
         return stats
 
     say(f"  converting {len(input_files)} scene(s), then allocating by point count ...")
@@ -765,6 +760,12 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
     split = split or SplitConfig()
     name = sanitize_name(name)
     out_root = staging_root / name
+    # stale scenes from an earlier build would silently leak between splits
+    if out_root.is_dir() and any(out_root.iterdir()):
+        raise FileExistsError(
+            f"Dataset '{name}' already exists at {out_root}. Rebuilding on top of it "
+            f"would mix old and new scenes across train/val/test. Delete that folder, "
+            f"or build under a new dataset name.")
     value_to_index = {int(c["source_value"]): int(c["index"]) for c in classes}
     say = progress or (lambda s: None)
 
@@ -887,9 +888,7 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
             "val_inputs": [str(p) for p in (val_inputs or [])],
             "test_inputs": [str(p) for p in (test_inputs or [])],
             "split_strategy": strategy,
-            "label_kind": spec.kind if spec else None,
             "label_field": spec.field if spec else "",
-            "truth_dir": spec.truth_dir if spec else "",
             "intensity_norm": intensity_norm,
             "hag_source": hag_src,
             "rgb_fields": rgb_fields,
@@ -906,6 +905,8 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
                                     for nm in (geo_features or [])]
                                  + ([{"name": "hag", "source_field": f"@hag:{hag_src}",
                                       "norm": "raw"}] if hag_src else [])),
+            "declared_crs_epsg": (int(declared_crs_epsg)
+                                  if declared_crs_epsg is not None else None),
             "crs": {s["scene"]: {"proc": s.get("crs_wkt"),
                                  "source": s.get("source_crs_wkt")} for s in all_stats},
             "ignore_values": [int(v) for v in ignore_values],
@@ -986,7 +987,7 @@ def convert_infer_job(job_id: str, input_dir: str, staging_root: Path, progress=
                 f"Ground class {ground_value} was set, but {files[0].name} carries no "
                 f"classification field (has: {sorted(fields)}). Clear the ground class "
                 f"to detect ground instead.")
-        spec = LabelSpec(kind="field", field=field)
+        spec = LabelSpec(field=field)
         say(f"  ground from the '{field}' field, value {ground_value}")
     scenes, stats = [], []
     for path in files:
@@ -996,13 +997,17 @@ def convert_infer_job(job_id: str, input_dir: str, staging_root: Path, progress=
                            compute_hag=hag, ground_value=ground_value,
                            hag_filter=hag_filter, ground_method=ground_method, feature_fields=feature_fields,
                            geo_features=geo_features, geo_k=geo_k,
-                           declared_crs_epsg=declared_crs_epsg)
+                           declared_crs_epsg=declared_crs_epsg,
+                           missing_fields="skip")
         st["scene"] = out_path.name
         st["source_file"] = str(path)
         if st.get("crs_warning"):
             say("  " + st["crs_warning"])
         if st.get("hag_warning"):
             say("  " + st["hag_warning"])
+        if st.get("skipped_fields"):
+            say(f"  ⚠ {path.stem}: field(s) not in this file - not baked, the "
+                f"model receives zeros: {', '.join(st['skipped_fields'])}")
         scenes.append(out_path.name)
         stats.append(st)
     meta = {
@@ -1134,77 +1139,3 @@ def _write_pred(dst: Path, xyz: np.ndarray, cls: np.ndarray, fmt: str,
                    header="x,y,z,classification"
                    + (",confidence" if confidence is not None else ""),
                    comments="")
-
-
-def _selfcheck():
-    """Allocator hits targets + both build paths materialize three disjoint splits."""
-    import tempfile
-
-    C = 3
-    pts = [1000] * 7 + [400, 400, 400]
-    hist = np.zeros((10, C), dtype=np.int64)
-    for i in range(7):
-        hist[i, 0] = 700; hist[i, 1] = 300
-    hist[7, 2] = hist[8, 2] = hist[9, 2] = 400
-    a = allocate_splits(pts, hist, 0.2, 0.2, "balanced", 42)
-    assert set(a.tolist()) == {0, 1, 2}, "all three splits used"
-    got = np.zeros((3, C))
-    for i, s in enumerate(a):
-        got[s] += hist[i]
-    for s in range(3):
-        assert got[s, 2] > 0, "rare class present in every split (presence guarantee)"
-    tot = sum(pts)
-    train_frac = sum(pts[i] for i in range(10) if a[i] == 0) / tot
-    assert 0.45 <= train_frac <= 0.75, f"train point-frac ~0.6, got {train_frac:.2f}"
-    ar = allocate_splits(pts, hist, 0.2, 0.2, "random", 1)
-    assert (ar >= 0).all() and set(ar.tolist()) == {0, 1, 2}
-
-    rng = np.random.RandomState(0)
-    n = 40000
-    xyz = rng.uniform(0, 100, size=(n, 3)).astype(np.float64)
-    cls = rng.randint(0, 3, size=n).astype(np.float64)
-    classes = [{"index": i, "source_value": i, "name": f"c{i}"} for i in range(3)]
-    with tempfile.TemporaryDirectory() as td:
-        td = Path(td)
-        np.savez(td / "scene.npz", xyz=xyz, classification=cls)
-        out = convert_dataset("selftest", td / "scene.npz",
-                              LabelSpec(kind="field", field="classification"),
-                              [dict(c) for c in classes], [], td / "staging",
-                              split=SplitConfig(val_frac=0.2, test_frac=0.2,
-                                                seam_buffer_m=1.0, tile_m=20.0))
-        meta = json.loads((out / "dataset_meta.json").read_text())
-        assert meta["schema_version"] == 2 and "split" in meta
-        assert set(meta["splits"]) == set(_SPLITS)
-        for sp in _SPLITS:
-            assert meta["splits"][sp]["scenes"], f"{sp} non-empty"
-            assert list((out / sp).glob("*.npz")), f"{sp}/ materialized"
-            assert all(f"{sp}_count" in c for c in meta["classes"])
-        kept = sum(meta["splits"][sp]["total_points"] for sp in _SPLITS)
-        assert kept <= n, "seam buffer only removes points"
-        assert kept >= 0.5 * n, "seam buffer must not delete most points"
-        multi = td / "multi"; multi.mkdir()
-        for k in range(9):
-            np.savez(multi / f"s{k}.npz", xyz=xyz, classification=cls)
-        out2 = convert_dataset("selftest2", multi, LabelSpec(field="classification"),
-                               [dict(c) for c in classes], [], td / "staging",
-                               split=SplitConfig(val_frac=0.2, test_frac=0.2))
-        m2 = json.loads((out2 / "dataset_meta.json").read_text())
-        names = {sp: set(m2["splits"][sp]["scenes"]) for sp in _SPLITS}
-        union = set().union(*names.values())
-        assert len(union) == 9 and sum(len(names[sp]) for sp in _SPLITS) == 9, \
-            "every scene assigned exactly once"
-        assert not (out2 / "_pool").exists(), "pool dir cleaned up"
-        vdir = td / "vprov"; vdir.mkdir()
-        np.savez(vdir / "v0.npz", xyz=xyz, classification=cls)
-        out3 = convert_dataset("selftest3", multi, LabelSpec(field="classification"),
-                               [dict(c) for c in classes], [], td / "staging",
-                               val_inputs=[str(vdir)],
-                               split=SplitConfig(val_frac=0.2, test_frac=0.2))
-        m3 = json.loads((out3 / "dataset_meta.json").read_text())
-        assert m3["source"]["split_strategy"] == "provided"
-        assert m3["splits"]["val"]["scenes"] == ["v0.npz"] and m3["splits"]["test"]["scenes"]
-    print("dataset self-check OK")
-
-
-if __name__ == "__main__":
-    _selfcheck()

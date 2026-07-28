@@ -6,7 +6,7 @@ import shutil
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, QEvent, QObject, Qt
+from PySide6.QtCore import QByteArray, QEvent, QObject
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (QAbstractSpinBox, QApplication, QComboBox, QFileDialog, QHBoxLayout,
                                QLabel, QListWidget, QListWidgetItem, QMessageBox, QStackedWidget,

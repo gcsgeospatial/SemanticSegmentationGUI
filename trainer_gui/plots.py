@@ -1,6 +1,5 @@
 """Run-artifact figures, drawn into Figure() directly (no pyplot - works headless
-and embedded). Sources: val_metrics.csv, metrics.csv, test_metrics.json,
-run.json (run_config.json on legacy runs).
+and embedded). Sources: val_metrics.csv, metrics.csv, test_metrics.json, run.json.
 """
 
 from __future__ import annotations
@@ -53,15 +52,11 @@ def read_csv_columns(path: Path) -> dict[str, list]:
 
 
 def read_config(run_dir: Path) -> dict:
-    # run.json is the single run record; run_config.json = legacy runs.
-    for fn in ("run.json", "run_config.json"):
-        p = Path(run_dir) / fn
-        if p.exists():
-            try:
-                return json.loads(p.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                return {}
-    return {}
+    p = Path(run_dir) / "run.json"
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
 
 
 def read_test_metrics(run_dir: Path) -> dict:
@@ -99,18 +94,6 @@ def series(run_dir: Path, metric: str) -> tuple[list, list]:
     return [], []
 
 
-val_series = series
-
-
-def full_series(run_dir: Path, metric: str) -> tuple[list, list]:
-    """The full raw-scored val row(s) - only when a proxy curve exists, else
-    series() already returned them."""
-    cols = read_csv_columns(Path(run_dir) / "val_metrics.csv")
-    if metric not in cols or not cols.get("epoch") or not _rows(cols, metric, True)[0]:
-        return [], []
-    return _rows(cols, metric, proxy=False)
-
-
 def _has_data(cols: dict, name: str) -> bool:
     return any(v is not None for v in cols.get(name, []))
 
@@ -130,7 +113,7 @@ def available_metrics(run_dir: Path) -> list[str]:
 def is_run_dir(d: Path) -> bool:
     d = Path(d)
     return d.is_dir() and any((d / fn).exists()
-                              for fn in ("val_metrics.csv", "run.json", "run_config.json"))
+                              for fn in ("val_metrics.csv", "run.json"))
 
 
 def discover_runs(root: Path) -> list[Path]:
@@ -162,9 +145,47 @@ def run_label(run_dir: Path) -> str:
     return f"{name}" + (f"  [{bb}]" if bb else "")
 
 
+# CVD-validated fixed hue order (dataviz six-checks, light surface); runs beyond
+# the named hues fold to gray so hues are never cycled or repainted.
+RUN_COLORS = ["#0072B2", "#E69F00", "#009E73", "#56B4E9", "#D55E00", "#CC79A7"]
+FOLD_COLOR = "#9a9a9a"
+
+
+def run_colors(run_dirs) -> dict[str, str]:
+    """Selection-order -> fixed hue, stable across every view in one redraw."""
+    return {str(d): (RUN_COLORS[i] if i < len(RUN_COLORS) else FOLD_COLOR)
+            for i, d in enumerate(run_dirs)}
+
+
+def full_points(run_dir: Path, metric: str) -> tuple[list, list]:
+    """(epochs, values) of raw-scored full-eval rows - the honest numbers, on a
+    different scale than the proxy curve, so they draw as distinct star marks."""
+    cols = read_csv_columns(Path(run_dir) / "val_metrics.csv")
+    if metric in cols and cols.get("epoch"):
+        return _rows(cols, metric, proxy=False)
+    return [], []
+
+
+def final_scores(run_dir: Path) -> dict:
+    """{'val'|'test': {'acc','miou','per_class'}} from test_metrics.json."""
+    tm = read_test_metrics(run_dir)
+    out = {}
+    for split in ("val", "test"):
+        m = tm.get(split) or {}
+        out[split] = {"acc": m.get("overall_acc"), "miou": m.get("overall_mIoU"),
+                      "per_class": m.get("per_class_iou") or {}}
+    return out
+
+
+def _no_data(ax, msg):
+    ax.text(0.5, 0.5, msg, ha="center", va="center",
+            transform=ax.transAxes, color="#888", fontsize=9)
+
+
 def multi_run_figure(run_dirs, metric: str = "val_miou", *, show_runs: bool = True,
                      show_avg: bool = True, fig: Figure | None = None) -> Figure:
-    """Overlay `metric` vs epoch for each run; optional mean ± std band across runs.
+    """Overlay `metric` vs epoch per run (entity-stable colors), full-eval rows
+    as stars, optional mean ± std band across runs.
 
     The average is computed per epoch over whichever runs reported that epoch
     (val passes share a stride, so curves line up); a ±1 std band shows spread.
@@ -172,124 +193,175 @@ def multi_run_figure(run_dirs, metric: str = "val_miou", *, show_runs: bool = Tr
     fig = fig or Figure(figsize=(9, 5.5))
     fig.clear()
     ax = fig.add_subplot(111)
+    colors = run_colors(run_dirs)
 
-    series = []
+    curves, starred = [], False
     for d in run_dirs:
-        xs, ys = val_series(d, metric)
-        if xs:
-            series.append((run_label(d), dict(zip(xs, ys))))
-            if show_runs:
-                ax.plot(xs, ys, marker="o", ms=3, lw=1.3,
-                        alpha=0.7 if (show_avg and len(run_dirs) > 1) else 1.0,
-                        label=run_label(d))
+        xs, ys = series(d, metric)
+        if not xs:
+            continue
+        c = colors[str(d)]
+        curves.append((run_label(d), dict(zip(xs, ys))))
+        if show_runs:
+            ax.plot(xs, ys, marker="o", ms=3.5, lw=2, color=c,
+                    alpha=0.75 if (show_avg and len(run_dirs) > 1) else 1.0,
+                    label=run_label(d))
+            fx, fy = full_points(d, metric)
+            if fx:
+                ax.plot(fx, fy, "*", ms=13, color=c, mec="white", mew=0.8,
+                        zorder=6, label="full eval (raw)" if not starred else None)
+                starred = True
 
-    if show_avg and len(series) >= 2:
-        epochs = sorted({e for _, m in series for e in m})
-        xs2, mean, std = [], [], []
-        for e in epochs:
-            vals = [m[e] for _, m in series if e in m]
-            xs2.append(e)
-            mean.append(float(np.mean(vals)))
-            std.append(float(np.std(vals)))
-        xs2, mean, std = np.array(xs2), np.array(mean), np.array(std)
+    if show_avg and len(curves) >= 2:
+        epochs = sorted({e for _, m in curves for e in m})
+        xs2 = np.array(epochs)
+        mean = np.array([float(np.mean([m[e] for _, m in curves if e in m]))
+                         for e in epochs])
+        std = np.array([float(np.std([m[e] for _, m in curves if e in m]))
+                        for e in epochs])
         ax.plot(xs2, mean, color="black", lw=2.6, zorder=5,
-                label=f"average (n={len(series)})")
+                label=f"average (n={len(curves)})")
         ax.fill_between(xs2, mean - std, mean + std, color="black", alpha=0.12,
                         zorder=1, label="±1 std")
 
-    if not series:
-        ax.text(0.5, 0.5, "No val_metrics.csv in the selected run(s).",
-                ha="center", va="center", transform=ax.transAxes, color="#888")
+    if not curves:
+        _no_data(ax, "No val_metrics.csv in the selected run(s).")
     ax.set_xlabel("epoch")
     ax.set_ylabel(metric_label(metric))
     ax.set_title(f"{metric_label(metric)} vs epoch")
-    ax.grid(alpha=0.3)
-    if series:
+    ax.grid(alpha=0.25)
+    if curves:
         ax.legend(fontsize=8, ncol=2)
     fig.tight_layout()
     return fig
 
 
-def single_run_figure(run_dir: Path, fig: Figure | None = None) -> Figure:
-    """Compact 2x2 dashboard for one run, focused on the val curves the periodic
-    val pass records (the live train metrics are already on the Train page)."""
-    run_dir = Path(run_dir)
-    fig = fig or Figure(figsize=(12, 8))
+_DASH_PANELS = (("val_miou", "validation mIoU"), ("train_loss", "train loss"),
+                ("lr", "learning rate"), ("sec_per_epoch", "sec / epoch"))
+
+
+def dashboard_figure(run_dirs, fig: Figure | None = None) -> Figure:
+    """2x2 training-dynamics small multiples: val mIoU (+ full-eval stars),
+    train loss, lr (log), epoch time. One axis per measure - never dual-axis."""
+    fig = fig or Figure(figsize=(9, 5.5))
     fig.clear()
-    cfg = read_config(run_dir)
-    test = read_test_metrics(run_dir)
-    axes = fig.subplots(2, 2)
-    title = f"{cfg.get('backbone', 'model')}  |  {cfg.get('dataset', '')}  |  {run_dir.name}"
-    fig.suptitle(title, fontsize=13, fontweight="bold")
+    colors = run_colors(run_dirs)
+    axes = fig.subplots(2, 2).ravel()
+    handles = {}
+    for ax, (metric, title) in zip(axes, _DASH_PANELS):
+        drew = False
+        for d in run_dirs:
+            xs, ys = series(d, metric)
+            if not xs:
+                continue
+            c = colors[str(d)]
+            (line,) = ax.plot(xs, ys, lw=2, ms=3, marker="o", color=c)
+            handles.setdefault(run_label(d), line)
+            drew = True
+            if metric == "val_miou":
+                fx, fy = full_points(d, metric)
+                if fx:
+                    ax.plot(fx, fy, "*", ms=12, color=c, mec="white",
+                            mew=0.8, zorder=6)
+        if metric == "lr" and drew:
+            ax.set_yscale("log")
+        if not drew:
+            _no_data(ax, f"no {title} data")
+        ax.set_title(title, fontsize=10)
+        ax.grid(alpha=0.25)
+        ax.tick_params(labelsize=8)
+    axes[2].set_xlabel("epoch", fontsize=9)
+    axes[3].set_xlabel("epoch", fontsize=9)
+    if handles:
+        fig.legend(handles.values(), handles.keys(), loc="lower center",
+                   fontsize=8, ncol=min(len(handles), 3), frameon=False)
+    fig.tight_layout(rect=(0, 0.07, 1, 1))
+    return fig
 
-    ax = axes[0, 0]
-    for metric, color in (("val_miou", "C0"), ("val_acc", "C1")):
-        xs, ys = val_series(run_dir, metric)
-        if xs:
-            ax.plot(xs, ys, marker="o", ms=3, color=color, label=metric_label(metric))
-        fx, fy = full_series(run_dir, metric)
-        if fx:      # raw-scored: a different scale, so a marker, never the line
-            ax.plot(fx, fy, marker="*", ms=11, ls="none", color=color,
-                    label=f"{metric_label(metric)} (Full Eval)")
-    for split, color in (("val", "C2"), ("test", "C3")):
-        miou = (test.get(split) or {}).get("overall_mIoU")
-        if miou is not None:
-            ax.axhline(miou, color=color, ls=":", lw=1.5, label=f"{split} final mIoU={miou:.3f}")
-    ax.set(title="Validation mIoU / accuracy", xlabel="epoch", ylim=(0, 1))
-    ax.grid(alpha=0.3)
-    ax.legend(fontsize=8)
 
-    ax = axes[0, 1]
-    cols = read_csv_columns(run_dir / "val_metrics.csv")
-    plotted = False
-    proxy = "val_miou" in cols and bool(_rows(cols, "val_miou", True)[0])
-    for name in [c for c in cols if c.startswith("iou_")]:
-        xs, ys = _rows(cols, name, proxy=proxy)
-        if xs:
-            ax.plot(xs, ys, marker=".", ms=4, label=name[4:])
-            plotted = True
-    if not plotted:
-        ax.text(0.5, 0.5, "no per-class val IoU", ha="center", va="center",
-                transform=ax.transAxes, color="#888")
-    ax.set(title="Per-class validation IoU", xlabel="epoch", ylim=(0, 1))
-    ax.grid(alpha=0.3)
-    if plotted:
-        ax.legend(fontsize=8, ncol=2)
+def class_iou_figure(run_dirs, fig: Figure | None = None) -> Figure:
+    """Per-class final IoU (test split, val fallback) as horizontal bars; up to
+    4 runs grouped side by side, classes sorted by the first run's score."""
+    fig = fig or Figure(figsize=(9, 5.5))
+    fig.clear()
+    ax = fig.add_subplot(111)
+    colors = run_colors(run_dirs)
+    shown = list(run_dirs)[:4]
 
-    ax = axes[1, 0]
-    m = read_csv_columns(run_dir / "metrics.csv")
-    me = m.get("epoch") or []
-    if m.get("train_loss"):
-        ax.plot([e for e in me], m["train_loss"], color="C0", label="train loss")
-    ax.set(title="Training loss / mIoU", xlabel="epoch")
-    ax.grid(alpha=0.3)
-    if m.get("train_iou"):
-        ax2 = ax.twinx()
-        ax2.plot([e for e in me], m["train_iou"], color="C4", label="train mIoU")
-        ax2.set_ylim(0, 1)
-        ax2.set_ylabel("train mIoU", color="C4")
-    ax.legend(fontsize=8, loc="center right")
+    per_run = []
+    for d in shown:
+        fs = final_scores(d)
+        pc = fs["test"]["per_class"] or fs["val"]["per_class"]
+        if pc:
+            per_run.append((d, pc))
+    if not per_run:
+        _no_data(ax, "No test_metrics.json in the selected run(s) - "
+                     "finish (or gracefully stop) a run to get final scores.")
+        fig.tight_layout()
+        return fig
 
-    ax = axes[1, 1]
-    ref = test.get("test") or test.get("val") or {}
-    classes = list((ref.get("per_class_iou") or {}).keys())
-    if classes:
-        idx = np.arange(len(classes))
-        w = 0.4
-        val_pc = (test.get("val") or {}).get("per_class_iou", {})
-        test_pc = (test.get("test") or {}).get("per_class_iou", {})
-        if val_pc:
-            ax.bar(idx - w / 2, [val_pc.get(c, 0) for c in classes], w, label="val", color="C2")
-        if test_pc:
-            ax.bar(idx + w / 2, [test_pc.get(c, 0) for c in classes], w, label="test", color="C3")
-        ax.set_xticks(idx)
-        ax.set_xticklabels(classes, rotation=30, ha="right", fontsize=8)
-        ax.set(title="Final per-class IoU", ylim=(0, 1))
-        ax.legend(fontsize=8)
-        ax.grid(alpha=0.3, axis="y")
+    classes = sorted({c for _, pc in per_run for c in pc},
+                     key=lambda c: -(per_run[0][1].get(c) or 0))
+    ypos = np.arange(len(classes), dtype=float)
+    h = 0.8 / len(per_run)
+    for i, (d, pc) in enumerate(per_run):
+        vals = [pc.get(c) or 0.0 for c in classes]
+        c = colors[str(d)]
+        bars = ax.barh(ypos - 0.4 + h * (i + 0.5), vals, height=h * 0.9,
+                       color=c, label=run_label(d))
+        if len(per_run) == 1:
+            for b, v in zip(bars, vals):
+                ax.text(v + 0.01, b.get_y() + b.get_height() / 2, f"{v:.2f}",
+                        va="center", fontsize=8, color="#444")
+    ax.set_yticks(ypos, classes)
+    ax.invert_yaxis()
+    ax.set_xlim(0, 1.12 if len(per_run) == 1 else 1.02)
+    ax.set_xlabel("IoU")
+    dropped = len(list(run_dirs)) - len(shown)
+    ax.set_title("Per-class IoU (final eval)"
+                 + (f"  ·  first 4 of {len(list(run_dirs))} selected" if dropped > 0 else ""))
+    ax.grid(alpha=0.25, axis="x")
+    if len(per_run) > 1:
+        # below the axes: with grouped bars no corner is reliably empty
+        fig.legend(fontsize=8, loc="lower center", ncol=min(len(per_run), 3),
+                   frameon=False)
+        fig.tight_layout(rect=(0, 0.07, 1, 1))
     else:
-        ax.set_title("Final per-class IoU (no test_metrics.json)")
-        ax.axis("off")
+        fig.tight_layout()
+    return fig
 
-    fig.tight_layout(rect=(0, 0, 1, 0.96))
+
+def leaderboard_figure(run_dirs, fig: Figure | None = None) -> Figure:
+    """Final test mIoU per run (val fallback, marked), sorted best-first,
+    direct-labeled; bars keep each run's selection color."""
+    fig = fig or Figure(figsize=(9, 5.5))
+    fig.clear()
+    ax = fig.add_subplot(111)
+    colors = run_colors(run_dirs)
+
+    rows = []
+    for d in run_dirs:
+        fs = final_scores(d)
+        if fs["test"]["miou"] is not None:
+            rows.append((run_label(d), fs["test"]["miou"], colors[str(d)], ""))
+        elif fs["val"]["miou"] is not None:
+            rows.append((run_label(d), fs["val"]["miou"], colors[str(d)], " (val)"))
+    if not rows:
+        _no_data(ax, "No test_metrics.json in the selected run(s) - "
+                     "finish (or gracefully stop) a run to get final scores.")
+        fig.tight_layout()
+        return fig
+
+    rows.sort(key=lambda r: -r[1])
+    ypos = np.arange(len(rows))
+    ax.barh(ypos, [r[1] for r in rows], height=0.6, color=[r[2] for r in rows])
+    ax.set_yticks(ypos, [r[0] + r[3] for r in rows])
+    ax.invert_yaxis()
+    for y, (_, v, _, _) in zip(ypos, rows):
+        ax.text(v + 0.01, y, f"{v:.3f}", va="center", fontsize=9, color="#444")
+    ax.set_xlim(0, 1.05)
+    ax.set_xlabel("final mIoU (test; '(val)' = no test split)")
+    ax.set_title("Run leaderboard")
+    ax.grid(alpha=0.25, axis="x")
+    fig.tight_layout()
     return fig

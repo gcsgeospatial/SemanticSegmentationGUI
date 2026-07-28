@@ -11,12 +11,10 @@ from typing import Any
 
 
 def _app_base(platform: str, environ) -> Path:
-    """Per-OS app-data base; APPDATA is honored on every platform (test override knob)."""
-    if environ.get("APPDATA"):
-        return Path(environ["APPDATA"])
+    """Per-OS app-data base."""
     home = Path.home()
     if platform == "win32":
-        return Path(environ.get("LOCALAPPDATA") or home)
+        return Path(environ.get("APPDATA") or environ.get("LOCALAPPDATA") or home)
     if platform == "darwin":
         return home / "Library" / "Application Support"
     return Path(environ.get("XDG_CONFIG_HOME") or (home / ".config"))
@@ -68,9 +66,6 @@ def run_roots(repo_root: str | None = None) -> list[Path]:
     roots = [*dataset_run_roots(), workspace_dir() / "inference", runs_dir()]
     if repo_root:
         roots.append(Path(repo_root) / "runs")
-    out = get("local_train_out", "")
-    if out:
-        roots.append(Path(out) / "runs")
     return roots
 
 
@@ -102,7 +97,27 @@ def set_exec_mode(mode: str) -> None:
     put("exec_mode", "local" if mode == "local" else "modal")
 
 
-# local-backend defaults; retired keys in old state.json (docker-era) are ignored
+def modal_datasets_volume() -> str:
+    """Modal volume datasets upload to; user-set on the Datasets page."""
+    return (get("modal_datasets_volume") or os.environ.get("TT_DATASET_VOLUME")
+            or "terminal-datasets")
+
+
+def set_modal_datasets_volume(name: str) -> None:
+    put("modal_datasets_volume", name.strip())
+
+
+def modal_outputs_volume() -> str:
+    """Custom Modal outputs volume; '' = the per-model '<app>-outputs' default."""
+    return (get("modal_outputs_volume") or os.environ.get("TT_OUTPUTS_VOLUME")
+            or "").strip()
+
+
+def set_modal_outputs_volume(name: str) -> None:
+    put("modal_outputs_volume", name.strip())
+
+
+# local-backend defaults
 _DEFAULT_LOCAL_CONFIG = {
     "datasets_root": "",
     "outputs_root": "",
@@ -202,11 +217,6 @@ def delete_dataset(name: str) -> tuple[str, str]:
 
     # forget first so the list reflects the delete even if cleanup fails
     forget_dataset(name)
-    for key in ("dg_config",):
-        allc = get(key, {})
-        if name in allc:
-            allc.pop(name, None)
-            put(key, allc)
 
     err = ""
     if staged and os.path.isdir(staged):

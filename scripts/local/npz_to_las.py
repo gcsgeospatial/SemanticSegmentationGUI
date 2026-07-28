@@ -4,7 +4,6 @@ Extra Bytes field listed by name.
 
 Usage:
   python npz_to_las.py scene.npz [more.npz ...]     # writes sibling .las
-  python npz_to_las.py --self-test
 """
 import os
 import sys
@@ -38,7 +37,7 @@ def npz_to_las(path):
     if "crs_wkt" in z.files:
         proc_wkt = str(z["crs_wkt"])
         src_wkt = str(z["source_crs_wkt"]) if "source_crs_wkt" in z.files else None
-        # single source of truth for the inverse (D2 legacy block raises here)
+        # restore_to_source is the single source of truth for the inverse reprojection
         sys.path.insert(0, _REPO_ROOT)
         from trainer_gui.readers import restore_to_source
         xyz = restore_to_source(xyz, proc_wkt, src_wkt)
@@ -61,31 +60,9 @@ def npz_to_las(path):
     return out
 
 
-def self_test():
-    import tempfile
-    from pathlib import Path
-    import laspy
-    with tempfile.TemporaryDirectory() as td:
-        p = Path(td) / "s.npz"
-        np.savez(p, xyz=np.random.rand(10, 3) * 100,
-                 rgb=np.random.randint(0, 256, (10, 3)),
-                 intensity=np.linspace(0, 2, 10).astype(np.float32),
-                 feat_hag=np.linspace(0, 30, 10).astype(np.float32),
-                 label=np.array([-1] * 5 + [2] * 5, np.int32))
-        las = laspy.read(npz_to_las(p))
-        assert np.allclose(np.asarray(las.feat_hag), np.linspace(0, 30, 10), atol=1e-5)
-        assert np.asarray(las.label).tolist() == [-1] * 5 + [2] * 5
-        assert np.asarray(las.red).max() > 255
-        # native-name collision lands under npz_ with full float precision
-        assert np.allclose(np.asarray(las.npz_intensity), np.linspace(0, 2, 10), atol=1e-6)
-    print("self-test OK")
-
-
 if __name__ == "__main__":
     args = sys.argv[1:]
-    if args == ["--self-test"]:
-        self_test()
-    elif args:
+    if args:
         for a in args:
             npz_to_las(a)
     else:

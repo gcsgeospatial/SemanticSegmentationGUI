@@ -132,7 +132,7 @@ def ranking_protocol(sampling):
 def best_val_miou(val_csv, protocol="proxy"):
     """Max val_miou over rows of `protocol` only (resume-safe seed). -1.0 if
     none. The other protocol scores on another scale and would freeze
-    final_model.pth forever; pre-protocol-column rows never seed."""
+    final_model.pth forever."""
     if not os.path.exists(val_csv):
         return -1.0
     best = -1.0
@@ -183,8 +183,8 @@ STOP_SENTINEL = f"{OUTPUTS_ROOT}/STOP"
 
 
 def clear_stop():
-    """Delete a stale STOP sentinel at startup. ponytail: concurrent runs
-    sharing one /outputs share the sentinel - press stop once per run."""
+    """Delete a stale STOP sentinel at startup; concurrent runs sharing one
+    /outputs share the sentinel."""
     try:
         os.remove(STOP_SENTINEL)
         print("  [stop] removed stale STOP sentinel", flush=True)
@@ -232,17 +232,15 @@ def _intensity_norm_from_meta(meta: dict) -> str:
 def write_run_manifest(run_dir, backbone, dataset=None, weights="final_model.pth"):
     """Finalize run.json - the single record inference reads, beside the
     weights. Merges normalized manifest fields over the trainer's raw config
-    (legacy run_config.json accepted as raw source). `backbone` = key."""
+    in run.json. `backbone` = key."""
     rc = {}
-    for fn in ("run.json", "run_config.json"):
-        p = os.path.join(run_dir, fn)
-        if os.path.exists(p):
-            try:
-                with open(p, encoding="utf-8") as f:
-                    rc = json.load(f)
-            except (OSError, ValueError):
-                rc = {}
-            break
+    p = os.path.join(run_dir, "run.json")
+    if os.path.exists(p):
+        try:
+            with open(p, encoding="utf-8") as f:
+                rc = json.load(f)
+        except (OSError, ValueError):
+            rc = {}
     inorm = "p95"
     if dataset:
         mp = f"{dataset_dir(dataset)}/dataset_meta.json"
@@ -270,35 +268,22 @@ def write_run_manifest(run_dir, backbone, dataset=None, weights="final_model.pth
 
 
 def infer_meta(weights_path):
-    """Normalized inference metadata from run.json (legacy run_config.json
-    fallback) beside the weights. None for a bare .pth; missing fields None."""
+    """Normalized inference metadata from run.json beside the weights.
+    None for a bare .pth; missing fields None."""
     d = os.path.dirname(weights_path)
     if os.path.basename(d) == "checkpoints":
         d = os.path.dirname(d)
-    rj, rc_path = os.path.join(d, "run.json"), os.path.join(d, "run_config.json")
-    if os.path.exists(rj):
-        try:
-            with open(rj, encoding="utf-8") as f:
-                m = json.load(f)
-        except (OSError, ValueError):
-            return None
-        return {k: m.get(k) for k in ("num_classes", "class_names", "grid", "chunk_xy",
-                                      "num_points", "dg",
-                                      "features", "color_source", "hag_source")}
-    if os.path.exists(rc_path):
-        try:
-            with open(rc_path, encoding="utf-8") as f:
-                rc = json.load(f)
-        except (OSError, ValueError):
-            return None
-        return {
-            "num_classes": rc.get("num_classes"),
-            "class_names": rc.get("class_names"),
-            "grid": rc.get("grid_size", rc.get("grid_m", rc.get("sub_grid_size"))),
-            "chunk_xy": rc.get("chunk_xy", rc.get("chunk_xy_m")),
-            "num_points": rc.get("num_points"),
-        }
-    return None
+    rj = os.path.join(d, "run.json")
+    if not os.path.exists(rj):
+        return None
+    try:
+        with open(rj, encoding="utf-8") as f:
+            m = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return {k: m.get(k) for k in ("num_classes", "class_names", "grid", "chunk_xy",
+                                  "num_points", "dg",
+                                  "features", "color_source")}
 
 
 def xy_chunk_groups(xyz, chunk_m, min_pts=1):
@@ -722,12 +707,12 @@ def pick_proxy_tiles(val_tiles, num_classes, budget, mode="coverage",
 
 def split_scenes(ds_root):
     """Read the dataset's three split folders verbatim (never re-carve).
-    Returns (name, pc_path, None) lists - third slot is a legacy cls_path."""
+    Returns (name, pc_path) lists."""
     import glob
     stem = lambda p: os.path.splitext(os.path.basename(p))[0]
 
     def _items(split):
-        return [(stem(p), p, None)
+        return [(stem(p), p)
                 for p in sorted(glob.glob(f"{ds_root}/{split}/*.npz"))]
 
     train, val, test = _items("train"), _items("val"), _items("test")
@@ -736,10 +721,9 @@ def split_scenes(ds_root):
     return train, val, test
 
 
-def validate_cache(prep_dir, sig, lists, legacy_pair):
-    """Refuse a prep cache built with different settings; stamps .done markers
-    to migrate pre-validation caches. True if the signature was newly written."""
-    import glob
+def validate_cache(prep_dir, sig):
+    """Refuse a prep cache built with different settings. True if the
+    signature was newly written."""
     meta_path = f"{prep_dir}/cache_meta.json"
     if os.path.exists(meta_path):
         with open(meta_path) as f:
@@ -752,19 +736,8 @@ def validate_cache(prep_dir, sig, lists, legacy_pair):
                 f"(mismatched: {diffs}). Reusing it would silently mix incompatible "
                 f"data. Point PREP_DIR at a fresh path or delete the stale cache.")
         return False
-    legacy = False
-    for split, items in lists:
-        d = f"{prep_dir}/{split}"
-        for name, _, _ in items:
-            pattern, done = legacy_pair(d, name)
-            if glob.glob(pattern) and not os.path.exists(done):
-                open(done, "w").close()
-                legacy = True
     with open(meta_path, "w") as f:
         json.dump(sig, f, indent=2)
-    if legacy:
-        print(f"  migrated existing cache at {prep_dir}: stamped .done markers + "
-              f"signature (assumed to match current settings).", flush=True)
     return True
 
 
@@ -920,22 +893,13 @@ def eval_metrics(t_inter, t_union, t_gt, correct, total, class_names, t_start,
 
 
 def init_val_csv(val_csv, class_names):
-    """Write the val_metrics.csv header if absent; upgrade a pre-protocol
-    header in place (rewrite: the trailing column must exist or appended rows
-    misalign). Existing rows stay short a field -> they read as non-proxy."""
+    """Write the val_metrics.csv header if absent."""
+    if os.path.exists(val_csv):
+        return
     cols = (["epoch", "val_acc", "val_miou"]
             + [f"iou_{n}" for n in class_names] + ["protocol"])
-    rows = []
-    if os.path.exists(val_csv):
-        with open(val_csv, newline="", encoding="utf-8", errors="replace") as f:
-            rows = list(csv.reader(f))
-        if rows and rows[0][-1:] == ["protocol"]:
-            return
-    rows[:1] = [cols]
-    tmp = val_csv + ".tmp"
-    with open(tmp, "w", newline="", encoding="utf-8") as f:
-        csv.writer(f).writerows(rows)
-    _replace_retry(tmp, val_csv)
+    with open(val_csv, "w", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow(cols)
 
 
 def append_val_row(val_csv, ep, m, class_names):
@@ -965,10 +929,9 @@ def proxy_guard(run_dir, report, protocol, class_names, ranking="proxy"):
     """Stamp/verify the checkpoint-ranking protocol of run_dir - call ONCE at
     startup right after BestCheckpoint (VAL_EVERY would leave epochs unguarded).
     Hashes tile BASENAMES only: absolute paths differ across win/linux/Modal and
-    would falsely wedge a cross-backend resume. Returns False when run_dir must
-    be abandoned for a fresh one (pre-upgrade run: v1 rows, or ranking rows with
-    no signature); raises RuntimeError when its rows were ranked under another
-    protocol or the checkpoint they crowned is gone.
+    would falsely wedge a cross-backend resume. Raises RuntimeError when the
+    run's rows were ranked under another protocol or the checkpoint they
+    crowned is gone.
     ranking='full' stores a bare marker - the full eval covers the whole val
     split, so there is no tile subset to pin. A proxy-mode signature keeps its
     exact pre-'full' shape so in-flight proxy runs still resume."""
@@ -980,26 +943,18 @@ def proxy_guard(run_dir, report, protocol, class_names, ranking="proxy"):
             "tiles_sha1": hashlib.sha1(
                 "\n".join(sorted(report["tiles"])).encode("utf-8")).hexdigest()[:16]})
     path = f"{run_dir}/proxy_val.json"
-    rows = pre = other = 0
+    rows = other = 0
     val_csv = f"{run_dir}/val_metrics.csv"
     if os.path.exists(val_csv):
         with open(val_csv, newline="", encoding="utf-8", errors="replace") as f:
             raw = list(csv.reader(f))
-        hdr = raw[0] if raw else []
-        v1 = hdr[-1:] != ["protocol"]
         for r in raw[1:]:
             if not r:
                 continue
-            if v1 or len(r) < len(hdr):
-                pre += 1
-            elif r[-1] == ranking:
+            if r[-1] == ranking:
                 rows += 1
             else:
                 other += 1
-    if pre:
-        print(f"  resume: skipping {os.path.basename(run_dir)} "
-              f"({pre} val row(s) from a pre-protocol-column run)", flush=True)
-        return False
     old = None
     if os.path.exists(path):
         try:
@@ -1007,17 +962,12 @@ def proxy_guard(run_dir, report, protocol, class_names, ranking="proxy"):
                 old = json.load(f)
         except (OSError, ValueError):
             old = None
-    # rows on the other scale under a signature that NAMES that scale = a mid-run
-    # switch; an unreadable signature stays lenient, as it was before 'full' existed
+    # rows on the other scale under a signature that NAMES that scale = a mid-run switch
     switched = (bool(other) and isinstance(old, dict)
                 and old.get("ranking", "proxy") != ranking)
     if not rows and not switched:
         atomic_json_save(sig, path)
         return True
-    if not os.path.exists(path):
-        print(f"  resume: skipping {os.path.basename(run_dir)} "
-              f"({ranking}-protocol rows from a pre-signature run)", flush=True)
-        return False
     if old != sig:
         was = old.get("ranking", "proxy") if isinstance(old, dict) else None
         if was is not None and was != ranking:
@@ -1132,6 +1082,19 @@ def run_infer_scenes(scenes, predict, pred_dir, run_dir, infer_cfg, cls_txt=Fals
     probs), written as <name>_pred.npz (+ _pred_CLS.txt) with the crash-safe
     per-scene infer_run.json rewrite."""
     import numpy as np
+    # backstop for the GUI's probe-based pre-skip: any feat_* the run needs
+    # that the scenes don't carry rides as zeros - missing data never aborts
+    need = [n for n in (infer_cfg.get("features") or []) if n.startswith("feat_")]
+    if need and scenes:
+        # union across ALL scenes: a mixed folder must never abort mid-run
+        missing = set()
+        for pc_path in scenes:
+            with np.load(pc_path) as z0:
+                missing.update(n for n in need if n not in z0.files)
+        if missing:
+            os.environ["TT_ZERO_CHANNELS"] = ",".join(sorted(zero_channels() | missing))
+            print(f"  [channels] not in the converted scenes -> fed as zeros: "
+                  f"{', '.join(sorted(missing))}", flush=True)
     zc = zero_channels()
     if zc:   # permanent provenance: these predictions ran without these inputs
         infer_cfg = {**infer_cfg, "zeroed_channels": sorted(zc)}
@@ -1177,13 +1140,9 @@ def kp_load_canonical(npz_path):
 
 
 def scene_feats(z):
-    """Every feat_* channel a scene npz carries; legacy bare 'hag' surfaces
-    as feat_hag."""
+    """Every feat_* channel a scene npz carries."""
     import numpy as np
-    out = {k: z[k].astype(np.float32) for k in z.files if k.startswith("feat_")}
-    if "feat_hag" not in out and "hag" in z.files:
-        out["feat_hag"] = z["hag"].astype(np.float32)
-    return out
+    return {k: z[k].astype(np.float32) for k in z.files if k.startswith("feat_")}
 
 
 def _grid_pool_t(p, a, l, voxel, num_classes):
@@ -1284,10 +1243,9 @@ def train_stride(chunk_xy):
 
 
 def train_stride_tag():
-    """Prep-dir suffix for the stride factor; "" for the legacy 0.5 so
-    existing caches stay valid untagged."""
-    f = float(os.environ.get("TT_TRAIN_STRIDE", "0.75"))
-    return "" if f == 0.5 else f"_ts{f:g}"
+    """Prep-dir suffix for the stride factor."""
+    # uniform tag for every factor: old untagged 0.5-era caches re-prep
+    return f"_ts{float(os.environ.get('TT_TRAIN_STRIDE', '0.75')):g}"
 
 
 def _savez_fast(path, **arrays):
@@ -1408,13 +1366,10 @@ def kp_ensure_prep(prep_dir, ds_root, sig, tile_fn):
     for split in ("train", "val", "test"):
         os.makedirs(f"{prep_dir}/{split}", exist_ok=True)
     train_list, val_list, test_list = split_scenes(ds_root)
-    any_new = [validate_cache(
-        prep_dir, sig,
-        [("train", train_list), ("val", val_list), ("test", test_list)],
-        lambda d, name: (f"{d}/{name}_x*.npz", f"{d}/{name}.done"))]
+    any_new = [validate_cache(prep_dir, sig)]
 
     def tile_remaining(items, out_dir, split):
-        for name, pc_path, _cls in items:
+        for name, pc_path in items:
             if os.path.exists(f"{out_dir}/{name}.done"):
                 continue
             n = tile_fn(name, pc_path, out_dir, split)
@@ -1506,8 +1461,7 @@ def kp_make_run_dir(variant):
 
 
 def kp_find_latest_checkpoint(opt_type, feature_modes, arch_hash=None,
-                              features=None, legacy_features=None,
-                              skip_done=False):
+                              features=None, skip_done=False):
     """Most recent run with checkpoints AND this script's recipe (optimizer,
     feature_mode, ordered feature spec - names, not width - and arch hash).
     Returns (run_dir, ckpt_path, epoch) or None."""
@@ -1524,17 +1478,14 @@ def kp_find_latest_checkpoint(opt_type, feature_modes, arch_hash=None,
             continue
         got_opt = fmode = ahash = None
         rc = {}
-        for cfgp in (f"{rd}/run.json", f"{rd}/run_config.json"):
-            try:
-                with open(cfgp) as f:
-                    rc = json.load(f)
-                got_opt = rc.get("optimizer", {}).get("type")
-                fmode = rc.get("feature_mode")
-                ahash = rc.get("arch_hash")
-                break
-            except Exception:
-                rc = {}
-                continue
+        try:
+            with open(f"{rd}/run.json") as f:
+                rc = json.load(f)
+            got_opt = rc.get("optimizer", {}).get("type")
+            fmode = rc.get("feature_mode")
+            ahash = rc.get("arch_hash")
+        except Exception:
+            rc = {}
         if got_opt != opt_type:
             print(f"  resume: skipping {os.path.basename(rd)} "
                   f"(recipe mismatch: optimizer={got_opt})", flush=True)
@@ -1543,12 +1494,8 @@ def kp_find_latest_checkpoint(opt_type, feature_modes, arch_hash=None,
             print(f"  resume: skipping {os.path.basename(rd)} "
                   f"(variant mismatch: feature_mode={fmode})", flush=True)
             continue
-        if rc.get("hag_source"):
-            print(f"  resume: skipping {os.path.basename(rd)} "
-                  f"(legacy --hag run: hag_source={rc['hag_source']})", flush=True)
-            continue
         if features is not None:
-            got_feats = list(rc.get("features") or legacy_features or features)
+            got_feats = list(rc.get("features") or features)
             if got_feats != list(features):
                 print(f"  resume: skipping {os.path.basename(rd)} "
                       f"(feature mismatch: {got_feats})", flush=True)
@@ -1568,7 +1515,8 @@ def kp_make_evaluate(forward, build_feat, grid, chunk_xy, num_classes,
                      class_names):
     """KP voted eval scored on the ORIGINAL raw points: center-weighted
     softmax votes per voxel, argmax, NN-propagate to raw, score vs raw GT.
-    forward([(cxyz, feat)]) -> per-tile (N, C) logits list."""
+    forward([(cxyz, feat)]) -> per-tile (N, C) logits list; scene_items are
+    (name, pc_path, split_dir) triples."""
     import glob
     import numpy as np
     import torch
@@ -1618,7 +1566,7 @@ def kp_make_evaluate(forward, build_feat, grid, chunk_xy, num_classes,
             return outs
 
         with torch.no_grad():
-            for name, pc_path, _cls, split_dir in scene_items:
+            for name, pc_path, split_dir in scene_items:
                 bs = bs0
                 tiles = sorted(glob.glob(f"{split_dir}/{name}_x*.npz"))
                 if not tiles:
@@ -1790,6 +1738,352 @@ def kp_make_target_batches(scenes, make_batch, build_feat, grid,
     return target_batches()
 
 
+def kp_resume_ladder(infer, eval_only, want_resume, find_latest, infer_input,
+                     variant, opt_type, n_epochs):
+    """train/eval/infer mode ladder -> (run_dir, resume_ckpt, start_epoch)."""
+    resume_info = find_latest() if (want_resume or eval_only) else None
+    if infer:
+        run_dir = infer_dir(infer_input)
+        os.makedirs(os.environ.get("TT_PRED_DIR") or f"{run_dir}/predictions",
+                    exist_ok=True)
+        return run_dir, None, 0
+    if resume_info:
+        run_dir, resume_ckpt, resume_epoch = resume_info
+        run_id = os.path.basename(run_dir)
+        os.makedirs(f"{run_dir}/checkpoints", exist_ok=True)
+        start_epoch = resume_epoch + 1
+        verb = "EVAL-ONLY on" if eval_only else "RESUMING"
+        print(f"  {verb} {run_id} from {os.path.basename(resume_ckpt)}"
+              + ("" if eval_only else f" -> starting at epoch {start_epoch}/{n_epochs}"),
+              flush=True)
+        return run_dir, resume_ckpt, start_epoch
+    if eval_only:
+        raise RuntimeError(f"eval mode: no {opt_type}-recipe run with "
+                           f"checkpoints found under /outputs")
+    _, run_dir = kp_make_run_dir(variant)
+    return run_dir, None, 0
+
+
+def kp_load_mode_weights(net, optim, resume_ckpt, start_epoch, eval_only,
+                         infer, weights, run_dir, n_epochs):
+    """Resume/eval/infer weight loading -> the (possibly bumped) start_epoch."""
+    import torch
+    if resume_ckpt is not None:
+        ckpt = torch.load(resume_ckpt, map_location="cuda", weights_only=True)
+        net.load_state_dict(ckpt["model"])
+        if "optim" in ckpt:
+            optim.load_state_dict(ckpt["optim"])
+        print(f"  resumed weights{' + optimizer' if 'optim' in ckpt else ''} "
+              f"at epoch {start_epoch}", flush=True)
+    if eval_only:
+        fm = (resolve_weights_path(weights)
+              if weights else f"{run_dir}/final_model.pth")
+        if weights and not os.path.exists(fm):
+            raise FileNotFoundError(f"--weights not found: {fm}")
+        if os.path.exists(fm):
+            net.load_state_dict(torch.load(fm, map_location="cuda", weights_only=True)["model"])
+            print(f"  EVAL-ONLY: loaded {fm}", flush=True)
+        start_epoch = n_epochs
+    if infer:
+        fm = (resolve_weights_path(weights)
+              if weights else None)
+        if not fm or not os.path.exists(fm):
+            raise FileNotFoundError(f"--mode infer requires --weights; not found: {fm}")
+        ck = load_ckpt_safe(fm, map_location="cuda")
+        # bare state-dict .pth (no 'model' wrapper) stays loadable for shared weights
+        sd = ck["model"] if (isinstance(ck, dict) and "model" in ck) else ck
+        net.load_state_dict(sd)
+        ep_tag = ck.get("epoch", "?") if isinstance(ck, dict) else "?"
+        print(f"  [infer] loaded {weights} (best-val epoch {ep_tag})", flush=True)
+        start_epoch = n_epochs
+    return start_epoch
+
+
+def init_metrics_csv(run_dir):
+    """metrics.csv with the shared per-epoch header (append-safe on resume)."""
+    metrics_csv = f"{run_dir}/metrics.csv"
+    if not os.path.exists(metrics_csv):
+        with open(metrics_csv, "w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow([
+                "epoch", "train_loss", "train_acc", "train_iou", "lr",
+                "sec_per_iter", "sec_per_epoch", "gpu_mem_mb",
+            ])
+    return metrics_csv
+
+
+def kp_proxy_batches(proxy_samples, make_batch, proxy_rep, err_msg):
+    """Pre-drawn proxy samples -> (batch, labels); err_msg(bn, why, e) words
+    the per-backbone rebuild-the-prep remedy."""
+    for bn, s in proxy_samples:
+        try:
+            b, lab_t = make_batch([s])
+        except Exception as e:
+            why = ", ".join(proxy_rep["covers"].get(bn, [])) or "the stride base"
+            raise RuntimeError(err_msg(bn, why, e)) from e
+        yield b, lab_t
+
+
+def kp_make_run_eval(net, forward, evaluate, make_batch, sample_tile,
+                     pick_train_tile, best, val_csv, run_dir, val_items,
+                     test_items, val_list, test_list, num_classes, class_names,
+                     val_full, eval_only, proxy_batches, proxy_tiles,
+                     proxy_rep):
+    """Shared KP eval driver: mid-training proxy/full val with best tracking,
+    plus the final PreciseBN + val/test pass that writes test_metrics.json.
+    forward(batch) -> logits; proxy_batches() -> (batch, labels) generator."""
+    import torch
+    import density as dg
+
+    def run_eval(ep, write_json=False):
+        if not write_json:
+            net.eval()
+            m = (evaluate(val_items, f"val@ep{ep}") if val_full else
+                 proxy_val(proxy_batches(), forward,
+                           num_classes, class_names, f"val@ep{ep}",
+                           len(proxy_tiles), PROXY_PROTOCOL_TILES,
+                           inventory=proxy_rep["inventory"]))
+            net.train()
+            if best.update(m):
+                atomic_torch_save({"model": net.state_dict(), "epoch": ep},
+                                  best.final)
+            append_val_row(val_csv, ep, m, class_names)
+            return m
+        if not eval_only:
+            def _bn_batches(n=48):
+                made = fails = 0
+                while made < n:
+                    if fails >= 200:
+                        raise DatasetExhausted(
+                            "PreciseBN: 200 consecutive tile failures - training "
+                            "tiles can't build batches; re-run dataset prep")
+                    s = sample_tile(pick_train_tile(), training=False)
+                    if s is None:
+                        fails += 1
+                        continue
+                    try:
+                        b, _ = make_batch([s])
+                    except Exception:
+                        fails += 1
+                        continue
+                    fails = 0
+                    made += 1
+                    yield b
+            dg.adabn_recalibrate(net, _bn_batches(),
+                                 forward=lambda mdl, b: forward(b))
+        net.eval()
+        m = evaluate(val_items, f"val@ep{ep}")
+        # deliberately no best.update, even in full mode: AdaBN above recalibrates BN, so this row is not comparable to the mid-training ones
+        append_val_row(val_csv, ep, m, class_names)
+        swapped = not eval_only and os.path.exists(best.final)
+        if swapped:
+            live_state = {k: v.clone() for k, v in net.state_dict().items()}
+            net.load_state_dict(torch.load(best.final, map_location="cuda",
+                                           weights_only=True)["model"])
+            net.eval()
+        mt = evaluate(test_items, f"test@ep{ep}")
+        if swapped:
+            net.load_state_dict(live_state)
+        with open(f"{run_dir}/test_metrics.json", "w", encoding="utf-8") as fj:
+            json.dump({"val": m, "test": mt,
+                       "val_scenes": [n for n, _ in val_list],
+                       "test_scenes": [n for n, _ in test_list]}, fj, indent=2)
+        net.train()
+        return m
+
+    return run_eval
+
+
+def kp_run_infer(run_dir, net, forward, kp_batch, build_feat, predict_points,
+                 backbone, note_name, weights, infer_input, grid, chunk_xy,
+                 grid_cli, chunk_cli, num_classes, class_names, feat_spec,
+                 exc_idx, infer_adabn, neighbor_limits=None):
+    """Dataset-free inference over <run_dir>/scenes: optional AdaBN then
+    per-scene predict via run_infer_scenes. neighbor_limits goes into the
+    infer config only when given (kpconv restores its pyramid crop)."""
+    import glob
+    from datetime import datetime, timezone
+    import numpy as np
+    import density as dg
+
+    if not infer_input:
+        raise ValueError("--mode infer requires --infer-input <job_id>")
+    if (grid_cli is not None and grid_cli != grid) or \
+       (chunk_cli is not None and chunk_cli != chunk_xy):
+        print(f"  [infer] note: {note_name} uses its trained geometry "
+              f"(grid={grid}, chunk={chunk_xy}); --grid/--chunk-xy ignored.", flush=True)
+    net.eval()
+    scenes = sorted(glob.glob(f"{run_dir}/scenes/*.npz"))
+    if not scenes:
+        raise FileNotFoundError(f"No scenes under {run_dir}/scenes")
+    pred_dir = os.environ.get("TT_PRED_DIR") or f"{run_dir}/predictions"
+    infer_cfg = {"backbone": backbone, "mode": "infer",
+                 "weights": weights,
+                 "infer_input": infer_input, "num_classes": num_classes,
+                 "class_names": class_names, "grid": grid, "chunk_xy": chunk_xy}
+    if neighbor_limits is not None:
+        infer_cfg["neighbor_limits"] = neighbor_limits
+    infer_cfg.update({"features": feat_spec, "gpu": gpu_name(),
+                      "exclude_classes": [class_names[i] for i in exc_idx],
+                      "started_utc": datetime.now(timezone.utc).isoformat()})
+    if infer_adabn:
+        print("  [infer] AdaBN: recomputing BN stats on target tiles...", flush=True)
+        dg.adabn_recalibrate(
+            net,
+            kp_make_target_batches(scenes, kp_batch, build_feat,
+                                   grid, chunk_xy, num_classes),
+            forward=lambda m, b: forward(b))
+        net.eval()
+
+    def _predict(pc_path):
+        z = np.load(pc_path)
+        raw = z["xyz"]
+        require_finite_xyz(raw, os.path.basename(pc_path))
+        xyz = (raw - np.floor(raw.min(0))).astype(np.float32)
+        intensity_n, ret_num = scene_arrays(z, len(xyz))
+        extras = feat_extras(z, feat_spec, os.path.basename(pc_path))
+        pred, conf, probs = predict_points(xyz, intensity_n, ret_num,
+                                           extras=extras)
+        return raw, pred, intensity_n, conf, probs
+
+    run_infer_scenes(scenes, _predict, pred_dir, run_dir, infer_cfg, cls_txt=True)
+
+
+def kp_train_loop(net, optim, forward, seg_loss, make_batch, sample_tile,
+                  pick_train_tile, lr_at, run_eval, best, run_dir, metrics_csv,
+                  num_classes, start_epoch, n_epochs, epoch_steps, pack_n,
+                  accum, checkpoint_gap, val_every, eval_only, grad_clip_fn,
+                  reg_fn=None):
+    """Shared KP training loop: prefetching, ACCUM steps with the CUDA-assert
+    re-raise, epoch metrics, periodic checkpoints/val, final PreciseBN eval and
+    best finalize. reg_fn() adds a regularizer to the loss (kpconv deform);
+    grad_clip_fn() clips each optimizer step."""
+    import traceback
+    import numpy as np
+    import torch
+
+    LOG_EVERY = 50
+    AMP = os.environ.get("TT_AMP") == "1"
+
+    def _draw():
+        for _ in range(1000):
+            s = sample_tile(pick_train_tile(), training=True)
+            if s is not None:
+                return s
+        raise DatasetExhausted(
+            "1000 consecutive empty tile draws - training tiles are empty or "
+            "too small; re-run dataset prep")
+    prefetch = (make_prefetcher(
+        lambda: make_batch([_draw() for _ in range(pack_n)]),
+        depth=int(os.environ.get("TT_PREFETCH", "2")))
+        if start_epoch < n_epochs else None)
+    print(f"  starting at epoch {start_epoch}, up to {n_epochs}, "
+          f"{epoch_steps} steps/epoch, pack {pack_n} x accum {accum}"
+          f"{' [bf16 autocast]' if AMP else ''}", flush=True)
+    t_run = time.time()
+    ep = n_epochs - 1
+    for ep in range(start_epoch, n_epochs):
+        cur_lr = lr_at(ep)
+        for g in optim.param_groups:
+            g["lr"] = cur_lr * g.get("lr_mult", 1.0)
+        net.train()
+        ep_loss = 0.0
+        ep_conf = torch.zeros(num_classes, num_classes, dtype=torch.long,
+                              device="cuda")
+        t_ep = time.time()
+        n_steps = n_fwd = n_failed = 0
+        print(f"  ep {ep:3d} starting (lr={cur_lr:.2e})…", flush=True)
+        for step in range(epoch_steps):
+            optim.zero_grad()
+            n_ok = 0
+            for _ in range(accum):
+                try:
+                    batch, lab_t = prefetch()
+                    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=AMP):
+                        logits = forward(batch)
+                        loss_seg = seg_loss(logits, lab_t)
+                        reg = reg_fn() if reg_fn is not None else None
+                        loss = (loss_seg if reg is None else loss_seg + reg) / accum
+                    if not torch.isfinite(loss):
+                        n_failed += 1
+                        continue
+                    loss.backward()
+                    n_ok += 1; n_fwd += 1
+                    ep_loss += loss.item() * accum
+                    pred = logits.argmax(-1)
+                    m = lab_t >= 0
+                    ep_conf += torch.bincount(
+                        lab_t[m] * num_classes + pred[m],
+                        minlength=num_classes * num_classes,
+                    ).reshape(num_classes, num_classes)
+                except Exception as e:
+                    if isinstance(e, (DatasetExhausted, NonFiniteXYZ)):
+                        raise
+                    # a device-side assert poisons the CUDA context (every later forward fails too), so re-raise with the remedy instead of burning the epoch
+                    if (isinstance(e, RuntimeError)
+                            and "out of memory" not in str(e)
+                            and any(s in str(e) for s in
+                                    ("CUDA error", "device-side assert",
+                                     "illegal memory access"))):
+                        raise RuntimeError(
+                            "unrecoverable CUDA error in forward. If it is an "
+                            "index/scatter-gather assert, a scene likely has "
+                            "non-finite coords: re-ingest the data and delete the "
+                            f"prep cache. Original: {e}") from e
+                    n_failed += 1
+                    if n_failed == 1:
+                        print(f"  forward failed (first occurrence, step {step}): {e}",
+                              flush=True)
+                        traceback.print_exc()
+            if n_ok:
+                grad_clip_fn()
+                optim.step()
+                n_steps += 1
+                if n_steps % LOG_EVERY == 0:
+                    print(f"    ep {ep:3d} step {n_steps:4d}: "
+                          f"loss={ep_loss/max(n_fwd,1):.4f}", flush=True)
+        if n_steps == 0:
+            raise RuntimeError(f"epoch {ep}: 0 optimizer steps ({n_failed} failed forwards).")
+        if n_failed:
+            print(f"  ep {ep:3d} note: {n_failed} failed forwards", flush=True)
+        sec_per_epoch = time.time() - t_ep
+        sec_per_iter = sec_per_epoch / max(n_steps, 1)
+        conf = ep_conf.cpu().numpy()
+        ep_inter = np.diag(conf)
+        ep_union = conf.sum(0) + conf.sum(1) - ep_inter
+        train_acc = int(np.trace(conf)) / max(int(conf.sum()), 1)
+        with np.errstate(invalid="ignore"):
+            train_iou = float(np.mean(ep_inter / np.maximum(ep_union, 1)))
+        gpu_mem = torch.cuda.max_memory_allocated() / 1e6
+        row = [ep, f"{ep_loss/max(n_fwd,1):.6f}", f"{train_acc:.4f}",
+               f"{train_iou:.4f}", f"{cur_lr:.6e}", f"{sec_per_iter:.4f}",
+               f"{sec_per_epoch:.2f}", f"{gpu_mem:.1f}"]
+        with open(metrics_csv, "a", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(row)
+        print(f"  ep {ep:3d}: loss={ep_loss/max(n_fwd,1):.4f} acc={train_acc:.4f} "
+              f"miou={train_iou:.4f} lr={cur_lr:.2e} s/iter={sec_per_iter:.3f} "
+              f"s/epoch={sec_per_epoch:.1f}", flush=True)
+        if (ep + 1) % checkpoint_gap == 0:
+            atomic_torch_save({"model": net.state_dict(),
+                               "optim": optim.state_dict(), "epoch": ep},
+                              f"{run_dir}/checkpoints/ep{ep:03d}.pth")
+        stop = stop_requested(ep)
+        if (ep + 1) % val_every == 0 and ep != n_epochs - 1 and not stop:
+            run_eval(ep)
+        if stop:
+            break
+
+    if prefetch:
+        prefetch.shutdown()
+
+    print("  final evaluation over the combined eval set…", flush=True)
+    run_eval(ep, write_json=True)
+    if not eval_only:
+        best.finalize(lambda p: atomic_torch_save(
+            {"model": net.state_dict(), "epoch": ep}, p))
+        open(f"{run_dir}/DONE", "w").close()
+    print(f"  total wall-clock: {(time.time() - t_run)/3600:.2f} h")
+
+
 def ptv3_load_canonical(npz_path, color_src):
     """Scene npz -> (xyz, rgb, lab). color_src picks the 3 color channels
     (fallbacks intensity -> rgb -> mid-gray; intensity x255 to rgb scale).
@@ -1912,7 +2206,7 @@ def ptv3_ensure_prep(prep_dir, ds_root, chunk_xy, stride, load_canonical):
                               "num_classes": meta.get("num_classes"),
                               "class_names": meta.get("class_names"),
                               "split_seed": sp.get("seed"),
-                              "split_mode": sp.get("mode")}, [], None)
+                              "split_mode": sp.get("mode")})
     any_new = [False]
     def already_tiled(out_dir, scene):
         return bool(glob.glob(f"{out_dir}/{scene}_x*.npz"))
@@ -2174,16 +2468,390 @@ def ptv3_make_evaluate(forward, build_feat, feat_spec, grid, chunk_xy,
     return evaluate
 
 
+def ptv3_build_feat(feat_spec, cxyz, rgbf, extras=None, drop=(),
+                    logdk_feat=False, logdk_k=8, normal_block=False):
+    """Spec-ordered features (+ 3-wide zero normal block for the SSL stems,
+    + optional log d_k). `drop` = spec indices to zero (train-time feature
+    dropout); the normal slot and log d_k never drop."""
+    import numpy as np
+    import density as dg
+    cols = []
+    for i, n in enumerate(feat_spec):
+        if n in ("rgb", "intensity"):
+            c = rgbf
+        elif n in ("x", "y", "z"):
+            c = cxyz[:, "xyz".index(n):"xyz".index(n) + 1]
+        else:
+            c = extras[n][:, None]
+        cols.append(np.zeros_like(c, dtype=np.float32) if i in drop else c)
+    if normal_block:
+        cols.append(np.zeros((len(cxyz), 3), np.float32))
+    if logdk_feat:
+        cols.append(dg.local_density_logdk(cxyz, logdk_k)[:, None])
+    return np.concatenate(cols, axis=1).astype(np.float32)
+
+
+def ptv3_in_bounds(xyz, chunk_xy):
+    """Finite points inside the chunk window (200 m |z| guard)."""
+    import numpy as np
+    return (np.isfinite(xyz).all(1)
+            & (np.abs(xyz[:, :2]).max(1) <= chunk_xy)
+            & (np.abs(xyz[:, 2]) <= 200.0))
+
+
+def ptv3_viable(path, chunk_xy):
+    """>=64 in-bounds points after centering - the batcher's keep rule."""
+    import numpy as np
+    xyz = np.load(path)["xyz"].astype(np.float32)
+    xyz = (xyz - xyz.mean(0, keepdims=True, dtype=np.float64)).astype(np.float32)
+    return int(ptv3_in_bounds(xyz, chunk_xy).sum()) >= 64
+
+
+def ptv3_scene_of(path):
+    """Tile path -> scene name (strips the _x<...> tile suffix)."""
+    b = os.path.basename(path)
+    return b.rsplit("_x", 1)[0]
+
+
+def ptv3_raw_loader(ds_root, split, name):
+    """Deferred raw-scene loader for the eval scene items."""
+    return lambda: load_xyz_label(f"{ds_root}/{split}/{name}.npz")
+
+
+def ptv3_eval_items(ds_root, prep_dir, hold, test_tiles):
+    """(val_items, test_items) scene triples for ptv3_make_evaluate."""
+    val_items = [(n, ptv3_raw_loader(ds_root, "val", n), f"{prep_dir}/val")
+                 for n in sorted(hold)]
+    test_items = [(n, ptv3_raw_loader(ds_root, "test", n), f"{prep_dir}/test")
+                  for n in sorted({ptv3_scene_of(p) for p in test_tiles})]
+    print(f"  eval set: {len(val_items)} holdout(val) + {len(test_items)} test scenes",
+          flush=True)
+    return val_items, test_items
+
+
+def ptv3_make_batcher(build_feat, feat_spec, grid, chunk_xy, augment_xyz,
+                      aug_enable, aug_color, rare_oversample, rare_cols,
+                      rare_center_prob, density_aug, coarsen_max, p_native):
+    """to_ptv3_batch(tiles, training=True) -> (Point batch dict, labels)."""
+    import numpy as np
+    import torch
+    import density as dg
+
+    def to_ptv3_batch(tiles_for_batch, training=True):
+        coords, feats, labels, offsets, grid_coords = [], [], [], [], []
+        running = 0
+        for tile in tiles_for_batch:
+            z = np.load(tile)
+            xyz, rgb, lab = z["xyz"], z["rgb"], z["lab"]
+            ex = feat_extras(z, feat_spec, os.path.basename(tile))
+            # 80k memory bound: a random ~30m crop while training, deterministic decimation for the proxy val (an uncropped tile OOMs outside the train loop's OOM guard)
+            if len(xyz) > 80000:
+                if not training:
+                    idx = np.arange(0, len(xyz), -(-len(xyz) // 80000))
+                else:
+                    c = None
+                    if (rare_oversample and rare_cols
+                            and np.random.rand() < rare_center_prob):
+                        ridx = np.where(np.isin(lab, rare_cols))[0]
+                        if len(ridx):
+                            c = xyz[ridx[np.random.randint(len(ridx))]]
+                    if c is None:
+                        c = xyz[np.random.randint(len(xyz))]
+                    d2 = np.sum((xyz[:, :2] - c[:2]) ** 2, axis=1)
+                    idx = np.where(d2 < 15.0 ** 2)[0]
+                    if len(idx) > 80000:
+                        idx = np.random.choice(idx, 80000, replace=False)
+                xyz, rgb, lab = xyz[idx], rgb[idx], lab[idx]
+                ex = {n: v[idx] for n, v in ex.items()}
+            xyz = xyz.astype(np.float32)
+            if training and aug_enable:
+                xyz = augment_xyz(xyz)
+            # float64 mean: a float32 mean at UTM magnitudes empties the window cut
+            xyz = (xyz - xyz.mean(0, keepdims=True, dtype=np.float64)
+                   ).astype(np.float32)
+            ok = ptv3_in_bounds(xyz, chunk_xy)
+            if int(ok.sum()) < 64:
+                continue
+            xyz = xyz[ok]; rgb = rgb[ok]; lab = lab[ok]
+            ex = {n: v[ok] for n, v in ex.items()}
+            # grid_coord MUST come from the same keys used to dedup: a different phase can collapse two voxels onto one grid_coord (CUDA assert)
+            g_eff = (dg.effective_grid(grid, coarsen_max, p_native)
+                     if (training and density_aug) else grid)
+            keys = np.floor(xyz / g_eff).astype(np.int64)
+            uniq = voxel_unique(keys)
+            xyz = xyz[uniq]; rgb = rgb[uniq]; lab = lab[uniq]
+            ex = {n: v[uniq] for n, v in ex.items()}
+            xyz = xyz.astype(np.float32)
+            fdrop = (np.flatnonzero(np.random.rand(len(feat_spec)) > aug_color)
+                     if training else ())
+            feat = build_feat(xyz, rgb.astype(np.float32) / 255.0, ex, drop=fdrop)
+            coords.append(xyz); feats.append(feat); labels.append(lab)
+            grid_coords.append(keys[uniq])
+            running += len(xyz)
+            offsets.append(running)
+        coord = torch.from_numpy(np.concatenate(coords).astype(np.float32)).cuda()
+        feat  = torch.from_numpy(np.concatenate(feats).astype(np.float32)).cuda()
+        label = torch.from_numpy(np.concatenate(labels).astype(np.int64)).cuda()
+        offset = torch.tensor(offsets, dtype=torch.long).cuda()
+        gc = np.concatenate(grid_coords)
+        gc -= gc.min(0, keepdims=True)
+        grid_coord = torch.from_numpy(np.ascontiguousarray(gc)).long().cuda()
+        return {"coord": coord, "grid_coord": grid_coord,
+                "feat": feat, "offset": offset}, label
+
+    return to_ptv3_batch
+
+
+def ptv3_make_predict_scene(forward_logits, load_canonical, build_feat,
+                            feat_spec, grid, chunk_xy, infer_tta,
+                            num_classes, exclude_idx=None):
+    """predict_scene(path) -> (raw xyz, pred, gray, conf, probs): chunked
+    voxel inference (+ optional scale TTA); unpredicted points backfill from
+    the nearest predicted neighbour."""
+    import numpy as np
+    import torch
+    from scipy.spatial import cKDTree
+    save_probs = os.environ.get("TT_SAVE_PROBS") == "1"
+
+    def _predict_scene(scene_path):
+        xyz, rgb, _ = load_canonical(scene_path)
+        z0 = np.load(scene_path)
+        ex0 = feat_extras(z0, feat_spec, os.path.basename(scene_path))
+        pred = np.full(len(xyz), -1, np.int64)
+        conf = np.zeros(len(xyz), np.float32)
+        probs = np.zeros((len(xyz), num_classes), np.float16) if save_probs else None
+        with torch.no_grad():
+            for idx in xy_chunk_groups(xyz, chunk_xy, min_pts=64):
+                w0 = (xyz[idx] - xyz[idx].mean(0)).astype(np.float32)
+                rgbf = rgb[idx].astype(np.float32) / 255.0
+                exw = {n: v[idx] for n, v in ex0.items()}
+                views = [1.0] + (list(np.linspace(0.85, 1.2, infer_tta))
+                                 if infer_tta else [])
+                pprob = None
+                for s in views:
+                    w = (w0 * s).astype(np.float32)
+                    keys = np.floor(w / grid).astype(np.int64)
+                    first, inverse = voxel_unique(keys, return_inverse=True)
+                    vx = w[first]
+                    feat = build_feat(vx, rgbf[first],
+                                      {n: v[first] for n, v in exw.items()})
+                    coord = torch.from_numpy(vx).cuda()
+                    featt = torch.from_numpy(feat).cuda()
+                    offset = torch.tensor([len(vx)], dtype=torch.long).cuda()
+                    gc = keys[first] - keys[first].min(0)
+                    grid_coord = torch.from_numpy(np.ascontiguousarray(gc)).long().cuda()
+                    lg = forward_logits({"coord": coord, "grid_coord": grid_coord,
+                                         "feat": featt, "offset": offset})
+                    vp = torch.softmax(lg.float(), -1).cpu().numpy()[inverse]
+                    pprob = vp if pprob is None else pprob + vp
+                pprob /= np.maximum(pprob.sum(-1, keepdims=True), 1e-12)
+                pprob = apply_class_mask(pprob, exclude_idx)
+                pred[idx] = pprob.argmax(-1)
+                conf[idx] = pprob.max(-1)
+                if save_probs:
+                    probs[idx] = pprob.astype(np.float16)
+        miss = pred < 0
+        if miss.any() and (~miss).any():
+            _, nn = cKDTree(xyz[~miss]).query(xyz[miss])
+            pred[miss] = pred[~miss][nn]
+        elif miss.any():
+            pred[:] = min(set(range(num_classes)) - set(exclude_idx or ()))
+        return z0["xyz"], pred, rgb[:, 0] / 255.0, conf, probs
+
+    return _predict_scene
+
+
+def ptv3_proxy_batches(proxy_tiles, batch_size, to_batch, viable, proxy_rep,
+                       chunk_xy, prep_dir):
+    """Zero-arg generator over the proxy-val tiles; a tile the batcher drops
+    is a hard protocol error."""
+    def _proxy_batches():
+        for i in range(0, len(proxy_tiles), batch_size):
+            chunk = proxy_tiles[i:i + batch_size]
+            batch, lab = to_batch(chunk, training=False)
+            if len(batch["offset"]) != len(chunk):
+                bad = ([os.path.basename(t) for t in chunk if not viable(t)]
+                       or [os.path.basename(t) for t in chunk])
+                raise RuntimeError(
+                    f"proxy val tile(s) {bad} were dropped at batch time (<64 "
+                    f"points within chunk_xy={chunk_xy}m of the tile centre); "
+                    f"they cover {[proxy_rep['covers'].get(n, []) for n in bad]}, "
+                    f"whose score would silently vanish from the ranking metric. "
+                    f"Delete {prep_dir} and relaunch to re-prep the val tiles.")
+            yield batch, lab
+    return _proxy_batches
+
+
+def ptv3_make_run_eval(backbone, head, evaluate, forward_logits, proxy_batches,
+                       proxy_tiles, proxy_rep, val_full, val_items, test_items,
+                       val_csv, best, save_best, set_train_mode, num_classes,
+                       names, run_dir):
+    """run_eval(ep, write_json=False): proxy/full val + best-checkpoint
+    update; the final write_json call also test-evals the best weights and
+    writes test_metrics.json."""
+    import torch
+
+    def run_eval(ep, write_json=False):
+        backbone.eval(); head.eval()
+        if not write_json:
+            m = (evaluate(val_items, f"val@ep{ep}") if val_full else
+                 proxy_val(proxy_batches(), forward_logits, num_classes,
+                           names, f"val@ep{ep}", len(proxy_tiles),
+                           PROXY_PROTOCOL_TILES,
+                           inventory=proxy_rep["inventory"]))
+            # weights before the csv row: a kill between them must not seed a best final_model.pth can never match
+            if best.update(m):
+                save_best(ep)
+            append_val_row(val_csv, ep, m, names)
+            set_train_mode()
+            return m
+        m = evaluate(val_items, f"val@ep{ep}")
+        # deliberately no best.update: the last epoch is never a crown candidate, matching the AdaBN trainers
+        append_val_row(val_csv, ep, m, names)
+        swapped = os.path.exists(best.final)
+        if swapped:
+            live_backbone = {k: v.clone() for k, v in backbone.state_dict().items()}
+            live_head = {k: v.clone() for k, v in head.state_dict().items()}
+            bckpt = torch.load(best.final, map_location="cuda", weights_only=True)
+            backbone.load_state_dict(bckpt["backbone"]); head.load_state_dict(bckpt["head"])
+            backbone.eval(); head.eval()
+        mt = evaluate(test_items, f"test@ep{ep}")
+        if swapped:
+            backbone.load_state_dict(live_backbone); head.load_state_dict(live_head)
+        with open(f"{run_dir}/test_metrics.json", "w", encoding="utf-8") as fj:
+            json.dump({"val": m, "test": mt,
+                       "val_scenes": [n for n, _, _ in val_items],
+                       "test_scenes": [n for n, _, _ in test_items]}, fj, indent=2)
+        set_train_mode()
+        return m
+
+    return run_eval
+
+
+def ptv3_train_loop(backbone, head, optim, seg_loss, forward_logits,
+                    make_train_batch, run_eval, best, save_best,
+                    set_train_mode, run_dir, run_id, metrics_csv, start_epoch,
+                    n_epochs, steps, batch_size, num_classes, base_lr,
+                    warmup_pct, grad_clip, checkpoint_gap, val_every,
+                    ckpt_extra=None):
+    """The PTv3-family epoch loop: prefetched steps with an OOM guard, one
+    metrics.csv row + periodic checkpoint per epoch, val/stop cadence, then
+    the final combined eval, best crowning and DONE marker."""
+    import glob
+    import numpy as np
+    import torch
+
+    LOG_EVERY = 20
+    AMP = os.environ.get("TT_AMP") == "1"
+    prefetch = (make_prefetcher(make_train_batch,
+                                depth=int(os.environ.get("TT_PREFETCH", "2")))
+                if start_epoch < n_epochs else None)
+    print(f"  starting at epoch {start_epoch}, up to {n_epochs}, "
+          f"{steps} steps/epoch (batch {batch_size})"
+          f"{' [bf16 autocast]' if AMP else ''}", flush=True)
+    t_run = time.time()
+    ep = n_epochs - 1
+    for ep in range(start_epoch, n_epochs):
+        cur_lr = ptv3_lr_at(ep, base_lr, warmup_pct, n_epochs)
+        for g in optim.param_groups:
+            g["lr"] = cur_lr
+        set_train_mode()
+        ep_loss = 0.0
+        ep_conf = torch.zeros(num_classes, num_classes, dtype=torch.long,
+                              device="cuda")
+        t_ep = time.time(); t_chunk = t_ep; n_steps = 0; last_log_step = 0
+        n_oom = 0
+        print(f"  ep {ep:3d} starting (lr={cur_lr:.2e})…", flush=True)
+        for step in range(steps):
+            try:
+                batch, label = prefetch()
+                with torch.autocast("cuda", dtype=torch.bfloat16, enabled=AMP):
+                    logits = forward_logits(batch)
+                    loss = seg_loss(logits, label)
+                optim.zero_grad(); loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    list(backbone.parameters()) + list(head.parameters()), grad_clip)
+                optim.step()
+                ep_loss += loss.item(); n_steps += 1
+                if n_steps % LOG_EVERY == 0:
+                    dt = time.time() - t_chunk
+                    print(f"    ep {ep:3d} step {n_steps:4d}: "
+                          f"loss={ep_loss/n_steps:.4f} "
+                          f"{(n_steps-last_log_step)/max(dt,1e-6):.2f} it/s", flush=True)
+                    t_chunk = time.time(); last_log_step = n_steps
+                pred = logits.argmax(-1)
+                m = label >= 0
+                ep_conf += torch.bincount(
+                    label[m] * num_classes + pred[m],
+                    minlength=num_classes * num_classes,
+                ).reshape(num_classes, num_classes)
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower():
+                    n_oom += 1
+                    torch.cuda.empty_cache(); continue
+                raise
+        if n_steps == 0:
+            raise RuntimeError(f"epoch {ep}: 0 optimizer steps ({n_oom} OOM steps); "
+                               f"lower --batch or --chunk-xy.")
+        if n_oom:
+            print(f"  ep {ep:3d} note: {n_oom} OOM steps skipped", flush=True)
+        sec_per_iter = (time.time() - t_ep) / max(n_steps, 1)
+        sec_per_epoch = time.time() - t_ep
+        conf = ep_conf.cpu().numpy()
+        ep_inter = np.diag(conf)
+        ep_union = conf.sum(0) + conf.sum(1) - ep_inter
+        train_acc = int(np.trace(conf)) / max(int(conf.sum()), 1)
+        with np.errstate(invalid="ignore"):
+            train_iou = float(np.mean(ep_inter / np.maximum(ep_union, 1)))
+        gpu_mem = torch.cuda.max_memory_allocated() / 1e6
+        with open(metrics_csv, "a", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow([
+                ep, ep_loss / max(n_steps, 1), f"{train_acc:.4f}",
+                f"{train_iou:.4f}", f"{cur_lr:.6e}", f"{sec_per_iter:.4f}",
+                f"{sec_per_epoch:.2f}", f"{gpu_mem:.1f}",
+            ])
+        print(f"  ep {ep:3d}: loss={ep_loss/max(n_steps,1):.4f} "
+              f"acc={train_acc:.4f} miou={train_iou:.4f} lr={cur_lr:.2e} "
+              f"s/iter={sec_per_iter:.3f} s/ep={sec_per_epoch:.1f}", flush=True)
+        if (ep + 1) % checkpoint_gap == 0 or ep == n_epochs - 1:
+            atomic_torch_save({"backbone": backbone.state_dict(),
+                               "head": head.state_dict(),
+                               "optim": optim.state_dict(), "epoch": ep,
+                               **(ckpt_extra or {})},
+                              f"{run_dir}/checkpoints/ep{ep:03d}.pth")
+            for old in sorted(glob.glob(f"{run_dir}/checkpoints/ep*.pth"))[:-2]:
+                try:
+                    os.remove(old)
+                except OSError:
+                    pass
+        stop = stop_requested(ep)
+        if (ep + 1) % val_every == 0 and ep != n_epochs - 1 and not stop:
+            run_eval(ep)
+        if stop:
+            break
+
+    if prefetch:
+        prefetch.shutdown()
+
+    print("  final evaluation over the combined eval set…", flush=True)
+    run_eval(ep, write_json=True)
+    best.finalize(lambda p: save_best(ep))
+    print(f"  total wall-clock {(time.time() - t_run)/3600:.2f} h")
+
+    open(f"{run_dir}/DONE", "w").close()
+    print(f"  run complete -> {run_id}", flush=True)
+
+
 FEAT_VOCAB = ("x", "y", "z", "intensity", "return_number", "rgb")
 
 
-def parse_feat_spec(env_value, legacy_default):
-    """FEAT_CHANNELS csv -> ordered names; empty -> the trainer's legacy
-    default. Valid: FEAT_VOCAB or feat_<name>."""
+def parse_feat_spec(env_value, default_spec):
+    """FEAT_CHANNELS csv -> ordered names; empty -> the trainer's default
+    spec. Valid: FEAT_VOCAB or feat_<name>."""
     import re
     names = [s.strip() for s in (env_value or "").split(",") if s.strip()]
     if not names:
-        return list(legacy_default)
+        return list(default_spec)
     # feat_intensity/feat_return_number ARE the canonical channels (old datasets
     # baked the raw column under a feat_ alias); collapse the distinction
     fix = {"feat_intensity": "intensity", "feat_return_number": "return_number",
@@ -2198,11 +2866,11 @@ def parse_feat_spec(env_value, legacy_default):
     return names
 
 
-def feat_spec_tag(spec, legacy):
-    """PREP_DIR suffix for a non-default spec; "" when spec == legacy so
+def feat_spec_tag(spec, default_spec):
+    """PREP_DIR suffix for a non-default spec; "" when spec == the default so
     existing cache paths stay valid."""
     import hashlib
-    if list(spec) == list(legacy):
+    if list(spec) == list(default_spec):
         return ""
     return "_f" + hashlib.sha1(",".join(spec).encode()).hexdigest()[:6]
 
@@ -2221,9 +2889,6 @@ def feat_extras(z, spec, where):
             out[n] = np.zeros(len(z["xyz"]), np.float32)
             continue
         if n not in z.files:
-            if n == "feat_hag" and "hag" in z.files:
-                out[n] = z["hag"].astype(np.float32)
-                continue
             avail = [k for k in z.files if k.startswith("feat_")]
             raise ValueError(
                 f"{where} has no '{n}' channel (available feat_*: "
@@ -2291,10 +2956,25 @@ def load_ckpt_safe(path, map_location="cpu"):
         ) from e
 
 
-def modal_shell_run(script, flag_vals, env_json, volumes):
+def modal_retry_marker(fcid, marker_root, commit):
+    """First attempt drops a marker file (markers accumulate on the outputs
+    volume); a marker already present means a Modal retry, so auto-resume.
+    `commit` is the volume's commit callable - this module must not import modal."""
+    marker = f"{marker_root}/{fcid}" if fcid else ""
+    if not fcid or os.path.exists(marker):
+        os.environ["TT_MODAL_RETRY"] = os.environ["AUTO_RESUME"] = "1"
+    else:
+        os.makedirs(marker_root, exist_ok=True)
+        open(marker, "w").close()
+        commit()
+
+
+def modal_shell_run(script, flag_vals, env_json, volumes, reload=None):
     """Body of every modal_train_* shell: build the trainer command (None
     flags skipped), merge --env-json into the env, commit volumes every 120s +
-    on exit. Volumes are duck-typed (.commit()) - this module must not import modal."""
+    on exit. `reload` (the outputs volume's .reload) is called after each commit
+    so an externally-uploaded /outputs/STOP sentinel becomes visible in the
+    container. Volumes are duck-typed - this module must not import modal."""
     import subprocess
     import sys
     import threading
@@ -2313,9 +2993,18 @@ def modal_shell_run(script, flag_vals, env_json, volumes):
     stop = threading.Event()
 
     def _commit_loop():
+        warned = False
         while not stop.wait(120):
             for v in volumes:
                 v.commit()
+            if reload is not None:
+                try:
+                    reload()
+                except Exception as e:  # open handles can block reload; STOP just waits a cycle
+                    if not warned:
+                        print(f"[modal-shell] volume reload failed ({e}); "
+                              f"STOP delivery delayed to the next pass", flush=True)
+                        warned = True
 
     threading.Thread(target=_commit_loop, daemon=True).start()
     try:
@@ -2324,617 +3013,3 @@ def modal_shell_run(script, flag_vals, env_json, volumes):
         stop.set()
         for v in volumes:
             v.commit()
-
-
-def _demo():
-    import tempfile
-    d = tempfile.mkdtemp()
-    px = lambda v: {"present_classes_mIoU": v, "protocol": "proxy_tiles_v2"}
-    fu = lambda v: {"present_classes_mIoU": v}
-    assert row_protocol(px(0.5)) == "proxy" and row_protocol(fu(0.5)) == "full"
-    assert ranking_protocol("full") == "full"
-    assert ranking_protocol("coverage") == "proxy"
-    os.environ["TT_ZERO_CHANNELS"] = "intensity"
-    try:
-        BestCheckpoint(d)
-        raise AssertionError("training with TT_ZERO_CHANNELS set must refuse")
-    except RuntimeError as e:
-        assert "inference-only" in str(e)
-    del os.environ["TT_ZERO_CHANNELS"]
-    b = BestCheckpoint(d)
-    assert b.update(px(0.5)) and not b.update(px(0.4)) and b.update(px(0.6))
-    # a full-protocol metric never crowns a proxy-ranked run, however high
-    assert not b.update(fu(0.99)) and abs(b.best - 0.6) < 1e-9
-    csv_path = os.path.join(d, "val_metrics.csv")
-    with open(csv_path, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["epoch", "val_acc", "val_miou", "protocol"])
-        w.writerow([0, 0.9, 0.7, "proxy"])
-        w.writerow([1, 0.9, 0.65, "proxy"])
-        w.writerow([1, 0.9, 0.95, "full"])
-    assert abs(best_val_miou(csv_path) - 0.7) < 1e-9
-    assert abs(best_val_miou(csv_path, "full") - 0.95) < 1e-9
-    assert not BestCheckpoint(d).update(px(0.69))
-    # a full-ranked run seeds off the full rows and ignores the proxy ones
-    bf = BestCheckpoint(d, "full")
-    assert abs(bf.best - 0.95) < 1e-9 and not bf.update(px(0.99))
-    assert bf.update(fu(0.96)) and not bf.update(fu(0.94))
-    open(b.final, "w").close()
-    b.finalize(lambda p: (_ for _ in ()).throw(AssertionError("should not save_last")))
-
-    with open(os.path.join(d, "run_config.json"), "w") as f:
-        json.dump({"num_classes": 7, "class_names": list("abcdefg"),
-                   "grid_m": 2.0, "chunk_xy_m": 100.0,
-                   "features": ["intensity", "return_number", "feat_hag"]}, f)
-    m = write_run_manifest(d, "kpconvx_cold")
-    assert m["backbone"] == "kpconvx_cold" and m["weights"] == "final_model.pth"
-    assert m["grid"] == 2.0 and m["chunk_xy"] == 100.0 and m["num_classes"] == 7
-    assert m["intensity_norm"] == "p95"
-    assert "hag_source" not in m and m.get("feature_mode") != "hag"
-    assert m["grid_m"] == 2.0
-    assert os.path.exists(os.path.join(d, "run.json"))
-    os.remove(os.path.join(d, "run_config.json"))
-    m_again = write_run_manifest(d, "kpconvx_cold")
-    assert m_again["grid"] == 2.0 and m_again["grid_m"] == 2.0
-    assert m["dg"] is not None and m["dg"]["logdk"] is False
-    os.environ["DG_LOGDK_FEAT"] = "1"; os.environ["DG_LOGDK_K"] = "12"
-    m2 = write_run_manifest(d, "kpconvx_cold")
-    assert m2["dg"]["logdk"] is True and m2["dg"]["logdk_k"] == 12
-    assert infer_meta(os.path.join(d, "final_model.pth"))["dg"]["logdk"] is True
-    os.environ.pop("DG_LOGDK_FEAT"); os.environ.pop("DG_LOGDK_K")
-
-    assert _intensity_norm_from_meta({"source": {"intensity_norm": "p95"}}) == "p95"
-    assert _intensity_norm_from_meta({"intensity_norm": "p95"}) == "p95"
-    assert _intensity_norm_from_meta({"source": {}}) == "max"
-
-    im = infer_meta(os.path.join(d, "final_model.pth"))
-    assert im and im["num_classes"] == 7 and im["grid"] == 2.0
-    assert im["features"] == ["intensity", "return_number", "feat_hag"]
-    assert im["hag_source"] is None and im["class_names"] == list("abcdefg")
-    assert infer_meta(os.path.join(tempfile.mkdtemp(), "bare.pth")) is None
-
-    import numpy as np
-    import torch as _torch
-    rng = np.random.RandomState(1)
-    pts = rng.rand(5_000, 3).astype(np.float32) * [300, 300, 10]
-    got = {(x0, y0): set(idx.tolist())
-           for x0, y0, idx in tile_xy_indices(_torch.from_numpy(pts), 100.0, 50.0)}
-    mins, maxs = pts[:, :2].min(0), pts[:, :2].max(0)
-    for x0 in np.arange(mins[0], maxs[0], 50.0):
-        for y0 in np.arange(mins[1], maxs[1], 50.0):
-            m = ((pts[:, 0] >= x0) & (pts[:, 0] < x0 + 100.0) &
-                 (pts[:, 1] >= y0) & (pts[:, 1] < y0 + 100.0))
-            ref = set(np.nonzero(m)[0].tolist())
-            assert got.get((x0, y0), set()) == ref
-
-    cd = tempfile.mkdtemp()
-    np.savez(f"{cd}/good_x0_y0.npz", lab=np.array([0, 1], np.int32))
-    open(f"{cd}/bad_x0_y50.npz", "w").write("not a zip")
-    open(f"{cd}/bad.done", "w").close()
-    try:
-        scan_class_balance([f"{cd}/good_x0_y0.npz", f"{cd}/bad_x0_y50.npz"], 2)
-        raise AssertionError("corrupt tile must raise after healing")
-    except RuntimeError as e:
-        assert "corrupt" in str(e)
-    assert not os.path.exists(f"{cd}/bad_x0_y50.npz")
-    assert not os.path.exists(f"{cd}/bad.done")
-    assert os.path.exists(f"{cd}/good_x0_y0.npz")
-
-    utm = np.array([620900.0, 4849000.0, 170.0]) + \
-        np.random.RandomState(2).rand(20_000, 3) * [30, 30, 5]
-    np.savez(f"{cd}/utm.npz", xyz=utm, label=np.zeros(len(utm), np.int32))
-    lx, _, _ = ptv3_load_canonical(f"{cd}/utm.npz", "intensity")
-    assert lx.dtype == np.float32 and 0 <= lx.min() and lx.max() < 40.0
-    c = (lx - lx.mean(0, keepdims=True, dtype=np.float64)).astype(np.float32)
-    assert (np.abs(c[:, :2]).max(1) <= 40.0).all()
-    assert np.allclose(lx + np.floor(utm.min(0)), utm, atol=1e-2)
-
-    _pn = iter(range(100))
-    pf = make_prefetcher(lambda: next(_pn), depth=2)
-    assert pf() == 0 and pf() == 1 and pf() == 2
-    pf.shutdown()
-
-    pts2 = rng.rand(2_000, 3).astype(np.float32) * 10 - 5
-    at2 = rng.rand(2_000, 2).astype(np.float32)
-    lb2 = rng.randint(-1, 4, 2_000).astype(np.int32)
-    sx2, sa2, sl2 = kp_grid_subsample(pts2, at2, lb2, 1.0, 4)
-    vk = np.floor(pts2 / 1.0).astype(np.int64)
-    uk = np.unique(vk, axis=0)
-    assert len(sx2) == len(uk)
-    for i, kk in enumerate(uk):
-        m = (vk == kk).all(1)
-        assert np.allclose(sx2[i], pts2[m].mean(0), atol=1e-5)
-        assert np.allclose(sa2[i], at2[m].mean(0), atol=1e-5)
-        vl = lb2[m][lb2[m] >= 0]
-        assert sl2[i] == (np.bincount(vl, minlength=4).argmax() if len(vl) else -1)
-
-    rng = np.random.RandomState(0)
-    for dims in (2, 3):
-        keys = rng.randint(-50, 50, size=(20_000, dims))
-        ref_u, ref_first, ref_inv = np.unique(keys, axis=0, return_index=True,
-                                              return_inverse=True)
-        first, inv = voxel_unique(keys, return_inverse=True)
-        assert np.array_equal(first, ref_first) and np.array_equal(inv, ref_inv.reshape(-1))
-        assert np.array_equal(keys[first], ref_u)
-    if _torch.cuda.is_available():
-        big = rng.randint(-40, 40, size=(50_000, 3))
-        ref_f, ref_i = voxel_unique(big, return_inverse=True)
-        keep, globals()["VOXEL_GPU_MIN"] = VOXEL_GPU_MIN, 1
-        try:
-            gf, gi = voxel_unique(big, return_inverse=True)
-        finally:
-            globals()["VOXEL_GPU_MIN"] = keep
-        assert np.array_equal(gf, ref_f) and np.array_equal(gi, ref_i)
-    assert list(prefetch_map(lambda x: x * x, range(20), depth=3)) \
-        == [x * x for x in range(20)]
-    xyz = rng.uniform(0, 300, size=(30_000, 3))
-    got = {tuple(sorted(g.tolist())) for g in xy_chunk_groups(xyz, 100.0, min_pts=64)}
-    mins = xyz[:, :2].min(0)
-    ref = set()
-    for x0 in np.arange(mins[0], xyz[:, 0].max() + 100.0, 100.0):
-        for y0 in np.arange(mins[1], xyz[:, 1].max() + 100.0, 100.0):
-            m = ((xyz[:, 0] >= x0) & (xyz[:, 0] < x0 + 100.0)
-                 & (xyz[:, 1] >= y0) & (xyz[:, 1] < y0 + 100.0))
-            if m.sum() >= 64:
-                ref.add(tuple(sorted(np.where(m)[0].tolist())))
-    assert got == ref, (len(got), len(ref))
-    doc = write_infer_run(d, {"backbone": "x"},
-                          [{"scene": "a.npz", "points": 10, "seconds": 1.5},
-                           {"scene": "b.npz", "points": 5, "seconds": 0.5}])
-    assert doc["total_points"] == 15 and doc["total_seconds"] == 2.0
-    assert json.load(open(os.path.join(d, "infer_run.json")))["backbone"] == "x"
-
-    import torch
-    g = torch.Generator().manual_seed(0)
-    logits = torch.randn(50, 4, generator=g)
-    labels = torch.randint(0, 4, (50,), generator=g)
-    seg = make_seg_loss(None, 0.0, False, 2.0, 1.0)
-    ref = (torch.nn.functional.cross_entropy(logits, labels)
-           + lovasz_softmax_flat(torch.softmax(logits, 1), labels))
-    assert torch.allclose(seg(logits, labels), ref)
-    assert float(seg(logits, torch.full((50,), -1))) == 0.0
-    assert torch.allclose(focal_loss(logits, labels, 0.0),
-                          torch.nn.functional.cross_entropy(logits, labels))
-    hot = torch.nn.functional.one_hot(labels, 4).float() * 1e6
-    assert float(lovasz_softmax_flat(torch.softmax(hot, 1), labels)) < 1e-3
-
-    counts = np.array([1000, 1000, 10, 0], np.int64)
-    assert auto_rare_classes(counts, 0.5) == [2]
-    w = class_weights_np(counts[:3], 0.5, 5.0)
-    assert w[2] > w[0] and w.max() <= 5.0 and w.min() >= 0.2
-    wa = class_weights_np(counts, 0.5, 5.0, absent_to_one=True)
-    assert wa[3] <= wa[2] and wa[2] > wa[0]
-    pick = make_tile_picker(["a", "b"], ["r"], 1.0)
-    assert pick() == "r"
-    assert make_tile_picker(["a"], [], 1.0)() == "a"
-
-    i_, u_, g_ = score_ious(np.array([0, 0, 1]), np.array([0, 1, 1]), 2)
-    assert list(i_) == [1, 1] and list(u_) == [2, 2] and list(g_) == [1, 2]
-    rs = np.random.RandomState(7)
-    pr5, la5 = rs.randint(0, 5, 3000), rs.randint(0, 6, 3000)
-    i5, u5, g5 = score_ious(pr5, la5, 5)
-    for c in range(5):
-        assert (i5[c] == ((pr5 == c) & (la5 == c)).sum()
-                and u5[c] == ((pr5 == c) | (la5 == c)).sum()
-                and g5[c] == (la5 == c).sum())
-    m_ev = eval_metrics(i_, u_, g_, 2, 3, ["a", "b"], time.time(), 1, "demo",
-                        extra={"skipped_scenes": 0, "scored_on": "raw_points"})
-    assert (abs(m_ev["overall_mIoU"] - 0.5) < 1e-9 and m_ev["scored_on"] == "raw_points"
-            and m_ev["present_classes"] == ["a", "b"])
-    vd = tempfile.mkdtemp()
-    append_val_row(f"{vd}/v.csv", 3, m_ev, ["a", "b"])
-    assert "3,0.6667,0.5000,0.5000,0.5000,full" in open(f"{vd}/v.csv").read()
-    v1 = f"{vd}/v1.csv"
-    with open(v1, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["epoch", "val_acc", "val_miou", "iou_a", "iou_b"])
-        w.writerow([0, 0.9, 0.88, 0.9, 0.86])
-    assert best_val_miou(v1) == -1.0
-    init_val_csv(v1, ["a", "b"])
-    append_val_row(v1, 4, dict(m_ev, protocol=PROXY_PROTOCOL_TILES), ["a", "b"])
-    init_val_csv(v1, ["a", "b"])
-    assert best_val_miou(v1) == 0.5 and len(open(v1).read().split()) == 3
-
-    i3, u3, g3 = score_ious(np.array([0, 0, 1]), np.array([0, 1, 1]), 3)
-    m_inv = eval_metrics(i3, u3, g3, 2, 3, ["a", "b", "c"], time.time(), 1,
-                         "demo", force_present=[0, 1, 2])
-    assert (abs(m_inv["present_classes_mIoU"] - 1 / 3) < 1e-9
-            and m_inv["forced_zero_classes"] == ["c"]
-            and m_inv["scored_classes"] == ["a", "b", "c"]
-            and m_inv["absent_classes"] == [])
-    m_nof = eval_metrics(i3, u3, g3, 2, 3, ["a", "b", "c"], time.time(), 1, "demo")
-    assert m_nof["present_classes_mIoU"] == 0.5
-    assert m_nof["forced_zero_classes"] == [] and m_nof["absent_classes"] == ["c"]
-
-    gd = tempfile.mkdtemp()
-    rep = {"mode": "coverage", "floor_points": 4096, "inventory": [0, 1],
-           "tiles": ["t1.npz", "t0.npz"]}
-    gcsv = f"{gd}/val_metrics.csv"
-    init_val_csv(gcsv, ["a", "b"])
-    assert proxy_guard(gd, rep, PROXY_PROTOCOL_TILES, ["a", "b"])
-    append_val_row(gcsv, 0, dict(m_ev, protocol=PROXY_PROTOCOL_TILES), ["a", "b"])
-    try:
-        proxy_guard(gd, rep, PROXY_PROTOCOL_TILES, ["a", "b"])
-        raise AssertionError("proxy rows with no final_model.pth must block")
-    except RuntimeError as e:
-        assert ("final_model.pth" in str(e) and "plot history" in str(e)
-                and "delete BOTH" not in str(e))
-    open(f"{gd}/final_model.pth", "w").close()
-    assert proxy_guard(gd, rep, PROXY_PROTOCOL_TILES, ["a", "b"])
-    assert proxy_guard(gd, {**rep, "tiles": ["t1.npz", "t0.npz"]},
-                       PROXY_PROTOCOL_TILES, ["a", "b"])
-    try:
-        proxy_guard(gd, {**rep, "mode": "density"}, PROXY_PROTOCOL_TILES, ["a", "b"])
-        raise AssertionError("a mode switch must block")
-    except RuntimeError as e:
-        assert "EVAL_ONLY" in str(e) and "val_metrics.csv" in str(e)
-    os.remove(f"{gd}/proxy_val.json")
-    assert not proxy_guard(gd, rep, PROXY_PROTOCOL_TILES, ["a", "b"])
-    open(f"{gd}/proxy_val.json", "w").write("{not json")
-    try:
-        proxy_guard(gd, rep, PROXY_PROTOCOL_TILES, ["a", "b"])
-        raise AssertionError("an unparseable signature with proxy rows must block")
-    except RuntimeError as e:
-        assert "unreadable proxy_val.json" in str(e)
-    nr = tempfile.mkdtemp()
-    init_val_csv(f"{nr}/val_metrics.csv", ["a", "b"])
-    append_val_row(f"{nr}/val_metrics.csv", 0, m_ev, ["a", "b"])
-    open(f"{nr}/proxy_val.json", "w").write("{not json")
-    assert proxy_guard(nr, {**rep, "mode": "density"}, PROXY_PROTOCOL_TILES, ["a", "b"])
-    assert json.load(open(f"{nr}/proxy_val.json"))["mode"] == "density"
-    ur = tempfile.mkdtemp()
-    with open(f"{ur}/val_metrics.csv", "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(["epoch", "val_acc", "val_miou", "iou_a", "iou_b"])
-        w.writerow([40, 0.9, 0.81, 0.9, 0.72])
-    open(f"{ur}/final_model.pth", "w").close()
-    assert not proxy_guard(ur, rep, PROXY_PROTOCOL_TILES, ["a", "b"])
-    init_val_csv(f"{ur}/val_metrics.csv", ["a", "b"])
-    assert not proxy_guard(ur, rep, PROXY_PROTOCOL_TILES, ["a", "b"])
-    assert not os.path.exists(f"{ur}/proxy_val.json")
-
-    # ranking='full': no tile subset to pin, and the two scales must not mix
-    fd = tempfile.mkdtemp()
-    fcsv = f"{fd}/val_metrics.csv"
-    init_val_csv(fcsv, ["a", "b"])
-    assert proxy_guard(fd, rep, PROXY_PROTOCOL_TILES, ["a", "b"], "full")
-    assert json.load(open(f"{fd}/proxy_val.json")) == {"ranking": "full"}
-    append_val_row(fcsv, 0, m_ev, ["a", "b"])            # m_ev has no protocol -> a 'full' row
-    open(f"{fd}/final_model.pth", "w").close()
-    assert proxy_guard(fd, rep, PROXY_PROTOCOL_TILES, ["a", "b"], "full")
-    for mode in ("coverage", "density"):
-        try:
-            proxy_guard(fd, {**rep, "mode": mode}, PROXY_PROTOCOL_TILES, ["a", "b"])
-            raise AssertionError(f"full -> {mode} must block")
-        except RuntimeError as e:
-            # the remedy names the setting that CONTINUES this run, not the new one
-            assert "PROXY_SAMPLING='full'" in str(e) and "different scales" in str(e)
-    # and the reverse: a proxy-ranked run (readable signature) may not go full
-    pd_ = tempfile.mkdtemp()
-    init_val_csv(f"{pd_}/val_metrics.csv", ["a", "b"])
-    proxy_guard(pd_, rep, PROXY_PROTOCOL_TILES, ["a", "b"])
-    append_val_row(f"{pd_}/val_metrics.csv", 0,
-                   dict(m_ev, protocol=PROXY_PROTOCOL_TILES), ["a", "b"])
-    open(f"{pd_}/final_model.pth", "w").close()
-    try:
-        proxy_guard(pd_, rep, PROXY_PROTOCOL_TILES, ["a", "b"], "full")
-        raise AssertionError("proxy -> full must block")
-    except RuntimeError as e:
-        assert "PROXY_SAMPLING='coverage'" in str(e) and "different scales" in str(e)
-    # a full-ranked run with rows but no crowned checkpoint blocks like a proxy one
-    fd2 = tempfile.mkdtemp()
-    init_val_csv(f"{fd2}/val_metrics.csv", ["a", "b"])
-    proxy_guard(fd2, rep, PROXY_PROTOCOL_TILES, ["a", "b"], "full")
-    append_val_row(f"{fd2}/val_metrics.csv", 0, m_ev, ["a", "b"])
-    try:
-        proxy_guard(fd2, rep, PROXY_PROTOCOL_TILES, ["a", "b"], "full")
-        raise AssertionError("full rows with no final_model.pth must block")
-    except RuntimeError as e:
-        assert "final_model.pth" in str(e) and "full val row" in str(e)
-
-    import ntpath
-    import posixpath
-    wd, pxd = tempfile.mkdtemp(), tempfile.mkdtemp()
-    proxy_guard(wd, {**rep, "tiles": [ntpath.basename(p) for p
-                                      in (r"D:\prep\t1.npz", r"D:\prep\t0.npz")]},
-                PROXY_PROTOCOL_TILES, ["a", "b"])
-    proxy_guard(pxd, {**rep, "tiles": [posixpath.basename(p) for p
-                                       in ("/vol/prep/t0.npz", "/vol/prep/t1.npz")]},
-                PROXY_PROTOCOL_TILES, ["a", "b"])
-    wsig = json.load(open(f"{wd}/proxy_val.json", encoding="utf-8"))
-    assert wsig == json.load(open(f"{pxd}/proxy_val.json", encoding="utf-8"))
-    assert "/" not in json.dumps(wsig) and "\\" not in json.dumps(wsig)
-
-    ptd = tempfile.mkdtemp()
-    pnm = ["ground", "veg", "pole", "wire"]
-    for i in range(12):
-        lab = [np.zeros(6000, np.int32)]
-        if i >= 9:
-            lab.append(np.full(3000, 1, np.int32))
-        if i == 8:
-            lab.append(np.full(5000, 2, np.int32))
-        if i == 7:
-            lab.append(np.full(5000, 3, np.int32))
-        np.savez(f"{ptd}/t{i:02d}.npz", lab=np.concatenate(lab))
-    pvt = sorted(f"{ptd}/t{i:02d}.npz" for i in range(12))
-    pcb = f"{ptd}/cb.npz"
-    pcov, cr = pick_proxy_tiles(pvt, 4, 8, "coverage", pnm, cache_path=pcb)
-    assert cr["inventory"] == [0, 1, 2, 3] and cr["shortfall"] == {}
-    assert all(v >= cr["floor_points"] for v in cr["per_class_picked"].values())
-    assert cr["covers"] == {"t08.npz": ["pole"], "t09.npz": ["veg"], "t10.npz": ["veg"]}
-    assert 8 < cr["n_tiles"] <= 8 + _PROXY_FLOOR_TILES * len(cr["inventory"])
-    assert [os.path.basename(p) for p in pcov] == cr["tiles"]
-    psh = [pvt[i] for i in np.random.RandomState(5).permutation(12)]
-    assert pick_proxy_tiles(sorted(psh), 4, 8, "coverage", pnm)[1] == cr
-    assert pick_proxy_tiles(pvt, 4, 8, "coverage", pnm, cache_path=pcb)[1] == cr
-    _, sr = pick_proxy_tiles(pvt, 4, 8, "coverage", pnm, cache_path=pcb,
-                             viable=lambda p: not p.endswith("t08.npz"))
-    assert sr["shortfall"] == {"pole": [0, sr["floor_points"]]}
-    assert "t08.npz" not in sr["tiles"]
-    assert pick_proxy_tiles(pvt, 4, 50, "coverage", pnm,
-                            cache_path=pcb)[1]["n_tiles"] == 12
-    try:
-        pick_proxy_tiles([], 4, 8)
-        raise AssertionError("an empty val split must raise")
-    except RuntimeError as e:
-        assert "non-empty val split" in str(e)
-    assert pick_proxy_tiles(pvt, 4, 2, "coverage", pnm,
-                            cache_path=pcb)[1]["shortfall"] == {}
-    try:
-        pick_proxy_tiles(pvt, 4, 8, "coverage", pnm, viable=lambda p: False)
-        raise AssertionError("an all-non-viable val split must raise")
-    except RuntimeError as e:
-        assert "12/12 rejected" in str(e) and "final_model.pth" in str(e)
-    try:
-        pick_proxy_tiles(pvt, 4, 8, "rare", pnm)
-        raise AssertionError("an unknown sampling mode must raise")
-    except ValueError as e:
-        assert "PROXY_SAMPLING" in str(e) and "coverage" in str(e)
-
-    sx, sa, sl = kp_grid_subsample(
-        np.array([[0.1, 0.1, 0.1], [0.2, 0.2, 0.2], [5.0, 5.0, 5.0]], np.float32),
-        np.array([[0.0], [1.0], [2.0]], np.float32),
-        np.array([1, 1, 0], np.int64), 1.0, 3)
-    assert len(sx) == 2 and abs(sa[0, 0] - 0.5) < 1e-6 and list(sl) == [1, 0]
-    assert kp_augment(sx).shape == sx.shape
-
-    assert parse_feat_spec("", ["intensity", "return_number"]) \
-        == ["intensity", "return_number"]
-    assert parse_feat_spec(" intensity , feat_ndvi ", []) == ["intensity", "feat_ndvi"]
-    assert parse_feat_spec("feat_intensity,feat_return_number,feat_geo_q", []) \
-        == ["intensity", "return_number", "feat_geo_q"]
-    try:
-        parse_feat_spec("bogus", [])
-        raise AssertionError("unknown spec name must raise")
-    except ValueError as e:
-        assert "bogus" in str(e) and "intensity" in str(e)
-
-    bf = kp_make_build_feat(False, 8)
-    xyz10 = np.random.RandomState(0).rand(10, 3).astype(np.float32)
-    f = bf(xyz10, np.ones(10, np.float32), np.zeros(10, np.float32))
-    assert f.shape == (10, 3) and np.all(f[:, 0] == 1.0)
-    fd = bf(xyz10, np.ones(10, np.float32), np.ones(10, np.float32), drop=[0])
-    assert np.all(fd[:, 1] == 0.0) and np.all(fd[:, 2] == 1.0)
-    assert np.all(fd[:, 0] == 1.0)
-    fq = np.arange(10, dtype=np.float32)
-    bfl = kp_make_build_feat(False, 8, spec=["intensity", "return_number", "feat_q"])
-    fl = bfl(xyz10, np.ones(10, np.float32), np.ones(10, np.float32),
-             extras={"feat_q": fq})
-    assert np.array_equal(fl[:, 3], fq)
-    fh = bfl(xyz10, np.ones(10, np.float32), np.ones(10, np.float32), drop=[2],
-             extras={"feat_q": fq})
-    assert np.all(fh[:, 3] == 0.0) and np.all(fh[:, 1] == 1.0)
-    bfs = kp_make_build_feat(False, 8, spec=["feat_q", "intensity"])
-    fs = bfs(xyz10, np.full(10, 0.5, np.float32), np.zeros(10, np.float32),
-             extras={"feat_q": fq})
-    assert fs.shape == (10, 3) and np.all(fs[:, 0] == 1.0)
-    assert np.array_equal(fs[:, 1], fq) and np.all(fs[:, 2] == 0.5)
-    try:
-        bfs(xyz10, fq, fq)
-        raise AssertionError("missing extras must raise")
-    except ValueError as e:
-        assert "feat_q" in str(e)
-
-    ds = tempfile.mkdtemp()
-    rng = np.random.RandomState(1)
-    for split in ("train", "val", "test"):
-        os.makedirs(f"{ds}/{split}")
-        np.savez(f"{ds}/{split}/s0.npz",
-                 xyz=rng.uniform(0, 60, (4000, 3)).astype(np.float32),
-                 intensity=rng.rand(4000).astype(np.float32),
-                 feat_demo=np.full(4000, 0.25, np.float32),
-                 label=rng.randint(0, 3, 4000).astype(np.int32))
-    prep = os.path.join(ds, "prep")
-    sig = {"pipeline": "demo", "grid": 2.0}
-    tile_fn = lambda name, pc, outd, split: kp_tile_and_save(
-        name, pc, outd, 30.0,
-        train_stride(30.0) if split == "train" else 15.0, 2.0, 3)
-    tr, va, te = kp_ensure_prep(prep, ds, sig, tile_fn)
-    assert [n for n, _, _ in tr] == ["s0"] and os.path.exists(f"{prep}/train/s0.done")
-    import glob as _glob
-    train_tiles = sorted(_glob.glob(f"{prep}/train/*.npz"))
-    assert train_tiles
-    kp_ensure_prep(prep, ds, sig, tile_fn)
-    try:
-        kp_ensure_prep(prep, ds, {**sig, "grid": 9.0}, tile_fn)
-        raise AssertionError("stale cache must be refused")
-    except RuntimeError:
-        pass
-    cc, pm = scan_class_balance(train_tiles, 3, cache_path=f"{prep}/cb.npz")
-    cc2, _ = scan_class_balance(train_tiles, 3, cache_path=f"{prep}/cb.npz")
-    assert cc.sum() > 0 and np.array_equal(cc, cc2) and pm.shape == (len(train_tiles), 3)
-
-    st = kp_make_sample_tile(bf, 2.0, 500, 0.8, False, 2.5, 0.5)
-    s = st(train_tiles[0], training=False)
-    assert s and s[0].shape == (len(s[2]), 3) and s[1].shape[1] == 3
-    assert abs(s[0].mean()) < 1e-3
-    zt = np.load(train_tiles[0])
-    assert "feat_demo" in zt.files and np.allclose(zt["feat_demo"], 0.25)
-    st3 = kp_make_sample_tile(kp_make_build_feat(False, 8,
-                                                 spec=["intensity", "feat_demo"]),
-                              2.0, 500, 1.0, False, 2.5, 0.5)
-    s3 = st3(train_tiles[0], training=False)
-    assert s3[1].shape[1] == 3 and np.allclose(s3[1][:, 2], 0.25)
-    try:
-        feat_extras(zt, ["feat_nope"], "t0")
-        raise AssertionError("absent feat_* must raise")
-    except ValueError as e:
-        assert "feat_nope" in str(e) and "feat_demo" in str(e)
-    os.environ["TT_ZERO_CHANNELS"] = "feat_demo, feat_nope"
-    zx = feat_extras(zt, ["feat_demo", "feat_nope"], "t0")
-    assert (zx["feat_demo"] == 0).all() and (zx["feat_nope"] == 0).all()
-    del os.environ["TT_ZERO_CHANNELS"]
-
-    fwd = lambda tiles: [np.tile([5.0, 0.0, 0.0], (len(c), 1)).astype(np.float32)
-                         for c, _ in tiles]
-    ev = kp_make_evaluate(fwd, bf, 2.0, 30.0, 3, ["a", "b", "c"])
-    os.environ["EVAL_BATCH"] = "1"
-    m_kp = ev([("s0", f"{ds}/val/s0.npz", None, f"{prep}/val")], "demo")
-    assert m_kp["num_scenes"] == 1 and m_kp["per_class_gt_count"]["a"] > 0
-    assert abs(m_kp["per_class_iou"]["a"] - m_kp["per_class_gt_count"]["a"]
-               / sum(m_kp["per_class_gt_count"].values())) < 0.02
-    os.environ["EVAL_BATCH"] = "3"
-    m_kp3 = ev([("s0", f"{ds}/val/s0.npz", None, f"{prep}/val")], "demo")
-    del os.environ["EVAL_BATCH"]
-    assert (m_kp3["per_class_iou"] == m_kp["per_class_iou"]
-            and m_kp3["overall_acc"] == m_kp["overall_acc"])
-    pp = kp_make_predict_points(
-        lambda cxyz, feat: np.tile([1.0, 0.0, 0.0], (len(cxyz), 1)).astype(np.float32),
-        bf, 2.0, 30.0, 3, 0, save_probs=True)
-    z0 = np.load(f"{ds}/val/s0.npz")
-    pr, cf, pb = pp(z0["xyz"], z0["intensity"], np.zeros(4000, np.float32))
-    assert pr.shape == (4000,) and set(pr.tolist()) == {0}
-    assert cf.shape == (4000,) and cf.dtype == np.float32 and cf.max() <= 1.0 + 1e-6
-    assert pb.shape == (4000, 3) and pb.dtype == np.float16
-
-    pd_ = tempfile.mkdtemp()
-    rp = np.random.RandomState(4)
-    pxyz = (rp.uniform(0, 60, (20_000, 3)) * [1, 1, 0.1]).astype(np.float32)
-    prgb = rp.randint(0, 256, (20_000, 3)).astype(np.uint8)
-    plab = rp.randint(0, 3, 20_000).astype(np.int32)
-    np.savez(f"{pd_}/pv.npz", xyz=pxyz, rgb=prgb, label=plab)
-    load_c = lambda p: ((lambda z: (z["xyz"].astype(np.float32), z["rgb"],
-                                    z["label"].astype(np.int32)))(np.load(p)))
-    ptv3_tile_and_save([f"{pd_}/pv.npz"], f"{pd_}/tiles", 30.0, 15.0, load_c)
-    tls = sorted(_glob.glob(f"{pd_}/tiles/pv_x*.npz"))
-    assert tls
-    lut = {p.tobytes(): i for i, p in enumerate(pxyz)}
-    for tp in tls:
-        zt = np.load(tp)
-        ii = np.array([lut[p.tobytes()] for p in zt["xyz"]])
-        assert (np.array_equal(zt["rgb"], prgb[ii])
-                and np.array_equal(zt["lab"], plab[ii]))
-        assert (zt["xyz"][:, :2].max(0) - zt["xyz"][:, :2].min(0) <= 30.0).all()
-    bfp = lambda vx, rgbn, extras: np.concatenate([vx, rgbn], 1).astype(np.float32)
-    fwdp = lambda b: _torch.nn.functional.pad(
-        _torch.full((len(b["feat"]), 1), 5.0), (0, 2))
-    evp = ptv3_make_evaluate(fwdp, bfp, [], 2.0, 30.0, 3, ["a", "b", "c"])
-    load_raw = lambda: (pxyz, plab)
-    os.environ["EVAL_BATCH"] = "1"
-    mp1 = evp([("pv", load_raw, f"{pd_}/tiles")], "demo")
-    os.environ["EVAL_BATCH"] = "3"
-    mp3 = evp([("pv", load_raw, f"{pd_}/tiles")], "demo")
-    del os.environ["EVAL_BATCH"]
-    assert mp1["num_scenes"] == 1 and mp1["per_class_gt_count"]["a"] > 0
-    assert abs(mp1["overall_acc"] - mp1["per_class_gt_count"]["a"]
-               / sum(mp1["per_class_gt_count"].values())) < 1e-9
-    assert (mp3["per_class_iou"] == mp1["per_class_iou"]
-            and mp3["overall_acc"] == mp1["overall_acc"])
-
-    zi, zr = scene_arrays({"files": []} and np.load(f"{ds}/val/s0.npz"), 4000)
-    assert zi.shape == (4000,) and np.all(zr == 0.0)
-    os.environ["TT_ZERO_CHANNELS"] = "intensity,return_number"
-    zi0, zr0 = scene_arrays(np.load(f"{ds}/val/s0.npz"), 4000)
-    assert np.all(zi0 == 0.0) and np.all(zr0 == 0.0)   # present column killed
-    os.environ["TT_ZERO_CHANNELS"] = "rgb"
-    zi1, _ = scene_arrays(np.load(f"{pd_}/pv.npz"), 20_000)
-    assert np.all(zi1 == 0.0)   # killed rgb must not leak in as the intensity proxy
-    np.savez(f"{pd_}/zc0.npz", xyz=pxyz[:100],
-             intensity=np.full(100, 0.5, np.float32), rgb=prgb[:100])
-    os.environ["TT_ZERO_CHANNELS"] = "intensity"
-    _, zrgb, _ = ptv3_load_canonical(f"{pd_}/zc0.npz", "intensity")
-    assert np.all(zrgb == 128.0)   # zeroed color pick -> constant, never live rgb
-    os.environ["TT_ZERO_CHANNELS"] = "rgb"
-    _, zrgb2, _ = ptv3_load_canonical(f"{pd_}/zc0.npz", "rgb")
-    assert np.all(zrgb2 == 128.0)
-    del os.environ["TT_ZERO_CHANNELS"]
-    _, zrgb3, _ = ptv3_load_canonical(f"{pd_}/zc0.npz", "rgb")
-    assert not np.all(zrgb3 == 128.0)   # kill lifted -> real rgb again
-    ij = tempfile.mkdtemp()
-    os.makedirs(f"{ij}/predictions")
-    run_infer_scenes([f"{ds}/val/s0.npz"],
-                     lambda p: (z0["xyz"], pr, z0["intensity"], cf, pb),
-                     f"{ij}/predictions", ij, {"backbone": "demo"}, cls_txt=True)
-    assert (os.path.exists(f"{ij}/predictions/s0_pred.npz")
-            and os.path.exists(f"{ij}/predictions/s0_pred_CLS.txt")
-            and json.load(open(f"{ij}/infer_run.json"))["total_points"] == 4000)
-    zp = np.load(f"{ij}/predictions/s0_pred.npz")
-    assert (zp["confidence"].dtype == np.float32
-            and zp["probs"].dtype == np.float16 and zp["probs"].shape == (4000, 3))
-    assert "crs_wkt" not in zp.files and "source_crs_wkt" not in zp.files
-
-    np.savez(f"{ij}/c0.npz", xyz=z0["xyz"], intensity=z0["intensity"],
-             crs_wkt=np.asarray('PROJCS["demo"]'))
-    run_infer_scenes([f"{ij}/c0.npz"],
-                     lambda p: (z0["xyz"], pr, z0["intensity"], cf, None),
-                     f"{ij}/predictions", ij, {"backbone": "demo"})
-    with np.load(f"{ij}/predictions/c0_pred.npz") as zc:
-        assert str(zc["crs_wkt"]) == 'PROJCS["demo"]'
-        assert "source_crs_wkt" not in zc.files
-
-    np.savez(f"{ij}/c1.npz", xyz=z0["xyz"], intensity=z0["intensity"],
-             crs_wkt=np.asarray('PROJCS["utm"]'),
-             source_crs_wkt=np.asarray('GEOGCS["src"]'))
-    run_infer_scenes([f"{ij}/c1.npz"],
-                     lambda p: (z0["xyz"], pr, z0["intensity"], cf, None),
-                     f"{ij}/predictions", ij, {"backbone": "demo"})
-    with np.load(f"{ij}/predictions/c1_pred.npz") as zc:
-        assert str(zc["crs_wkt"]) == 'PROJCS["utm"]'
-        assert str(zc["source_crs_wkt"]) == 'GEOGCS["src"]'
-
-    os.environ["LOSS_FOCAL_GAMMA"] = "3.5"
-    uf, fg = env_overrides({"USE_FOCAL": False, "FOCAL_GAMMA": 2.0},
-                           ["USE_FOCAL", "FOCAL_GAMMA"])
-    assert uf is False and abs(fg - 3.5) < 1e-9
-    del os.environ["LOSS_FOCAL_GAMMA"]
-
-    class _V:
-        n = 0
-        def commit(self):
-            _V.n += 1
-    modal_shell_run("-V", [("--unused", None)], None, [_V()])
-    assert _V.n == 1
-
-    rng2 = np.random.RandomState(7)
-    C = 5
-    ks = rng2.randint(0, 9, (30_000, 3)).astype(np.int64)
-    vs = rng2.rand(30_000, C).astype(np.float32)
-    ps = rng2.rand(30_000, 3).astype(np.float32)
-    acc = VoxelVoteAccum(C, max_rows=1_000)
-    for s in range(0, 30_000, 700):
-        acc.add(ks[s:s + 700], vs[s:s + 700], ps[s:s + 700])
-    pred_a, rep_a = acc.result()
-    first, inv = voxel_unique(ks, return_inverse=True)
-    ref_votes = np.stack([np.bincount(inv, weights=vs[:, c], minlength=len(first))
-                          for c in range(C)], axis=1)
-    assert np.array_equal(rep_a, ps[first])
-    assert np.array_equal(pred_a, ref_votes.argmax(1))
-    assert VoxelVoteAccum(C).result() is None
-
-    from scipy.spatial import cKDTree as _KD
-    rep = rng2.rand(400, 3).astype(np.float32)
-    pu = rng2.randint(0, C, 400)
-    raw = rng2.rand(9_000, 3).astype(np.float32)
-    lab = rng2.randint(-1, C + 1, 9_000).astype(np.int32)
-    _, nn = _KD(rep).query(raw)
-    v = (lab >= 0) & (lab < C)
-    ri, ru, rg = score_ious(pu[nn][v], lab[v], C)
-    i_, u_, g_, c_, t_ = score_raw_from_voxels(rep, pu, raw, lab, C, chunk=512)
-    assert (np.array_equal(i_, ri) and np.array_equal(u_, ru)
-            and np.array_equal(g_, rg))
-    assert t_ == int(v.sum()) and c_ == int((pu[nn][v] == lab[v]).sum())
-    print("ok")
-
-
-if __name__ == "__main__":
-    _demo()
