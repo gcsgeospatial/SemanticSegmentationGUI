@@ -1063,6 +1063,8 @@ def export_predictions(pred_dir, fmt: str, progress=None, class_map=None,
                       if "dominant_member" in d.files else None)
             member_names = ([str(s) for s in d["member_names"]]
                             if "member_names" in d.files else None)
+            instance = (np.asarray(d["instance"], np.uint32)
+                        if "instance" in d.files else None)
         if member is not None and fmt in ("las", "laz") and not legend_said:
             legend_said = True
             say("  ens_member field (ensemble's dominant model per point): "
@@ -1081,7 +1083,7 @@ def export_predictions(pred_dir, fmt: str, progress=None, class_map=None,
         cls = np.clip(cls, 0, 255).astype(np.uint8)
         dst = src.with_suffix(f".{fmt}")
         _write_pred(dst, xyz, cls, fmt, confidence=conf, crs_wkt=crs_wkt,
-                    source_crs_wkt=source_wkt, member=member)
+                    source_crs_wkt=source_wkt, member=member, instance=instance)
         written.append(dst)
         say(f"  {src.name} -> {dst.name} ({len(xyz):,} pts"
             + (f"; {low:,} below confidence {unclass_threshold:g} -> class {unclass}"
@@ -1090,12 +1092,14 @@ def export_predictions(pred_dir, fmt: str, progress=None, class_map=None,
 
 
 def _write_pred(dst: Path, xyz: np.ndarray, cls: np.ndarray, fmt: str,
-                confidence=None, crs_wkt=None, source_crs_wkt=None, member=None):
+                confidence=None, crs_wkt=None, source_crs_wkt=None, member=None,
+                instance=None):
     """One classified cloud -> dst, with xyz inverse-transformed back to the source
     frame via the shared keystone restore (raises the D2 legacy block). The embedded
     las/laz WKT VLR is the SOURCE CRS so deliverables overlay the input clouds.
     confidence rides in las/laz (Extra Bytes) and txt/csv, member (ensemble dominant
-    model) as las/laz "ens_member", and ply stays classification-only."""
+    model) as las/laz "ens_member", instance (panoptic, 0 = stuff) as las/laz
+    "instance_id" and a txt/csv column, and ply stays classification-only."""
     xyz = restore_to_source(xyz, crs_wkt, source_crs_wkt)
     geo_wkt = source_crs_wkt or crs_wkt
     if fmt in ("las", "laz"):
@@ -1105,6 +1109,8 @@ def _write_pred(dst: Path, xyz: np.ndarray, cls: np.ndarray, fmt: str,
             h.add_extra_dim(laspy.ExtraBytesParams(name="confidence", type=np.float32))
         if member is not None:
             h.add_extra_dim(laspy.ExtraBytesParams(name="ens_member", type=np.uint8))
+        if instance is not None:
+            h.add_extra_dim(laspy.ExtraBytesParams(name="instance_id", type=np.uint32))
         if geo_wkt:
             try:
                 from pyproj import CRS
@@ -1120,6 +1126,8 @@ def _write_pred(dst: Path, xyz: np.ndarray, cls: np.ndarray, fmt: str,
             las.confidence = confidence
         if member is not None:
             las.ens_member = member
+        if instance is not None:
+            las.instance_id = instance
         las.write(str(dst))
     elif fmt == "ply":
         header = ("ply\nformat ascii 1.0\n" + f"element vertex {len(xyz)}\n"
@@ -1128,14 +1136,19 @@ def _write_pred(dst: Path, xyz: np.ndarray, cls: np.ndarray, fmt: str,
         np.savetxt(dst, np.column_stack([xyz, cls]),
                    fmt=["%.3f"] * 3 + ["%d"], header=header, comments="")
     elif fmt == "txt":
-        cols = [xyz, cls] + ([confidence] if confidence is not None else [])
+        cols = [xyz, cls] + ([confidence] if confidence is not None else []) \
+            + ([instance] if instance is not None else [])
         np.savetxt(dst, np.column_stack(cols), fmt="%.3f %.3f %.3f %d"
-                   + (" %.3f" if confidence is not None else ""))
+                   + (" %.3f" if confidence is not None else "")
+                   + (" %d" if instance is not None else ""))
     elif fmt == "csv":
-        cols = [xyz, cls] + ([confidence] if confidence is not None else [])
+        cols = [xyz, cls] + ([confidence] if confidence is not None else []) \
+            + ([instance] if instance is not None else [])
         np.savetxt(dst, np.column_stack(cols), delimiter=",",
                    fmt=["%.3f"] * 3 + ["%d"]
-                   + (["%.3f"] if confidence is not None else []),
+                   + (["%.3f"] if confidence is not None else [])
+                   + (["%d"] if instance is not None else []),
                    header="x,y,z,classification"
-                   + (",confidence" if confidence is not None else ""),
+                   + (",confidence" if confidence is not None else "")
+                   + (",instance" if instance is not None else ""),
                    comments="")
