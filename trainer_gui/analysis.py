@@ -87,8 +87,9 @@ def _npz_class(z) -> np.ndarray | None:
     return None
 
 
-def _read_classes(path: Path) -> np.ndarray:
+def read_classes(path: Path) -> np.ndarray:
     """Per-point class indices from a file with an explicit classification."""
+    path = Path(path)
     if path.suffix.lower() == ".npz":
         cls = _npz_class(np.load(str(path), allow_pickle=False))
         if cls is None:
@@ -103,27 +104,37 @@ def _read_classes(path: Path) -> np.ndarray:
                      f"use files that carry explicit per-point classes")
 
 
-def prediction_metrics(pred_path, gt_path) -> dict:
-    """Accuracy + mIoU + per-class IoU on GT-labeled points; mIoU averages only
-    classes present in GT or prediction."""
-    pred_path, gt_path = Path(pred_path), Path(gt_path)
-    pred = _read_classes(pred_path)
-    gt = _read_classes(gt_path)
-    scene = pred_path.stem
-    for suffix in ("_pred", "_gt"):
-        scene = scene.replace(suffix, "")
-    n = min(len(pred), len(gt))
-    pred, gt = pred[:n], gt[:n]
+def prediction_metrics(pred: np.ndarray, gt: np.ndarray,
+                       gt_map: dict[int, int] | None = None) -> dict:
+    """Accuracy / mIoU / macro-F1 + per-class IoU-precision-recall-F1.
+
+    gt_map remaps truth classes into the prediction's class space; truth
+    classes absent from the map are excluded from scoring entirely, and the
+    macro averages run only over classes present in the (mapped) truth - so
+    predicting classes the truth doesn't contain is never penalized."""
+    pred = np.asarray(pred, np.int64).reshape(-1)
+    gt = np.asarray(gt, np.int64).reshape(-1)
+    if gt_map is not None:
+        mapped = np.full_like(gt, -1)
+        for src, dst in gt_map.items():
+            mapped[gt == int(src)] = int(dst)
+        gt = mapped
     has = gt >= 0
-    labeled = int(has.sum())
-    acc = float((pred[has] == gt[has]).sum()) / max(labeled, 1)
-    present = sorted({int(c) for c in np.unique(pred[has])} | {int(c) for c in np.unique(gt[has])})
-    present = [c for c in present if c >= 0]
-    ious = {}
-    for c in present:
-        inter = int(((pred == c) & (gt == c) & has).sum())
-        union = int((((pred == c) | (gt == c)) & has).sum())
-        ious[c] = inter / union if union else 0.0
-    miou = float(np.mean(list(ious.values()))) if ious else 0.0
-    return {"scene": scene, "accuracy": acc, "miou": miou,
-            "labeled": labeled, "per_class_iou": ious}
+    evaluated = int(has.sum())
+    p, g = pred[has], gt[has]
+    acc = float((p == g).sum()) / max(evaluated, 1)
+    per = {}
+    for c in (int(c) for c in np.unique(g)):
+        tp = int(((p == c) & (g == c)).sum())
+        fp = int(((p == c) & (g != c)).sum())
+        fn = int(((p != c) & (g == c)).sum())
+        prec = tp / max(tp + fp, 1)
+        rec = tp / max(tp + fn, 1)
+        per[c] = {"iou": tp / max(tp + fp + fn, 1),
+                  "precision": prec, "recall": rec,
+                  "f1": 2 * prec * rec / max(prec + rec, 1e-12),
+                  "support": tp + fn}
+    mean = lambda k: float(np.mean([v[k] for v in per.values()])) if per else 0.0
+    return {"accuracy": acc, "miou": mean("iou"), "macro_f1": mean("f1"),
+            "evaluated": evaluated, "ignored": int(len(gt) - evaluated),
+            "per_class": per}

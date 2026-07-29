@@ -12,17 +12,164 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QCursor
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout,
-                               QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
-                               QListWidget, QListWidgetItem, QMenu, QPushButton, QRadioButton,
-                               QSpinBox, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDoubleSpinBox,
+                               QFileDialog, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout,
+                               QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu,
+                               QPushButton, QRadioButton, QSpinBox, QTableWidget,
+                               QTableWidgetItem, QVBoxLayout, QWidget)
 
 from .. import analysis, appstate, dataset, local_cli, modal_cli, plots, pretrain, ui
 from ..backbones import ALS_GRID_M, ALS_TILE_M, BACKBONES
 from ..jobs import FuncWorker, JobRunner
 from ..logconsole import LogConsole
+
+
+class GtCompareDialog(QDialog):
+    """Compare a prediction to ground truth: pick both files, then map each
+    truth class to a prediction class (or ignore it). Only mapped truth
+    points are scored, so schema mismatches never poison the metrics."""
+
+    IGNORE = -1
+    _FLT = "Labeled clouds (*.npz *.las *.laz *.ply *.txt *.csv);;All files (*)"
+
+    def __init__(self, parent, class_names: list | None):
+        super().__init__(parent)
+        self.setWindowTitle("Compare to ground truth")
+        self._names = class_names or []
+        self.pred_path = self.gt_path = ""
+        self.pred_arr = self.gt_arr = None
+        self.gt_map: dict[int, int] = {}
+        self._combos: dict[int, QComboBox] = {}
+
+        lay = QVBoxLayout(self)
+        form = QFormLayout()
+        self.pred_edit = QLineEdit()
+        self.gt_edit = QLineEdit()
+        for label, edit, pick in (("Prediction", self.pred_edit, self._pick_pred),
+                                  ("Ground truth", self.gt_edit, self._pick_gt)):
+            edit.setReadOnly(True)
+            row = QHBoxLayout()
+            row.addWidget(edit, 1)
+            btn = QPushButton("Browse…")
+            btn.clicked.connect(pick)
+            row.addWidget(btn)
+            form.addRow(label, ui.wrap(row))
+        lay.addLayout(form)
+
+        self.table = QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(
+            ["Truth class", "Points", "Counts as prediction class"])
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        lay.addWidget(self.table, 1)
+
+        self.status = QLabel("Pick a prediction and its ground truth; truth classes "
+                             "appear here for mapping. Unmapped classes are ignored, "
+                             "never counted against the model.")
+        self.status.setWordWrap(True)
+        lay.addWidget(self.status)
+
+        btns = QHBoxLayout()
+        btns.addStretch()
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        btns.addWidget(cancel)
+        self.go_btn = QPushButton("Compare")
+        self.go_btn.setObjectName("primary")
+        self.go_btn.clicked.connect(self._go)
+        btns.addWidget(self.go_btn)
+        lay.addLayout(btns)
+        self.resize(600, 500)
+
+    def _name(self, c: int) -> str:
+        return (f"{c}: {self._names[c]}" if 0 <= c < len(self._names)
+                else f"class {c}")
+
+    def _load(self, path: str) -> np.ndarray | None:
+        QApplication.setOverrideCursor(QCursor(Qt.WaitCursor))
+        try:
+            return analysis.read_classes(Path(path))
+        except Exception as e:
+            self.status.setText(f"✗ {e}")
+            return None
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    def _pick_pred(self):
+        p, _ = QFileDialog.getOpenFileName(self, "Prediction cloud",
+                                           appstate.get("last_view_dir", ""), self._FLT)
+        if not p:
+            return
+        arr = self._load(p)
+        if arr is None:
+            return
+        self.pred_path, self.pred_arr = p, arr
+        self.pred_edit.setText(p)
+        appstate.put("last_view_dir", str(Path(p).parent))
+        self._rebuild()
+
+    def _pick_gt(self):
+        p, _ = QFileDialog.getOpenFileName(self, "Ground truth for this scene",
+                                           appstate.get("truth_file", ""), self._FLT)
+        if not p:
+            return
+        arr = self._load(p)
+        if arr is None:
+            return
+        self.gt_path, self.gt_arr = p, arr
+        self.gt_edit.setText(p)
+        appstate.put("truth_file", p)
+        self._rebuild()
+
+    def _rebuild(self):
+        """Mapping table: one row per truth class, combo of prediction classes.
+        Default = same id where it exists in the prediction, saved map wins."""
+        self.table.setRowCount(0)
+        self._combos = {}
+        if self.gt_arr is None:
+            return
+        vals, counts = np.unique(self.gt_arr[self.gt_arr >= 0], return_counts=True)
+        pred_classes = ([] if self.pred_arr is None else
+                        [int(v) for v in np.unique(self.pred_arr) if v >= 0])
+        saved = appstate.get("gt_class_map") or {}
+        self.table.setRowCount(len(vals))
+        for r, (v, cnt) in enumerate(zip(vals, counts)):
+            v = int(v)
+            self.table.setItem(r, 0, QTableWidgetItem(self._name(v)))
+            self.table.setItem(r, 1, QTableWidgetItem(f"{int(cnt):,}"))
+            combo = QComboBox()
+            combo.addItem("— ignore —", self.IGNORE)
+            for pc in pred_classes:
+                combo.addItem(self._name(pc), pc)
+            want = saved.get(str(v), v if v in pred_classes else self.IGNORE)
+            combo.setCurrentIndex(max(combo.findData(int(want)), 0))
+            self.table.setCellWidget(r, 2, combo)
+            self._combos[v] = combo
+        if pred_classes:
+            self.status.setText("Review the mapping, then Compare.")
+
+    def _go(self):
+        if self.pred_arr is None or self.gt_arr is None:
+            self.status.setText("✗ Pick both a prediction and a ground truth file first.")
+            return
+        if len(self.pred_arr) != len(self.gt_arr):
+            self.status.setText(
+                f"✗ Point counts differ ({len(self.pred_arr):,} vs "
+                f"{len(self.gt_arr):,}) - these files don't match point-for-point. "
+                f"Pick the prediction exported from this exact scene.")
+            return
+        self.gt_map = {v: int(c.currentData()) for v, c in self._combos.items()
+                       if c.currentData() != self.IGNORE}
+        if not self.gt_map:
+            self.status.setText("✗ Every truth class is set to ignore - map at "
+                                "least one to a prediction class.")
+            return
+        appstate.put("gt_class_map", {str(k): v for k, v in self.gt_map.items()})
+        self.accept()
 
 
 class InferPage(QWidget):
@@ -314,8 +461,10 @@ class InferPage(QWidget):
         self.kill_btn.clicked.connect(self._kill)
         run_row.addWidget(self.kill_btn)
         self.compare_btn = QPushButton("Compare to ground truth…")
-        self.compare_btn.setToolTip("Pick a prediction + its ground truth; accuracy, "
-                                    "mIoU and per-class IoU print to the log.")
+        self.compare_btn.setToolTip("Pick a prediction + its ground truth, map truth "
+                                    "classes to prediction classes, and score only the "
+                                    "mapped points: accuracy, mIoU, macro-F1 and "
+                                    "per-class stats print to the log.")
         self.compare_btn.clicked.connect(self._compare_gt)
         run_row.addWidget(self.compare_btn)
         run_row.addStretch()
@@ -1610,59 +1759,46 @@ class InferPage(QWidget):
         self._append(f"\n✗ Failed to start: {err}")
         self._end_run("✗ failed to start")
 
-    def _pick_pred_gt(self):
-        """Prompt for a prediction cloud then its ground-truth labels.
-        Returns (pred, gt) or None if cancelled."""
-        flt = "Labeled clouds (*.npz *.las *.laz *.ply *.txt *.csv);;All files (*)"
-        pred, _ = QFileDialog.getOpenFileName(
-            self, "Prediction cloud to compare", appstate.get("last_view_dir", ""), flt)
-        if not pred:
-            return None
-        appstate.put("last_view_dir", str(Path(pred).parent))
-        gt, _ = QFileDialog.getOpenFileName(
-            self, "Ground truth for this scene", appstate.get("truth_file", ""), flt)
-        if not gt:
-            return None
-        appstate.put("truth_file", gt)
-        return pred, gt
-
     def _compare_gt(self):
-        """Prompt for a prediction + ground truth (both must carry explicit
-        per-point classes) and print accuracy + mIoU to the log."""
-        picked = self._pick_pred_gt()
-        if not picked:
+        """Class-mapping compare dialog, then score only mapped truth points
+        and print accuracy / mIoU / macro-F1 + per-class stats to the log."""
+        dlg = GtCompareDialog(self, self._run_class_names)
+        if dlg.exec() != QDialog.Accepted:
             return
-        pred, gt = picked
-        self._append(f"\nComparing {Path(pred).name} to {Path(gt).name}; "
-                     f"computing accuracy + mIoU…")
-        try:
-            m = analysis.prediction_metrics(pred, gt)
-        except Exception as e:
-            self._append(f"  ✗ couldn't compute stats: {e}")
-            return
+        pred, gt = dlg.pred_path, dlg.gt_path
+        m = analysis.prediction_metrics(dlg.pred_arr, dlg.gt_arr, dlg.gt_map)
         names = self._run_class_names or []
         nm = lambda c: names[c] if 0 <= c < len(names) else f"class {c}"
-        lines = [f"── {m['scene'] or Path(pred).stem} vs ground truth ──",
-                 f"  accuracy : {m['accuracy']:.4f}",
-                 f"  mIoU     : {m['miou']:.4f}   (over {len(m['per_class_iou'])} present classes)",
-                 f"  labeled  : {m['labeled']:,} pts",
-                 "  per-class IoU:"]
-        lines += [f"    {nm(c)}: {iou:.4f}" for c, iou in sorted(m["per_class_iou"].items())]
+        scene = Path(pred).stem
+        for suffix in ("_pred", "_gt"):
+            scene = scene.replace(suffix, "")
+        lines = [f"\n── {scene} vs {Path(gt).name} ──",
+                 f"  accuracy {m['accuracy']:.4f}   mIoU {m['miou']:.4f}   "
+                 f"macro-F1 {m['macro_f1']:.4f}",
+                 f"  evaluated {m['evaluated']:,} pts over {len(m['per_class'])} "
+                 f"mapped classes"
+                 + (f"  (ignored {m['ignored']:,} unmapped pts)" if m["ignored"] else "")]
+        w = max(len(nm(c)) for c in m["per_class"])
+        lines.append(f"  {'class'.ljust(w)}    IoU     F1   prec  recall     points")
+        lines += [f"  {nm(c).ljust(w)}  {s['iou']:.3f}  {s['f1']:.3f}  "
+                  f"{s['precision']:.3f}   {s['recall']:.3f} {s['support']:>10,}"
+                  for c, s in sorted(m["per_class"].items())]
         mpath = Path(pred).with_suffix(".metrics.json")
         try:
             with open(mpath, "w", encoding="utf-8") as f:
                 json.dump({"prediction": str(pred), "ground_truth": str(gt),
-                           "class_names": names, **m}, f, indent=2)
+                           "scene": scene, "class_names": names,
+                           "gt_class_map": {str(k): v for k, v in dlg.gt_map.items()},
+                           **m}, f, indent=2)
             lines.append(f"  saved -> {mpath}")
         except OSError as e:
             lines.append(f"  (couldn't save metrics json: {e})")
         row = {"when": datetime.now().strftime("%Y-%m-%d %H:%M"),
-               "prediction": str(pred), "ground_truth": str(gt),
-               "scene": m["scene"] or Path(pred).stem,
+               "prediction": str(pred), "ground_truth": str(gt), "scene": scene,
                "accuracy": f"{m['accuracy']:.4f}", "miou": f"{m['miou']:.4f}",
-               "labeled": str(m["labeled"])}
-        row.update({f"iou_{nm(c)}": f"{iou:.4f}"
-                    for c, iou in m["per_class_iou"].items()})
+               "macro_f1": f"{m['macro_f1']:.4f}", "labeled": str(m["evaluated"])}
+        row.update({f"iou_{nm(c)}": f"{s['iou']:.4f}"
+                    for c, s in m["per_class"].items()})
         cpath = appstate.workspace_dir() / "gt_metrics.csv"
         try:
             rows = []
@@ -1671,7 +1807,7 @@ class InferPage(QWidget):
                     rows = [r for r in csv.DictReader(f) if any(r.values())]
             rows.append(row)
             core = ["when", "prediction", "ground_truth", "scene",
-                    "accuracy", "miou", "labeled"]
+                    "accuracy", "miou", "macro_f1", "labeled"]
             extra = sorted({k for r in rows for k in r if k} - set(core))
             with open(cpath, "w", newline="", encoding="utf-8") as f:
                 w = csv.DictWriter(f, fieldnames=core + extra, restval="")
