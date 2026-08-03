@@ -33,7 +33,7 @@ class DatasetsPage(QWidget):
         self._label_values: dict[int, int] = {}
         self._done_cb = None
         self._scanned_for: str | None = None
-        self._copied_classes: dict[int, tuple[str, bool]] = {}
+        self._copied_classes: dict[int, tuple[str, int | None, bool]] = {}
         self._run_open = False
         self._crs_probe = None
         self._crs_probe_name = ""
@@ -264,8 +264,14 @@ class DatasetsPage(QWidget):
         btn_row.addWidget(self.copy_btn)
         btn_row.addStretch()
         cl.addLayout(btn_row)
-        self.class_table = QTableWidget(0, 4)
-        self.class_table.setHorizontalHeaderLabels(["Train", "Source value(s)", "Points seen", "Class name"])
+        self.class_table = QTableWidget(0, 5)
+        self.class_table.setHorizontalHeaderLabels(
+            ["Train", "Source value(s)", "Points seen", "Class name", "ASPRS out"])
+        self.class_table.horizontalHeaderItem(4).setToolTip(
+            "Classification code written when exporting predictions (ASPRS "
+            "LAS). Auto-fills from the class name; edit freely. Blank = auto "
+            "at export (name match, else the source value).")
+        self.class_table.itemChanged.connect(self._on_class_edited)
         self.class_table.verticalHeader().setVisible(False)
         self.class_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
         self.class_table.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed)
@@ -507,15 +513,17 @@ class DatasetsPage(QWidget):
         src = meta.get("source", {})
         copied = []
         if meta.get("classes"):
-            groups: dict[int, tuple[str, list[int]]] = {}
+            groups: dict[int, tuple[str, int | None, list[int]]] = {}
             for cl in meta["classes"]:
                 vals = cl.get("source_values") or [cl.get("source_value", cl["index"])]
-                groups.setdefault(int(cl["index"]), (str(cl["name"]), []))[1].extend(
+                groups.setdefault(int(cl["index"]),
+                                  (str(cl["name"]), cl.get("asprs_value"), []))[2].extend(
                     int(v) for v in vals)
-            rows = [(vals, nm, True) for nm, vals in groups.values()]
-            rows += [([int(v)], f"class_{v}", False) for v in src.get("ignore_values", [])]
+            rows = [(vals, nm, ap, True) for nm, ap, vals in groups.values()]
+            rows += [([int(v)], f"class_{v}", None, False)
+                     for v in src.get("ignore_values", [])]
             self.class_table.setRowCount(len(rows))
-            for r, (vals, nm, train) in enumerate(rows):
+            for r, (vals, nm, ap, train) in enumerate(rows):
                 chk = QCheckBox()
                 chk.setChecked(train)
                 cell = QWidget()
@@ -531,7 +539,10 @@ class DatasetsPage(QWidget):
                     item.setFlags(item.flags() & ~Qt.ItemIsEditable)
                     self.class_table.setItem(r, col, item)
                 self.class_table.setItem(r, 3, QTableWidgetItem(nm))
-            self._copied_classes = {v: (nm, train) for vals, nm, train in rows for v in vals}
+                if ap is not None:  # stored code beats the name auto-fill
+                    self.class_table.setItem(r, 4, QTableWidgetItem(str(int(ap))))
+            self._copied_classes = {v: (nm, ap, train)
+                                    for vals, nm, ap, train in rows for v in vals}
             copied.append(f"{len(groups)} classes (+{len(rows) - len(groups)} ignored)")
         sp = meta.get("split", {})
         req = sp.get("requested", {})
@@ -628,8 +639,10 @@ class DatasetsPage(QWidget):
             for r in range(self.class_table.rowCount()):
                 for v in _parse_values(self.class_table.item(r, 1).text()):
                     if v in self._copied_classes:
-                        nm, train = self._copied_classes[v]
+                        nm, ap, train = self._copied_classes[v]
                         self.class_table.item(r, 3).setText(nm)
+                        if ap is not None:  # stored code beats the name auto-fill
+                            self.class_table.setItem(r, 4, QTableWidgetItem(str(int(ap))))
                         self.class_table.cellWidget(r, 0).findChild(QCheckBox).setChecked(train)
                         break
         self._scanned_for = self._scan_in_path
@@ -691,6 +704,16 @@ class DatasetsPage(QWidget):
             self.class_table.removeRow(r)
         self._append(f"Combined source values [{', '.join(map(str, vals))}] into class '{name}'.")
 
+    def _on_class_edited(self, item):
+        """Renaming a class auto-fills its ASPRS export code (blank when the
+        name has no standard code); direct edits to the code cell stand until
+        the name changes again."""
+        if item.column() != 3:
+            return
+        code = dataset.asprs_code_for(item.text())
+        self.class_table.setItem(item.row(), 4,
+                                 QTableWidgetItem("" if code is None else str(code)))
+
     def _classes_from_table(self):
         """One class per row. A row's Source value may list several values ("5,6");
         each maps to the same class index/name."""
@@ -703,10 +726,14 @@ class DatasetsPage(QWidget):
                 ignored.extend(vals)
                 continue
             name = self.class_table.item(r, 3).text().strip() or f"class_{vals[0]}"
+            code_item = self.class_table.item(r, 4)
+            code_txt = code_item.text().strip() if code_item else ""
+            asprs = int(code_txt) if code_txt.isdigit() and int(code_txt) <= 255 else None
             if name not in name_to_index:
                 name_to_index[name] = len(name_to_index)
             for v in vals:
-                classes.append({"index": name_to_index[name], "source_value": v, "name": name})
+                classes.append({"index": name_to_index[name], "source_value": v,
+                                "name": name, "asprs_value": asprs})
         return classes, ignored
 
     def _conversion_plan(self):
@@ -730,6 +757,16 @@ class DatasetsPage(QWidget):
         if self.class_table.rowCount() == 0:
             self._append("Run 'Scan label values' and name classes first.")
             return None
+        for r in range(self.class_table.rowCount()):
+            if not self.class_table.cellWidget(r, 0).findChild(QCheckBox).isChecked():
+                continue
+            it = self.class_table.item(r, 4)
+            txt = it.text().strip() if it else ""
+            if txt and not (txt.isdigit() and int(txt) <= 255):
+                self._append(f"✗ ASPRS out '{txt}' (row {r + 1}): enter a whole number "
+                             "0-255 (LAS classification is one byte), or clear the "
+                             "cell for auto.")
+                return None
         classes, ignored = self._classes_from_table()
         if not classes:
             self._append("All values unchecked - nothing to train on.")

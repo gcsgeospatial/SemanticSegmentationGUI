@@ -39,8 +39,9 @@ BACKBONES = {
     "utonia": ("modal_train_utonia.py", "utonia", "trainer-src-utonia"),
 }
 
-# pip deps that are Modal-shell plumbing, not part of the training env contract
-_IGNORE = {"modal"}
+# pip deps that are Modal-shell plumbing, not part of the training env contract;
+# laspy/lazrs/pyproj/pgeof are local-only conversion deps for the inference portal
+_IGNORE = {"modal", "laspy", "lazrs", "pyproj", "pgeof"}
 
 
 def _norm(name: str) -> str:
@@ -125,7 +126,7 @@ def compare(key: str, modal: dict, pixi: dict, rsha: str | None) -> list[str]:
             errs.append(f"{key}: '{name}' pin drift: modal '{con}' vs pixi "
                         f"'{pixi['pins'][name]}'")
     for name in pixi["pins"]:
-        if name not in modal["pins"]:
+        if name not in modal["pins"] and name not in _IGNORE:
             errs.append(f"{key}: pip dep '{name}' in pixi feature but not in modal recipe")
     if modal["index_url"] and pixi["index_url"] != modal["index_url"]:
         errs.append(f"{key}: index-url drift: modal '{modal['index_url']}' vs pixi "

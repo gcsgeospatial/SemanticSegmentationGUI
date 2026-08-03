@@ -295,6 +295,11 @@ platforms = ["linux-64-cuda120", "win-64-cuda120"]   # cu124 wheels: any 12.x dr
 [feature.utonia.dependencies]
 python = "3.11.*"
 trainer-src-utonia = "*"
+# conversion/export stack for the inference portal (PDAL bindings are conda-only);
+# numpy<2 conda-side pin is mandatory: python-pdal's conda dep would otherwise
+# free-solve numpy 2.x against the pypi numpy<2.0 pin
+numpy = "<2"
+python-pdal = ">=3.5.4,<4"
 
 [feature.utonia.activation.env]
 UTONIA_SRC = "$CONDA_PREFIX/opt/utonia"
@@ -326,6 +331,12 @@ huggingface-hub = "*"
 packaging = "*"
 spconv-cu124 = "*"
 torch-scatter = "*"
+# conversion/export (portal): explicit lazrs line instead of the laspy[lazrs]
+# extra keeps check_env_sync's name-for-name diff workable
+laspy = ">=2.5"
+lazrs = ">=0.8,<0.9"
+pyproj = ">=3.7"
+pgeof = ">=0.3"
 
 [feature.utonia.tasks]
 sanity = "python -c \"import os, sys, torch, spconv, torch_scatter, huggingface_hub; sys.path.insert(0, os.environ['UTONIA_SRC']); import utonia; print('utonia env ok, torch', torch.__version__)\""

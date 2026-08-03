@@ -58,6 +58,8 @@ def main(argv=None):
     ap.add_argument("run_dir", help="a finished runs/<id> dir (has final_model.pth + run.json)")
     ap.add_argument("--version", default=None,
                     help="package version (default: YYYY.M.D of today)")
+    ap.add_argument("--output-dir", default=str(OUT_DIR),
+                    help="channel dir to build into (default: conda-recipes/output)")
     args = ap.parse_args(argv)
 
     run = Path(args.run_dir)
@@ -82,14 +84,17 @@ def main(argv=None):
             name=name, version=version, staged=staged.as_posix(),
             summary=f"{backbone} weights trained on {dataset} ({run.name})"),
             encoding="utf-8")
-        OUT_DIR.mkdir(parents=True, exist_ok=True)
+        out_dir = Path(args.output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
         print(f"[package-weights] {name} {version} <- {run}")
+        # --no-include-recipe: without it the .conda embeds a second copy of the
+        # staged source under info/recipe/, doubling multi-hundred-MB weights
         r = subprocess.run(["rattler-build", "build", "-r", str(recipe),
-                            "--output-dir", str(OUT_DIR)])
+                            "--no-include-recipe", "--output-dir", args.output_dir])
         if r.returncode:
             sys.exit(r.returncode)
-    built = sorted(OUT_DIR.glob(f"noarch/{name}-{version}-*.conda"))
-    print(f"[package-weights] built: {built[-1] if built else OUT_DIR}")
+    built = sorted(out_dir.glob(f"noarch/{name}-{version}-*.conda"))
+    print(f"[package-weights] built: {built[-1] if built else out_dir}")
     print("[package-weights] publish with: pixi run -e pkg upload")
 
 

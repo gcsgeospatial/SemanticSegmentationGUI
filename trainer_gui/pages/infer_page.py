@@ -428,9 +428,27 @@ class InferPage(QWidget):
             self.fmt_combo.addItem(label, key)
         i = self.fmt_combo.findData(appstate.get("infer_format", "las"))
         self.fmt_combo.setCurrentIndex(i if i >= 0 else 0)
-        self.fmt_combo.setToolTip("Predictions are written as xyz + classification "
-                                  "(no colour columns).")
+        self.fmt_combo.setToolTip(
+            "las/laz inputs re-emit the original file with every source "
+            "dimension (colour, intensity, returns, GPS time) plus the "
+            "predicted classification and confidence; other formats/inputs "
+            "write xyz + classification.")
         iform.addRow("Prediction format", self.fmt_combo)
+        self.codes_combo = QComboBox()
+        for label, key in (("ASPRS (auto, editable per dataset)", "asprs"),
+                           ("Dataset source values", "source"),
+                           ("Raw model indices", "raw")):
+            self.codes_combo.addItem(label, key)
+        i = self.codes_combo.findData(appstate.get("infer_codes", "asprs"))
+        self.codes_combo.setCurrentIndex(max(i, 0))
+        self.codes_combo.setToolTip(
+            "Classification codes written to the exported files. ASPRS: each "
+            "class's code from the dataset's Classes table ('ASPRS out' "
+            "column, auto-matched from the class name; unmatched classes "
+            "keep their source value or land in the 64+ user band). Source "
+            "values: the codes the training data used. Raw: model indices "
+            "0..N-1.")
+        iform.addRow("Output codes", self.codes_combo)
         self.unclass_chk = QCheckBox("Mark low-confidence points Unclassified")
         self.unclass_chk.setChecked(True)
         self.unclass_spin = QDoubleSpinBox()
@@ -1020,20 +1038,16 @@ class InferPage(QWidget):
         self._rebuild_chan_table()
 
     def _apply_manifest_lock(self, locked: bool):
-        """Grey out what a run.json dictates (arch, grid, tile); while a manifest
-        is applied the three rows fold into the manifest_summary line."""
+        """Grey out what a run.json dictates (the arch). Grid/tile auto-fill from
+        the run but stay editable for experiments; the summary line keeps the
+        run's own values as the reference, and reloading the manifest restores
+        them."""
         self.backbone_combo.setEnabled(not locked)
-        self.grid_spin.setEnabled(not locked)
-        if locked:
-            self.chunk_spin.setEnabled(False)
-        else:
-            key = self.backbone_combo.currentData()
-            b = BACKBONES.get(key) if key else None
-            self.chunk_spin.setEnabled(bool(b) and b.has_chunk)
+        key = self.backbone_combo.currentData()
+        b = BACKBONES.get(key) if key else None
+        self.chunk_spin.setEnabled(bool(b) and b.has_chunk)
         folded = locked and self._manifest is not None
         self.wf.setRowVisible(self.backbone_combo, not folded)
-        self.iform.setRowVisible(self.grid_spin, not folded)
-        self.iform.setRowVisible(self.chunk_spin, not folded)
         if folded:
             m = self._manifest
             b = BACKBONES.get(m.get("backbone"))
@@ -1044,7 +1058,7 @@ class InferPage(QWidget):
             tile = self.chunk_spin.value() if tile is None else float(tile)
             src = "run.json" if self._manifest_path else f"run '{self._modal_cfg_run}'"
             self.manifest_summary.setText(
-                f"{arch} · grid {grid:g} · tile {tile:g} · from {src}")
+                f"{arch} · run grid {grid:g} · run tile {tile:g} · from {src}")
         self.wf.setRowVisible(self.manifest_summary, folded)
 
     def _pick_weights(self):
@@ -1621,10 +1635,15 @@ class InferPage(QWidget):
         appstate.put("last_view_dir", str(pred_dir))
         fmt = self.fmt_combo.currentData()
         appstate.put("infer_format", fmt)
+        appstate.put("infer_codes", self.codes_combo.currentData())
         thr = self.unclass_spin.value() if self.unclass_chk.isChecked() else None
-        self._append(f"\n[export] writing predictions as {fmt} (xyz + classification)…")
+        inp = self.input_edit.text().strip()
+        originals = ({p.stem: p for p in dataset.expand_inputs(inp)}
+                     if inp and os.path.exists(inp) else {})
+        self._append(f"\n[export] writing predictions as {fmt}…")
         self.exporter.start(dataset.export_predictions, pred_dir, fmt,
-                            class_map=self._class_map(), unclass_threshold=thr)
+                            class_map=self._class_map(), unclass_threshold=thr,
+                            originals=originals)
 
     def _owning_dataset(self) -> str | None:
         """Dataset the active weights belong to (ensemble: the first member's)."""
@@ -1645,18 +1664,19 @@ class InferPage(QWidget):
             return None
 
     def _class_map(self) -> dict | None:
-        """{model index: source classification value} from the run's dataset
-        meta; None (identity) when the dataset can't be resolved."""
-        try:
-            cmap = {int(c["index"]): int((c.get("source_values") or
-                                          [c["source_value"]])[0])
-                    for c in (self._dataset_meta() or {}).get("classes", [])}
-        except (ValueError, KeyError, TypeError, IndexError):
-            cmap = None
-        if not cmap:
+        """{model index: exported LAS code} per the Output codes choice;
+        None writes raw model indices."""
+        mode = self.codes_combo.currentData()
+        classes = (self._dataset_meta() or {}).get("classes", [])
+        cmap = dataset.export_class_map(classes, mode)
+        if mode != "raw" and not cmap:
             self._append("[export] no dataset meta for these weights; exported "
                          "codes are raw model indices.")
-            return None
+        elif cmap and mode == "asprs":
+            names = {int(c["index"]): c.get("name", "?") for c in classes}
+            self._append("[export] ASPRS codes: "
+                         + ", ".join(f"{names.get(i, i)}={v}"
+                                     for i, v in sorted(cmap.items())))
         return cmap
 
     def _on_exported(self, written):

@@ -571,7 +571,8 @@ _RAM_HEADROOM = 0.7
 def _worker_cap_detail(files: list[Path]) -> tuple[int, str]:
     """(thread count that won't OOM, human reason for the log)."""
     cores = os.cpu_count() or 4
-    cap = min(cores, max(len(files), 1))
+    # cores-1: these threads run in the GUI process; keep its event loop schedulable
+    cap = min(max(cores - 1, 1), max(len(files), 1))
     reason = f"cores={cores}, files={len(files)}"
     ram = _available_ram_bytes()
     if ram and files:
@@ -853,6 +854,8 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
         if e is None:
             by_index[i] = {"index": i, "name": c["name"],
                            "source_values": [int(c["source_value"])],
+                           "asprs_value": (int(c["asprs_value"])
+                                           if c.get("asprs_value") is not None else None),
                            **{f"{sp}_count": int(c[f"{sp}_count"]) for sp in _SPLITS}}
         else:
             e["source_values"].append(int(c["source_value"]))
@@ -1028,11 +1031,109 @@ def convert_infer_job(job_id: str, input_dir: str, staging_root: Path, progress=
 PRED_EXPORT_FORMATS = ("las", "laz", "ply", "txt", "csv")
 
 
+# ASPRS LAS 1.4 standard codes by class-name keyword; first hit wins, so the
+# low/medium vegetation aliases must outrank the generic vegetation ones
+ASPRS_ALIASES = [
+    (2, ("ground", "terrain", "bare earth", "bareearth")),
+    (3, ("low veg", "grass", "shrub")),
+    (4, ("med veg", "medium veg", "bush", "hedge")),
+    (5, ("veg", "tree", "canopy", "forest", "foliage")),
+    (6, ("building", "roof", "structure", "facade", "house")),
+    (7, ("noise", "low point", "outlier")),
+    (9, ("water", "river", "lake", "pond", "sea", "pool")),
+    (10, (r"rail\b", "railway", "railroad")),
+    (11, ("road", "pavement", "asphalt", "sidewalk")),
+    (14, ("wire", "power line", "powerline", "conductor", "cable", "catenary")),
+    (15, ("tower", "pylon", "transmission")),
+    (17, ("bridge", "overpass", "viaduct")),
+    (1, ("unclassified", "unknown", "unlabeled", "unlabelled", "clutter", "default")),
+]
+ASPRS_USER_BASE = 64  # first user-definable code (LAS 1.4)
+
+
+def asprs_code_for(name: str) -> int | None:
+    """The ASPRS code whose alias starts a word in the class name ('veg'
+    matches 'high_vegetation'); None = no standard code for this name.
+    Alias entries are regex fragments anchored at a word start."""
+    n = re.sub(r"[_\-./]+", " ", str(name).lower()).strip()
+    for code, keys in ASPRS_ALIASES:
+        if any(re.search(rf"\b{k}", n) for k in keys):
+            return code
+    return None
+
+
+def export_class_map(meta_classes, mode: str) -> dict | None:
+    """{model index: exported LAS code} from a dataset meta's classes list.
+    mode 'asprs': the class's stored asprs_value, else a name match, else its
+    source value (collisions fall into the 64+ user band). mode 'source': the
+    training data's source values. mode 'raw' (or unusable meta): None."""
+    if mode == "raw" or not meta_classes:
+        return None
+    try:
+        if mode == "source":
+            return {int(c["index"]): int((c.get("source_values") or
+                                          [c["source_value"]])[0])
+                    for c in meta_classes}
+        cs = sorted(meta_classes, key=lambda c: int(c["index"]))
+        cmap = {int(c["index"]): (int(c["asprs_value"])
+                                  if c.get("asprs_value") is not None
+                                  else asprs_code_for(c.get("name", "")))
+                for c in cs}
+        taken = {v for v in cmap.values() if v is not None}
+        nxt = ASPRS_USER_BASE
+        for c in cs:
+            i = int(c["index"])
+            if cmap[i] is not None:
+                continue
+            src = c.get("source_values") or [c.get("source_value")]
+            v = int(src[0]) if src and src[0] is not None else None
+            if v is None or v in taken:
+                v = max(nxt, ASPRS_USER_BASE)
+                while v in taken:
+                    v += 1
+                nxt = v + 1
+            cmap[i] = v
+            taken.add(v)
+        return cmap
+    except (ValueError, KeyError, TypeError, IndexError):
+        return None
+
+
+def _rewrite_original(orig: Path, dst: Path, cls, confidence=None, member=None,
+                      instance=None):
+    """The original las/laz re-emitted with the predicted classification (+
+    extra dims): every source dimension, VLR and CRS survives. COPC metadata is
+    stripped (the rewrite invalidates the hierarchy: output is plain las/laz).
+    Raises on point-count mismatch - the caller falls back to the xyz-only
+    writer."""
+    import laspy
+    las = laspy.read(str(orig))
+    if len(las.points) != len(cls):
+        raise ValueError(f"{len(las.points):,} points vs {len(cls):,} predictions")
+    if int(cls.max(initial=0)) > 31 and las.header.point_format.id < 6:
+        # 5-bit classification below format 6; formats 6/7 so colour survives the upconvert
+        target = 7 if "red" in las.point_format.dimension_names else 6
+        las = laspy.convert(las, point_format_id=target)
+    for lst in (las.header.vlrs, las.header.evlrs or []):
+        lst[:] = [v for v in lst if getattr(v, "user_id", "") != "copc"]
+    for name, arr, typ in (("confidence", confidence, np.float32),
+                           ("ens_member", member, np.uint8),
+                           ("instance_id", instance, np.uint32)):
+        if arr is not None:
+            if name not in las.point_format.dimension_names:
+                las.add_extra_dim(laspy.ExtraBytesParams(name=name, type=typ))
+            setattr(las, name, arr)
+    las.classification = cls
+    las.write(str(dst))
+
+
 def export_predictions(pred_dir, fmt: str, progress=None, class_map=None,
-                       unclass_threshold=None) -> list[Path]:
-    """Export each <name>_pred.npz as <name>_pred.<fmt> (xyz + classification
-    [+ confidence]), with class_map remapping model indices to source values.
-    Points below unclass_threshold export as class 1 (0 if 1 is taken; 255 with no
+                       unclass_threshold=None, originals=None) -> list[Path]:
+    """Export each <name>_pred.npz as <name>_pred.<fmt>, with class_map
+    remapping model indices to output codes. las/laz with a matching original
+    las/laz in `originals` ({input stem: path}) carries every source dimension
+    over; anything else writes xyz + classification [+ confidence]. Points
+    below unclass_threshold export as class 1 (0 if 1 is taken; 255 with no
     class_map). The npz keeps the raw prediction so a new threshold re-exports
     without re-running."""
     fmt = fmt.lower().lstrip(".")
@@ -1082,10 +1183,22 @@ def export_predictions(pred_dir, fmt: str, progress=None, class_map=None,
             low = int(mask.sum())
         cls = np.clip(cls, 0, 255).astype(np.uint8)
         dst = src.with_suffix(f".{fmt}")
-        _write_pred(dst, xyz, cls, fmt, confidence=conf, crs_wkt=crs_wkt,
-                    source_crs_wkt=source_wkt, member=member, instance=instance)
+        carried = False
+        orig = (originals or {}).get(src.name[:-len("_pred.npz")])
+        if fmt in ("las", "laz") and orig and Path(orig).suffix.lower() in (".las", ".laz"):
+            try:
+                _rewrite_original(Path(orig), dst, cls, confidence=conf,
+                                  member=member, instance=instance)
+                carried = True
+            except Exception as e:
+                say(f"  ⚠ {Path(orig).name}: can't carry source dimensions "
+                    f"({e}); writing xyz + classification only.")
+        if not carried:
+            _write_pred(dst, xyz, cls, fmt, confidence=conf, crs_wkt=crs_wkt,
+                        source_crs_wkt=source_wkt, member=member, instance=instance)
         written.append(dst)
         say(f"  {src.name} -> {dst.name} ({len(xyz):,} pts"
+            + ("; source dimensions carried over" if carried else "")
             + (f"; {low:,} below confidence {unclass_threshold:g} -> class {unclass}"
                if unclass_threshold is not None and conf is not None else "") + ")")
     return written

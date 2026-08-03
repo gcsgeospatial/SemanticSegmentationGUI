@@ -121,6 +121,19 @@ class JobRunner(QObject):
         self.proc.errorOccurred.connect(
             lambda e: self.failed.emit(str(e)))
         self.proc.start(program, args)
+        self._lower_priority()
+
+    def _lower_priority(self):
+        """BELOW_NORMAL on the launcher (windows): pixi's python child inherits
+        it at spawn, so a pegged trainer still yields to the UI thread."""
+        if sys.platform != "win32" or not self.running:
+            return
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        h = k32.OpenProcess(0x0200, False, int(self.proc.processId()))  # PROCESS_SET_INFORMATION
+        if h:
+            k32.SetPriorityClass(h, 0x00004000)  # BELOW_NORMAL_PRIORITY_CLASS
+            k32.CloseHandle(h)
 
     def terminate(self):
         """Kill the whole process tree - QProcess.kill() alone only hits the

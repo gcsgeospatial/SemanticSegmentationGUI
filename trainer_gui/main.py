@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -19,13 +20,13 @@ PAGES = ["Datasets", "Train", "Inference", "Panoptic", "Plotting"]
 
 
 class _NoWheelEdit(QObject):
-    """Eat wheel events on unfocused spin boxes/combos so page scrolling never
-    mutates a value. ponytail: add QSlider if one becomes a scroll victim."""
+    """Eat wheel events on spin boxes/combos - focused or not - so the wheel
+    never mutates a value; type or use the arrows instead. ponytail: add
+    QSlider if one becomes a scroll victim."""
 
     def eventFilter(self, obj, event):
         if (event.type() == QEvent.Wheel
-                and isinstance(obj, (QAbstractSpinBox, QComboBox))
-                and not obj.hasFocus()):
+                and isinstance(obj, (QAbstractSpinBox, QComboBox))):
             event.ignore()
             return True
         return super().eventFilter(obj, event)
@@ -202,6 +203,11 @@ def _check_modal_cli(parent=None) -> bool:
 
 
 def main() -> int:
+    # cores-2 before any numpy/pgeof/PDAL import: native libs otherwise grab
+    # every core at normal priority and starve the UI event loop
+    cores = os.cpu_count() or 4
+    for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+        os.environ.setdefault(var, str(max(cores - 2, 1)))
     from . import appstate, theme
     if sys.platform == "win32":
         # own taskbar identity so Windows shows icon.png, not python.exe's

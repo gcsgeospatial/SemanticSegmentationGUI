@@ -326,22 +326,19 @@ class PanopticPage(QWidget):
         return None
 
     def _class_map(self) -> dict | None:
-        """{model index: source classification value} via the run's dataset
-        meta, mirroring the Inference export; None = raw indices."""
+        """{model index: exported LAS code} via the run's dataset meta, using
+        the Inference page's Output codes choice; None = raw indices."""
         m = self._run_manifest()
         mp = appstate.known_datasets().get((m or {}).get("dataset") or "",
                                            {}).get("meta_path", "")
         meta = _load_json(Path(mp)) if mp else None
-        try:
-            cmap = {int(c["index"]): int((c.get("source_values") or
-                                          [c["source_value"]])[0])
-                    for c in (meta or {}).get("classes", [])}
-        except (ValueError, KeyError, TypeError, IndexError):
-            cmap = None
+        mode = appstate.get("infer_codes", "asprs")
+        cmap = dataset.export_class_map((meta or {}).get("classes", []), mode)
         if cmap:
             return cmap
-        self._append("[export] no dataset meta for this run; exported codes "
-                     "are raw model indices.")
+        if mode != "raw":
+            self._append("[export] no dataset meta for this run; exported codes "
+                         "are raw model indices.")
         return None
 
     def _on_exported(self, written):
