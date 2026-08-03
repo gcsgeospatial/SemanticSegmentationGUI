@@ -61,8 +61,7 @@ scripts/local/    the real trainers/inferencers - plain argparse, no modal.
                   Edit these. Run standalone: python scripts/local/local_train_ptv3.py --dataset X
 scripts/modal/    thin shells that bake the local twin into a modal.Image
                   and subprocess it in the cloud (train_common.modal_shell_run).
-scripts/helper/   train_common.py (shared training/manifest logic),
-                  density.py, _modal_shim.py (used by tools/check_env_sync.py)
+scripts/helper/   train_common.py (shared training/manifest logic)
 ```
 
 Each `local_train_<model>.py` takes the same kebab-case flags the GUI fills in
@@ -79,20 +78,12 @@ pixi install --manifest-path envs/pixi.toml -e <model>    # or the GUI's Install
 pixi run --manifest-path envs/pixi.toml -e <model> sanity # import check
 ```
 
-Model sources are **conda packages** (`conda-recipes/trainer-src-*`, pinned
-upstream SHAs, C++ extensions prebuilt) on a public prefix.dev channel - users
-need zero auth. Trained checkpoints ship the same way:
-
-```bash
-pixi run --manifest-path envs/pixi.toml -e pkg package-weights <run_dir>
-pixi run --manifest-path envs/pixi.toml -e pkg upload
-```
-
-and installed `trainer-weights-*` packages show up in the Infer page's
-**Installed…** picker. The modal recipes stay the dependency source of truth -
-`python tools/check_env_sync.py` fails on any drift between
-them, `envs/pixi.toml`, and the recipe SHAs. Full details:
-`conda-recipes/README.md`.
+Model sources are **conda packages** (`trainer-src-*`: pinned upstream SHAs,
+C++ extensions prebuilt) on a public prefix.dev channel - users need zero
+auth. Trained checkpoints ship the same way, and installed
+`trainer-weights-*` packages show up in the Infer page's **Installed…**
+picker. The modal recipes are the dependency source of truth;
+`envs/pixi.toml` mirrors them.
 
 ## Models
 
@@ -228,9 +219,7 @@ and never re-split.
 trainer_gui/     the PySide6 app (pip/pixi package) - pages/, local_cli.py, ...
 scripts/local/   the real trainers/inferencers (run in per-model pixi envs)
 scripts/modal/   thin shells (see its README.md)
-scripts/helper/  train_common.py, density.py, _modal_shim.py
+scripts/helper/  train_common.py
 envs/            pixi.toml + pixi.lock - one training env per backbone
-conda-recipes/   trainer-src-* recipes + README (rattler-build / prefix.dev)
-tools/           check_env_sync.py (modal↔pixi drift), package_weights.py
 ```
 

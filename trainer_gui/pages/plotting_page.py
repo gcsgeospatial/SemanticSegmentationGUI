@@ -8,9 +8,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import matplotlib
-
-matplotlib.use("QtAgg")
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavToolbar
 from PySide6.QtCore import Qt
@@ -182,22 +179,6 @@ class PlottingPage(QWidget):
             text = "\n".join(parts)
         self.test_label.setText(text)
         self.test_label.setVisible(bool(text))
-
-    # ------------------------------------------------------------- navigation target
-    def receive_nav(self, run=None, **_):
-        """navigate("Plotting", run=<run dir or id>) preselects that run."""
-        if not run:
-            return
-        want = str(run)
-        want_name = Path(want).name
-        self.run_list.clearSelection()
-        for i in range(self.run_list.count()):
-            item = self.run_list.item(i)
-            key = item.data(Qt.UserRole)
-            if key == want or Path(key).name == want_name:
-                item.setSelected(True)
-                self.run_list.scrollToItem(item)
-                break
 
     # ------------------------------------------------------------- draw
     def _on_view(self):

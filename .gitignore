@@ -3,5 +3,10 @@ __pycache__/
 *.egg-info/
 build/
 
-conda-recipes/output/
 envs/.pixi/
+
+# in-house maintainer tooling - kept local, not part of the published repo
+conda-recipes/
+tools/check_env_sync.py
+tools/package_weights.py
+scripts/helper/_modal_shim.py

@@ -255,35 +255,15 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
     IN_CH = 1 + len(FEAT_SPEC)
 
     def _cache_signature():
-        sp = ds_meta.get("split", {})
-        return {
-            "format_version": 2,
-            "pipeline": "kpconv",
-            "grid": GRID,
-            "chunk_xy": CHUNK_XY,
-            "stride": STRIDE,
-            "split_seed": sp.get("seed"),
-            "split_mode": sp.get("mode"),
-            "min_pts_mask": 64,
-            "min_pts_sub": 32,
-            "intensity_norm": "p95_clip2",
-            "num_classes": NUM_CLASSES,
-            "class_names": CLASS_NAMES,
-            "feature_recipe": "bias," + ",".join(
-                "ret_num" if n == "return_number" else n
-                for n in FEAT_SPEC),
-            "conv_radius": CONV_RADIUS,
-            "deform_radius": DEFORM_RADIUS,
-            "arch_hash": arch_hash(_arch(DEFORMABLE)),
-        }
+        return tc.kp_cache_signature(
+            "kpconv", ds_meta, GRID, CHUNK_XY, STRIDE, NUM_CLASSES,
+            CLASS_NAMES, FEAT_SPEC,
+            conv_radius=CONV_RADIUS, deform_radius=DEFORM_RADIUS,
+            arch_hash=arch_hash(_arch(DEFORMABLE)))
 
     def ensure_prep():
-        return tc.kp_ensure_prep(
-            PREP_DIR, ds_root, _cache_signature(),
-            lambda name, pc_path, out_dir, split: tc.kp_tile_and_save(
-                name, pc_path, out_dir, CHUNK_XY,
-                tc.train_stride(CHUNK_XY) if split == "train" else STRIDE,
-                GRID, NUM_CLASSES))
+        return tc.kp_ensure_prep_std(PREP_DIR, ds_root, _cache_signature(),
+                                     CHUNK_XY, STRIDE, GRID, NUM_CLASSES)
 
     def find_latest_checkpoint():
         return tc.kp_find_latest_checkpoint(
@@ -374,23 +354,9 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
     proxy_tiles = proxy_rep = None
     proxy_samples = []
     if not INFER and not EVAL_ONLY:
-        with tc.fixed_np_seed():
-            proxy_tiles, proxy_rep = tc.pick_proxy_tiles(
-                val_tiles, NUM_CLASSES, PROXY_TILES, mode=PROXY_SAMPLING,
-                class_names=CLASS_NAMES,
-                cache_path=f"{PREP_DIR}/val_class_balance_cache.npz",
-                viable=lambda p: sample_tile(p, training=False) is not None)
-            # subsampled ONCE here, before the prefetch threads exist: sample_tile draws from the global np.random, so re-sampling each val pass would race them and fork the scored point set
-            for tp in proxy_tiles:
-                s = sample_tile(tp, training=False)
-                if s is None:
-                    bn = os.path.basename(tp)
-                    why = ", ".join(proxy_rep["covers"].get(bn, [])) or "the stride base"
-                    raise RuntimeError(
-                        f"proxy val tile {bn} (curated for {why}) has fewer than "
-                        f"32 points: delete {PREP_DIR} and re-run the dataset prep")
-                proxy_samples.append((os.path.basename(tp), s))
-        print(tc.VAL_FULL_NOTE if VAL_FULL else proxy_rep["text"], flush=True)
+        proxy_tiles, proxy_rep, proxy_samples = tc.kp_curate_proxy(
+            val_tiles, NUM_CLASSES, PROXY_TILES, PROXY_SAMPLING, CLASS_NAMES,
+            PREP_DIR, sample_tile)
         if not tc.proxy_guard(run_dir, proxy_rep, tc.PROXY_PROTOCOL_TILES,
                               CLASS_NAMES, VAL_RANK):
             run_id, run_dir = tc.kp_make_run_dir("kpconv_native")
@@ -529,28 +495,11 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
     if INFER:
         seg_loss = pick_train_tile = None
     else:
-        class_counts, present_mask = tc.scan_class_balance(
-            train_tiles, NUM_CLASSES,
-            cache_path=f"{PREP_DIR}/class_balance_cache.npz")
-        rare_classes = (list(RARE_CLASSES) if RARE_CLASSES is not None
-                        else tc.auto_rare_classes(class_counts, RARE_FREQ_FRAC))
-        rare_tiles = ([train_tiles[i]
-                       for i in np.nonzero(present_mask[:, rare_classes].any(1))[0]]
-                      if (RARE_OVERSAMPLE and rare_classes) else [])
-        print(f"  class counts: {dict(zip(CLASS_NAMES, class_counts.tolist()))}", flush=True)
-        print(f"  rare classes: {[CLASS_NAMES[c] for c in rare_classes]}", flush=True)
-        print(f"  rare-class tiles: {len(rare_tiles)} / {len(train_tiles)}", flush=True)
-
-        if CLASS_WEIGHTING:
-            w = tc.class_weights_np(class_counts, WEIGHT_BETA, WEIGHT_CAP)
-            class_weights = torch.tensor(w, dtype=torch.float32).cuda()
-            print(f"  class weights: "
-                  f"{dict(zip(CLASS_NAMES, [round(float(x), 3) for x in w]))}", flush=True)
-        else:
-            class_weights = None
-        seg_loss = tc.make_seg_loss(class_weights, LABEL_SMOOTH, USE_FOCAL,
-                                    FOCAL_GAMMA, LOVASZ_WEIGHT)
-        pick_train_tile = tc.make_tile_picker(train_tiles, rare_tiles, RARE_TILE_PROB)
+        seg_loss, pick_train_tile = tc.kp_class_balance_setup(
+            train_tiles, NUM_CLASSES, CLASS_NAMES, PREP_DIR, RARE_CLASSES,
+            RARE_FREQ_FRAC, RARE_OVERSAMPLE, RARE_TILE_PROB, CLASS_WEIGHTING,
+            WEIGHT_BETA, WEIGHT_CAP, LABEL_SMOOTH, USE_FOCAL, FOCAL_GAMMA,
+            LOVASZ_WEIGHT)
 
     def _kp_batch(cxyz, feat):
         return make_kp_batch([(cxyz, feat, None)])[0]
@@ -578,16 +527,9 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
     val_csv = f"{run_dir}/val_metrics.csv"
     tc.init_val_csv(val_csv, CLASS_NAMES)
 
-    val_items  = [(n, p, f"{PREP_DIR}/val")  for n, p in val_list]
-    test_items = [(n, p, f"{PREP_DIR}/test") for n, p in test_list]
-    print(f"  eval set: {len(val_items)} holdout(val) + {len(test_items)} test scenes",
-          flush=True)
-
-    def _fwd_eval(tiles):
-        b, _ = make_kp_batch([(c, f, None) for c, f in tiles])
-        lg = net(b, cfg).cpu().numpy().astype(np.float32)
-        return np.split(lg, np.cumsum([len(c) for c, _ in tiles])[:-1])
-    evaluate = tc.kp_make_evaluate(_fwd_eval, build_feat, GRID, CHUNK_XY,
+    val_items, test_items = tc.kp_eval_items(PREP_DIR, val_list, test_list)
+    evaluate = tc.kp_make_evaluate(tc.kp_make_fwd_eval(make_kp_batch, _forward),
+                                   build_feat, GRID, CHUNK_XY,
                                    NUM_CLASSES, CLASS_NAMES)
 
     best = tc.BestCheckpoint(run_dir, VAL_RANK)

@@ -3,7 +3,6 @@ epoch metrics. Backends: local (pixi run) or Modal (cloud GPU)."""
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import time
@@ -398,9 +397,8 @@ class TrainPage(QWidget):
         name = self.dataset_combo.currentText()
         info = appstate.known_datasets().get(name, {})
         meta_path = info.get("meta_path", "")
-        if meta_path and os.path.exists(meta_path):
-            with open(meta_path, "r", encoding="utf-8") as f:
-                self._meta = json.load(f)
+        if meta_path:
+            self._meta = appstate.read_json(meta_path)
         if not name:
             self._set_ds_status("")
             self._ds_ready = False
@@ -848,7 +846,7 @@ class TrainPage(QWidget):
         if not (staged and os.path.isdir(staged)):
             self._append(f"[local] ⚠ No staged copy of '{name}' - "
                          f"the trainer won't find the dataset.")
-        elif Path(staged).parent != Path(appstate.local_config()["datasets_root"]):
+        elif Path(staged).parent != appstate.workspace_dir():
             dataset_dir = staged
         prog, args, run_env = local_cli.run_script(
             b.script, flags, b, repo_root=self.repo_root,

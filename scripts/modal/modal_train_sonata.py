@@ -4,15 +4,16 @@ cloud run identical code. Flags: --dataset --grid --chunk-xy --epochs --batch
 GPU/timeout from TT_GPU / TT_TIMEOUT_HOURS."""
 
 import os
+import sys
 from typing import Optional
 
 import modal
 
-APP_NAME      = "sonata"
-GPU_TYPE      = os.environ.get("TT_GPU", "A100")
-TIMEOUT_HOURS = int(os.environ.get("TT_TIMEOUT_HOURS", "24"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # local run
+sys.path.insert(0, "/root")                                     # in-container
+import _shell
 
-app = modal.App(APP_NAME)
+APP_NAME = "sonata"
 
 image = (
     modal.Image.debian_slim(python_version="3.10")
@@ -52,26 +53,14 @@ image = image.run_commands(
 )
 
 image = image.add_local_file("scripts/local/local_train_sonata.py", "/root/local_train_sonata.py")
-image = image.add_local_file("scripts/local/local_train_concerto.py", "/root/local_train_concerto.py")
+image = image.add_local_file("scripts/local/local_train_ptv3.py", "/root/local_train_ptv3.py")
 image = image.add_local_file("scripts/helper/train_common.py", "/root/train_common.py")
-image = image.add_local_file("scripts/helper/density.py", "/root/density.py")
+image = image.add_local_file("scripts/modal/_shell.py", "/root/_shell.py")
 
-outputs_volume  = modal.Volume.from_name(
-    os.environ.get("TT_OUTPUTS_VOLUME") or f"{APP_NAME}-outputs", create_if_missing=True)
-datasets_volume = modal.Volume.from_name(
-    os.environ.get("TT_DATASET_VOLUME", "terminal-datasets"), create_if_missing=True)
+app, outputs_volume, datasets_volume, _fn_kwargs, _launch = _shell.setup(APP_NAME)
 
 
-@app.function(
-    image=image,
-    gpu=GPU_TYPE,
-    volumes={"/outputs": outputs_volume, "/datasets": datasets_volume},
-    cpu=8,
-    memory=49152,
-    timeout=TIMEOUT_HOURS * 3600,
-    # auto-restart on failure; each retry auto-resumes from the last checkpoint
-    retries=modal.Retries(max_retries=10, backoff_coefficient=1.0, initial_delay=5.0),
-)
+@app.function(image=image, **_fn_kwargs)
 def train_sonata(dataset: Optional[str] = None, grid: Optional[float] = None,
                  epochs: Optional[int] = None, batch: Optional[int] = None,
                  steps_per_epoch: Optional[int] = None, chunk_xy: Optional[float] = None,
@@ -83,11 +72,8 @@ def train_sonata(dataset: Optional[str] = None, grid: Optional[float] = None,
     import sys
     sys.path.insert(0, "/root")
     import train_common
-    # resume only on Modal's own retries; markers accumulate on the outputs volume
-    train_common.modal_retry_marker(modal.current_function_call_id(),
-                                    "/outputs/.attempts", outputs_volume.commit)
-    train_common.modal_shell_run(
-        "/root/local_train_sonata.py",
+    train_common.modal_entry(
+        modal.current_function_call_id(), "/root/local_train_sonata.py",
         [
             ("--dataset", dataset),
             ("--grid", grid),
@@ -100,10 +86,7 @@ def train_sonata(dataset: Optional[str] = None, grid: Optional[float] = None,
             ("--infer-input", infer_input),
             ("--freeze-encoder", freeze_encoder),
         ],
-        env_json,
-        [outputs_volume, datasets_volume],
-        reload=outputs_volume.reload,
-    )
+        env_json, outputs_volume, datasets_volume)
 
 
 @app.local_entrypoint()
@@ -114,9 +97,4 @@ def main(dataset: Optional[str] = None, grid: Optional[float] = None,
          infer_input: Optional[str] = None,
          freeze_encoder: Optional[int] = None,
          env_json: Optional[str] = None):
-    what = f"infer({weights})" if mode == "infer" else f"train({dataset})"
-    print(f"Launching {APP_NAME} [{what}] on {GPU_TYPE} for up to {TIMEOUT_HOURS}h.")
-    train_sonata.remote(dataset=dataset, grid=grid, epochs=epochs, batch=batch,
-                        steps_per_epoch=steps_per_epoch, chunk_xy=chunk_xy, mode=mode,
-                        weights=weights, infer_input=infer_input,
-                        freeze_encoder=freeze_encoder, env_json=env_json)
+    _launch(train_sonata, **locals())

@@ -5,7 +5,6 @@ training. Instances ride back into the *_pred.npz and export as las/laz
 
 from __future__ import annotations
 
-import json
 import re
 from pathlib import Path
 
@@ -17,14 +16,6 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog
 from .. import appstate, dataset, panoptic, ui
 from ..jobs import FuncWorker
 from ..logconsole import LogConsole
-
-
-def _load_json(p: Path) -> dict | None:
-    try:
-        with open(p, encoding="utf-8") as f:
-            return json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return None
 
 
 def _job_id(pred_dir: Path) -> str:
@@ -40,7 +31,7 @@ def _class_names_for(pred_dir: Path) -> tuple[list | None, str]:
     infer_run.json (local runs). None when nothing names the classes."""
     for p in (pred_dir / "infer_run.json", pred_dir.parent / "run.json",
               pred_dir.parent.parent / "run.json"):
-        m = _load_json(p)
+        m = appstate.read_json(p)
         if m and m.get("class_names"):
             return list(m["class_names"]), p.name
     roots = [appstate.scratch_infer_dir()]
@@ -50,7 +41,7 @@ def _class_names_for(pred_dir: Path) -> tuple[list | None, str]:
         except (KeyError, OSError):
             pass
     for r in roots:
-        m = _load_json(r / _job_id(pred_dir) / "infer_run.json")
+        m = appstate.read_json(r / _job_id(pred_dir) / "infer_run.json")
         if m and m.get("class_names"):
             return list(m["class_names"]), "infer_run.json"
     return None, ""
@@ -320,7 +311,7 @@ class PanopticPage(QWidget):
         cands += [d.parent for d in (appstate.workspace_dir() / "inference")
                   .glob(f"*/predictions_{_job_id(pd)}_m*")]
         for c in cands:
-            m = _load_json(c / "run.json")
+            m = appstate.read_json(c / "run.json")
             if m and m.get("dataset"):
                 return m
         return None
@@ -331,15 +322,9 @@ class PanopticPage(QWidget):
         m = self._run_manifest()
         mp = appstate.known_datasets().get((m or {}).get("dataset") or "",
                                            {}).get("meta_path", "")
-        meta = _load_json(Path(mp)) if mp else None
+        meta = appstate.read_json(Path(mp)) if mp else None
         mode = appstate.get("infer_codes", "asprs")
-        cmap = dataset.export_class_map((meta or {}).get("classes", []), mode)
-        if cmap:
-            return cmap
-        if mode != "raw":
-            self._append("[export] no dataset meta for this run; exported codes "
-                         "are raw model indices.")
-        return None
+        return dataset.class_map_for_export(meta, mode, self._append, "this run")
 
     def _on_exported(self, written):
         if not written:
@@ -369,20 +354,17 @@ class PanopticPage(QWidget):
     def _begin_run(self, title: str):
         """Freeze the input surface: the worker owns the npz files, and the
         export callback must see the folder the run started on."""
-        self._run_open = True
+        ui.begin_log_run(self, title)
         for w in (self.pred_combo, self.browse_btn, self.rescan_btn, self.cbox):
             w.setEnabled(False)
         self.kill_btn.setVisible(True)
-        self.log.begin_run(title)
 
     def _finish(self, summary: str):
         for w in (self.pred_combo, self.browse_btn, self.rescan_btn, self.cbox):
             w.setEnabled(True)
         self.run_btn.setEnabled(True)
         self.kill_btn.setVisible(False)
-        if self._run_open:
-            self._run_open = False
-            self.log.end_run(summary)
+        ui.end_log_run(self, summary)
 
     def _append(self, text: str, newline: bool = True):
         ui.append_log(self.log, text, newline)

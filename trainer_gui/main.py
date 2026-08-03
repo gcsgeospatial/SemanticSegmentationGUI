@@ -134,14 +134,9 @@ class MainWindow(QWidget):
         appstate.put("ui_theme", mode)
         theme.apply(QApplication.instance(), mode)
 
-    def _navigate(self, page_name: str, **kwargs):
-        """ui.navigate target: switch pages, then hand the payload to receive_nav."""
+    def _navigate(self, page_name: str):
+        """ui.navigate target: switch pages."""
         self.nav.setCurrentRow(PAGES.index(page_name))
-        page = {"Datasets": self.datasets_page, "Train": self.train_page,
-                "Inference": self.infer_page, "Panoptic": self.panoptic_page,
-                "Plotting": self.plotting_page}[page_name]
-        if kwargs and hasattr(page, "receive_nav"):
-            page.receive_nav(**kwargs)
 
     def _go(self, row: int):
         # name-keyed so inserting a page never silently shifts the refreshes

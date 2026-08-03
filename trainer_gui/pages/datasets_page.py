@@ -4,7 +4,6 @@ build + train + inference."""
 
 from __future__ import annotations
 
-import json
 import os
 import re
 from pathlib import Path
@@ -370,15 +369,11 @@ class DatasetsPage(QWidget):
         self._append("⏹ Stopped.")
         self._end_run("stopped")
 
-    # one begin_run per long op, closed exactly once via the _run_open latch
     def _begin_run(self, title: str):
-        self.log.begin_run(title)
-        self._run_open = True
+        ui.begin_log_run(self, title)
 
     def _end_run(self, summary: str):
-        if self._run_open:
-            self._run_open = False
-            self.log.end_run(summary)
+        ui.end_log_run(self, summary)
 
     def _dispatch_done(self, result):
         cb, self._done_cb = self._done_cb, None
@@ -500,14 +495,32 @@ class DatasetsPage(QWidget):
             menu.addAction(n, lambda n=n: self._copy_settings_from(n))
         menu.exec(self.copy_btn.mapToGlobal(self.copy_btn.rect().bottomLeft()))
 
+    def _set_class_row(self, r: int, train: bool, values_text: str,
+                       count_text: str, name: str, asprs=None):
+        """Fill one class-table row: Train checkbox, read-only value/count
+        cells, editable name (its itemChanged auto-fills the ASPRS column)."""
+        chk = QCheckBox()
+        chk.setChecked(train)
+        cell = QWidget()
+        lay = QHBoxLayout(cell)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setAlignment(Qt.AlignCenter)
+        lay.addWidget(chk)
+        self.class_table.setCellWidget(r, 0, cell)
+        for col, text in ((1, values_text), (2, count_text)):
+            item = QTableWidgetItem(text)
+            item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+            self.class_table.setItem(r, col, item)
+        self.class_table.setItem(r, 3, QTableWidgetItem(name))
+        if asprs is not None:  # stored code beats the name auto-fill
+            self.class_table.setItem(r, 4, QTableWidgetItem(str(int(asprs))))
+
     def _copy_settings_from(self, name: str):
         """Repopulate classes, split and feature selections from a dataset's
         meta; fields missing from the meta are skipped silently."""
         meta_path = appstate.known_datasets().get(name, {}).get("meta_path", "")
-        try:
-            with open(meta_path, "r", encoding="utf-8") as f:
-                meta = json.load(f)
-        except (OSError, json.JSONDecodeError):
+        meta = appstate.read_json(meta_path)
+        if meta is None:
             self._append(f"✗ Couldn't read dataset_meta.json for '{name}'.")
             return
         src = meta.get("source", {})
@@ -524,23 +537,9 @@ class DatasetsPage(QWidget):
                      for v in src.get("ignore_values", [])]
             self.class_table.setRowCount(len(rows))
             for r, (vals, nm, ap, train) in enumerate(rows):
-                chk = QCheckBox()
-                chk.setChecked(train)
-                cell = QWidget()
-                lay = QHBoxLayout(cell)
-                lay.setContentsMargins(0, 0, 0, 0)
-                lay.setAlignment(Qt.AlignCenter)
-                lay.addWidget(chk)
-                self.class_table.setCellWidget(r, 0, cell)
                 cnt = sum(self._label_values.get(v, 0) for v in vals)
-                for col, text in ((1, ",".join(str(v) for v in vals)),
-                                  (2, f"{cnt:,}" if cnt else "-")):
-                    item = QTableWidgetItem(text)
-                    item.setFlags(item.flags() & ~Qt.ItemIsEditable)
-                    self.class_table.setItem(r, col, item)
-                self.class_table.setItem(r, 3, QTableWidgetItem(nm))
-                if ap is not None:  # stored code beats the name auto-fill
-                    self.class_table.setItem(r, 4, QTableWidgetItem(str(int(ap))))
+                self._set_class_row(r, train, ",".join(str(v) for v in vals),
+                                    f"{cnt:,}" if cnt else "-", nm, ap)
             self._copied_classes = {v: (nm, ap, train)
                                     for vals, nm, ap, train in rows for v in vals}
             copied.append(f"{len(groups)} classes (+{len(rows) - len(groups)} ignored)")
@@ -622,19 +621,8 @@ class DatasetsPage(QWidget):
         ignore_zero = "class" in self._spec().field.lower()
         self.class_table.setRowCount(len(counts))
         for r, (val, cnt) in enumerate(counts.items()):
-            chk = QCheckBox()
-            chk.setChecked(not (ignore_zero and val == 0))
-            cell = QWidget()
-            lay = QHBoxLayout(cell)
-            lay.setContentsMargins(0, 0, 0, 0)
-            lay.setAlignment(Qt.AlignCenter)
-            lay.addWidget(chk)
-            self.class_table.setCellWidget(r, 0, cell)
-            for col, text in ((1, str(val)), (2, f"{cnt:,}")):
-                item = QTableWidgetItem(text)
-                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
-                self.class_table.setItem(r, col, item)
-            self.class_table.setItem(r, 3, QTableWidgetItem(f"class_{val}"))
+            self._set_class_row(r, not (ignore_zero and val == 0),
+                                str(val), f"{cnt:,}", f"class_{val}")
         if self._copied_classes:
             for r in range(self.class_table.rowCount()):
                 for v in _parse_values(self.class_table.item(r, 1).text()):
@@ -812,7 +800,6 @@ class DatasetsPage(QWidget):
             "geo_k": int(self.geo_k.value()),
             "rgb_fields": rgb_sel if len(mapped) == 3 else None,
             "declared_crs_epsg": declared,
-            "max_workers": 1,
         }
 
     def _start_tiling(self):
@@ -846,7 +833,7 @@ class DatasetsPage(QWidget):
                 geo_features=plan["geo_features"],
                 geo_k=plan["geo_k"],
                 rgb_fields=plan["rgb_fields"],
-                max_workers=plan["max_workers"], progress=progress, **crs_kw)
+                progress=progress, **crs_kw)
 
         self._done_cb = self._on_converted
         self.worker.start(job)
@@ -893,10 +880,7 @@ class DatasetsPage(QWidget):
     def _register_dataset(staged: Path) -> bool:
         """Validate + remember a converted dataset folder. It must hold a readable
         dataset_meta.json; False (nothing recorded) when it doesn't."""
-        try:
-            with open(staged / "dataset_meta.json", "r", encoding="utf-8") as f:
-                json.load(f)
-        except (OSError, json.JSONDecodeError):
+        if appstate.read_json(staged / "dataset_meta.json") is None:
             return False
         appstate.remember_dataset(staged.name, {
             "staged_dir": str(staged),
@@ -1065,9 +1049,8 @@ class DatasetsPage(QWidget):
             if not on_disk:
                 status += "  ·  local copy missing (upload will ask where it is)"
         meta_path = info.get("meta_path", "")
-        if meta_path and os.path.exists(meta_path):
-            with open(meta_path, "r", encoding="utf-8") as f:
-                meta = json.load(f)
+        meta = appstate.read_json(meta_path) if meta_path else None
+        if meta is not None:
             s = meta.get("stats", {})
             spl = meta.get("splits", {})
             n_tr = len(spl.get("train", {}).get("scenes", []))

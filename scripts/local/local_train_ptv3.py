@@ -1,19 +1,31 @@
-"""PTv3 local trainer on a canonical trainer_gui dataset (standalone model.py,
-standard attention), on PTv3's published outdoor recipe. Color slot prefers
-intensity over RGB (run.json "color_source" keeps old RGB checkpoints honest);
-FEAT_CHANNELS env overrides the input spec, run.json "features" records it.
-Flags: --dataset --grid --chunk-xy --epochs --batch --steps-per-epoch | --mode
-infer --weights --infer-input <job_id>.
+"""PTv3-family local trainer on a canonical trainer_gui dataset. The base mode
+is plain PTv3 (standalone model.py, standard attention) on PTv3's published
+outdoor recipe; the concerto/sonata/utonia wrappers overwrite the PKG/HF
+globals to fine-tune a pretrained Pointcept-SSL encoder (upcast walk + linear
+seg head, CC-BY-NC 4.0 weights, checkpoints embed the model config so --mode
+infer works offline). Color slot prefers intensity over RGB (run.json
+"color_source" keeps old RGB checkpoints honest); FEAT_CHANNELS env overrides
+the input spec, run.json "features" records it. Custom FEAT_CHANNELS
+re-initializes a pretrained input stem (it needs the default layout).
+Flags: --dataset --grid --chunk-xy --epochs --batch --steps-per-epoch
+[--freeze-encoder] | --mode infer --weights --infer-input <job_id>.
 """
 
 import os
 from typing import Optional
+
+# pcssl wrappers overwrite these; HF_NAME None = plain cold-start PTv3
+PKG      = None
+HF_NAME  = None
+HF_REPO  = None
+BB_KEY   = "ptv3"
 
 N_EPOCHS      = 100
 BATCH_SIZE    = 4
 
 GRID_SIZE     = 0.25
 USE_FLASH_ATTN = False
+FREEZE_ENCODER = False
 
 FEAT_CHANNELS = ""
 
@@ -66,7 +78,8 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                epochs: Optional[int] = None, batch: Optional[int] = None,
                steps_per_epoch: Optional[int] = None, chunk_xy: Optional[float] = None,
                mode: str = "train", weights: Optional[str] = None,
-               infer_input: Optional[str] = None):
+               infer_input: Optional[str] = None,
+               freeze_encoder: Optional[int] = None):
     if dataset is None and mode != "infer":
         raise ValueError("--dataset is required: pass a canonical trainer_gui dataset "
                          "name materialized under /datasets. The only "
@@ -79,14 +92,22 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
     import train_common as tc
     (DG_DENSITY_AUG, DG_COARSEN_MAX, DG_P_NATIVE, DG_LOGDK_FEAT, DG_LOGDK_K,
      DG_INFER_TTA, USE_FOCAL, FOCAL_GAMMA, CLASS_WEIGHTING, WEIGHT_BETA,
-     RARE_OVERSAMPLE, RARE_CENTER_PROB, VAL_EVERY,
+     RARE_OVERSAMPLE, VAL_EVERY,
      FEAT_CHANNELS, PROXY_SAMPLING) = tc.env_overrides(globals(), [
         "DG_DENSITY_AUG", "DG_COARSEN_MAX", "DG_P_NATIVE", "DG_LOGDK_FEAT",
         "DG_LOGDK_K", "DG_INFER_TTA", "USE_FOCAL", "FOCAL_GAMMA",
-        "CLASS_WEIGHTING", "WEIGHT_BETA", "RARE_OVERSAMPLE", "RARE_CENTER_PROB",
+        "CLASS_WEIGHTING", "WEIGHT_BETA", "RARE_OVERSAMPLE",
         "VAL_EVERY", "FEAT_CHANNELS", "PROXY_SAMPLING"])
 
-    sys.path.insert(0, os.path.dirname(os.environ.get("PTV3_SRC", "/opt/ptv3")))
+    # wrappers overwrite the PKG globals per call - read them here, not at import
+    PKG, HF_NAME, HF_REPO, BB_KEY = (globals()["PKG"], globals()["HF_NAME"],
+                                     globals()["HF_REPO"], globals()["BB_KEY"])
+    pretrained = HF_NAME is not None
+    if pretrained:
+        sys.path.insert(0, os.environ.get(f"{PKG.upper()}_SRC", f"/opt/{PKG}"))
+    else:
+        sys.path.insert(0, os.path.dirname(os.environ.get("PTV3_SRC", "/opt/ptv3")))
+    spec_label = "this backbone" if pretrained else "PTv3"
 
     GRID_SIZE   = grid if grid is not None else globals()["GRID_SIZE"]
     N_EPOCHS    = epochs if epochs is not None else globals()["N_EPOCHS"]
@@ -94,6 +115,8 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
     STEPS       = steps_per_epoch if steps_per_epoch is not None else 500
     CHUNK_XY    = chunk_xy if chunk_xy is not None else 50.0
     STRIDE      = CHUNK_XY / 2.0
+    FREEZE = bool(freeze_encoder if freeze_encoder is not None
+                  else globals()["FREEZE_ENCODER"])
     color_src = "intensity"
     FEAT_DEFAULT = ["x", "y", "z", "intensity"]
     FEAT_SPEC = list(FEAT_DEFAULT)
@@ -106,53 +129,125 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
         FEAT_DEFAULT = ["x", "y", "z", "rgb" if color_src == "rgb" else "intensity"]
         FEAT_SPEC = (list(FEAT_DEFAULT) if mode == "infer"
                      else tc.parse_feat_spec(FEAT_CHANNELS, FEAT_DEFAULT))
-        tc.ptv3_check_spec(FEAT_SPEC, "PTv3")
+        tc.ptv3_check_spec(FEAT_SPEC, spec_label)
         if "rgb" in FEAT_SPEC:
             color_src = "rgb"
         elif "intensity" in FEAT_SPEC and ds_meta.get("has_intensity"):
             color_src = "intensity"
-        PREP_DIR = (f"{ds_root}/prep/ptv3_{color_src}"
+        PREP_DIR = (f"{ds_root}/prep/{'pcssl' if pretrained else 'ptv3'}_{color_src}"
                     f"{tc.feat_spec_tag(FEAT_SPEC, FEAT_DEFAULT)}_chunk{int(CHUNK_XY)}_loc"
                     f"{tc.train_stride_tag()}")
 
     def _in_ch(spec):
+        # a pretrained stem expects a trailing 3-wide (zeroed) normal slot
         return (sum(3 if n in ("rgb", "intensity") else 1 for n in spec)
-                + (1 if DG_LOGDK_FEAT else 0))
+                + (3 if pretrained else 0) + (1 if DG_LOGDK_FEAT else 0))
     IN_CH = _in_ch(FEAT_SPEC)
 
     def load_canonical(npz_path):
         return tc.ptv3_load_canonical(npz_path, color_src)
 
-    from ptv3.model import PointTransformerV3
-    # PTv3's 5x5x5 stem needs the spconv-cu118 build; cu124's backward asserts
+    if pretrained:
+        import importlib
+        _mdl = importlib.import_module(f"{PKG}.model")
+    else:
+        from ptv3.model import PointTransformerV3
+        # PTv3's 5x5x5 stem needs the spconv-cu118 build; cu124's backward asserts
+
+    def _upcast_feat(point):
+        """Upstream upcast walk: concat each pooling level's features back onto
+        its parent -> per-input-point features of dim sum(enc_channels)."""
+        while "pooling_parent" in point.keys():
+            parent = point.pop("pooling_parent")
+            inverse = point.pop("pooling_inverse")
+            parent.feat = torch.cat([parent.feat, point.feat[inverse]], dim=-1)
+            point = parent
+        return point.feat
+
+    def _forward_logits(batch):
+        if pretrained:
+            return head(_upcast_feat(backbone(batch)))
+        point = backbone(batch)
+        return head(point["feat"] if isinstance(point, dict) else point.feat)
 
     def build_feat(cxyz, rgbf, extras=None, drop=()):
         return tc.ptv3_build_feat(FEAT_SPEC, cxyz, rgbf, extras, drop,
-                                  DG_LOGDK_FEAT, DG_LOGDK_K)
+                                  DG_LOGDK_FEAT, DG_LOGDK_K,
+                                  normal_block=pretrained)
 
-    def build_model(num_classes):
-        backbone = PointTransformerV3(
-            in_channels=IN_CH,
-            order=("z", "z-trans", "hilbert", "hilbert-trans"),
-            stride=(2, 2, 2, 2),
-            enc_depths=(2, 2, 2, 6, 2),
-            enc_channels=(32, 64, 128, 256, 512),
-            enc_num_head=(2, 4, 8, 16, 32),
-            enc_patch_size=(1024, 1024, 1024, 1024, 1024),
-            dec_depths=(2, 2, 2, 2),
-            dec_channels=(64, 64, 128, 256),
-            dec_num_head=(4, 4, 8, 16),
-            dec_patch_size=(1024, 1024, 1024, 1024),
-            drop_path=DROP_PATH,
-            enable_flash=USE_FLASH_ATTN,
-            cls_mode=False,
-        ).cuda()
-        head = torch.nn.Linear(64, num_classes).cuda()
-        return backbone, head
+    def _stem_is_pretrained():
+        # only the exact pretraining layout maps onto the pretrained stem
+        return pretrained and (FEAT_SPEC == FEAT_DEFAULT and not DG_LOGDK_FEAT)
 
-    def _forward_logits(batch):
-        point = backbone(batch)
-        return head(point["feat"] if isinstance(point, dict) else point.feat)
+    def build_model(num_classes, from_config=None):
+        """(backbone, head, model_cfg, stem_pre). Plain PTv3 builds the fixed
+        published arch (model_cfg None); pretrained downloads the HF checkpoint
+        (or rebuilds offline from a config embedded in our checkpoints)."""
+        if not pretrained:
+            backbone = PointTransformerV3(
+                in_channels=IN_CH,
+                order=("z", "z-trans", "hilbert", "hilbert-trans"),
+                stride=(2, 2, 2, 2),
+                enc_depths=(2, 2, 2, 6, 2),
+                enc_channels=(32, 64, 128, 256, 512),
+                enc_num_head=(2, 4, 8, 16, 32),
+                enc_patch_size=(1024, 1024, 1024, 1024, 1024),
+                dec_depths=(2, 2, 2, 2),
+                dec_channels=(64, 64, 128, 256),
+                dec_num_head=(4, 4, 8, 16),
+                dec_patch_size=(1024, 1024, 1024, 1024),
+                drop_path=DROP_PATH,
+                enable_flash=USE_FLASH_ATTN,
+                cls_mode=False,
+            ).cuda()
+            head = torch.nn.Linear(64, num_classes).cuda()
+            return backbone, head, None, False
+        stem_pre = _stem_is_pretrained()
+        if from_config is not None:
+            config = dict(from_config)
+            sd = None
+        else:
+            ckpt = _mdl.load(HF_NAME, repo_id=HF_REPO,
+                             download_root=f"{tc.OUTPUTS_ROOT}/hf_cache/{PKG}",
+                             ckpt_only=True)
+            config = dict(ckpt["config"])
+            sd = ckpt["state_dict"]
+        n_stages = len(config.get("enc_depths", (3, 3, 3, 12, 3)))
+        if not USE_FLASH_ATTN:
+            config["enable_flash"] = False
+            config["upcast_attention"] = True
+            config["upcast_softmax"] = True
+            config["enc_patch_size"] = [min(int(s), 1024) for s in
+                                        config.get("enc_patch_size",
+                                                   [1024] * n_stages)]
+        config["in_channels"] = IN_CH
+        config["drop_path"] = DROP_PATH
+        config["freeze_encoder"] = False
+        backbone = _mdl.PointTransformerV3(**config).cuda()
+        if sd is not None:
+            if not stem_pre:
+                sd = {k: v for k, v in sd.items()
+                      if not k.startswith("embedding.")}
+            missing, unexpected = backbone.load_state_dict(sd, strict=False)
+            bad = ([k for k in missing if not k.startswith("embedding.")]
+                   + list(unexpected))
+            if bad:
+                raise RuntimeError(f"pretrained {HF_NAME} did not match the "
+                                   f"rebuilt architecture: {bad[:8]}")
+            print(f"  loaded pretrained {HF_NAME} "
+                  f"({'pretrained' if stem_pre else 'custom (re-initialized)'} "
+                  f"input stem, {IN_CH} channels)", flush=True)
+        if FREEZE:
+            for p in backbone.enc.parameters():
+                p.requires_grad = False
+            if stem_pre:
+                for p in backbone.embedding.parameters():
+                    p.requires_grad = False
+        head_in = (int(sum(config.get("enc_channels", (48, 96, 192, 384, 512))))
+                   if config.get("enc_mode")
+                   else int(config.get("dec_channels", (96, 96, 192, 384))[0]))
+        head = torch.nn.Linear(head_in, num_classes).cuda()
+        return backbone, head, config, stem_pre
 
     if mode == "infer":
         if not weights or not infer_input:
@@ -178,10 +273,14 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
             if len(set(mf)) != len(mf):
                 raise ValueError(f"run.json 'features' has duplicates: {mf}")
             FEAT_SPEC = tc.parse_feat_spec(",".join(mf), FEAT_DEFAULT)
-            tc.ptv3_check_spec(FEAT_SPEC, "PTv3")
+            tc.ptv3_check_spec(FEAT_SPEC, spec_label)
         IN_CH = _in_ch(FEAT_SPEC)
 
-        backbone, head = build_model(num_classes)
+        if pretrained and "config" not in ckpt:
+            raise ValueError(f"{weights} has no embedded model config "
+                             f"(not a local_train_{BB_KEY}.py checkpoint?)")
+        backbone, head, model_cfg, stem_pre = build_model(
+            num_classes, from_config=ckpt.get("config"))
         backbone.load_state_dict(bsd)
         head.load_state_dict(hsd)
         backbone.eval(); head.eval()
@@ -196,13 +295,17 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
         pred_dir = os.environ.get("TT_PRED_DIR") or f"{run_dir}/predictions"
         os.makedirs(pred_dir, exist_ok=True)
         exc_idx = tc.exclude_class_idx(class_names)
-        infer_cfg = {"backbone": "PTv3", "mode": "infer", "weights": weights,
+        infer_cfg = {"backbone": BB_KEY if pretrained else "PTv3",
+                     "mode": "infer", "weights": weights,
                      "infer_input": infer_input, "num_classes": num_classes,
                      "class_names": class_names, "grid_size": GRID_SIZE,
                      "color_source": color_src, "features": FEAT_SPEC,
                      "chunk_xy": CHUNK_XY, "gpu": tc.gpu_name(),
                      "exclude_classes": [class_names[i] for i in exc_idx],
                      "started_utc": datetime.now(timezone.utc).isoformat()}
+        if pretrained:
+            infer_cfg["pretrained"] = HF_NAME
+            infer_cfg["stem"] = "pretrained" if stem_pre else "custom"
 
         predict_scene = tc.ptv3_make_predict_scene(
             _forward_logits, load_canonical, build_feat, FEAT_SPEC, GRID_SIZE,
@@ -211,7 +314,11 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
         return
 
     print("=" * 70)
-    print(f"  PTv3  {dataset}  ({tc.gpu_name()}, {N_EPOCHS} ep, batch {BATCH_SIZE})")
+    if pretrained:
+        print(f"  {BB_KEY} [{HF_NAME}{', frozen encoder' if FREEZE else ''}]  "
+              f"{dataset}  ({tc.gpu_name()}, {N_EPOCHS} ep, batch {BATCH_SIZE})")
+    else:
+        print(f"  PTv3  {dataset}  ({tc.gpu_name()}, {N_EPOCHS} ep, batch {BATCH_SIZE})")
     print("=" * 70)
     print(f"  CUDA: {torch.cuda.is_available()}  "
           f"{torch.cuda.get_device_name(0) if torch.cuda.is_available() else ''}")
@@ -241,33 +348,17 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
         viable=_viable)
     print(tc.VAL_FULL_NOTE if VAL_FULL else proxy_rep["text"], flush=True)
 
-    tag = dataset
-    _pt = "ptv3"
-
     _recipe = {"grid_size": GRID_SIZE, "chunk_xy": CHUNK_XY, "features": FEAT_SPEC,
                "n_epochs": N_EPOCHS, "num_classes": NUM_CLASSES,
                "class_names": CLASS_NAMES}
-    resume_info = (tc.find_latest_unfinished_run(f"{tag}_{_pt}", _recipe)
-                   if (RESUME or AUTO_RESUME) else None)
-    if resume_info and not tc.proxy_guard(resume_info[0], proxy_rep,
-                                          tc.PROXY_PROTOCOL_TILES, names,
-                                          VAL_RANK):
-        resume_info = None
-    if resume_info:
-        run_dir, resume_ckpt, resume_epoch = resume_info
-        run_id = os.path.basename(run_dir)
-        os.makedirs(f"{run_dir}/checkpoints", exist_ok=True)
-        start_epoch = resume_epoch + 1
-        print(f"  RESUMING {run_id} from {os.path.basename(resume_ckpt)} "
-              f"-> epoch {start_epoch}/{N_EPOCHS}", flush=True)
-    else:
-        run_id = datetime.now(timezone.utc).strftime(f"%Y%m%d_%H%M%S_{tag}_{_pt}")
-        run_dir = f"{tc.OUTPUTS_ROOT}/runs/{run_id}"
-        os.makedirs(f"{run_dir}/checkpoints", exist_ok=True)
-        resume_ckpt, start_epoch = None, 0
+    run_dir, run_id, resume_ckpt, start_epoch = tc.resume_ladder(
+        f"{dataset}_{BB_KEY}", _recipe, RESUME or AUTO_RESUME, proxy_rep,
+        tc.PROXY_PROTOCOL_TILES, names, VAL_RANK, N_EPOCHS)
+    if resume_ckpt is None:
         with open(f"{run_dir}/run.json", "w") as f:
             cfg = {
-                "backbone": "PTv3", "n_epochs": N_EPOCHS, "batch_size": BATCH_SIZE,
+                "backbone": BB_KEY if pretrained else "PTv3",
+                "n_epochs": N_EPOCHS, "batch_size": BATCH_SIZE,
                 "dataset": dataset,
                 "mode": mode, "gpu": tc.gpu_name(),
                 "num_classes": NUM_CLASSES, "grid_size": GRID_SIZE,
@@ -298,13 +389,30 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                                   "rare_tile_prob": RARE_TILE_PROB,
                                   "rare_center_prob": RARE_CENTER_PROB},
             }
+            if pretrained:
+                cfg.update({"pretrained": HF_NAME, "hf_repo": HF_REPO,
+                            "stem": "pretrained" if _stem_is_pretrained() else "custom",
+                            "freeze_encoder": FREEZE})
             json.dump(cfg, f, indent=2)
 
-    backbone, head = build_model(NUM_CLASSES)
-    print(f"  Params: {sum(p.numel() for p in backbone.parameters()):,}")
+    backbone, head, model_cfg, stem_pre = build_model(NUM_CLASSES)
+    if pretrained:
+        n_all = sum(p.numel() for p in backbone.parameters())
+        n_train = (sum(p.numel() for p in backbone.parameters() if p.requires_grad)
+                   + sum(p.numel() for p in head.parameters()))
+        print(f"  Params: {n_all:,} ({n_train:,} trainable)")
+    else:
+        print(f"  Params: {sum(p.numel() for p in backbone.parameters()):,}")
+
+    def _set_backbone_mode():
+        # requires_grad=False alone still lets BN stats update and DropPath fire; eval() is what actually stops both
+        backbone.train(not FREEZE)
+        if FREEZE and not stem_pre:
+            backbone.embedding.train()
 
     optim = torch.optim.AdamW(
-        list(backbone.parameters()) + list(head.parameters()),
+        [p for p in backbone.parameters() if p.requires_grad]
+        + list(head.parameters()),
         lr=BASE_LR, weight_decay=WEIGHT_DECAY,
     )
     if resume_ckpt is not None:
@@ -368,19 +476,25 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
 
     best = tc.BestCheckpoint(run_dir, VAL_RANK)
     tc.proxy_guard(run_dir, proxy_rep, tc.PROXY_PROTOCOL_TILES, names, VAL_RANK)
-    tc.write_run_manifest(run_dir, "ptv3", dataset)
+    tc.write_run_manifest(run_dir, BB_KEY, dataset)
 
     _proxy_batches = tc.ptv3_proxy_batches(proxy_tiles, BATCH_SIZE,
                                            to_ptv3_batch, _viable, proxy_rep,
                                            CHUNK_XY, PREP_DIR)
 
     def _save_best(ep):
-        tc.atomic_torch_save({"backbone": backbone.state_dict(),
-                              "head": head.state_dict(), "epoch": ep},
-                             best.final)
+        state = {"backbone": backbone.state_dict(),
+                 "head": head.state_dict(), "epoch": ep}
+        if pretrained:
+            state["config"] = model_cfg
+        tc.atomic_torch_save(state, best.final)
 
     def _set_train_mode():
-        backbone.train(); head.train()
+        if pretrained:
+            _set_backbone_mode()
+        else:
+            backbone.train()
+        head.train()
 
     run_eval = tc.ptv3_make_run_eval(
         backbone, head, evaluate, _forward_logits, _proxy_batches, proxy_tiles,
@@ -393,12 +507,18 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                               training=True),
         run_eval, best, _save_best, _set_train_mode, run_dir, run_id,
         metrics_csv, start_epoch, N_EPOCHS, STEPS, BATCH_SIZE, NUM_CLASSES,
-        BASE_LR, WARMUP_PCT, GRAD_CLIP, CHECKPOINT_GAP, VAL_EVERY)
+        BASE_LR, WARMUP_PCT, GRAD_CLIP, CHECKPOINT_GAP, VAL_EVERY,
+        ckpt_extra={"config": model_cfg} if pretrained else None)
+
+
+# the pcssl wrappers import this module and call train_pcssl/main by these names
+train_pcssl = train_ptv3
 
 
 def main():
     import argparse
-    ap = argparse.ArgumentParser(description='Local ptv3 trainer/inferencer.')
+    ap = argparse.ArgumentParser(
+        description='Local PTv3-family trainer/inferencer (ptv3 + pcssl wrappers).')
     ap.add_argument('--dataset', default=None)
     ap.add_argument('--grid', type=float, default=None)
     ap.add_argument('--epochs', type=int, default=None)
@@ -408,6 +528,10 @@ def main():
     ap.add_argument('--mode', default='train')
     ap.add_argument('--weights', default=None)
     ap.add_argument('--infer-input', default=None)
+    ap.add_argument('--freeze-encoder', type=int, default=None,
+                    help='1 = linear probe: freeze the pretrained encoder, '
+                         'train only the seg head (0 = full fine-tune); '
+                         'pcssl wrappers only')
     args = ap.parse_args()
     train_ptv3(**vars(args))
 

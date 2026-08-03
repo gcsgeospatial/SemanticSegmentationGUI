@@ -93,38 +93,27 @@ def local_vram_gb() -> float | None:
 
 def gpu_preflight() -> tuple[bool, str]:
     """(proceed, message) for GPU availability. The trainers are CUDA-only
-    (every script calls .cuda(), no CPU path), so hard-block when GPUs are
-    disabled in local_config OR when nvidia-smi -L reports no usable device."""
-    cfg = appstate.local_config()
-    if not cfg.get("gpus"):
-        return False, ("[local] GPUs are disabled (local_config['gpus']=''), but these "
-                       "models require CUDA. Set gpus='all' (or a device id) and run "
-                       "again.")
+    (every script calls .cuda(), no CPU path), so hard-block when nvidia-smi -L
+    reports no usable device."""
     ok, detail = _nvidia_smi_gpus()
     if not ok:
         return False, (f"[local] no usable NVIDIA GPU detected ({detail}). These models "
                        "are CUDA-only with no CPU fallback. Install/repair the NVIDIA "
-                       "driver so `nvidia-smi -L` lists a device, or set "
-                       "local_config['gpus'] to the intended device, then launch again.")
+                       "driver so `nvidia-smi -L` lists a device, then launch again.")
     return True, ""
 
 
 def run_env(*, outputs_root: str = "", dataset_dir: str = "", infer_dir: str = "",
             pred_dir: str = "", gpu: str = "", env: "dict | None" = None) -> dict:
-    """The extra_env dict for JobRunner: the TT_* path contract + CUDA device
-    selection."""
-    cfg = appstate.local_config()
-    out = {"TT_DATASETS_ROOT": str(cfg["datasets_root"]),
-           "TT_OUTPUTS_ROOT": str(outputs_root or cfg["outputs_root"])}
+    """The extra_env dict for JobRunner: the TT_* path contract."""
+    out = {"TT_DATASETS_ROOT": str(appstate.workspace_dir()),
+           "TT_OUTPUTS_ROOT": str(outputs_root or appstate.local_runs_dir())}
     if dataset_dir:
         out["TT_DATASET_DIR"] = str(dataset_dir)
     if infer_dir:
         out["TT_INFER_DIR"] = str(infer_dir)
     if pred_dir:
         out["TT_PRED_DIR"] = str(pred_dir)
-    gpus = str(cfg.get("gpus") or "")
-    if gpus and gpus != "all":   # 'all' = don't restrict; '' is blocked upstream
-        out["CUDA_VISIBLE_DEVICES"] = gpus.removeprefix("device=")
     if gpu:
         out["TT_GPU"] = gpu                  # cosmetic locally; keeps log parity
     out.update(env or {})                    # e.g. DG_* density-generalization flags

@@ -11,11 +11,9 @@ trainers read the folders verbatim.
 from __future__ import annotations
 
 import json
-import os
 import re
 import shutil
 import zipfile
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -536,66 +534,16 @@ def convert_scene(path: Path, spec: LabelSpec | None, value_to_index: dict[int, 
                         missing_fields=missing_fields)
 
 
-def _available_ram_bytes() -> int | None:
-    """Available physical RAM (bytes), stdlib only; None when undeterminable."""
-    try:
-        if hasattr(os, "sysconf") and "SC_AVPHYS_PAGES" in os.sysconf_names:
-            return os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
-    except (ValueError, OSError):
-        pass
-    if os.name == "nt":
-        try:
-            import ctypes
-
-            class _MS(ctypes.Structure):
-                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
-                            ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
-                            ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
-                            ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
-                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
-
-            m = _MS()
-            m.dwLength = ctypes.sizeof(_MS)
-            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)):
-                return int(m.ullAvailPhys)
-        except Exception:
-            pass
-    return None
-
-
-# fat per-worker RAM estimate (LAZ inflates 10-20x + transient copies); overshooting only costs parallelism, never a crash
-_RAM_PER_FILE_FACTOR = 30
-_RAM_HEADROOM = 0.7
-
-
-def _worker_cap_detail(files: list[Path]) -> tuple[int, str]:
-    """(thread count that won't OOM, human reason for the log)."""
-    cores = os.cpu_count() or 4
-    # cores-1: these threads run in the GUI process; keep its event loop schedulable
-    cap = min(max(cores - 1, 1), max(len(files), 1))
-    reason = f"cores={cores}, files={len(files)}"
-    ram = _available_ram_bytes()
-    if ram and files:
-        biggest = max((f.stat().st_size for f in files), default=0)
-        if biggest > 0:
-            mem_cap = max(1, int(ram * _RAM_HEADROOM // (biggest * _RAM_PER_FILE_FACTOR)))
-            if mem_cap < cap:
-                cap = mem_cap
-                reason = (f"RAM-limited: {ram / 1e9:.1f} GB free, "
-                          f"~{biggest * _RAM_PER_FILE_FACTOR / 1e9:.1f} GB/worker")
-    return cap, reason
-
-
 def _convert_many(files: list[Path], dest_for, spec, value_to_index, intensity_norm, say,
                   *, compute_hag, ground_value, hag_filter, ground_method,
                   feature_fields: list[str] | None = None,
                   geo_features: list[str] | None = None, geo_k: int = 100,
                   rgb_fields: list[str] | None = None,
-                  max_workers: int | None = None,
                   declared_crs_epsg: int | None = None) -> list[dict]:
-    """Convert each file concurrently; stat dicts return in INPUT order (the caller
-    feeds allocate_splits positionally). Threads: read/PDAL/savez drop the GIL."""
-    def work(f: Path) -> dict:
+    """Convert each file; stat dicts return in INPUT order (the caller
+    feeds allocate_splits positionally)."""
+    out = []
+    for f in files:
         cloud = _apply_rgb_mapping(read_points(f, declared_crs_epsg), rgb_fields)
         raw = read_labels(f, cloud, spec) if spec is not None else None
         out_path = dest_for(f)
@@ -604,19 +552,8 @@ def _convert_many(files: list[Path], dest_for, spec, value_to_index, intensity_n
                           hag_filter=hag_filter, ground_method=ground_method, feature_fields=feature_fields,
                           geo_features=geo_features, geo_k=geo_k)
         st["scene"] = out_path.name
-        return st
-
-    if max_workers is not None:
-        workers, why = max_workers, "forced"
-    else:
-        workers, why = _worker_cap_detail(files)
-    mode = "PARALLEL" if workers > 1 else "SERIAL"
-    say(f"  {mode}: {workers} worker(s) [{why}]")
-    out = []
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        for f, st in zip(files, ex.map(work, files)):
-            say(f"  converted {f.name}")
-            out.append(st)
+        say(f"  converted {f.name}")
+        out.append(st)
     return out
 
 
@@ -630,7 +567,6 @@ def _plan_and_convert(input_files: list[Path], val_files: list[Path] | None,
                       feature_fields: list[str] | None = None,
                       geo_features: list[str] | None = None, geo_k: int = 100,
                       rgb_fields: list[str] | None = None,
-                      max_workers: int | None = None,
                       declared_crs_epsg: int | None = None) -> dict:
     """Convert sources into out_root/{train,val,test}/*.npz; returns per-split
     stat lists. Explicit val/test folders are used verbatim; the rest is allocated."""
@@ -655,7 +591,7 @@ def _plan_and_convert(input_files: list[Path], val_files: list[Path] | None,
                 ground_value=ground_value, hag_filter=hag_filter, ground_method=ground_method,
                 feature_fields=feature_fields, geo_features=geo_features,
                 geo_k=geo_k, rgb_fields=rgb_fields,
-                max_workers=max_workers, declared_crs_epsg=declared_crs_epsg))
+                declared_crs_epsg=declared_crs_epsg))
     vfrac = 0.0 if val_files else split.val_frac
     tfrac = 0.0 if test_files else split.test_frac
 
@@ -666,7 +602,7 @@ def _plan_and_convert(input_files: list[Path], val_files: list[Path] | None,
             ground_value=ground_value, hag_filter=hag_filter, ground_method=ground_method,
             feature_fields=feature_fields, geo_features=geo_features,
             geo_k=geo_k, rgb_fields=rgb_fields,
-            max_workers=max_workers, declared_crs_epsg=declared_crs_epsg))
+            declared_crs_epsg=declared_crs_epsg))
         return stats
 
     if len(input_files) == 1:
@@ -713,7 +649,7 @@ def _plan_and_convert(input_files: list[Path], val_files: list[Path] | None,
                          ground_value=ground_value, hag_filter=hag_filter, ground_method=ground_method,
                          feature_fields=feature_fields, geo_features=geo_features,
                          geo_k=geo_k, rgb_fields=rgb_fields,
-                         max_workers=max_workers, declared_crs_epsg=declared_crs_epsg)
+                         declared_crs_epsg=declared_crs_epsg)
     for st in pool:
         st["_pool_path"] = out_root / "_pool" / st["scene"]
     pts = [st["n_points"] for st in pool]
@@ -746,7 +682,6 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
                     geo_features: list[str] | None = None,
                     geo_k: int = 100,
                     rgb_fields: list[str] | None = None,
-                    max_workers: int | None = None,
                     declared_crs_epsg: int | None = None,
                     progress=None) -> Path:
     """Convert `inputs` (files/folders) into a staged canonical dataset.
@@ -812,7 +747,6 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
                                     geo_features=geo_features,
                                     geo_k=geo_k,
                                     rgb_fields=rgb_fields,
-                                    max_workers=max_workers,
                                     declared_crs_epsg=declared_crs_epsg)
     for sp in _SPLITS:
         if not scene_stats[sp]:
@@ -1097,6 +1031,16 @@ def export_class_map(meta_classes, mode: str) -> dict | None:
         return cmap
     except (ValueError, KeyError, TypeError, IndexError):
         return None
+
+
+def class_map_for_export(meta: dict | None, mode: str, say, subject: str) -> dict | None:
+    """export_class_map over a dataset meta, logging the raw-indices fallback via
+    `say`; `subject` names the weights/run in the log line."""
+    cmap = export_class_map((meta or {}).get("classes", []), mode)
+    if mode != "raw" and not cmap:
+        say(f"[export] no dataset meta for {subject}; exported codes are raw "
+            f"model indices.")
+    return cmap
 
 
 def _rewrite_original(orig: Path, dst: Path, cls, confidence=None, member=None,

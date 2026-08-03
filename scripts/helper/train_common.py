@@ -31,6 +31,194 @@ def resolve_weights_path(weights):
     return weights if os.path.isabs(weights) else f"{OUTPUTS_ROOT}/{weights}"
 
 
+# ---- density-domain-generalization primitives ------------------------------
+# Occupancy o = rho*g^2; o < 1 breaks density invariance, and coarsening is
+# one-way (thin dense, never densify sparse).
+# DG_* env overrides are set by the GUI panel (or directly), never CLI args.
+
+def env_bool(name, default):
+    v = os.environ.get(name)
+    return bool(default) if v is None else v.strip().lower() in ("1", "true", "yes", "on")
+
+
+def env_float(name, default):
+    v = os.environ.get(name)
+    return float(v) if v not in (None, "") else float(default)
+
+
+def env_int(name, default):
+    v = os.environ.get(name)
+    return int(float(v)) if v not in (None, "") else int(default)
+
+
+def env_str(name, default):
+    v = os.environ.get(name)
+    return v if v not in (None, "") else default
+
+
+# D1 - density/grid jitter: per-tile effective grid g_eff >= g0.
+def effective_grid(g0, coarsen_max=2.5, p_native=0.5, rng=None):
+    """g0 with prob p_native, else log-uniform in [g0, g0*coarsen_max]
+    (coarsen_max = 1/(g0*sqrt(rho_min)) reaches output density rho_min)."""
+    import numpy as np
+    rng = rng or np.random.default_rng()
+    if coarsen_max <= 1.0 or rng.random() < p_native:
+        return float(g0)
+    return float(g0) * float(np.exp(rng.uniform(0.0, np.log(coarsen_max))))
+
+
+# D0/D0b - canonicalize to a grid: first point per g-cell.
+def voxel_first_idx(xyz, g):
+    """Indices of the first point per g-voxel; slice every per-point companion
+    array by them too."""
+    import numpy as np
+    keys = np.floor(np.asarray(xyz)[:, :3] / float(g)).astype(np.int64)
+    _, idx = np.unique(keys, axis=0, return_index=True)
+    return np.sort(idx)
+
+
+# D3b - local-density input channel: log d_k ~ -0.5 log rho (pair with D1).
+def local_density_logdk(xyz, k=8):
+    """Per-point log distance to the k-th nearest neighbour (natural log).
+    Larger = sparser. Returns float32 array, shape (N,)."""
+    import numpy as np
+    from scipy.spatial import cKDTree
+    xyz = np.asarray(xyz)[:, :3]
+    n = len(xyz)
+    if n <= 1:
+        return np.zeros(n, np.float32)
+    kk = min(k, n - 1)
+    d, _ = cKDTree(xyz).query(xyz, k=kk + 1)
+    dk = d[:, -1]
+    return np.log(np.maximum(dk, 1e-6)).astype(np.float32)
+
+
+# D2b - AdaBN: re-estimate BN running stats on the unlabeled target.
+def adabn_recalibrate(model, batches, forward, momentum=None, reset=True):
+    """Refresh BN running mean/var over target `batches` via forward(model, b).
+    momentum None = cumulative (PreciseBN); float = exponential, and reset zeroes
+    stats first (pure AdaBN). Leaves model.eval(); returns the model."""
+    import torch
+    import torch.nn as nn
+    bns = [m for m in model.modules()
+           if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d,
+                             nn.SyncBatchNorm))]
+    saved = []
+    for bn in bns:
+        # stats snapshot: zero batches must not leave zeroed running stats
+        stats = ((bn.running_mean.clone(), bn.running_var.clone(),
+                  bn.num_batches_tracked.clone())
+                 if bn.track_running_stats else None)
+        saved.append((bn.training, bn.momentum, stats))
+        if reset and bn.track_running_stats:
+            bn.running_mean.zero_()
+            bn.running_var.fill_(1.0)
+            bn.num_batches_tracked.zero_()
+        bn.momentum = momentum
+        bn.train()
+    n = 0
+    with torch.no_grad():
+        for batch in batches:
+            forward(model, batch)
+            n += 1
+    for bn, (was_training, mom, stats) in zip(bns, saved):
+        bn.momentum = mom
+        bn.train(was_training)
+        if n == 0 and stats is not None:
+            bn.running_mean.copy_(stats[0])
+            bn.running_var.copy_(stats[1])
+            bn.num_batches_tracked.copy_(stats[2])
+    model.eval()
+    if n == 0:
+        raise RuntimeError(
+            "AdaBN got zero target batches (every chunk was under the minimum "
+            "point count); rerun with adaptation Off or infer on larger scenes")
+    return model
+
+
+# D2c - APCoTTA (arXiv:2505.09971) reduced to the offline one-shot job shape:
+# AdaBN stats refresh + entropy-filtered entropy minimization on BN affine
+# params + stochastic restore toward source weights (their RPI).
+def apcotta_adapt(model, batches, logits_fn, lr=1e-3, ent_frac=0.4,
+                  restore_p=0.01):
+    """Adapt over target `batches` via logits_fn(model, batch) -> (N, C).
+    Only points with entropy < ent_frac*ln(C) contribute loss (official code
+    uses 0.8 nats absolute ~= 0.36*ln C at their 9 classes; 0.4 scales with C);
+    each step restores every trainable element to its source value with prob
+    restore_p. Strict superset of adabn_recalibrate. Leaves model.eval()."""
+    # ponytail: BN-affine-only updates, cumulative running stats (paper keeps
+    # per-batch stats), no gradient layer selection or weak/strong consistency
+    # views; add the full recipe if a survey still underperforms plain AdaBN.
+    import numpy as np
+    import torch
+    import torch.nn as nn
+    bns = [m for m in model.modules()
+           if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d,
+                             nn.SyncBatchNorm))]
+    params = [p for bn in bns for p in (bn.weight, bn.bias) if p is not None]
+    if not params:
+        raise RuntimeError(
+            "APCoTTA needs BatchNorm layers with affine params; this model has "
+            "none - use plain inference (or AdaBN on a BN-based backbone)")
+    source = [p.detach().clone() for p in params]
+    grad_state = [(p, p.requires_grad) for p in model.parameters()]
+    for p, _ in grad_state:
+        p.requires_grad_(False)
+    for p in params:
+        p.requires_grad_(True)
+    saved = []
+    for bn in bns:
+        # stats snapshot: zero batches must not leave zeroed running stats
+        stats = ((bn.running_mean.clone(), bn.running_var.clone(),
+                  bn.num_batches_tracked.clone())
+                 if bn.track_running_stats else None)
+        saved.append((bn.training, bn.momentum, stats))
+        if bn.track_running_stats:
+            bn.running_mean.zero_()
+            bn.running_var.fill_(1.0)
+            bn.num_batches_tracked.zero_()
+        bn.momentum = None
+        bn.train()
+    opt = torch.optim.SGD(params, lr=lr, momentum=0.9)
+    n_step = n_skip = 0
+    with torch.enable_grad():
+        for batch in batches:
+            logits = logits_fn(model, batch).float()
+            logp = torch.log_softmax(logits, -1)
+            ent = -(logp.exp() * logp).sum(-1)
+            keep = ent < ent_frac * float(np.log(logits.shape[-1]))
+            if not keep.any():
+                n_skip += 1
+                continue
+            opt.zero_grad()
+            ent[keep].mean().backward()
+            opt.step()
+            with torch.no_grad():
+                for p, s in zip(params, source):
+                    m = torch.rand_like(p) < restore_p
+                    p[m] = s[m]
+            n_step += 1
+    for p, req in grad_state:
+        p.requires_grad_(req)
+    for bn, (was_training, mom, stats) in zip(bns, saved):
+        bn.momentum = mom
+        bn.train(was_training)
+        if n_step + n_skip == 0 and stats is not None:
+            bn.running_mean.copy_(stats[0])
+            bn.running_var.copy_(stats[1])
+            bn.num_batches_tracked.copy_(stats[2])
+    model.eval()
+    if n_step + n_skip == 0:
+        raise RuntimeError(
+            "APCoTTA got zero target batches (every chunk was under the minimum "
+            "point count); rerun with adaptation Off or infer on larger scenes")
+    print(f"  [infer] APCoTTA: {n_step} adaptation step(s), "
+          f"{n_skip} batch(es) skipped as all-high-entropy", flush=True)
+    return model
+
+# ---- end density-DG primitives ---------------------------------------------
+
+
 def write_pred(path, xyz, pred, intensity=None, confidence=None, probs=None,
                crs_wkt=None, source_crs_wkt=None):
     """Inferred-scene npz: xyz + classification (+ intensity, confidence,
@@ -209,16 +397,12 @@ def stop_requested(ep):
 def _dg_block() -> dict | None:
     """DG settings that travel WITH the weights (logdk changes model input
     width - inference rebuilds with the same k). AdaBN/TTA are per-job."""
-    try:
-        import density as dg
-    except ImportError:
-        return None
     return {
-        "density_aug": dg.env_bool("DG_DENSITY_AUG", False),
-        "coarsen_max": dg.env_float("DG_COARSEN_MAX", 2.5),
-        "p_native":    dg.env_float("DG_P_NATIVE", 0.5),
-        "logdk":       dg.env_bool("DG_LOGDK_FEAT", False),
-        "logdk_k":     dg.env_int("DG_LOGDK_K", 8),
+        "density_aug": env_bool("DG_DENSITY_AUG", False),
+        "coarsen_max": env_float("DG_COARSEN_MAX", 2.5),
+        "p_native":    env_float("DG_P_NATIVE", 0.5),
+        "logdk":       env_bool("DG_LOGDK_FEAT", False),
+        "logdk_k":     env_int("DG_LOGDK_K", 8),
     }
 
 
@@ -1360,6 +1544,122 @@ def kp_tile_and_save(name, pc_path, out_dir, chunk_xy, stride, grid, num_classes
     return n_tiles
 
 
+def kp_cache_signature(pipeline, ds_meta, grid, chunk_xy, stride, num_classes,
+                       class_names, feat_spec, **extra):
+    """Shared KP prep-cache signature. 'bias'/'ret_num' spellings are part of
+    the cache key - changing them invalidates existing prep caches."""
+    sp = ds_meta.get("split", {})
+    sig = {
+        "format_version": 2,
+        "pipeline": pipeline,
+        "grid": grid,
+        "chunk_xy": chunk_xy,
+        "stride": stride,
+        "split_seed": sp.get("seed"),
+        "split_mode": sp.get("mode"),
+        "min_pts_mask": 64,
+        "min_pts_sub": 32,
+        "intensity_norm": "p95_clip2",
+        "num_classes": num_classes,
+        "class_names": class_names,
+        "feature_recipe": "bias," + ",".join(
+            "ret_num" if n == "return_number" else n for n in feat_spec),
+    }
+    sig.update(extra)
+    return sig
+
+
+def kp_ensure_prep_std(prep_dir, ds_root, sig, chunk_xy, stride, grid,
+                       num_classes):
+    """kp_ensure_prep with the standard KP tiler wiring."""
+    return kp_ensure_prep(
+        prep_dir, ds_root, sig,
+        lambda name, pc_path, out_dir, split: kp_tile_and_save(
+            name, pc_path, out_dir, chunk_xy,
+            train_stride(chunk_xy) if split == "train" else stride,
+            grid, num_classes))
+
+
+def kp_curate_proxy(val_tiles, num_classes, budget, sampling, class_names,
+                    prep_dir, sample_tile):
+    """Curated proxy subset + pre-drawn samples. Subsampled ONCE, before the
+    prefetch threads exist: sample_tile draws from the global np.random, so
+    re-sampling each val pass would race them and fork the scored point set.
+    Returns (proxy_tiles, proxy_rep, proxy_samples)."""
+    with fixed_np_seed():
+        tiles, rep = pick_proxy_tiles(
+            val_tiles, num_classes, budget, mode=sampling,
+            class_names=class_names,
+            cache_path=f"{prep_dir}/val_class_balance_cache.npz",
+            viable=lambda p: sample_tile(p, training=False) is not None)
+        samples = []
+        for p in tiles:
+            s = sample_tile(p, training=False)
+            if s is None:
+                bn = os.path.basename(p)
+                why = ", ".join(rep["covers"].get(bn, [])) or "the stride base"
+                raise RuntimeError(
+                    f"proxy val tile {bn} (curated for {why}) has fewer than "
+                    f"32 points: delete {prep_dir} and re-run the dataset prep")
+            samples.append((os.path.basename(p), s))
+    print(VAL_FULL_NOTE if ranking_protocol(sampling) == "full" else rep["text"],
+          flush=True)
+    return tiles, rep, samples
+
+
+def kp_class_balance_setup(train_tiles, num_classes, class_names, prep_dir,
+                           rare_classes, rare_freq_frac, rare_oversample,
+                           rare_tile_prob, class_weighting, weight_beta,
+                           weight_cap, label_smooth, use_focal, focal_gamma,
+                           lovasz_weight):
+    """Class counts -> rare-tile pool, weights, seg loss, tile picker.
+    Returns (seg_loss, pick_train_tile)."""
+    import numpy as np
+    import torch
+    counts, present = scan_class_balance(
+        train_tiles, num_classes,
+        cache_path=f"{prep_dir}/class_balance_cache.npz")
+    print(f"  class counts: {dict(zip(class_names, counts.tolist()))}",
+          flush=True)
+    rare = (list(rare_classes) if rare_classes is not None
+            else auto_rare_classes(counts, rare_freq_frac))
+    rare_tiles = ([train_tiles[i] for i in np.nonzero(present[:, rare].any(1))[0]]
+                  if (rare_oversample and rare) else [])
+    print(f"  rare classes: {[class_names[c] for c in rare]}", flush=True)
+    print(f"  rare-class tiles: {len(rare_tiles)} / {len(train_tiles)}", flush=True)
+    if class_weighting:
+        w = class_weights_np(counts, weight_beta, weight_cap)
+        weights = torch.tensor(w, dtype=torch.float32).cuda()
+        print(f"  class weights: "
+              f"{dict(zip(class_names, [round(float(x), 3) for x in w]))}",
+              flush=True)
+    else:
+        weights = None
+    seg_loss = make_seg_loss(weights, label_smooth, use_focal, focal_gamma,
+                             lovasz_weight)
+    return seg_loss, make_tile_picker(train_tiles, rare_tiles, rare_tile_prob)
+
+
+def kp_eval_items(prep_dir, val_list, test_list):
+    """(val_items, test_items) for kp_make_evaluate, with the eval-set print."""
+    val_items = [(n, p, f"{prep_dir}/val") for n, p in val_list]
+    test_items = [(n, p, f"{prep_dir}/test") for n, p in test_list]
+    print(f"  eval set: {len(val_items)} holdout(val) + {len(test_items)} "
+          f"test scenes", flush=True)
+    return val_items, test_items
+
+
+def kp_make_fwd_eval(make_batch, forward):
+    """Batched eval forward: tiles -> per-tile logit arrays."""
+    import numpy as np
+
+    def _fwd_eval(tiles):
+        b, _ = make_batch([(c, f, None) for c, f in tiles])
+        lg = forward(b).cpu().numpy().astype(np.float32)
+        return np.split(lg, np.cumsum([len(c) for c, _ in tiles])[:-1])
+    return _fwd_eval
+
+
 def kp_ensure_prep(prep_dir, ds_root, sig, tile_fn):
     """Idempotent KP prep: validate cache signature, tile each un-.done scene
     via tile_fn(name, pc_path, out_dir, split). Returns (train, val, test)."""
@@ -1392,7 +1692,6 @@ def kp_make_build_feat(logdk_feat, logdk_k,
     (+ log d_k). Bias always first, never dropped; every spec channel IS
     droppable."""
     import numpy as np
-    import density as dg
     spec = list(spec)
 
     def build_feat(xyz, intensity, ret_num, drop=(), extras=None):
@@ -1409,7 +1708,7 @@ def kp_make_build_feat(logdk_feat, logdk_k,
             attrs[:, list(drop)] = 0.0
         cols = [bias, attrs]
         if logdk_feat:
-            cols.append(dg.local_density_logdk(xyz, logdk_k)[:, None])
+            cols.append(local_density_logdk(xyz, logdk_k)[:, None])
         return np.concatenate(cols, axis=1).astype(np.float32)
 
     build_feat.spec = spec
@@ -1422,7 +1721,6 @@ def kp_make_sample_tile(build_feat, grid, max_pts, aug_color,
     None. aug_color = per-channel KEEP probability, one independent coin per
     channel per training tile."""
     import numpy as np
-    import density as dg
 
     def sample_tile(tile_path, max_pts=max_pts, min_pts=32, training=True):
         z = np.load(tile_path)
@@ -1437,9 +1735,9 @@ def kp_make_sample_tile(build_feat, grid, max_pts, aug_color,
         xyz, intensity, ret_num, lab = xyz[idx], intensity[idx], ret_num[idx], lab[idx]
         extras = {n: v[idx] for n, v in extras.items()}
         if training and density_aug:
-            g_eff = dg.effective_grid(grid, coarsen_max, p_native)
+            g_eff = effective_grid(grid, coarsen_max, p_native)
             if g_eff > grid:
-                keep = dg.voxel_first_idx(xyz, g_eff)
+                keep = voxel_first_idx(xyz, g_eff)
                 xyz, intensity, ret_num, lab = xyz[keep], intensity[keep], ret_num[keep], lab[keep]
                 extras = {n: v[keep] for n, v in extras.items()}
         drop = (np.flatnonzero(np.random.rand(len(build_feat.spec)) > aug_color)
@@ -1833,7 +2131,6 @@ def kp_make_run_eval(net, forward, evaluate, make_batch, sample_tile,
     plus the final PreciseBN + val/test pass that writes test_metrics.json.
     forward(batch) -> logits; proxy_batches() -> (batch, labels) generator."""
     import torch
-    import density as dg
 
     def run_eval(ep, write_json=False):
         if not write_json:
@@ -1869,8 +2166,8 @@ def kp_make_run_eval(net, forward, evaluate, make_batch, sample_tile,
                     fails = 0
                     made += 1
                     yield b
-            dg.adabn_recalibrate(net, _bn_batches(),
-                                 forward=lambda mdl, b: forward(b))
+            adabn_recalibrate(net, _bn_batches(),
+                              forward=lambda mdl, b: forward(b))
         net.eval()
         m = evaluate(val_items, f"val@ep{ep}")
         # deliberately no best.update, even in full mode: AdaBN above recalibrates BN, so this row is not comparable to the mid-training ones
@@ -1904,7 +2201,6 @@ def kp_run_infer(run_dir, net, forward, kp_batch, build_feat, predict_points,
     import glob
     from datetime import datetime, timezone
     import numpy as np
-    import density as dg
 
     if not infer_input:
         raise ValueError("--mode infer requires --infer-input <job_id>")
@@ -1931,14 +2227,14 @@ def kp_run_infer(run_dir, net, forward, kp_batch, build_feat, predict_points,
                          "unset one - they are alternative adaptation modes")
     if infer_apcotta:
         print("  [infer] APCoTTA: adapting BN on target tiles...", flush=True)
-        dg.apcotta_adapt(
+        apcotta_adapt(
             net,
             kp_make_target_batches(scenes, kp_batch, build_feat,
                                    grid, chunk_xy, num_classes),
             logits_fn=lambda m, b: forward(b))
     elif infer_adabn:
         print("  [infer] AdaBN: recomputing BN stats on target tiles...", flush=True)
-        dg.adabn_recalibrate(
+        adabn_recalibrate(
             net,
             kp_make_target_batches(scenes, kp_batch, build_feat,
                                    grid, chunk_xy, num_classes),
@@ -2334,6 +2630,33 @@ def find_latest_unfinished_run(suffix, cfg=None):
     return None
 
 
+def resume_ladder(suffix, recipe, want_resume, proxy_rep, protocol,
+                  class_names, ranking, n_epochs):
+    """Shared resume ladder: newest unfinished matching-recipe run (verified
+    by proxy_guard) resumes, else a fresh timestamped run dir is created.
+    Returns (run_dir, run_id, resume_ckpt, start_epoch); resume_ckpt None =
+    fresh run, so the caller writes its run.json."""
+    from datetime import datetime, timezone
+    resume_info = (find_latest_unfinished_run(suffix, recipe)
+                   if want_resume else None)
+    if resume_info and not proxy_guard(resume_info[0], proxy_rep, protocol,
+                                       class_names, ranking):
+        resume_info = None
+    if resume_info:
+        run_dir, resume_ckpt, resume_epoch = resume_info
+        run_id = os.path.basename(run_dir)
+        os.makedirs(f"{run_dir}/checkpoints", exist_ok=True)
+        start_epoch = resume_epoch + 1
+        print(f"  RESUMING {run_id} from {os.path.basename(resume_ckpt)} "
+              f"-> epoch {start_epoch}/{n_epochs}", flush=True)
+    else:
+        run_id = datetime.now(timezone.utc).strftime(f"%Y%m%d_%H%M%S_{suffix}")
+        run_dir = f"{OUTPUTS_ROOT}/runs/{run_id}"
+        os.makedirs(f"{run_dir}/checkpoints", exist_ok=True)
+        resume_ckpt, start_epoch = None, 0
+    return run_dir, run_id, resume_ckpt, start_epoch
+
+
 def ptv3_make_evaluate(forward, build_feat, feat_spec, grid, chunk_xy,
                        num_classes, class_names):
     """PTv3-family voted eval scored on the ORIGINAL raw points (KP protocol).
@@ -2485,7 +2808,6 @@ def ptv3_build_feat(feat_spec, cxyz, rgbf, extras=None, drop=(),
     + optional log d_k). `drop` = spec indices to zero (train-time feature
     dropout); the normal slot and log d_k never drop."""
     import numpy as np
-    import density as dg
     cols = []
     for i, n in enumerate(feat_spec):
         if n in ("rgb", "intensity"):
@@ -2498,7 +2820,7 @@ def ptv3_build_feat(feat_spec, cxyz, rgbf, extras=None, drop=(),
     if normal_block:
         cols.append(np.zeros((len(cxyz), 3), np.float32))
     if logdk_feat:
-        cols.append(dg.local_density_logdk(cxyz, logdk_k)[:, None])
+        cols.append(local_density_logdk(cxyz, logdk_k)[:, None])
     return np.concatenate(cols, axis=1).astype(np.float32)
 
 
@@ -2546,7 +2868,6 @@ def ptv3_make_batcher(build_feat, feat_spec, grid, chunk_xy, augment_xyz,
     """to_ptv3_batch(tiles, training=True) -> (Point batch dict, labels)."""
     import numpy as np
     import torch
-    import density as dg
 
     def to_ptv3_batch(tiles_for_batch, training=True):
         coords, feats, labels, offsets, grid_coords = [], [], [], [], []
@@ -2586,7 +2907,7 @@ def ptv3_make_batcher(build_feat, feat_spec, grid, chunk_xy, augment_xyz,
             xyz = xyz[ok]; rgb = rgb[ok]; lab = lab[ok]
             ex = {n: v[ok] for n, v in ex.items()}
             # grid_coord MUST come from the same keys used to dedup: a different phase can collapse two voxels onto one grid_coord (CUDA assert)
-            g_eff = (dg.effective_grid(grid, coarsen_max, p_native)
+            g_eff = (effective_grid(grid, coarsen_max, p_native)
                      if (training and density_aug) else grid)
             keys = np.floor(xyz / g_eff).astype(np.int64)
             uniq = voxel_unique(keys)
@@ -2917,14 +3238,12 @@ _ENV_KNOBS = {
     "DG_INFER_ADABN":   ("DG_INFER_ADABN",       "env_bool"),
     "DG_INFER_APCOTTA": ("DG_INFER_APCOTTA",     "env_bool"),
     "DG_INFER_TTA":     ("DG_INFER_TTA",         "env_int"),
-    "EVAL_VOTES":       ("EVAL_VOTES",           "env_int"),
     "VAL_EVERY":        ("VAL_EVERY",            "env_int"),
     "USE_FOCAL":        ("LOSS_FOCAL",           "env_bool"),
     "FOCAL_GAMMA":      ("LOSS_FOCAL_GAMMA",     "env_float"),
     "CLASS_WEIGHTING":  ("LOSS_CLASS_WEIGHTING", "env_bool"),
     "WEIGHT_BETA":      ("LOSS_WEIGHT_BETA",     "env_float"),
     "RARE_OVERSAMPLE":  ("RARE_OVERSAMPLE",      "env_bool"),
-    "RARE_CENTER_PROB": ("RARE_CENTER_PROB",     "env_float"),
     "PROXY_SAMPLING":   ("PROXY_SAMPLING",       "env_str"),
     "KP_AGGREGATION":   ("KP_AGGREGATION",       "env_str"),
     "KP_NORM":          ("KP_NORM",              "env_str"),
@@ -2935,11 +3254,10 @@ _ENV_KNOBS = {
 def env_overrides(g, names):
     """Values for `names` in order, each env-overridable (the GUI exports
     DG_*/LOSS_*/RARE_*/EVAL_*/KP_*), defaulting to g[name]."""
-    import density as dg
     out = []
     for name in names:
         env_key, parser = _ENV_KNOBS[name]
-        out.append(getattr(dg, parser)(env_key, g[name]))
+        out.append(globals()[parser](env_key, g[name]))
     return tuple(out)
 
 
@@ -2974,11 +3292,19 @@ def modal_retry_marker(fcid, marker_root, commit):
     `commit` is the volume's commit callable - this module must not import modal."""
     marker = f"{marker_root}/{fcid}" if fcid else ""
     if not fcid or os.path.exists(marker):
-        os.environ["TT_MODAL_RETRY"] = os.environ["AUTO_RESUME"] = "1"
+        os.environ["AUTO_RESUME"] = "1"
     else:
         os.makedirs(marker_root, exist_ok=True)
         open(marker, "w").close()
         commit()
+
+
+def modal_entry(fcid, script, flag_vals, env_json, outputs_volume, datasets_volume):
+    """Body of every modal_train_* @app.function: retry marker, then shell out.
+    Volumes are duck-typed - this module must not import modal."""
+    modal_retry_marker(fcid, "/outputs/.attempts", outputs_volume.commit)
+    modal_shell_run(script, flag_vals, env_json, [outputs_volume, datasets_volume],
+                    reload=outputs_volume.reload)
 
 
 def modal_shell_run(script, flag_vals, env_json, volumes, reload=None):

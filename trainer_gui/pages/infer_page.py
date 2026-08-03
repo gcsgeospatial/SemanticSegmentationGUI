@@ -17,7 +17,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QCursor
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDoubleSpinBox,
                                QFileDialog, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout,
-                               QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu,
+                               QLabel, QLineEdit, QListWidget, QMenu,
                                QPushButton, QRadioButton, QSpinBox, QTableWidget,
                                QTableWidgetItem, QVBoxLayout, QWidget)
 
@@ -422,10 +422,9 @@ class InferPage(QWidget):
 
         # export-only knobs: the .npz keeps raw predictions, so re-export never re-runs inference
         self.fmt_combo = QComboBox()
-        for label, key in (("LAS (.las)", "las"), ("LAZ (.laz)", "laz"),
-                           ("PLY (.ply)", "ply"), ("Text (.txt)", "txt"),
-                           ("CSV (.csv)", "csv")):
-            self.fmt_combo.addItem(label, key)
+        for key in dataset.PRED_EXPORT_FORMATS:
+            name = {"txt": "Text"}.get(key, key.upper())
+            self.fmt_combo.addItem(f"{name} (.{key})", key)
         i = self.fmt_combo.findData(appstate.get("infer_format", "las"))
         self.fmt_combo.setCurrentIndex(i if i >= 0 else 0)
         self.fmt_combo.setToolTip(
@@ -1517,8 +1516,15 @@ class InferPage(QWidget):
         return fields or None, geo or None, (geo_k if geo_k is not None else 100)
 
     def _infer_out_dir(self) -> Path:
-        """<dataset>/infer/<job> when the run names a known on-disk dataset,
-        else a workspace scratch spot."""
+        """Local: converted scenes live inside the run's prediction folder
+        (workspace/inference/<run_tag>/predictions_<job>/scenes) - no separate
+        _infer staging area. Modal keeps the dataset/scratch staging spot for
+        the volume upload."""
+        if appstate.get_exec_mode() == "local":
+            base = appstate.workspace_dir() / "inference"
+            if self._ens_running:
+                return base / "ensemble" / f"predictions_{self._job_id}_ensemble"
+            return base / self._weights_run_tag() / f"predictions_{self._job_id}"
         name = self._owning_dataset()
         staged = appstate.known_datasets().get(name or "", {}).get("staged_dir", "")
         if staged and os.path.isdir(staged):
@@ -1657,22 +1663,16 @@ class InferPage(QWidget):
         self._manifest (_apply_manifest_fields runs before it's adopted)."""
         name = manifest.get("dataset") if manifest else self._owning_dataset()
         mp = appstate.known_datasets().get(name or "", {}).get("meta_path", "")
-        try:
-            with open(mp, encoding="utf-8") as f:
-                return json.load(f)
-        except (OSError, json.JSONDecodeError):
-            return None
+        return appstate.read_json(mp)
 
     def _class_map(self) -> dict | None:
         """{model index: exported LAS code} per the Output codes choice;
         None writes raw model indices."""
         mode = self.codes_combo.currentData()
         classes = (self._dataset_meta() or {}).get("classes", [])
-        cmap = dataset.export_class_map(classes, mode)
-        if mode != "raw" and not cmap:
-            self._append("[export] no dataset meta for these weights; exported "
-                         "codes are raw model indices.")
-        elif cmap and mode == "asprs":
+        cmap = dataset.class_map_for_export({"classes": classes}, mode,
+                                            self._append, "these weights")
+        if cmap and mode == "asprs":
             names = {int(c["index"]): c.get("name", "?") for c in classes}
             self._append("[export] ASPRS codes: "
                          + ", ".join(f"{names.get(i, i)}={v}"
@@ -1862,12 +1862,11 @@ class InferPage(QWidget):
     def _begin_run(self, title: str):
         """Run header; earlier runs stay scrollable above the divider. Also
         freezes the channel table: the run uses this snapshot everywhere."""
-        self._run_open = True
+        ui.begin_log_run(self, title)
         self._active_zeroed = self._zeroed_channels()
         self._active_cols = self._mapped_columns()
         self.chan_grid_host.setEnabled(False)
         self.kill_btn.setVisible(True)
-        self.log.begin_run(title)
 
     def _end_run(self, summary: str):
         """Close the current run header exactly once (terminal points can
@@ -1875,9 +1874,7 @@ class InferPage(QWidget):
         self._active_zeroed = self._active_cols = None
         self.chan_grid_host.setEnabled(True)
         self.kill_btn.setVisible(False)
-        if self._run_open:
-            self._run_open = False
-            self.log.end_run(summary)
+        ui.end_log_run(self, summary)
 
     def _append(self, text: str, newline: bool = True):
         ui.append_log(self.log, text, newline)
@@ -1994,14 +1991,7 @@ def _scene_channel_report(staged, features: list | None = None,
 
 def _manifest_in(rdir: Path) -> dict | None:
     """run.json in a run folder, or None."""
-    p = Path(rdir) / "run.json"
-    if p.is_file():
-        try:
-            with open(p, encoding="utf-8") as f:
-                return json.load(f)
-        except (OSError, json.JSONDecodeError):
-            pass
-    return None
+    return appstate.read_json(Path(rdir) / "run.json")
 
 
 def _parse_run_ref(text: str) -> tuple:

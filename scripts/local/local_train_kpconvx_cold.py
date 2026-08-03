@@ -155,34 +155,12 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
                          "no intensity)")
     IN_CH = 1 + len(FEAT_SPEC)
 
-    def _cache_signature():
-        sp = ds_meta.get("split", {})
-        # 'bias'/'ret_num' spellings are part of the cache key - changing them invalidates existing prep caches
-        return {
-            "format_version": 2,
-            "pipeline": "kpconvx_cold",
-            "grid": GRID,
-            "chunk_xy": CHUNK_XY,
-            "stride": STRIDE,
-            "split_seed": sp.get("seed"),
-            "split_mode": sp.get("mode"),
-            "min_pts_mask": 64,
-            "min_pts_sub": 32,
-            "intensity_norm": "p95_clip2",
-            "num_classes": NUM_CLASSES,
-            "class_names": CLASS_NAMES,
-            "feature_recipe": "bias," + ",".join(
-                "ret_num" if n == "return_number" else n
-                for n in FEAT_SPEC),
-        }
-
     def ensure_prep():
-        return tc.kp_ensure_prep(
-            PREP_DIR, ds_root, _cache_signature(),
-            lambda name, pc_path, out_dir, split: tc.kp_tile_and_save(
-                name, pc_path, out_dir, CHUNK_XY,
-                tc.train_stride(CHUNK_XY) if split == "train" else STRIDE,
-                GRID, NUM_CLASSES))
+        return tc.kp_ensure_prep_std(
+            PREP_DIR, ds_root,
+            tc.kp_cache_signature("kpconvx_cold", ds_meta, GRID, CHUNK_XY,
+                                  STRIDE, NUM_CLASSES, CLASS_NAMES, FEAT_SPEC),
+            CHUNK_XY, STRIDE, GRID, NUM_CLASSES)
 
     def find_latest_checkpoint():
         return tc.kp_find_latest_checkpoint("AdamW", {FEATURE_MODE},
@@ -220,23 +198,9 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
         tc.init_val_csv(f"{run_dir}/val_metrics.csv", CLASS_NAMES)
         best = tc.BestCheckpoint(run_dir, VAL_RANK)
     if not INFER and not EVAL_ONLY:
-        with tc.fixed_np_seed():
-            proxy_tiles, proxy_rep = tc.pick_proxy_tiles(
-                val_tiles, NUM_CLASSES, PROXY_TILES, mode=PROXY_SAMPLING,
-                class_names=CLASS_NAMES,
-                cache_path=f"{PREP_DIR}/val_class_balance_cache.npz",
-                viable=lambda p: sample_tile(p, training=False) is not None)
-            # subsampled ONCE here, before the prefetch threads exist: sample_tile draws from the global np.random, so re-sampling each val pass would race them and fork the scored point set
-            for p in proxy_tiles:
-                s = sample_tile(p, training=False)
-                if s is None:
-                    bn = os.path.basename(p)
-                    why = ", ".join(proxy_rep["covers"].get(bn, [])) or "the stride base"
-                    raise RuntimeError(
-                        f"proxy val tile {bn} (curated for {why}) has fewer than "
-                        f"32 points: delete {PREP_DIR} and re-run the dataset prep")
-                proxy_samples.append((os.path.basename(p), s))
-        print(tc.VAL_FULL_NOTE if VAL_FULL else proxy_rep["text"], flush=True)
+        proxy_tiles, proxy_rep, proxy_samples = tc.kp_curate_proxy(
+            val_tiles, NUM_CLASSES, PROXY_TILES, PROXY_SAMPLING, CLASS_NAMES,
+            PREP_DIR, sample_tile)
         if not tc.proxy_guard(run_dir, proxy_rep, tc.PROXY_PROTOCOL_TILES,
                               CLASS_NAMES, VAL_RANK):
             run_id, run_dir = tc.kp_make_run_dir("kpconvx_cold_native")
@@ -358,30 +322,11 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
     if INFER:
         seg_loss = pick_train_tile = None
     else:
-        class_counts, present_mask = tc.scan_class_balance(
-            train_tiles, NUM_CLASSES,
-            cache_path=f"{PREP_DIR}/class_balance_cache.npz")
-        print(f"  class counts: {dict(zip(CLASS_NAMES, class_counts.tolist()))}",
-              flush=True)
-        rare_classes = (list(RARE_CLASSES) if RARE_CLASSES is not None
-                        else tc.auto_rare_classes(class_counts, RARE_FREQ_FRAC))
-        rare_tiles = ([train_tiles[i]
-                       for i in np.nonzero(present_mask[:, rare_classes].any(1))[0]]
-                      if (RARE_OVERSAMPLE and rare_classes) else [])
-        print(f"  rare classes: {[CLASS_NAMES[c] for c in rare_classes]}", flush=True)
-        print(f"  rare-class tiles: {len(rare_tiles)} / {len(train_tiles)}", flush=True)
-
-        if CLASS_WEIGHTING:
-            w = tc.class_weights_np(class_counts, WEIGHT_BETA, WEIGHT_CAP)
-            class_weights = torch.tensor(w, dtype=torch.float32).cuda()
-            print(f"  class weights: "
-                  f"{dict(zip(CLASS_NAMES, [round(float(x), 3) for x in w]))}",
-                  flush=True)
-        else:
-            class_weights = None
-        seg_loss = tc.make_seg_loss(class_weights, LABEL_SMOOTH, USE_FOCAL,
-                                    FOCAL_GAMMA, LOVASZ_WEIGHT)
-        pick_train_tile = tc.make_tile_picker(train_tiles, rare_tiles, RARE_TILE_PROB)
+        seg_loss, pick_train_tile = tc.kp_class_balance_setup(
+            train_tiles, NUM_CLASSES, CLASS_NAMES, PREP_DIR, RARE_CLASSES,
+            RARE_FREQ_FRAC, RARE_OVERSAMPLE, RARE_TILE_PROB, CLASS_WEIGHTING,
+            WEIGHT_BETA, WEIGHT_CAP, LABEL_SMOOTH, USE_FOCAL, FOCAL_GAMMA,
+            LOVASZ_WEIGHT)
 
     from utils.torch_pyramid import build_full_pyramid
 
@@ -438,16 +383,9 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
 
     val_csv = f"{run_dir}/val_metrics.csv"
 
-    val_items  = [(n, p, f"{PREP_DIR}/val")  for n, p in val_list]
-    test_items = [(n, p, f"{PREP_DIR}/test") for n, p in test_list]
-    print(f"  eval set: {len(val_items)} holdout(val) + {len(test_items)} test scenes",
-          flush=True)
-
-    def _fwd_eval(tiles):
-        b, _ = make_kp_pack([(c, f, None) for c, f in tiles])
-        lg = net(b).cpu().numpy().astype(np.float32)
-        return np.split(lg, np.cumsum([len(c) for c, _ in tiles])[:-1])
-    evaluate = tc.kp_make_evaluate(_fwd_eval, build_feat, GRID, CHUNK_XY,
+    val_items, test_items = tc.kp_eval_items(PREP_DIR, val_list, test_list)
+    evaluate = tc.kp_make_evaluate(tc.kp_make_fwd_eval(make_kp_pack, _forward),
+                                   build_feat, GRID, CHUNK_XY,
                                    NUM_CLASSES, CLASS_NAMES)
 
     tc.write_run_manifest(run_dir, "kpconvx_cold", dataset)

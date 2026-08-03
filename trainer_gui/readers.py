@@ -53,12 +53,6 @@ def _is_meter_horizontal(crs) -> bool:
     return hor.is_projected and abs(hor.axis_info[0].unit_conversion_factor - 1.0) <= 1e-9
 
 
-def _wkt_looks_meter_projected(wkt: str) -> bool:
-    """Cheap no-pyproj sniff: a projected WKT whose length unit is the metre."""
-    up = wkt.upper()
-    return ("PROJCRS" in up or "PROJCS" in up) and ('"METRE"' in up or '"METER"' in up)
-
-
 def _estimate_utm(crs, xyz, CRS, Transformer):
     """UTM zone for the cloud centroid (PROJ db is bundled, no network)."""
     from pyproj.aoi import AreaOfInterest
@@ -85,13 +79,7 @@ def normalize_to_meters(xyz, source_crs_wkt):
     xyz = np.asarray(xyz, np.float64)
     if not source_crs_wkt:
         return xyz, None, None
-    try:
-        from pyproj import CRS, Transformer
-    except ImportError:
-        if _wkt_looks_meter_projected(source_crs_wkt):
-            return xyz, source_crs_wkt, None
-        raise ValueError("pyproj is required to reproject this source CRS to meters. "
-                         "Install pyproj in the GUI environment")
+    from pyproj import CRS, Transformer
     try:
         crs = CRS.from_wkt(source_crs_wkt)
     except Exception as e:

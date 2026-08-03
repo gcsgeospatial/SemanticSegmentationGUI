@@ -5,11 +5,12 @@ and embedded). Sources: val_metrics.csv, metrics.csv, test_metrics.json, run.jso
 from __future__ import annotations
 
 import csv
-import json
 from pathlib import Path
 
 import numpy as np
 from matplotlib.figure import Figure
+
+from . import appstate
 
 METRIC_LABELS = {
     "val_miou": "validation mIoU", "val_acc": "validation accuracy",
@@ -52,21 +53,11 @@ def read_csv_columns(path: Path) -> dict[str, list]:
 
 
 def read_config(run_dir: Path) -> dict:
-    p = Path(run_dir) / "run.json"
-    try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
+    return appstate.read_json(Path(run_dir) / "run.json") or {}
 
 
 def read_test_metrics(run_dir: Path) -> dict:
-    p = Path(run_dir) / "test_metrics.json"
-    if p.exists():
-        try:
-            return json.loads(p.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return {}
-    return {}
+    return appstate.read_json(Path(run_dir) / "test_metrics.json") or {}
 
 
 def _rows(cols: dict, metric: str, proxy: bool) -> tuple[list, list]:

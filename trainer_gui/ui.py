@@ -4,22 +4,26 @@ width weights, not splitters) and the page-level scroll_v wrapper."""
 from __future__ import annotations
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QTextCursor
-from PySide6.QtWidgets import (QComboBox, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit,
+from PySide6.QtWidgets import (QComboBox, QHBoxLayout, QLabel, QLineEdit,
                                QScrollArea, QVBoxLayout, QWidget)
 
 
-def append_log(log: QPlainTextEdit, text: str, newline: bool = True):
-    """Append with tail-f autoscroll: only follows if already at the bottom."""
-    if hasattr(log, "begin_run"):   # logconsole.LogConsole: it owns scroll/color
-        log.append(text, newline)
-        return
-    bar = log.verticalScrollBar()
-    at_bottom = bar.value() >= bar.maximum() - log.fontMetrics().height()
-    log.moveCursor(QTextCursor.End)
-    log.insertPlainText(text + ("\n" if newline else ""))
-    if at_bottom:
-        bar.setValue(bar.maximum())
+def append_log(log, text: str, newline: bool = True):
+    """Append to a page's LogConsole (it owns scroll/color)."""
+    log.append(text, newline)
+
+
+# one begin_run per long op, closed exactly once via the page._run_open latch
+
+def begin_log_run(page, title: str) -> None:
+    page.log.begin_run(title)
+    page._run_open = True
+
+
+def end_log_run(page, summary: str) -> None:
+    if page._run_open:
+        page._run_open = False
+        page.log.end_run(summary)
 
 
 # cross-page navigation: MainWindow registers its switcher; pages call navigate()
@@ -31,9 +35,9 @@ def set_navigator(fn) -> None:
     _navigator = fn
 
 
-def navigate(page_name: str, **kwargs) -> None:
+def navigate(page_name: str) -> None:
     if _navigator is not None:
-        _navigator(page_name, **kwargs)
+        _navigator(page_name)
 
 
 def vsplit(*widgets: QWidget, sizes: list[int] | None = None) -> QWidget:

@@ -117,23 +117,13 @@ def set_modal_outputs_volume(name: str) -> None:
     put("modal_outputs_volume", name.strip())
 
 
-# local-backend defaults
-_DEFAULT_LOCAL_CONFIG = {
-    "datasets_root": "",
-    "outputs_root": "",
-    "gpus": "all",
-}
-
-
-def local_config() -> dict:
-    cfg = {**_DEFAULT_LOCAL_CONFIG, **get("local_config", {})}
-    cfg["datasets_root"] = cfg["datasets_root"] or str(workspace_dir())
-    cfg["outputs_root"] = cfg["outputs_root"] or str(local_runs_dir())
-    return cfg
-
-
-def set_local_config(cfg: dict) -> None:
-    put("local_config", cfg)
+def read_json(path) -> dict | None:
+    """Parse a JSON file; None when it's missing, unreadable or invalid."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
 
 
 def _state_path() -> Path:
@@ -141,11 +131,7 @@ def _state_path() -> Path:
 
 
 def load_state() -> dict:
-    try:
-        with open(_state_path(), "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return {}
+    return read_json(_state_path()) or {}
 
 
 def save_state(state: dict) -> None:
