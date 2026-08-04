@@ -20,9 +20,10 @@ REPO_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
 
 
 def soft_vote(probs, labels=None):
-    """(M, N, C) distributions -> ((N,) argmax labels, (N,) f32 confidence).
-    Averages over the COVERING models only (all-zero row = not covered);
-    points nobody covered fall back to a plain vote over `labels`."""
+    """(M, N, C) distributions -> ((N,) argmax labels, (N,) f32 confidence,
+    (N, C) f32 fused distribution). Averages over the COVERING models only
+    (all-zero row = not covered); points nobody covered fall back to a plain
+    vote over `labels` (their fused row stays zero)."""
     probs = np.asarray(probs, np.float32)
     cov = (probs.sum(-1) > 0).sum(0)
     p = probs.sum(0) / np.maximum(cov, 1)[:, None]
@@ -31,7 +32,7 @@ def soft_vote(probs, labels=None):
     if labels is not None and miss.any():
         labels = np.asarray(labels)[:, miss]
         lab[miss], conf[miss] = weighted_vote(labels, np.ones(labels.shape, np.float32))
-    return lab, conf
+    return lab, conf, p
 
 
 def weighted_vote(labels, weights):
@@ -98,11 +99,14 @@ def load_pred(path):
 
 
 def write_out(path, xyz, cls, intensity, confidence, agree, crs_wkt=None,
-              dominant=None, member_names=None, source_crs_wkt=None):
+              dominant=None, member_names=None, source_crs_wkt=None,
+              probs=None):
     if path.endswith(".npz"):
         d = {"xyz": xyz, "classification": cls.astype(np.int32),
              "confidence": np.asarray(confidence, np.float32),
              "agreement": np.asarray(agree, np.float32)}
+        if probs is not None:   # fused distribution: post-vote smoothing input
+            d["probs"] = np.asarray(probs, np.float16)
         if dominant is not None:
             d["dominant_member"] = np.asarray(dominant, np.uint8)
             if member_names:
@@ -224,9 +228,10 @@ def ensemble(input_dirs, out_dir, log=print):
             confs.append(cf)
             probs.append(pb)
         stacked = np.stack(labs)
+        fused = None
         if all(p is not None for p in probs):
             log(f"  {stem}: soft vote (all {len(probs)} members carry probs)")
-            voted, conf = soft_vote(np.stack(probs), stacked)
+            voted, conf, fused = soft_vote(np.stack(probs), stacked)
             dom = dominant_member(voted, probs=np.stack(probs))
         else:
             noprobs = [d for d, p in zip(input_dirs, probs) if p is None]
@@ -244,7 +249,8 @@ def ensemble(input_dirs, out_dir, log=print):
                 src_crs = str(zr["source_crs_wkt"]) if "source_crs_wkt" in zr.files else None
         out_path = f"{out_dir}/{os.path.basename(ref_path)}"
         write_out(out_path, ref_xyz, voted, ref_itn, conf, agree, crs_wkt=crs,
-                  dominant=dom, member_names=names, source_crs_wkt=src_crs)
+                  dominant=dom, member_names=names, source_crs_wkt=src_crs,
+                  probs=fused)
         log(f"  {os.path.basename(out_path)}: {len(voted)} pts, "
             f"mean confidence {float(conf.mean()):.3f}, "
             f"mean agreement {float(agree.mean()):.3f}")

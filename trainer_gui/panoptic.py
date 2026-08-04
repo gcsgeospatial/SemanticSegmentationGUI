@@ -159,6 +159,39 @@ class Alpine:
 
 # ---------------------------------------------------------------- GUI step
 
+def job_id_for(pred_dir: Path) -> str:
+    """predictions_<job>[_m<k>|_ensemble][/predictions] -> <job>."""
+    import re
+    pred_dir = Path(pred_dir)
+    name = pred_dir.parent.name if pred_dir.name == "predictions" else pred_dir.name
+    name = re.sub(r"(_m\d+|_ensemble)$", "", name)
+    return name[len("predictions_"):] if name.startswith("predictions_") else name
+
+
+def class_names_for(pred_dir: Path) -> tuple[list | None, str]:
+    """(class_names, source label): infer_run.json beside the npz (ensemble),
+    run.json a level up (downloaded runs), else the staged infer job's
+    infer_run.json (local runs). None when nothing names the classes."""
+    from . import appstate
+    pred_dir = Path(pred_dir)
+    for p in (pred_dir / "infer_run.json", pred_dir.parent / "run.json",
+              pred_dir.parent.parent / "run.json"):
+        m = appstate.read_json(p)
+        if m and m.get("class_names"):
+            return list(m["class_names"]), p.name
+    roots = [appstate.scratch_infer_dir()]
+    for name in appstate.known_datasets():
+        try:
+            roots.append(appstate.dataset_root(name) / "infer")
+        except (KeyError, OSError):
+            pass
+    for r in roots:
+        m = appstate.read_json(r / job_id_for(pred_dir) / "infer_run.json")
+        if m and m.get("class_names"):
+            return list(m["class_names"]), "infer_run.json"
+    return None, ""
+
+
 def run_panoptic(pred_dir, things: dict, k: int = 32, split: bool = True,
                  margin: float = 1.3, progress=None) -> dict:
     """Cluster every *_pred.npz in pred_dir with ALPINE and write the result
@@ -184,6 +217,7 @@ def run_panoptic(pred_dir, things: dict, k: int = 32, split: bool = True,
         total += n_inst
         tmp = f.with_name(f.stem + ".tmp.npz")
         np.savez(tmp, **data)
-        os.replace(tmp, f)
+        from .postproc import replace_retry
+        replace_retry(tmp, f)
         say(f"  {f.name}: {n_inst:,} instances over {len(xyz):,} pts")
     return {"files": len(files), "instances": total}

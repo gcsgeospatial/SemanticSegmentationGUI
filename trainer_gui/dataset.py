@@ -1044,7 +1044,7 @@ def class_map_for_export(meta: dict | None, mode: str, say, subject: str) -> dic
 
 
 def _rewrite_original(orig: Path, dst: Path, cls, confidence=None, member=None,
-                      instance=None):
+                      instance=None, extra_dims=None):
     """The original las/laz re-emitted with the predicted classification (+
     extra dims): every source dimension, VLR and CRS survives. COPC metadata is
     stripped (the rewrite invalidates the hierarchy: output is plain las/laz).
@@ -1060,9 +1060,11 @@ def _rewrite_original(orig: Path, dst: Path, cls, confidence=None, member=None,
         las = laspy.convert(las, point_format_id=target)
     for lst in (las.header.vlrs, las.header.evlrs or []):
         lst[:] = [v for v in lst if getattr(v, "user_id", "") != "copc"]
-    for name, arr, typ in (("confidence", confidence, np.float32),
-                           ("ens_member", member, np.uint8),
-                           ("instance_id", instance, np.uint32)):
+    named = [("confidence", confidence, np.float32),
+             ("ens_member", member, np.uint8),
+             ("instance_id", instance, np.uint32)]
+    named += [(n, a, t) for n, (a, t) in (extra_dims or {}).items()]
+    for name, arr, typ in named:
         if arr is not None:
             if name not in las.point_format.dimension_names:
                 las.add_extra_dim(laspy.ExtraBytesParams(name=name, type=typ))
@@ -1071,15 +1073,42 @@ def _rewrite_original(orig: Path, dst: Path, cls, confidence=None, member=None,
     las.write(str(dst))
 
 
+def _prob_extra_dims(probs, entropy, margin, prob_dims, class_names):
+    """las/laz Extra Bytes derived from the saved (N, C) softmax: normalized
+    entropy + top-2 margin as float32, optional per-class dims quantized to
+    uint8 (p*255) since C float dims would double the file."""
+    p = np.asarray(probs, np.float32)
+    p /= np.maximum(p.sum(-1, keepdims=True), 1e-12)
+    out = {}
+    if entropy:
+        h = -(p * np.log(np.maximum(p, 1e-12))).sum(-1) / np.log(p.shape[1])
+        out["entropy"] = (h.astype(np.float32), np.float32)
+    if margin:
+        top2 = np.partition(p, -2, axis=-1)[:, -2:]
+        out["margin"] = ((top2[:, 1] - top2[:, 0]).astype(np.float32), np.float32)
+    if prob_dims:
+        names = list(class_names or []) + [str(i) for i in range(len(class_names or []),
+                                                                 p.shape[1])]
+        for i in range(p.shape[1]):
+            safe = "".join(c if c.isalnum() else "_" for c in str(names[i]))
+            out[f"prob_{safe}"[:32]] = ((p[:, i] * 255).round().astype(np.uint8),
+                                        np.uint8)
+    return out
+
+
 def export_predictions(pred_dir, fmt: str, progress=None, class_map=None,
-                       unclass_threshold=None, originals=None) -> list[Path]:
+                       unclass_threshold=None, originals=None,
+                       entropy=False, margin=False, prob_dims=False,
+                       class_names=None) -> list[Path]:
     """Export each <name>_pred.npz as <name>_pred.<fmt>, with class_map
     remapping model indices to output codes. las/laz with a matching original
     las/laz in `originals` ({input stem: path}) carries every source dimension
     over; anything else writes xyz + classification [+ confidence]. Points
     below unclass_threshold export as class 1 (0 if 1 is taken; 255 with no
     class_map). The npz keeps the raw prediction so a new threshold re-exports
-    without re-running."""
+    without re-running. entropy/margin/prob_dims add per-point uncertainty
+    Extra Bytes (las/laz only) derived from the npz "probs" key, which exists
+    when inference ran with TT_SAVE_PROBS=1."""
     fmt = fmt.lower().lstrip(".")
     if fmt not in PRED_EXPORT_FORMATS:
         raise ValueError(f"unsupported prediction format '{fmt}' "
@@ -1110,6 +1139,17 @@ def export_predictions(pred_dir, fmt: str, progress=None, class_map=None,
                             if "member_names" in d.files else None)
             instance = (np.asarray(d["instance"], np.uint32)
                         if "instance" in d.files else None)
+            want_probs = entropy or margin or prob_dims
+            probs = (np.asarray(d["probs"], np.float32)
+                     if want_probs and "probs" in d.files else None)
+        extra_dims = None
+        if want_probs and fmt in ("las", "laz"):
+            if probs is None:
+                say(f"  ⚠ {src.name}: no probs in the npz (inference ran without "
+                    f"save-probs); skipping uncertainty dims.")
+            else:
+                extra_dims = _prob_extra_dims(probs, entropy, margin, prob_dims,
+                                              class_names)
         if member is not None and fmt in ("las", "laz") and not legend_said:
             legend_said = True
             say("  ens_member field (ensemble's dominant model per point): "
@@ -1132,14 +1172,16 @@ def export_predictions(pred_dir, fmt: str, progress=None, class_map=None,
         if fmt in ("las", "laz") and orig and Path(orig).suffix.lower() in (".las", ".laz"):
             try:
                 _rewrite_original(Path(orig), dst, cls, confidence=conf,
-                                  member=member, instance=instance)
+                                  member=member, instance=instance,
+                                  extra_dims=extra_dims)
                 carried = True
             except Exception as e:
                 say(f"  ⚠ {Path(orig).name}: can't carry source dimensions "
                     f"({e}); writing xyz + classification only.")
         if not carried:
             _write_pred(dst, xyz, cls, fmt, confidence=conf, crs_wkt=crs_wkt,
-                        source_crs_wkt=source_wkt, member=member, instance=instance)
+                        source_crs_wkt=source_wkt, member=member, instance=instance,
+                        extra_dims=extra_dims)
         written.append(dst)
         say(f"  {src.name} -> {dst.name} ({len(xyz):,} pts"
             + ("; source dimensions carried over" if carried else "")
@@ -1148,9 +1190,67 @@ def export_predictions(pred_dir, fmt: str, progress=None, class_map=None,
     return written
 
 
+def prediction_report(pred_dir, class_names=None, unclass_threshold=None,
+                      margin_threshold=0.1, progress=None) -> dict:
+    """Job-level QA summary over every *_pred.npz: per-class counts and mean
+    confidence, plus mean entropy and contested-point counts when probs were
+    saved. Written to <pred_dir>/report.json and returned. Uncertainty stats
+    are model confidence, not calibrated probability."""
+    say = progress or (lambda s: None)
+    names = list(class_names or [])
+    scenes = {}
+    for src in sorted(Path(pred_dir).glob("*_pred.npz")):
+        with np.load(src) as d:
+            cls = np.asarray(d["classification"], np.int64)
+            conf = (np.asarray(d["confidence"], np.float32)
+                    if "confidence" in d.files else None)
+            probs = (np.asarray(d["probs"], np.float32)
+                     if "probs" in d.files else None)
+            inst = np.asarray(d["instance"]) if "instance" in d.files else None
+        n = len(cls)
+        per_class = {}
+        for c in np.unique(cls):
+            m = cls == c
+            label = names[c] if c < len(names) else str(int(c))
+            per_class[label] = {
+                "points": int(m.sum()),
+                "fraction": round(float(m.mean()), 4),
+                "mean_confidence": (round(float(conf[m].mean()), 4)
+                                    if conf is not None else None),
+            }
+        entry = {"points": n, "classes": per_class}
+        if conf is not None and unclass_threshold is not None:
+            entry["below_unclass_threshold"] = int((conf < unclass_threshold).sum())
+        if probs is not None:
+            p = probs / np.maximum(probs.sum(-1, keepdims=True), 1e-12)
+            h = -(p * np.log(np.maximum(p, 1e-12))).sum(-1) / np.log(p.shape[1])
+            top2 = np.partition(p, -2, axis=-1)[:, -2:]
+            entry["mean_entropy"] = round(float(h.mean()), 4)
+            entry["contested_points"] = int(
+                ((top2[:, 1] - top2[:, 0]) < margin_threshold).sum())
+        if inst is not None:
+            entry["instances"] = int(inst.max(initial=0))
+        scenes[src.name[:-len("_pred.npz")]] = entry
+    if not scenes:
+        raise RuntimeError(f"no *_pred.npz files in {pred_dir}")
+    total = sum(s["points"] for s in scenes.values())
+    report = {"schema": 1, "class_names": names, "total_points": total,
+              "margin_threshold": margin_threshold,
+              "unclass_threshold": unclass_threshold, "scenes": scenes}
+    out = Path(pred_dir) / "report.json"
+    out.write_text(json.dumps(report, indent=1), encoding="utf-8")
+    agg = {}
+    for s in scenes.values():
+        for label, e in s["classes"].items():
+            agg[label] = agg.get(label, 0) + e["points"]
+    say(f"  report: {total:,} pts | " + ", ".join(
+        f"{k} {v / total:.0%}" for k, v in sorted(agg.items(), key=lambda x: -x[1])))
+    return report
+
+
 def _write_pred(dst: Path, xyz: np.ndarray, cls: np.ndarray, fmt: str,
                 confidence=None, crs_wkt=None, source_crs_wkt=None, member=None,
-                instance=None):
+                instance=None, extra_dims=None):
     """One classified cloud -> dst, with xyz inverse-transformed back to the source
     frame via the shared keystone restore (raises the D2 legacy block). The embedded
     las/laz WKT VLR is the SOURCE CRS so deliverables overlay the input clouds.
@@ -1168,6 +1268,8 @@ def _write_pred(dst: Path, xyz: np.ndarray, cls: np.ndarray, fmt: str,
             h.add_extra_dim(laspy.ExtraBytesParams(name="ens_member", type=np.uint8))
         if instance is not None:
             h.add_extra_dim(laspy.ExtraBytesParams(name="instance_id", type=np.uint32))
+        for name, (_arr, typ) in (extra_dims or {}).items():
+            h.add_extra_dim(laspy.ExtraBytesParams(name=name, type=typ))
         if geo_wkt:
             try:
                 from pyproj import CRS
@@ -1185,6 +1287,8 @@ def _write_pred(dst: Path, xyz: np.ndarray, cls: np.ndarray, fmt: str,
             las.ens_member = member
         if instance is not None:
             las.instance_id = instance
+        for name, (arr, _typ) in (extra_dims or {}).items():
+            setattr(las, name, arr)
         las.write(str(dst))
     elif fmt == "ply":
         header = ("ply\nformat ascii 1.0\n" + f"element vertex {len(xyz)}\n"

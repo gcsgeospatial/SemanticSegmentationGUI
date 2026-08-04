@@ -485,6 +485,34 @@ def xy_chunk_groups(xyz, chunk_m, min_pts=1):
     return [g for g in np.split(order, cuts) if len(g) >= min_pts]
 
 
+def xy_tile_groups(xyz, chunk_m, stride, min_pts=1):
+    """Overlapping chunk_m XY tiles at `stride` (numpy twin of
+    tile_xy_indices): a point lands in every tile covering it, up to
+    (chunk/stride)^2 tiles. Yields index arrays."""
+    import numpy as np
+    xy = np.asarray(xyz)[:, :2]
+    if len(xy) == 0:
+        return
+    lo, hi = xy.min(0), xy.max(0)
+    # zero-extent axis (profile slice / scan column): arange would yield no
+    # starts and the scene would silently fall to the constant-class backfill
+    x_starts = np.arange(lo[0], hi[0], stride) if hi[0] > lo[0] else lo[:1]
+    y_starts = np.arange(lo[1], hi[1], stride) if hi[1] > lo[1] else lo[1:2]
+    ox = np.argsort(xy[:, 0], kind="stable")
+    xs = xy[ox, 0]
+    for x0 in x_starts:
+        a, b = np.searchsorted(xs, [x0, x0 + chunk_m])
+        strip = ox[a:b]
+        if len(strip) == 0:
+            continue
+        strip = strip[np.argsort(xy[strip, 1], kind="stable")]
+        ys = xy[strip, 1]
+        for y0 in y_starts:
+            c, d = np.searchsorted(ys, [y0, y0 + chunk_m])
+            if d - c >= min_pts:
+                yield strip[c:d]
+
+
 VOXEL_GPU_MIN = 1_000_000
 
 
@@ -544,6 +572,10 @@ def write_infer_run(run_dir, config, scene_stats):
     doc["adabn"] = os.environ.get("DG_INFER_ADABN") == "1"
     doc["apcotta"] = os.environ.get("DG_INFER_APCOTTA") == "1"
     doc["tta_views"] = int(os.environ.get("DG_INFER_TTA", "0") or 0)
+    doc["tta_rigid"] = [n.strip() for n in
+                        os.environ.get("DG_INFER_TTA_RIGID", "").split(",")
+                        if n.strip()]
+    doc["overlap_vote"] = os.environ.get("TT_INFER_OVERLAP", "1") == "1"
     doc["save_probs"] = os.environ.get("TT_SAVE_PROBS") == "1"
     doc["scenes"] = scene_stats
     doc["total_points"] = int(sum(s["points"] for s in scene_stats))
@@ -581,6 +613,32 @@ def apply_class_mask(prob, exclude_idx):
     prob[..., exclude_idx] = 0.0
     prob /= np.maximum(prob.sum(-1, keepdims=True), 1e-12)
     return prob
+
+
+def infer_tta_views(tta, rigid=None):
+    """Inference TTA view transforms over CENTERED coords: identity + `tta`
+    scale views + named rigid views (DG_INFER_TTA_RIGID csv). Rigid views are
+    gravity-safe (yaw/flip only); softmax sums across views need no
+    re-indexing because every transform is per-point."""
+    import numpy as np
+    rigid_views = {
+        "xflip":  lambda w: w * np.array([-1, 1, 1], dtype=w.dtype),
+        "yflip":  lambda w: w * np.array([1, -1, 1], dtype=w.dtype),
+        "rot90":  lambda w: np.stack([-w[:, 1], w[:, 0], w[:, 2]], 1),
+        "rot180": lambda w: w * np.array([-1, -1, 1], dtype=w.dtype),
+        "rot270": lambda w: np.stack([w[:, 1], -w[:, 0], w[:, 2]], 1),
+    }
+    views = [lambda w: w]
+    if tta:
+        views += [(lambda w, s=np.float32(s): w * s)
+                  for s in np.linspace(0.85, 1.2, int(tta))]
+    for name in (n.strip() for n in (rigid or "").split(",") if n.strip()):
+        if name not in rigid_views:
+            raise ValueError(
+                f"unknown TTA view '{name}' in DG_INFER_TTA_RIGID; valid names: "
+                f"{', '.join(sorted(rigid_views))}")
+        views.append(rigid_views[name])
+    return views
 
 
 def gpu_name():
@@ -982,11 +1040,46 @@ class VoxelVoteAccum:
 
     def result(self):
         """(per-voxel argmax pred, representative raw xyz) or None if empty."""
+        got = self.result_votes()
+        return None if got is None else (got[0].argmax(1), got[1])
+
+    def result_votes(self):
+        """(per-voxel vote sums (V, C), representative raw xyz) or None -
+        inference needs the soft votes for confidence/probs, not just argmax."""
         if not self.rows:
             return None
         if self.dirty:
             self._compact()
-        return self.votes[0].argmax(1), self.xyz[0]
+        return self.votes[0], self.xyz[0]
+
+
+def overlap_tapered_add(acc, pxyz, prob, chunk_xy, grid):
+    """Center-tapered vote for one overlapping tile - the exact weighting the
+    voted full evals use; shared by the KP and PTv3 infer paths."""
+    import numpy as np
+    cxy = (pxyz[:, :2].min(0) + pxyz[:, :2].max(0)) / 2
+    d = np.abs(pxyz[:, :2] - cxy).max(1)
+    wgt = np.clip(1.0 - d / (chunk_xy / 2.0), 0.05, 1.0) ** 2
+    acc.add(np.floor(pxyz / grid).astype(np.int64),
+            (prob * wgt[:, None]).astype(np.float32),
+            pxyz.astype(np.float32))
+
+
+def overlap_finalize(acc, xyz, num_classes, save_probs, exclude_idx):
+    """Accumulated votes -> per-raw-point (pred, conf, probs); the empty
+    accumulator (no viable tile) falls back to the minimum non-excluded class
+    like the legacy miss path. Frees the accumulator's key array up front -
+    it is (V, 3) int64 and no longer needed."""
+    import numpy as np
+    got = acc.result_votes()
+    acc.keys = []
+    if got is None:
+        fb = min(set(range(num_classes)) - set(exclude_idx or ()))
+        pred = np.full(len(xyz), fb, np.int64)
+        conf = np.zeros(len(xyz), np.float32)
+        probs = np.zeros((len(xyz), num_classes), np.float16) if save_probs else None
+        return pred, conf, probs
+    return votes_to_points(got[0], got[1], xyz, num_classes, save_probs)
 
 
 def score_raw_from_voxels(rep_xyz, pred_u, raw_xyz, raw_lab, num_classes,
@@ -1015,6 +1108,31 @@ def score_raw_from_voxels(rep_xyz, pred_u, raw_xyz, raw_lab, num_classes,
         i_, u_, g_ = score_ious(rp, rl, num_classes)
         inter += i_; union += u_; gt += g_
     return inter, union, gt, correct, total
+
+
+def votes_to_points(votes, rep_xyz, xyz, num_classes, save_probs,
+                    chunk=8_000_000):
+    """Voted per-voxel probs -> per-raw-point (pred, conf, probs) via the
+    eval path's nearest-voxel-representative propagation, chunked like
+    score_raw_from_voxels for the same memory reasons. Normalizes `votes`
+    IN PLACE - a second (V, C) float64 copy is GBs at scene scale."""
+    import numpy as np
+    from scipy.spatial import cKDTree
+    votes /= np.maximum(votes.sum(1, keepdims=True), 1e-12)
+    vprob = votes
+    vpred = vprob.argmax(1).astype(np.int64)
+    vconf = vprob.max(1).astype(np.float32)
+    tree = cKDTree(rep_xyz)
+    pred = np.empty(len(xyz), np.int64)
+    conf = np.empty(len(xyz), np.float32)
+    probs = np.empty((len(xyz), num_classes), np.float16) if save_probs else None
+    for s in range(0, len(xyz), chunk):
+        _, nn = tree.query(xyz[s:s + chunk], workers=-1)
+        pred[s:s + chunk] = vpred[nn]
+        conf[s:s + chunk] = vconf[nn]
+        if probs is not None:
+            probs[s:s + chunk] = vprob[nn].astype(np.float16)
+    return pred, conf, probs
 
 
 def load_xyz_label(npz_path):
@@ -1936,21 +2054,34 @@ def kp_make_predict_points(forward_prob, build_feat, grid, chunk_xy,
                            num_classes, tta, save_probs=False, exclude_idx=None):
     """Sliding-window inference -> (pred, confidence, probs) per raw point.
     forward_prob(cxyz, feat) -> (N, C) softmax; exceptions skip the window.
-    exclude_idx masks classes pre-argmax; conf/probs are post-mask."""
+    exclude_idx masks classes pre-argmax; conf/probs are post-mask.
+    TT_INFER_OVERLAP=1 (default): chunk/2-strided tiles + center-tapered
+    per-voxel soft voting - the same protocol as the voted full eval, so
+    exported labels match what the metrics measured."""
     import numpy as np
     import torch
     from scipy.spatial import cKDTree
 
     feat_names = [n for n in getattr(build_feat, "spec", []) if n.startswith("feat_")]
+    overlap = os.environ.get("TT_INFER_OVERLAP", "1") == "1"
+    views = infer_tta_views(tta, os.environ.get("DG_INFER_TTA_RIGID", ""))
+    # x/y feature channels are orientation-coupled: rigid views must rebuild
+    # feat from the transformed coords or the model sees inconsistent input
+    coord_feats = bool({"x", "y"} & set(getattr(build_feat, "spec", [])))
 
     def predict_points(xyz, intensity_n, ret_num, extras=None):
-        pred = np.full(len(xyz), -1, np.int64)
-        conf = np.zeros(len(xyz), np.float32)
-        probs = np.zeros((len(xyz), num_classes), np.float16) if save_probs else None
+        acc = VoxelVoteAccum(num_classes) if overlap else None
+        pred = conf = probs = None
+        if not overlap:
+            pred = np.full(len(xyz), -1, np.int64)
+            conf = np.zeros(len(xyz), np.float32)
+            probs = np.zeros((len(xyz), num_classes), np.float16) if save_probs else None
+        windows = (xy_tile_groups(xyz, chunk_xy, chunk_xy / 2.0, min_pts=64)
+                   if overlap else xy_chunk_groups(xyz, chunk_xy, min_pts=64))
         n_done = n_skipped = 0
         last_err = None
         with torch.no_grad():
-            for idx in xy_chunk_groups(xyz, chunk_xy, min_pts=64):
+            for idx in windows:
                 cols = [intensity_n[idx], ret_num[idx]]
                 cols += [extras[n][idx] for n in feat_names]
                 attrs = np.stack(cols, axis=1).astype(np.float32)
@@ -1959,25 +2090,32 @@ def kp_make_predict_points(forward_prob, build_feat, grid, chunk_xy,
                     continue
                 sub_ex = {n: sa[:, 2 + i] for i, n in enumerate(feat_names)}
                 feat = build_feat(sx, sa[:, 0], sa[:, 1], extras=sub_ex)
-                base = (sx - sx.mean(0)).astype(np.float32)
-                views = [1.0] + (list(np.linspace(0.85, 1.2, tta)) if tta else [])
+                mx = sx.mean(0)
+                base = (sx - mx).astype(np.float32)
                 try:
                     prob = None
-                    for s in views:
-                        p = forward_prob((base * s).astype(np.float32), feat)
+                    for view in views:
+                        vb = view(base)
+                        vf = (build_feat(vb.astype(np.float64) + mx, sa[:, 0],
+                                         sa[:, 1], extras=sub_ex)
+                              if coord_feats else feat)
+                        p = forward_prob(vb.astype(np.float32), vf)
                         prob = p if prob is None else prob + p
                     prob /= np.maximum(prob.sum(-1, keepdims=True), 1e-12)
                     prob = apply_class_mask(prob, exclude_idx)
-                    sub_pred = prob.argmax(-1)
                 except Exception as ex:
                     n_skipped += 1
                     last_err = ex
                     continue
-                _, nn = cKDTree(sx).query(xyz[idx])
-                pred[idx] = sub_pred[nn]
-                conf[idx] = prob.max(-1)[nn]
-                if save_probs:
-                    probs[idx] = prob[nn].astype(np.float16)
+                if overlap:
+                    overlap_tapered_add(acc, sx, prob, chunk_xy, grid)
+                else:
+                    sub_pred = prob.argmax(-1)
+                    _, nn = cKDTree(sx).query(xyz[idx])
+                    pred[idx] = sub_pred[nn]
+                    conf[idx] = prob.max(-1)[nn]
+                    if save_probs:
+                        probs[idx] = prob[nn].astype(np.float16)
                 n_done += 1
         if n_skipped:
             print(f"  [infer] WARNING: {n_skipped} window(s) failed "
@@ -1986,6 +2124,8 @@ def kp_make_predict_points(forward_prob, build_feat, grid, chunk_xy,
             raise RuntimeError(
                 f"inference produced nothing: all {n_skipped} window(s) "
                 f"failed (last error: {last_err})")
+        if overlap:
+            return overlap_finalize(acc, xyz, num_classes, save_probs, exclude_idx)
         miss = pred < 0
         if miss.any() and (~miss).any():
             _, nn = cKDTree(xyz[~miss]).query(xyz[miss])
@@ -2938,30 +3078,37 @@ def ptv3_make_predict_scene(forward_logits, load_canonical, build_feat,
                             feat_spec, grid, chunk_xy, infer_tta,
                             num_classes, exclude_idx=None):
     """predict_scene(path) -> (raw xyz, pred, gray, conf, probs): chunked
-    voxel inference (+ optional scale TTA); unpredicted points backfill from
-    the nearest predicted neighbour."""
+    voxel inference (+ optional TTA views); unpredicted points backfill from
+    the nearest predicted neighbour. TT_INFER_OVERLAP=1 (default): chunk/2-
+    strided tiles + center-tapered per-voxel soft voting, mirroring the voted
+    full eval so exported labels match what the metrics measured."""
     import numpy as np
     import torch
     from scipy.spatial import cKDTree
     save_probs = os.environ.get("TT_SAVE_PROBS") == "1"
+    overlap = os.environ.get("TT_INFER_OVERLAP", "1") == "1"
+    views = infer_tta_views(infer_tta, os.environ.get("DG_INFER_TTA_RIGID", ""))
 
     def _predict_scene(scene_path):
         xyz, rgb, _ = load_canonical(scene_path)
         z0 = np.load(scene_path)
         ex0 = feat_extras(z0, feat_spec, os.path.basename(scene_path))
-        pred = np.full(len(xyz), -1, np.int64)
-        conf = np.zeros(len(xyz), np.float32)
-        probs = np.zeros((len(xyz), num_classes), np.float16) if save_probs else None
+        acc = VoxelVoteAccum(num_classes) if overlap else None
+        pred = conf = probs = None
+        if not overlap:
+            pred = np.full(len(xyz), -1, np.int64)
+            conf = np.zeros(len(xyz), np.float32)
+            probs = np.zeros((len(xyz), num_classes), np.float16) if save_probs else None
+        windows = (xy_tile_groups(xyz, chunk_xy, chunk_xy / 2.0, min_pts=64)
+                   if overlap else xy_chunk_groups(xyz, chunk_xy, min_pts=64))
         with torch.no_grad():
-            for idx in xy_chunk_groups(xyz, chunk_xy, min_pts=64):
+            for idx in windows:
                 w0 = (xyz[idx] - xyz[idx].mean(0)).astype(np.float32)
                 rgbf = rgb[idx].astype(np.float32) / 255.0
                 exw = {n: v[idx] for n, v in ex0.items()}
-                views = [1.0] + (list(np.linspace(0.85, 1.2, infer_tta))
-                                 if infer_tta else [])
                 pprob = None
-                for s in views:
-                    w = (w0 * s).astype(np.float32)
+                for view in views:
+                    w = view(w0).astype(np.float32)
                     keys = np.floor(w / grid).astype(np.int64)
                     first, inverse = voxel_unique(keys, return_inverse=True)
                     vx = w[first]
@@ -2978,10 +3125,17 @@ def ptv3_make_predict_scene(forward_logits, load_canonical, build_feat,
                     pprob = vp if pprob is None else pprob + vp
                 pprob /= np.maximum(pprob.sum(-1, keepdims=True), 1e-12)
                 pprob = apply_class_mask(pprob, exclude_idx)
-                pred[idx] = pprob.argmax(-1)
-                conf[idx] = pprob.max(-1)
-                if save_probs:
-                    probs[idx] = pprob.astype(np.float16)
+                if overlap:
+                    overlap_tapered_add(acc, xyz[idx], pprob, chunk_xy, grid)
+                else:
+                    pred[idx] = pprob.argmax(-1)
+                    conf[idx] = pprob.max(-1)
+                    if save_probs:
+                        probs[idx] = pprob.astype(np.float16)
+        if overlap:
+            pred, conf, probs = overlap_finalize(acc, xyz, num_classes,
+                                                 save_probs, exclude_idx)
+            return z0["xyz"], pred, rgb[:, 0] / 255.0, conf, probs
         miss = pred < 0
         if miss.any() and (~miss).any():
             _, nn = cKDTree(xyz[~miss]).query(xyz[miss])

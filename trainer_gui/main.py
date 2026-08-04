@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (QAbstractSpinBox, QApplication, QComboBox, QFileD
 # modal runs launch with cwd=REPO_ROOT so `modal run scripts/...` resolves
 REPO_ROOT = str(Path(__file__).resolve().parents[1])
 
-PAGES = ["Datasets", "Train", "Inference", "Panoptic", "Plotting"]
+PAGES = ["Datasets", "Train", "Inference", "Plotting"]
 
 
 class _NoWheelEdit(QObject):
@@ -98,7 +98,6 @@ class MainWindow(QWidget):
         from . import ui
         from .pages.datasets_page import DatasetsPage
         from .pages.infer_page import InferPage
-        from .pages.panoptic_page import PanopticPage
         from .pages.plotting_page import PlottingPage
         from .pages.train_page import TrainPage
 
@@ -106,9 +105,8 @@ class MainWindow(QWidget):
         self.train_page = TrainPage(REPO_ROOT)
         self.plotting_page = PlottingPage(REPO_ROOT)
         self.infer_page = InferPage(REPO_ROOT)
-        self.panoptic_page = PanopticPage(REPO_ROOT)
         for page in (self.datasets_page, self.train_page,
-                     self.infer_page, self.panoptic_page, self.plotting_page):
+                     self.infer_page, self.plotting_page):
             ui.polish_forms(page)
             self.stack.addWidget(ui.scroll_v(page))
 
@@ -142,7 +140,6 @@ class MainWindow(QWidget):
         # name-keyed so inserting a page never silently shifts the refreshes
         refresh = {"Train": lambda: self.train_page.reload_datasets(),
                    "Inference": lambda: self.infer_page.reload_runs(),
-                   "Panoptic": lambda: self.panoptic_page.reload_preds(),
                    "Plotting": lambda: self.plotting_page._rescan()}.get(PAGES[row])
         if refresh:
             refresh()

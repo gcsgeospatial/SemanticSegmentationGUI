@@ -21,7 +21,8 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDou
                                QPushButton, QRadioButton, QSpinBox, QTableWidget,
                                QTableWidgetItem, QVBoxLayout, QWidget)
 
-from .. import analysis, appstate, dataset, local_cli, modal_cli, plots, pretrain, ui
+from .. import (analysis, appstate, dataset, local_cli, modal_cli, panoptic,
+                plots, postproc, pretrain, ui)
 from ..backbones import ALS_GRID_M, ALS_TILE_M, BACKBONES
 from ..jobs import FuncWorker, JobRunner
 from ..logconsole import LogConsole
@@ -200,6 +201,11 @@ class InferPage(QWidget):
         self._ens_running = False
         self._ens_idx = -1
         self._ens_dirs: list[Path] = []
+        self._chain_dir: Path | None = None     # postproc/panoptic/export target
+        self._chain_scenes: Path | None = None  # staged scenes for the rule pass
+        self._chain_names: list | None = None   # class names of the chain target
+        self._chain_restore = False             # reprocess: reset even with no passes
+        self._chain_originals = True            # input box matches the chain target
         self._run_open = False
         self._crs_probe = None
         self._crs_probe_name = ""
@@ -367,23 +373,43 @@ class InferPage(QWidget):
             "source weights. Slightly slower; can help on larger domain gaps.\n"
             "Output depends on this job's density and class mix, so the same model "
             "can score differently per area; note it when comparing runs.")
-        self.tta_spin = QSpinBox()
-        self.tta_spin.setRange(0, 5)
-        self.tta_spin.setSuffix(" views")
-        self.tta_spin.setToolTip(
-            "Extra density/scale views averaged into each tile's prediction "
-            "(DG_INFER_TTA). 0 = off. Each view adds a full pass over the tile, "
-            "so inference time scales with the count.")
+        self.tta_combo = QComboBox()
+        for label, scale, rigid in (
+                ("Off", 0, ""),
+                ("Scale ×4", 3, ""),
+                ("Flips ×4", 0, "xflip,yflip,rot180"),
+                ("Flips+rotations ×6", 0, "xflip,yflip,rot180,rot90,rot270"),
+                ("Full ×9", 3, "xflip,yflip,rot180,rot90,rot270")):
+            self.tta_combo.addItem(label, (scale, rigid))
+        self.tta_combo.setToolTip(
+            "Test-time augmentation: each view is a full extra pass whose "
+            "softmax is averaged in (the ×N is the total pass count).\n"
+            "Scale: density views 0.85-1.2 (DG_INFER_TTA).\n"
+            "Flips/rotations: gravity-safe rigid views (DG_INFER_TTA_RIGID) - "
+            "flips are the literature's best value per pass; rotations also "
+            "average out the PTv3 family's serialization orientation "
+            "artifacts.")
+        self.overlap_chk = QCheckBox("Overlap voting")
+        self.overlap_chk.setChecked(True)
+        self.overlap_chk.setToolTip(
+            "Predict on half-tile-strided overlapping tiles and soft-vote per "
+            "voxel with center-tapered weights - the exact protocol of the "
+            "voted full eval, so exported labels match what the metrics "
+            "measured. Fixes context-starved tile edges; costs 2-4x inference "
+            "time (TT_INFER_OVERLAP). RandLA-Net already votes overlapping "
+            "spheres and ignores this.")
         self.probs_chk = QCheckBox("Save class probabilities")
         self.probs_chk.setToolTip(
             "Store the full per-point class distribution (float16) in each "
             "prediction npz (TT_SAVE_PROBS). Needed for soft ensemble voting and "
-            "offline confidence/mask analysis; costs ~2 bytes x classes per point.")
+            "offline confidence/mask analysis; costs ~2 bytes x classes per point. "
+            "Forced on while KNN smoothing is enabled below.")
         dg_row = QHBoxLayout()
         dg_row.addWidget(QLabel("Adapt"))
         dg_row.addWidget(self.adapt_combo)
         dg_row.addWidget(QLabel("TTA"))
-        dg_row.addWidget(self.tta_spin)
+        dg_row.addWidget(self.tta_combo)
+        dg_row.addWidget(self.overlap_chk)
         dg_row.addWidget(self.probs_chk)
         dg_row.addStretch()
         iform.addRow("Domain adaptation", ui.wrap(dg_row))
@@ -468,6 +494,130 @@ class InferPage(QWidget):
         uc_row.addStretch()
         iform.addRow("Confidence", ui.wrap(uc_row))
 
+        # post-inference label cleanup: runs on the *_pred.npz after inference
+        # (and after the ensemble vote), before export; re-runnable any time
+        self.pp_box = QGroupBox("Post-processing (after inference, before export)")
+        self.pp_box.setCheckable(True)
+        self.pp_box.setChecked(True)
+        pp = QFormLayout(self.pp_box)
+        pp.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        self.knn_chk = QCheckBox("KNN smoothing")
+        self.knn_chk.setChecked(True)
+        self.knn_chk.setToolTip(
+            "Gaussian-weighted soft vote over each point's k nearest neighbors "
+            "within the radius (RangeNet++-style, ~+2 mIoU precedent). Small k "
+            "and the hard radius cutoff protect interleaved-class boundaries. "
+            "Needs saved probabilities - forced on while this is checked.")
+        self.knn_k_spin = QSpinBox()
+        self.knn_k_spin.setRange(2, 32)
+        self.knn_k_spin.setValue(8)
+        self.knn_r_spin = QDoubleSpinBox()
+        self.knn_r_spin.setRange(0.05, 10.0)
+        self.knn_r_spin.setSingleStep(0.25)
+        self.knn_r_spin.setDecimals(2)
+        self.knn_r_spin.setValue(0.75)
+        kr = QHBoxLayout()
+        kr.addWidget(self.knn_chk)
+        kr.addWidget(QLabel("k"))
+        kr.addWidget(self.knn_k_spin)
+        kr.addWidget(QLabel("radius m"))
+        kr.addWidget(self.knn_r_spin)
+        kr.addStretch()
+        pp.addRow("Smoothing", ui.wrap(kr))
+        self.sieve_chk = QCheckBox("Remove small islands")
+        self.sieve_chk.setChecked(True)
+        self.sieve_chk.setToolTip(
+            "Dissolve same-class connected components smaller than the minimum "
+            "into the majority label of their surroundings (minimum mapping "
+            "unit; kills vegetation speckles on roofs, ground speckles in cars).")
+        self.sieve_r_spin = QDoubleSpinBox()
+        self.sieve_r_spin.setRange(0.1, 10.0)
+        self.sieve_r_spin.setSingleStep(0.25)
+        self.sieve_r_spin.setDecimals(2)
+        self.sieve_r_spin.setValue(1.0)
+        self.sieve_n_spin = QSpinBox()
+        self.sieve_n_spin.setRange(2, 10000)
+        self.sieve_n_spin.setValue(25)
+        sr = QHBoxLayout()
+        sr.addWidget(self.sieve_chk)
+        sr.addWidget(QLabel("radius m"))
+        sr.addWidget(self.sieve_r_spin)
+        sr.addWidget(QLabel("min pts"))
+        sr.addWidget(self.sieve_n_spin)
+        sr.addStretch()
+        pp.addRow("Sieve", ui.wrap(sr))
+        self.rules_chk = QCheckBox("Geometry rules")
+        self.rules_chk.setToolTip(
+            "Confidence-gated confusion-pair fixes on the scene's raw HAG + "
+            "pgeof planarity/scattering (lasclassify lineage): low-confidence "
+            "vegetation that is high and planar -> building (and the reverse "
+            "for scattered 'building'), ground <-> low vegetation re-banded by "
+            "HAG. Only fires on the class roles picked below; needs Compute "
+            "HAG on the scenes.")
+        self.rules_gate_spin = QDoubleSpinBox()
+        self.rules_gate_spin.setRange(0.0, 1.0)
+        self.rules_gate_spin.setSingleStep(0.05)
+        self.rules_gate_spin.setDecimals(2)
+        self.rules_gate_spin.setValue(0.50)
+        rr = QHBoxLayout()
+        rr.addWidget(self.rules_chk)
+        rr.addWidget(QLabel("confidence gate"))
+        rr.addWidget(self.rules_gate_spin)
+        rr.addStretch()
+        pp.addRow("Rules", ui.wrap(rr))
+        self._role_combos: dict[str, QComboBox] = {}
+        rolerow = QHBoxLayout()
+        for key, label in (("ground", "ground"), ("low_veg", "low veg"),
+                           ("veg", "vegetation"), ("building", "building")):
+            c = QComboBox()
+            c.setToolTip("Which of this run's classes plays this role in the "
+                         "geometry rules; (none) disables the rules that "
+                         "need it.")
+            rolerow.addWidget(QLabel(label))
+            rolerow.addWidget(c)
+            self._role_combos[key] = c
+        rolerow.addStretch()
+        pp.addRow("Class roles", ui.wrap(rolerow))
+        self._rebuild_role_combos()
+
+        # panoptic instances: ALPINE clustering folded in from the old tab -
+        # off by default, expands when the user goes down that path
+        self.pan_box = QGroupBox("Instance clustering (ALPINE, training-free)")
+        self.pan_box.setCheckable(True)
+        self.pan_box.setChecked(False)
+        self.pan_box.setToolTip(
+            "Cluster the checked 'thing' classes into per-point instance ids "
+            "(ALPINE, arXiv 2503.13203) after post-processing; exports as an "
+            "'instance_id' extra dimension (0 = stuff). PLY drops instances - "
+            "pick las/laz/txt/csv.")
+        pv = QVBoxLayout(self.pan_box)
+        self.pan_grid = QGridLayout()
+        self.pan_grid.setColumnStretch(0, 1)
+        pv.addLayout(self.pan_grid)
+        self._pan_rows: list[tuple] = []
+        prow = QHBoxLayout()
+        self.pan_k_spin = QSpinBox()
+        self.pan_k_spin.setRange(2, 256)
+        self.pan_k_spin.setValue(32)
+        self.pan_k_spin.setToolTip("kNN graph neighbors per point (paper default 32).")
+        self.pan_split_chk = QCheckBox("split oversized clusters")
+        self.pan_split_chk.setChecked(True)
+        self.pan_split_chk.setToolTip("Split merged neighbors whose fitted 2D box "
+                                      "exceeds the class footprint (paper's box-splitting).")
+        self.pan_margin_spin = QDoubleSpinBox()
+        self.pan_margin_spin.setRange(1.0, 5.0)
+        self.pan_margin_spin.setSingleStep(0.1)
+        self.pan_margin_spin.setValue(1.3)
+        self.pan_margin_spin.setToolTip("Footprint tolerance before a cluster is split.")
+        prow.addWidget(QLabel("neighbors k"))
+        prow.addWidget(self.pan_k_spin)
+        prow.addWidget(self.pan_split_chk)
+        prow.addWidget(QLabel("margin"))
+        prow.addWidget(self.pan_margin_spin)
+        prow.addStretch()
+        pv.addLayout(prow)
+        self._rebuild_pan_table()
+
         run_row = QHBoxLayout()
         self.run_btn = QPushButton("Run inference")
         self.run_btn.setObjectName("primary")
@@ -484,11 +634,21 @@ class InferPage(QWidget):
                                     "per-class stats print to the log.")
         self.compare_btn.clicked.connect(self._compare_gt)
         run_row.addWidget(self.compare_btn)
+        self.reprocess_btn = QPushButton("Post-process existing…")
+        self.reprocess_btn.setToolTip(
+            "Run the post-processing / instance clustering configured above "
+            "(plus export) on a predictions folder from an earlier inference "
+            "run - no re-inference. Passes always restart from the stored "
+            "original labels, so re-running with new knobs is safe.")
+        self.reprocess_btn.clicked.connect(self._postprocess_existing)
+        run_row.addWidget(self.reprocess_btn)
         run_row.addStretch()
 
         forms_col = QVBoxLayout()
         forms_col.addWidget(wbox)
         forms_col.addWidget(ibox)
+        forms_col.addWidget(self.pp_box)
+        forms_col.addWidget(self.pan_box)
         forms_col.addLayout(run_row)
 
         self.log = LogConsole()
@@ -510,6 +670,14 @@ class InferPage(QWidget):
         self.voter.output.connect(self._append)
         self.voter.done.connect(self._on_voted)
         self.voter.error.connect(self._on_vote_error)
+        self.postprocessor = FuncWorker(self)
+        self.postprocessor.output.connect(self._append)
+        self.postprocessor.done.connect(self._on_postprocessed)
+        self.postprocessor.error.connect(self._on_chain_error)
+        self.clusterer = FuncWorker(self)
+        self.clusterer.output.connect(self._append)
+        self.clusterer.done.connect(self._on_clustered)
+        self.clusterer.error.connect(self._on_chain_error)
         self.cfg_fetcher = FuncWorker(self)
         self.cfg_fetcher.output.connect(self._append)
         self.cfg_fetcher.done.connect(self._on_cfg_fetched)
@@ -579,9 +747,123 @@ class InferPage(QWidget):
         self._refresh_env_marks()
 
     def _set_run_classes(self, names):
-        """Adopt the run's class names (they label the per-class IoU stats)."""
+        """Adopt the run's class names (they label the per-class IoU stats,
+        the rule roles and the instance-clustering thing table)."""
         self._run_class_names = list(names) if names else None
         self._rebuild_class_list()
+        self._rebuild_role_combos()
+        self._rebuild_pan_table()
+
+    _ROLE_GUESS = {"ground": ("ground",), "low_veg": ("low_veg", "low veg", "lowveg"),
+                   "veg": ("veg", "tree", "canopy"), "building": ("building", "roof")}
+
+    def _rebuild_role_combos(self):
+        """(none) + the run's classes per role, pre-guessed by name substring;
+        the guess is a default, the dropdown is the decision."""
+        names = self._run_class_names or []
+        for key, combo in self._role_combos.items():
+            keep = combo.currentText()   # "" only before the first build
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("(none)")
+            combo.addItems([str(n) for n in names])
+            # a deliberate "(none)" survives rebuilds; only a missing or
+            # never-made choice falls back to the substring guess
+            pick = combo.findText(keep) if keep else -1
+            if pick < 0:
+                pick = 0
+                for i, n in enumerate(names, start=1):
+                    low = str(n).lower()
+                    if any(g in low for g in self._ROLE_GUESS[key]) \
+                            and (key != "veg" or "low" not in low):
+                        pick = i
+                        break
+            combo.setCurrentIndex(pick)
+            combo.blockSignals(False)
+
+    def _rebuild_pan_table(self):
+        """Thing-class table (checkbox + footprint spins), name-keyed prefs in
+        appstate 'panoptic_boxes' - folded in from the old Panoptic tab."""
+        while self.pan_grid.count():
+            it = self.pan_grid.takeAt(0)
+            if it.widget():
+                it.widget().deleteLater()
+        self._pan_rows = []
+        names = self._run_class_names or []
+        if not names:
+            ph = QLabel("(load a run to list its classes)")
+            ph.setObjectName("pageSub")
+            self.pan_grid.addWidget(ph, 0, 0)
+            return
+        saved = appstate.get("panoptic_boxes", {})
+        self.pan_grid.addWidget(QLabel("length m"), 0, 1)
+        self.pan_grid.addWidget(QLabel("width m"), 0, 2)
+        for row, name in enumerate(names, start=1):
+            prefs = saved.get(str(name), {})
+            chk = QCheckBox(str(name))
+            # ground-ish classes are terrain, not countable objects
+            chk.setChecked(bool(prefs.get("thing", "ground" not in str(name).lower())))
+            spins = []
+            for col, key in ((1, "l"), (2, "w")):
+                s = QDoubleSpinBox()
+                s.setRange(0.1, 500.0)
+                s.setSingleStep(0.5)
+                s.setValue(float(prefs.get(key, 2.0)))
+                s.setToolTip("Typical object footprint; sets the clustering "
+                             "distance and the split threshold.")
+                self.pan_grid.addWidget(s, row, col)
+                spins.append(s)
+            self.pan_grid.addWidget(chk, row, 0)
+            self._pan_rows.append((row - 1, str(name), chk, spins[0], spins[1]))
+
+    def _pan_things(self, names: list | None) -> dict:
+        """{class index IN `names`: (length_m, width_m)} for checked thing
+        rows, matched by class NAME so a reprocessed folder with a different
+        class order still clusters the right classes; persists the choices
+        name-keyed like the old tab did."""
+        saved = appstate.get("panoptic_boxes", {})
+        for _, name, chk, ls, ws in self._pan_rows:
+            saved[name] = {"thing": chk.isChecked(), "l": ls.value(),
+                           "w": ws.value()}
+        appstate.put("panoptic_boxes", saved)
+        names = [str(n) for n in (names or [])]
+        return {names.index(name): (ls.value(), ws.value())
+                for _, name, chk, ls, ws in self._pan_rows
+                if chk.isChecked() and name in names}
+
+    def _postproc_config(self, names: list | None) -> dict | None:
+        """kwargs for postproc.run_postproc per the group's checkboxes, or
+        None when the group is off / nothing is enabled. Rule roles resolve by
+        class NAME against `names` (the chain target's classes), so a
+        reprocessed folder with a different class order stays correct."""
+        if not self.pp_box.isChecked():
+            return None
+        knn = ({"k": self.knn_k_spin.value(), "radius": self.knn_r_spin.value()}
+               if self.knn_chk.isChecked() else None)
+        sieve = ({"radius": self.sieve_r_spin.value(),
+                  "min_pts": self.sieve_n_spin.value()}
+                 if self.sieve_chk.isChecked() else None)
+        rules = None
+        if self.rules_chk.isChecked():
+            if not names:
+                self._append("[postproc] geometry rules skipped - no class "
+                             "names resolve for this predictions folder")
+            else:
+                names = [str(n) for n in names]
+                roles = {}
+                for key, combo in self._role_combos.items():
+                    t = combo.currentText()
+                    roles[key] = names.index(t) if t in names else None
+                if (roles["veg"] is not None and roles["building"] is not None) or \
+                   (roles["ground"] is not None and roles["low_veg"] is not None):
+                    rules = {"gate": self.rules_gate_spin.value(), "roles": roles}
+                else:
+                    self._append("[postproc] geometry rules skipped - pick at "
+                                 "least one full role pair (vegetation+building "
+                                 "or ground+low veg) in Class roles")
+        if not (knn or sieve or rules):
+            return None
+        return {"knn": knn, "sieve": sieve, "rules": rules}
 
     def _rebuild_class_list(self):
         """One toggled-on button per run class. Deliberately not persisted -
@@ -862,10 +1144,19 @@ class InferPage(QWidget):
             env["DG_INFER_ADABN"] = "1"
         elif adapt == "APCoTTA":
             env["DG_INFER_APCOTTA"] = "1"
-        if self.tta_spin.value() > 0:
-            env["DG_INFER_TTA"] = str(self.tta_spin.value())
+        scale, rigid = self.tta_combo.currentData()
+        if scale:
+            env["DG_INFER_TTA"] = str(scale)
+        if rigid:
+            env["DG_INFER_TTA_RIGID"] = rigid
+        if not self.overlap_chk.isChecked():
+            env["TT_INFER_OVERLAP"] = "0"
         if self.probs_chk.isChecked():
             env["TT_SAVE_PROBS"] = "1"
+        elif self.pp_box.isChecked() and self.knn_chk.isChecked():
+            env["TT_SAVE_PROBS"] = "1"
+            self._append("[postproc] KNN smoothing needs probabilities - "
+                         "saving them for this run (TT_SAVE_PROBS=1)")
         if env:
             self._append("[dg] inference: " + " ".join(f"{k}={v}" for k, v in sorted(env.items())))
         # class mask rides the same env dict, so it covers local, modal and ensemble alike
@@ -1622,7 +1913,8 @@ class InferPage(QWidget):
 
     def _report_predictions(self, pred_dir):
         """Verify predictions landed (a stage can exit 0 yet write nothing),
-        then export them as the chosen format on a worker thread."""
+        then chain post-processing -> instance clustering -> export, each on a
+        worker thread."""
         pred_dir = Path(pred_dir) if pred_dir else None
         if not (pred_dir and pred_dir.is_dir()):
             self._ens_running = False
@@ -1639,17 +1931,160 @@ class InferPage(QWidget):
             self._end_run("✗ no prediction files written")
             return
         appstate.put("last_view_dir", str(pred_dir))
+        self._chain_dir = pred_dir
+        self._chain_scenes = Path(self._staged) / "scenes" if self._staged else None
+        self._chain_names = self._run_class_names
+        self._chain_restore = False
+        self._chain_originals = True
+        self._start_postproc()
+
+    # ------------------------------------------- postproc -> instances -> export
+    def _start_postproc(self):
+        cfg = self._postproc_config(self._chain_names)
+        if not cfg:
+            if self._chain_restore:
+                # reprocess with no passes = reset: restore *_orig labels and
+                # drop stale instance ids before export
+                self._append(f"\n[postproc] no passes enabled - restoring "
+                             f"original predictions in {self._chain_dir}…")
+                self.postprocessor.start(postproc.run_postproc,
+                                         str(self._chain_dir))
+                return
+            self._maybe_cluster()
+            return
+        on = [n for n, v in (("KNN", cfg["knn"]), ("sieve", cfg["sieve"]),
+                             ("rules", cfg["rules"])) if v]
+        self._append(f"\n[postproc] {' + '.join(on)} over {self._chain_dir}…")
+        scenes = (str(self._chain_scenes)
+                  if self._chain_scenes and self._chain_scenes.is_dir() else None)
+        self.postprocessor.start(postproc.run_postproc, str(self._chain_dir),
+                                 scenes_dir=scenes, **cfg)
+
+    def _on_postprocessed(self, result):
+        self._append(f"✓ post-processing changed {result['changed']:,} labels "
+                     f"across {result['files']} scene(s).")
+        self._maybe_cluster()
+
+    def _maybe_cluster(self):
+        if not self.pan_box.isChecked():
+            self._start_export()
+            return
+        if not self._chain_names:
+            self._append("[instances] skipped - no class names resolve for "
+                         "this predictions folder, so thing classes can't be "
+                         "mapped")
+            self._start_export()
+            return
+        things = self._pan_things(self._chain_names)
+        if not things:
+            self._append("[instances] no thing classes checked - skipping "
+                         "clustering")
+            self._start_export()
+            return
+        if self.fmt_combo.currentData() == "ply":
+            self._append("[instances] note: PLY is classification-only - "
+                         "instance ids stay in the npz; pick las/laz/txt/csv "
+                         "to export them")
+        names = {i: n for i, n, *_ in self._pan_rows}
+        self._append("\n[instances] ALPINE clustering (k=%d, split=%s, "
+                     "margin=%.2f) over: %s"
+                     % (self.pan_k_spin.value(), self.pan_split_chk.isChecked(),
+                        self.pan_margin_spin.value(),
+                        ", ".join(f"{names[i]} ({l:g}x{w:g} m)"
+                                  for i, (l, w) in sorted(things.items()))))
+        self.clusterer.start(panoptic.run_panoptic, str(self._chain_dir), things,
+                             k=self.pan_k_spin.value(),
+                             split=self.pan_split_chk.isChecked(),
+                             margin=self.pan_margin_spin.value())
+
+    def _on_clustered(self, result):
+        self._append(f"✓ {result['instances']:,} instances across "
+                     f"{result['files']} scene(s).")
+        self._start_export()
+
+    def _start_export(self):
         fmt = self.fmt_combo.currentData()
         appstate.put("infer_format", fmt)
         appstate.put("infer_codes", self.codes_combo.currentData())
         thr = self.unclass_spin.value() if self.unclass_chk.isChecked() else None
-        inp = self.input_edit.text().strip()
-        originals = ({p.stem: p for p in dataset.expand_inputs(inp)}
-                     if inp and os.path.exists(inp) else {})
+        originals = {}
+        if self._chain_originals:
+            inp = self.input_edit.text().strip()
+            originals = ({p.stem: p for p in dataset.expand_inputs(inp)}
+                         if inp and os.path.exists(inp) else {})
+        else:
+            # reprocess of an older job: the input box has no relation to that
+            # job, and a same-stem collision would rewrite the wrong source
+            self._append("[export] source-dimension carry-over skipped - "
+                         "original inputs for this folder are unknown")
         self._append(f"\n[export] writing predictions as {fmt}…")
-        self.exporter.start(dataset.export_predictions, pred_dir, fmt,
+        self.exporter.start(dataset.export_predictions, self._chain_dir, fmt,
                             class_map=self._class_map(), unclass_threshold=thr,
                             originals=originals)
+
+    def _on_chain_error(self, tb: str):
+        self._ens_running = False
+        self.run_btn.setEnabled(True)
+        self._append(f"\n✗ post-processing step failed; predictions remain as "
+                     f"raw .npz in {self._chain_dir}.\n{tb}")
+        self._end_run("✗ post-processing failed (raw .npz kept)")
+
+    def _postprocess_existing(self):
+        """Run the configured postproc/clustering/export chain on an earlier
+        run's predictions folder - no re-inference, no page-state mutation:
+        roles and thing classes resolve by NAME against the folder's own
+        class list."""
+        if self.runner.running or any(
+                w.running for w in (self.postprocessor, self.clusterer,
+                                    self.exporter, self.voter, self.converter,
+                                    self.preflight)):
+            self._append("A run is already in progress.")
+            return
+        d = QFileDialog.getExistingDirectory(
+            self, "Predictions folder (contains *_pred.npz)",
+            appstate.get("last_view_dir", str(appstate.workspace_dir())))
+        if not d:
+            return
+        p = Path(d)
+        if not any(p.glob("*_pred.npz")):
+            self._append(f"✗ No *_pred.npz files in {p} - pick the predictions "
+                         "folder an inference run wrote.")
+            return
+        names, src = panoptic.class_names_for(p)
+        if names:
+            self._append(f"[postproc] classes from {src}; role and thing "
+                         "choices match by class name")
+        else:
+            self._append("[postproc] no run manifest beside these predictions - "
+                         "geometry rules and instance clustering are disabled "
+                         "for this folder; smoothing/sieve still run")
+        self._chain_dir = p
+        self._chain_scenes = self._resolve_scenes_dir(p)
+        self._chain_names = names
+        self._chain_restore = True
+        self._chain_originals = False
+        if self._chain_scenes is None:
+            self._append("[postproc] staged scenes folder not found for this "
+                         "job - the geometry rule pass will be skipped")
+        appstate.put("last_view_dir", str(p))
+        self.run_btn.setEnabled(False)
+        self._begin_run(f"Post-process - {p.name}")
+        self._start_postproc()
+
+    def _resolve_scenes_dir(self, pred_dir: Path) -> Path | None:
+        """The staged scenes folder for a predictions dir: beside it, in the
+        scratch infer root, or under a known dataset's infer jobs."""
+        job = panoptic.job_id_for(pred_dir)
+        cands = [pred_dir / "scenes", appstate.scratch_infer_dir() / job / "scenes"]
+        for name in appstate.known_datasets():
+            try:
+                cands.append(appstate.dataset_root(name) / "infer" / job / "scenes")
+            except (KeyError, OSError):
+                pass
+        for c in cands:
+            if c.is_dir() and any(c.glob("*.npz")):
+                return c
+        return None
 
     def _owning_dataset(self) -> str | None:
         """Dataset the active weights belong to (ensemble: the first member's)."""
@@ -1752,6 +2187,7 @@ class InferPage(QWidget):
         if not gok:
             self._ens_running = False
             self.run_btn.setEnabled(True)
+            self._end_run("✗ aborted at GPU preflight")
             return
         ok, msg = local_cli.env_preflight(b, self.repo_root)
         if msg:
@@ -1759,6 +2195,7 @@ class InferPage(QWidget):
         if not ok:
             self._ens_running = False
             self.run_btn.setEnabled(True)
+            self._end_run("✗ aborted at env preflight")
             return
         self.runner.start(prog, args, cwd=self.repo_root, extra_env=run_env)
 
@@ -1845,7 +2282,8 @@ class InferPage(QWidget):
         if self.runner.running:
             self.runner.terminate()
             killed = True
-        for w in (self.converter, self.preflight, self.voter, self.exporter):
+        for w in (self.converter, self.preflight, self.voter,
+                  self.postprocessor, self.clusterer, self.exporter):
             if w.running:
                 w.cancel()
                 killed = True
@@ -1857,6 +2295,10 @@ class InferPage(QWidget):
             self._append("[modal] note: killing the local client can leave the "
                          "cloud app running. `modal app list` to check, "
                          "`modal app stop <app>` to stop it.")
+        # FuncWorker cancel is cooperative and its stopped signal connects to
+        # nothing here - re-enable the button on the kill path itself
+        self._ens_running = False
+        self.run_btn.setEnabled(True)
         self._end_run("✗ killed")
 
     def _begin_run(self, title: str):

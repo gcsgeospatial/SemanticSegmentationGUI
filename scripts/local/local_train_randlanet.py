@@ -466,6 +466,8 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
 
     def make_predict_scene(net, num_classes, exclude_idx=None):
         SAVE_PROBS = os.environ.get("TT_SAVE_PROBS") == "1"
+        TTA_VIEWS = tc.infer_tta_views(DG_INFER_TTA,
+                                       os.environ.get("DG_INFER_TTA_RIGID", ""))
 
         def _predict_scene(pc_path):
             z = np.load(pc_path)
@@ -486,11 +488,9 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
               for vp in range(n_passes):
                 rng = np.random.RandomState(20250720 + vp)
                 for pc0, f2, orig in _sphere_blocks(sub_xyz, sub_src, rng):
-                    views = [1.0] + (list(np.linspace(0.85, 1.2, DG_INFER_TTA))
-                                     if DG_INFER_TTA else [])
                     prob = None
-                    for sv in views:
-                        pc_c = (pc0 * sv).astype(np.float32)
+                    for view in TTA_VIEWS:
+                        pc_c = view(pc0).astype(np.float32)
                         item = (pc_c, f2.astype(np.float32), np.zeros(N, np.int64),
                                 np.arange(N, dtype=np.int32), np.array([0], np.int32))
                         batch = _to_device(collate_fn([item]))
