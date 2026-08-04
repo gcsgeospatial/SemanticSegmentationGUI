@@ -2,7 +2,8 @@
 
 Layout: <staging>/<name>/{dataset_meta.json, train|val|test/<scene>.npz} - xyz f64,
 label i32 (-1 = ignore), optional rgb u8 / intensity f32 / return_number f32, with
-inference jobs using the same npz minus `label` under scenes/. The split is decided
+inference jobs using the same npz minus `label` as flat <stem>_input.npz files
+next to job.json (predictions merge into the same npz). The split is decided
 ONCE here (point-count fractions over whole scenes, or tiles of a single cloud
 reassembled into holey per-split clouds) and recorded in dataset_meta.json;
 trainers read the folders verbatim.
@@ -11,6 +12,7 @@ trainers read the folders verbatim.
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import zipfile
@@ -869,8 +871,10 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
         "stats": stats,
     }
 
-    with open(out_root / "dataset_meta.json", "w", encoding="utf-8") as f:
-        json.dump(meta, f, indent=2)
+    # atomic: a crash mid-write must never corrupt the dataset's manifest
+    tmp = out_root / "dataset_meta.json.tmp"
+    tmp.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    os.replace(tmp, out_root / "dataset_meta.json")
     say(f"staged dataset -> {out_root}")
     return out_root
 
@@ -888,8 +892,9 @@ def convert_infer_job(job_id: str, input_dir: str, staging_root: Path, progress=
                       geo_k: int = 100,
                       declared_crs_epsg: int | None = None,
                       out_dir: Path | None = None) -> Path:
-    """Label-less conversion for inference jobs -> <staging>/_infer/<job_id>/ (or
-    out_dir), though the container mount stays /datasets/_infer/<job> either way.
+    """Label-less conversion for inference: each input file becomes
+    <out_dir>/<stem>_input.npz (flat, next to where predictions will merge in)
+    plus one job.json manifest. input_dir may be a single file or a folder.
     intensity_norm MUST match the weights' training norm - a mismatch feeds
     out-of-distribution intensity. hag/ground_value behave as on the Datasets
     page; a scene without ground_value degrades to detection, never to no HAG."""
@@ -912,7 +917,8 @@ def convert_infer_job(job_id: str, input_dir: str, staging_root: Path, progress=
         say(f"  computing geometric feature(s) per scene (pgeof optimal, "
             f"k≤{geo_k}): {', '.join(geo_features)} …")
     out_root = Path(out_dir) if out_dir else (staging_root / "_infer" / job_id)
-    files = discover_scenes(input_dir)
+    inp = Path(input_dir)
+    files = [inp] if inp.is_file() else discover_scenes(input_dir)
     if not files:
         raise FileNotFoundError(f"No supported point-cloud files in {input_dir}")
     spec = None
@@ -928,7 +934,7 @@ def convert_infer_job(job_id: str, input_dir: str, staging_root: Path, progress=
         say(f"  ground from the '{field}' field, value {ground_value}")
     scenes, stats = [], []
     for path in files:
-        out_path = out_root / "scenes" / (path.stem + ".npz")
+        out_path = out_root / (path.stem + "_input.npz")
         say(f"  converting {path.name} ...")
         st = convert_scene(path, spec, {}, out_path, intensity_norm=intensity_norm,
                            compute_hag=hag, ground_value=ground_value,
@@ -947,22 +953,83 @@ def convert_infer_job(job_id: str, input_dir: str, staging_root: Path, progress=
                 f"model receives zeros: {', '.join(st['skipped_fields'])}")
         scenes.append(out_path.name)
         stats.append(st)
-    meta = {
-        "schema_version": 1,
+    update_job_json(out_root, "staging", {
+        "schema_version": 2,
         "job_id": job_id,
         "created_utc": datetime.now(timezone.utc).isoformat(),
-        "input_dir": str(input_dir),
+        "input": str(input_dir),
         "scenes": scenes,
         "sources": {s["scene"]: s["source_file"] for s in stats},
-    }
-    with open(out_root / "job_meta.json", "w", encoding="utf-8") as f:
-        json.dump(meta, f, indent=2)
+        "intensity_norm": intensity_norm, "hag": bool(hag),
+        "hag_filter": hag_filter, "ground_method": ground_method,
+        "ground_value": ground_value, "feature_fields": feature_fields,
+        "geo_features": geo_features, "geo_k": geo_k,
+        "declared_crs_epsg": declared_crs_epsg,
+    })
     say(f"staged inference job -> {out_root}")
     return out_root
 
 
 # e57 deliberately absent: ASTM E2807 defines no classification attribute
 PRED_EXPORT_FORMATS = ("las", "laz", "ply", "txt", "csv")
+
+
+def update_job_json(job_dir, section, doc):
+    """job.json is the single per-job manifest (staging/infer/postproc/
+    panoptic/report); each stage owns one section, atomically rewritten."""
+    path = Path(job_dir) / "job.json"
+    data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    data[section] = doc
+    tmp = path.with_name("job.json.tmp")
+    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+    return doc
+
+
+def infer_stem(path) -> str:
+    """tile_input.npz / tile_pred.npz -> tile (the source-file stem)."""
+    return re.sub(r"_(input|pred)$", "", Path(path).stem)
+
+
+def pred_files(pred_dir) -> list[Path]:
+    """Prediction-bearing npz files in a job dir: merged *_input.npz (the
+    one-file layout) plus standalone *_pred.npz (ensemble members, Modal
+    pulls); when both exist for a stem the merged file wins."""
+    by_stem: dict[str, Path] = {}
+    for pat in ("*_input.npz", "*_pred.npz"):
+        for p in sorted(Path(pred_dir).glob(pat)):
+            by_stem.setdefault(infer_stem(p), p)
+    return sorted(by_stem.values())
+
+
+def merge_predictions(job_dir, pred_src_dir, progress=None) -> int:
+    """Fold standalone <stem>_pred.npz (a Modal pull) into the job's
+    <stem>_input.npz; the pred file is deleted after the fold so the job dir
+    ends at one npz per input. Returns the number of scenes merged."""
+    say = progress or (lambda s: None)
+    n = 0
+    for pf in sorted(Path(pred_src_dir).glob("*_pred.npz")):
+        scene = Path(job_dir) / (infer_stem(pf) + "_input.npz")
+        if not scene.exists():
+            say(f"  ⚠ {pf.name}: no matching *_input.npz in {job_dir}; kept as-is")
+            continue
+        with np.load(scene) as z:
+            d = {k: z[k] for k in z.files}
+        # fresh predictions invalidate any previous postproc/clustering state
+        for stale in ("classification_orig", "confidence_orig", "instance", "probs"):
+            d.pop(stale, None)
+        with np.load(pf) as z:
+            for k in z.files:
+                # scene already holds geometry/channels; take predictions only
+                if k not in ("xyz", "intensity", "crs_wkt", "source_crs_wkt"):
+                    d[k] = z[k]
+        tmp = scene.with_name(scene.stem + ".tmp.npz")
+        np.savez(tmp, **d)
+        os.replace(tmp, scene)
+        pf.unlink()
+        n += 1
+        say(f"  merged predictions into {scene.name}")
+    return n
 
 
 # ASPRS LAS 1.4 standard codes by class-name keyword; first hit wins, so the
@@ -1100,7 +1167,7 @@ def export_predictions(pred_dir, fmt: str, progress=None, class_map=None,
                        unclass_threshold=None, originals=None,
                        entropy=False, margin=False, prob_dims=False,
                        class_names=None) -> list[Path]:
-    """Export each <name>_pred.npz as <name>_pred.<fmt>, with class_map
+    """Export each inferred npz as <stem>_pred.<fmt>, with class_map
     remapping model indices to output codes. las/laz with a matching original
     las/laz in `originals` ({input stem: path}) carries every source dimension
     over; anything else writes xyz + classification [+ confidence]. Points
@@ -1125,8 +1192,12 @@ def export_predictions(pred_dir, fmt: str, progress=None, class_map=None,
             "points export as 255)")
     written: list[Path] = []
     legend_said = False
-    for src in sorted(Path(pred_dir).glob("*_pred.npz")):
+    for src in pred_files(pred_dir):
         with np.load(src) as d:
+            if "classification" not in d.files:
+                say(f"  ⚠ {src.name}: staged scene without predictions yet - "
+                    f"run inference first; skipped.")
+                continue
             xyz = np.asarray(d["xyz"], np.float64)
             cls = np.asarray(d["classification"], np.int64)
             conf = (np.asarray(d["confidence"], np.float32)
@@ -1166,9 +1237,9 @@ def export_predictions(pred_dir, fmt: str, progress=None, class_map=None,
             cls[mask] = unclass
             low = int(mask.sum())
         cls = np.clip(cls, 0, 255).astype(np.uint8)
-        dst = src.with_suffix(f".{fmt}")
+        dst = src.with_name(f"{infer_stem(src)}_pred.{fmt}")
         carried = False
-        orig = (originals or {}).get(src.name[:-len("_pred.npz")])
+        orig = (originals or {}).get(infer_stem(src))
         if fmt in ("las", "laz") and orig and Path(orig).suffix.lower() in (".las", ".laz"):
             try:
                 _rewrite_original(Path(orig), dst, cls, confidence=conf,
@@ -1192,15 +1263,17 @@ def export_predictions(pred_dir, fmt: str, progress=None, class_map=None,
 
 def prediction_report(pred_dir, class_names=None, unclass_threshold=None,
                       margin_threshold=0.1, progress=None) -> dict:
-    """Job-level QA summary over every *_pred.npz: per-class counts and mean
+    """Job-level QA summary over every inferred npz: per-class counts and mean
     confidence, plus mean entropy and contested-point counts when probs were
-    saved. Written to <pred_dir>/report.json and returned. Uncertainty stats
-    are model confidence, not calibrated probability."""
+    saved. Written to job.json's "report" section and returned. Uncertainty
+    stats are model confidence, not calibrated probability."""
     say = progress or (lambda s: None)
     names = list(class_names or [])
     scenes = {}
-    for src in sorted(Path(pred_dir).glob("*_pred.npz")):
+    for src in pred_files(pred_dir):
         with np.load(src) as d:
+            if "classification" not in d.files:
+                continue
             cls = np.asarray(d["classification"], np.int64)
             conf = (np.asarray(d["confidence"], np.float32)
                     if "confidence" in d.files else None)
@@ -1230,15 +1303,14 @@ def prediction_report(pred_dir, class_names=None, unclass_threshold=None,
                 ((top2[:, 1] - top2[:, 0]) < margin_threshold).sum())
         if inst is not None:
             entry["instances"] = int(inst.max(initial=0))
-        scenes[src.name[:-len("_pred.npz")]] = entry
+        scenes[infer_stem(src)] = entry
     if not scenes:
-        raise RuntimeError(f"no *_pred.npz files in {pred_dir}")
+        raise RuntimeError(f"no inferred npz files in {pred_dir}")
     total = sum(s["points"] for s in scenes.values())
     report = {"schema": 1, "class_names": names, "total_points": total,
               "margin_threshold": margin_threshold,
               "unclass_threshold": unclass_threshold, "scenes": scenes}
-    out = Path(pred_dir) / "report.json"
-    out.write_text(json.dumps(report, indent=1), encoding="utf-8")
+    update_job_json(pred_dir, "report", report)
     agg = {}
     for s in scenes.values():
         for label, e in s["classes"].items():

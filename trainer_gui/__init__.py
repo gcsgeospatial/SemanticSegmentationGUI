@@ -6,7 +6,7 @@ __version__ = "0.1.0"
 def _preload_modern_libstdcxx() -> None:
     """Linux: make the conda env's libstdc++ win over the (often older) system one.
 
-    pip wheels with C++ extensions (pgeof, matplotlib) need a recent C++ ABI
+    pip wheels with C++ extensions (pgeof) need a recent C++ ABI
     (CXXABI_1.3.15), which PySide6/Qt normally supplies at startup - but anything
     importing them before Qt can resolve to the system libstdc++.so.6 and fail
     with 'version CXXABI_… not found'. Preloading the env's libstdc++ GLOBAL here

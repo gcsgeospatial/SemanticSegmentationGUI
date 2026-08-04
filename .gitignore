@@ -10,3 +10,4 @@ conda-recipes/
 tools/check_env_sync.py
 tools/package_weights.py
 scripts/helper/_modal_shim.py
+devtools/

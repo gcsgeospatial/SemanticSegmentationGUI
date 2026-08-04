@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog,
                                QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
 from .. import analysis, appstate, dataset, local_cli, modal_cli, theme, ui
-from ..backbones import BACKBONES, GPU_CHOICES, GPU_VRAM_GB, PARAM_TIPS, batch_for_vram
+from ..backbones import BACKBONES, GPU_CHOICES, PARAM_TIPS
 from ..jobs import FuncWorker, JobRunner, LogParser
 from ..logconsole import LogConsole
 
@@ -76,7 +76,6 @@ class TrainPage(QWidget):
         self._run_live = False
         self._run_t0: float | None = None
         self._run_epochs = 0
-        self._local_vram: float | None | str = "?"   # nvidia-smi is slow; probe once
 
         root = QVBoxLayout(self)
         title = QLabel("Train")
@@ -146,8 +145,8 @@ class TrainPage(QWidget):
         self.outvol_edit.setPlaceholderText("<model>-outputs (per-model default)")
         self.outvol_edit.setToolTip(
             "Modal volume runs are written to (created if missing). Empty = one "
-            "volume per model, '<model>-outputs'. The Inference and Plotting "
-            "pages read the same setting, so pick one scheme and stay on it.")
+            "volume per model, '<model>-outputs'. The Inference page reads the "
+            "same setting, so pick one scheme and stay on it.")
         form.addRow("Outputs volume (Modal)", self.outvol_edit)
         self.timeout_spin = QSpinBox()
         self.timeout_spin.setRange(1, 168)
@@ -171,7 +170,6 @@ class TrainPage(QWidget):
         form.addRow("", self.resume_chk)
         self.backbone_combo.currentIndexChanged.connect(self._sync_gpu_default)
         self.gpu_combo.currentIndexChanged.connect(self._refresh_summaries)
-        self.gpu_combo.currentIndexChanged.connect(self._apply_batch_prefill)
 
         run_row = QHBoxLayout()
         self.launch_btn = QPushButton("Launch training")
@@ -247,7 +245,6 @@ class TrainPage(QWidget):
         self.status_worker.done.connect(self._apply_statuses)
         self.parser.epoch.connect(self._on_epoch)
         self.parser.val_metrics.connect(self._on_val)
-        self.parser.run_id.connect(self._on_run_id)
         self.modal_worker.done.connect(self._on_modal_preflight)
         self.modal_worker.error.connect(self._on_modal_preflight_error)
         self.stop_worker.done.connect(self._on_stop_sent)
@@ -511,23 +508,12 @@ class TrainPage(QWidget):
         else:
             w.setValue(float(v))
 
-    def _vram_gb(self) -> tuple[float | None, str]:
-        """(VRAM, source label) of the device this run would land on."""
-        if appstate.get_exec_mode() != "local":
-            g = self.gpu_combo.currentText()
-            return GPU_VRAM_GB.get(g), g
-        if self._local_vram == "?":
-            self._local_vram = local_cli.local_vram_gb()
-        return self._local_vram, "local GPU"
-
     def _apply_batch_prefill(self):
-        """Prefill (never clamp) Batch from the target device's VRAM."""
+        """Prefill Batch with the model's default."""
         w = self._param_widgets.get("batch")
         b = self._backbone()
-        if w is None or b is None:
-            return
-        vram, _src = self._vram_gb()
-        w.setValue(b.batch_default if vram is None else batch_for_vram(b, vram))
+        if w is not None and b is not None:
+            w.setValue(b.batch_default)
 
     def _refresh_summaries(self):
         """Echo the run's headline settings into the launch summary bar."""
@@ -1055,7 +1041,8 @@ class TrainPage(QWidget):
             self._set_run_live(False)
         if code == 0:
             extra = (f" Run id: {self._last_run_id}." if self._last_run_id else "")
-            self._append(f"\n✓ Done.{extra} See the Plotting page for artifacts.")
+            self._append(f"\n✓ Done.{extra} Metrics live in the run dir "
+                         f"(run.json + metrics.csv).")
         else:
             self._append(f"\n✗ Exited with code {code}.")
 
@@ -1078,7 +1065,7 @@ class TrainPage(QWidget):
     def _on_val(self, m: dict):
         """Grey starred row for a held-out val pass: no train loss, val acc/mIoU
         (present-classes). Colored at insert time from the current theme."""
-        grey = QBrush(QColor(theme.colors(appstate.get("ui_theme", "system"))["muted"]))
+        grey = QBrush(QColor(theme.colors()["muted"]))
         r = self.metrics_table.rowCount()
         self.metrics_table.insertRow(r)
         for col, val in enumerate((f"{m['epoch']}★", "-",
@@ -1088,14 +1075,6 @@ class TrainPage(QWidget):
             item.setForeground(grey)
             self.metrics_table.setItem(r, col, item)
         self.metrics_table.scrollToBottom()
-
-    def _on_run_id(self, run_id: str):
-        self._last_run_id = run_id
-        history = appstate.get("run_history", [])
-        b = self._backbone()
-        history.append({"run_id": run_id, "backbone": b.key if b else "",
-                        "dataset": self.dataset_combo.currentText()})
-        appstate.put("run_history", history[-200:])
 
     def _restore_last_config(self):
         """Repopulate the page from the last launched config; stale dataset/

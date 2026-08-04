@@ -13,7 +13,6 @@ contract as panoptic."""
 from __future__ import annotations
 
 import os
-from pathlib import Path
 
 import numpy as np
 from scipy.sparse import coo_matrix
@@ -125,24 +124,23 @@ def _sieve(xyz, labels, radius, min_pts, num_classes):
     return new, int((new != labels).sum())
 
 
-def _rules(labels, conf, scene_path, roles, gate, say):
+def _rules(labels, conf, data, roles, gate, say):
     """Confidence-gated confusion-pair rules; each rule only fires when its
-    class roles resolve and its features exist. The HAG gate runs before any
-    geometry is computed - pgeof over a full scene is minutes, feat_hag is a
-    key read. Returns (labels, changed)."""
+    class roles resolve and its features exist. Channels come from the merged
+    npz itself (the one-file layout). The HAG gate runs before any geometry is
+    computed - pgeof over a full scene is minutes, feat_hag is a key read.
+    Returns (labels, changed)."""
     veg, bld = roles.get("veg"), roles.get("building")
     gnd, lveg = roles.get("ground"), roles.get("low_veg")
-    with np.load(scene_path) as z:
-        if "feat_hag" not in z.files:
-            say("    rules: scene has no feat_hag - enable 'Compute HAG' on "
-                "the Inference page to unlock the HAG rules")
-            return labels, 0
-        hag = z["feat_hag"].astype(np.float32)
-        keys = set(z.files)
-        pl = z["feat_geo_planarity"] if "feat_geo_planarity" in keys else None
-        sc = z["feat_geo_scattering"] if "feat_geo_scattering" in keys else None
-        need_geo = veg is not None and bld is not None and (pl is None or sc is None)
-        xyz = z["xyz"] if need_geo else None
+    if "feat_hag" not in data:
+        say("    rules: no feat_hag in the npz - stage with HAG enabled to "
+            "unlock the HAG rules (ensemble outputs carry no channels)")
+        return labels, 0
+    hag = np.asarray(data["feat_hag"], np.float32)
+    pl = data.get("feat_geo_planarity")
+    sc = data.get("feat_geo_scattering")
+    need_geo = veg is not None and bld is not None and (pl is None or sc is None)
+    xyz = np.asarray(data["xyz"], np.float64) if need_geo else None
     if xyz is not None:
         from . import pretrain
         say(f"    computing planarity/scattering (pgeof) for {len(xyz):,} pts…")
@@ -167,20 +165,25 @@ def _rules(labels, conf, scene_path, roles, gate, say):
     return new, int((new != labels).sum())
 
 
-def run_postproc(pred_dir, scenes_dir=None, knn=None, sieve=None, rules=None,
+def run_postproc(pred_dir, knn=None, sieve=None, rules=None,
                  progress=None) -> dict:
-    """Apply the enabled passes to every *_pred.npz in pred_dir, in the fixed
-    order KNN vote -> sieve -> rules. knn={"k","radius"},
+    """Apply the enabled passes to every inferred npz in pred_dir, in the
+    fixed order KNN vote -> sieve -> rules. knn={"k","radius"},
     sieve={"radius","min_pts"}, rules={"gate","roles":{role: index|None}}.
     With no passes enabled this still restores classification/confidence from
     the stored originals (and drops stale instance ids) - the 'reset' path.
-    Atomic per-file rewrite; postproc.json records settings + change counts."""
+    Atomic per-file rewrite; job.json's "postproc" section records settings +
+    change counts."""
+    from .dataset import pred_files, update_job_json
     say = progress or (lambda s: None)
-    files = sorted(Path(pred_dir).glob("*_pred.npz"))
+    files = []
+    for f in pred_files(pred_dir):
+        with np.load(f) as d:
+            if "classification" in d.files:
+                files.append(f)
     if not files:
-        raise RuntimeError(f"no *_pred.npz files in {pred_dir} - run Inference "
-                           "on this folder first, then come back")
-    scenes_dir = Path(scenes_dir) if scenes_dir else None
+        raise RuntimeError(f"no inferred npz files in {pred_dir} - run "
+                           "Inference on this folder first, then come back")
     stats = []
     for f in files:
         with np.load(f) as d:
@@ -213,16 +216,9 @@ def run_postproc(pred_dir, scenes_dir=None, knn=None, sieve=None, rules=None,
             labels, st["sieve"] = _sieve(xyz, labels, float(sieve["radius"]),
                                          int(sieve["min_pts"]), num_classes)
         if rules:
-            scene = scenes_dir / f.name.replace("_pred.npz", ".npz") \
-                if scenes_dir else None
-            if scene is None or not scene.exists():
-                say(f"  {f.name}: rules skipped - scene npz not found "
-                    f"({scene}); geometry rules need the staged scenes folder")
-            else:
-                say(f"  {f.name}: geometry rules (gate={rules['gate']:g})…")
-                labels, st["rules"] = _rules(labels, conf, scene,
-                                             rules["roles"],
-                                             float(rules["gate"]), say)
+            say(f"  {f.name}: geometry rules (gate={rules['gate']:g})…")
+            labels, st["rules"] = _rules(labels, conf, data, rules["roles"],
+                                         float(rules["gate"]), say)
         data["classification"] = labels.astype(np.int32)
         data["confidence"] = conf.astype(np.float32)
         data.pop("instance", None)   # stale vs the rewritten labels
@@ -232,13 +228,11 @@ def run_postproc(pred_dir, scenes_dir=None, knn=None, sieve=None, rules=None,
         say(f"  {f.name}: changed knn={st['knn']:,} sieve={st['sieve']:,} "
             f"rules={st['rules']:,} of {len(xyz):,} pts")
         stats.append(st)
-    doc = {"knn": knn, "sieve": sieve,
-           "rules": ({"gate": rules["gate"], "roles": rules["roles"]}
-                     if rules else None),
-           "scenes": stats}
-    import json
-    with open(Path(pred_dir) / "postproc.json", "w", encoding="utf-8") as fh:
-        json.dump(doc, fh, indent=2)
+    update_job_json(pred_dir, "postproc", {
+        "knn": knn, "sieve": sieve,
+        "rules": ({"gate": rules["gate"], "roles": rules["roles"]}
+                  if rules else None),
+        "scenes": stats})
     return {"files": len(files),
             "changed": int(sum(s["knn"] + s["sieve"] + s["rules"]
                                for s in stats))}

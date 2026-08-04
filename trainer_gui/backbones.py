@@ -41,7 +41,6 @@ class Backbone:
     script: str
     app_name: str
     rec_gpu: str = "A100"
-    min_vram_gb: int = 16          # VRAM the default batch needs; scales batch_for_vram
     params: list = field(default_factory=list)
 
     @property
@@ -97,7 +96,7 @@ BACKBONES: dict[str, Backbone] = {b.key: b for b in [
         key="ptv3", label="PTv3", script="scripts/modal/modal_train_ptv3.py",
         app_name="ptv3",
         # 24 GB floor: fp32 non-flash attention leaves 16 GB no margin
-        rec_gpu="A100", min_vram_gb=24,
+        rec_gpu="A100",
         params=[ParamSpec("grid", "Grid size (m)", "float", ALS_GRID_M, 0.02, 3.0,
                           step=0.05, decimals=2)]
                + _common(250, 4),
@@ -105,7 +104,7 @@ BACKBONES: dict[str, Backbone] = {b.key: b for b in [
     Backbone(
         key="randlanet", label="RandLA-Net", script="scripts/modal/modal_train_randlanet.py",
         app_name="randlanet-cold",
-        rec_gpu="A10G", min_vram_gb=8,
+        rec_gpu="A10G",
         params=[ParamSpec("sub-grid", "Sub-grid size (m)", "float", ALS_GRID_M, 0.02, 2.0,
                           step=0.05, decimals=2),
                 ParamSpec("num-points", "Points / sample", "int", 45056, 4096, 131072)]
@@ -114,7 +113,7 @@ BACKBONES: dict[str, Backbone] = {b.key: b for b in [
     Backbone(
         key="kpconvx_cold", label="KPConvX-L", script="scripts/modal/modal_train_kpconvx_cold.py",
         app_name="kpconvx-cold",
-        rec_gpu="A100-80GB", min_vram_gb=24,
+        rec_gpu="A100-80GB",
         params=[ParamSpec("grid", "Grid size (m)", "float", ALS_GRID_M, 0.1, 5.0,
                           step=0.05, decimals=2)]
                + _common(150, 4, steps_default=300, tile_m=KP_TILE_M),
@@ -123,7 +122,7 @@ BACKBONES: dict[str, Backbone] = {b.key: b for b in [
     Backbone(
         key="kpconv", label="KPConv", script="scripts/modal/modal_train_kpconv.py",
         app_name="kpconv",
-        rec_gpu="A100-80GB", min_vram_gb=40,
+        rec_gpu="A100-80GB",
         params=[ParamSpec("grid", "Grid size (m)", "float", ALS_GRID_M, 0.1, 5.0,
                           step=0.05, decimals=2)]
                + _common(150, 3, steps_default=300, tile_m=KP_TILE_M),
@@ -132,7 +131,7 @@ BACKBONES: dict[str, Backbone] = {b.key: b for b in [
     Backbone(
         key="concerto", label="Concerto", script="scripts/modal/modal_train_concerto.py",
         app_name="concerto",
-        rec_gpu="A100", min_vram_gb=24,
+        rec_gpu="A100",
         params=[ParamSpec("grid", "Grid size (m)", "float", ALS_GRID_M, 0.02, 3.0,
                           step=0.05, decimals=2),
                 ParamSpec("freeze-encoder", "Freeze encoder (0/1)", "int", 0, 0, 1)]
@@ -141,7 +140,7 @@ BACKBONES: dict[str, Backbone] = {b.key: b for b in [
     Backbone(
         key="sonata", label="Sonata", script="scripts/modal/modal_train_sonata.py",
         app_name="sonata",
-        rec_gpu="A100", min_vram_gb=24,
+        rec_gpu="A100",
         params=[ParamSpec("grid", "Grid size (m)", "float", ALS_GRID_M, 0.02, 3.0,
                           step=0.05, decimals=2),
                 ParamSpec("freeze-encoder", "Freeze encoder (0/1)", "int", 0, 0, 1)]
@@ -150,7 +149,7 @@ BACKBONES: dict[str, Backbone] = {b.key: b for b in [
     Backbone(
         key="utonia", label="Utonia", script="scripts/modal/modal_train_utonia.py",
         app_name="utonia",
-        rec_gpu="A100", min_vram_gb=24,
+        rec_gpu="A100",
         params=[ParamSpec("grid", "Grid size (m)", "float", ALS_GRID_M, 0.02, 3.0,
                           step=0.05, decimals=2),
                 ParamSpec("freeze-encoder", "Freeze encoder (0/1)", "int", 0, 0, 1)]
@@ -160,18 +159,3 @@ BACKBONES: dict[str, Backbone] = {b.key: b for b in [
 
 GPU_CHOICES = ["A10G", "L4", "L40S", "A100", "A100-80GB", "H100"]
 
-GPU_VRAM_GB = {"A10G": 24, "L4": 24, "L40S": 48, "A100": 40,
-               "A100-80GB": 80, "H100": 80}
-
-# weights + optimizer + CUDA context; batch-independent, so it comes off the top
-VRAM_RESERVE_GB = 2.0
-
-
-def batch_for_vram(b: Backbone, vram_gb: float) -> int:
-    """Batch that fits `vram_gb`, scaled linearly from the backbone's known-good
-    (batch_default @ min_vram_gb) pair - VRAM tracks total points, and points
-    scale with batch. Capped at 2x default: past that the tuned LR stops holding
-    (AdamW wants sqrt-scaling) and batch stops being a free hardware knob."""
-    head = max(float(vram_gb) - VRAM_RESERVE_GB, 0.0)
-    ref = max(float(b.min_vram_gb) - VRAM_RESERVE_GB, 1.0)
-    return max(1, min(int(b.batch_default * head / ref), 2 * b.batch_default))

@@ -1,5 +1,7 @@
-"""App theming - Light/Dark/System. apply() sets Fusion + QPalette + QSS; status
-labels use semantic roles via set_accent. Every pair meets WCAG AA."""
+"""App theming - Light/Dark (Vista-simple: flat chrome, aero blue accent).
+The default is whatever the OS says, resolved once at startup; the user's
+explicit pick persists. apply() sets Fusion + QPalette + QSS; status labels
+use semantic roles via set_accent. Every pair meets WCAG AA."""
 
 from __future__ import annotations
 
@@ -7,18 +9,18 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import QApplication, QStyleFactory
 
-# ---- palettes ----
 LIGHT = {
-    "bg": "#ffffff", "panel": "#ffffff", "text": "#1b1f27", "muted": "#5b6273",
-    "border": "#d4d8e0", "disabled_text": "#767d8b",
-    "accent": "#2f6fed", "accent_hover": "#2257c9",
-    "on_accent": "#ffffff", "focus": "#2f6fed",
+    "bg": "#f0f3f8", "panel": "#ffffff", "text": "#1b1f27", "muted": "#5b6273",
+    "border": "#c5cbd6", "disabled_text": "#767d8b",
+    "accent": "#0066cc", "accent_hover": "#0052a3",
+    "on_accent": "#ffffff", "focus": "#0066cc",
     "ok": "#1f7a33", "warn": "#9a5300", "error": "#b03030",
-    "button": "#f5f6f9", "button_hover": "#e9ecf2", "button_text": "#1b1f27",
-    "sel_bg": "#2f6fed", "sel_text": "#ffffff",
+    "button": "#f4f6fa", "button_hover": "#e4ebf5", "button_text": "#1b1f27",
+    "sel_bg": "#0066cc", "sel_text": "#ffffff",
     "log_bg": "#11141b", "log_text": "#d6dae3",
-    "sidebar_bg": "#1f2430", "sidebar_text": "#c8cdd6", "sidebar_muted": "#8b93a4",
-    "sidebar_sel_bg": "#323a4d", "sidebar_sel_text": "#ffffff", "sidebar_disabled": "#5b6273",
+    "sidebar_bg": "#dfe7f2", "sidebar_text": "#2a3140", "sidebar_muted": "#5b6273",
+    "sidebar_sel_bg": "#0066cc", "sidebar_sel_text": "#ffffff",
+    "sidebar_disabled": "#8b93a4",
 }
 DARK = {
     "bg": "#1b1f27", "panel": "#232936", "text": "#e8ebf1", "muted": "#a6b0c0",
@@ -30,14 +32,13 @@ DARK = {
     "sel_bg": "#3b6cf6", "sel_text": "#ffffff",
     "log_bg": "#0e1116", "log_text": "#d6dae3",
     "sidebar_bg": "#161a22", "sidebar_text": "#c8cdd6", "sidebar_muted": "#8b93a4",
-    "sidebar_sel_bg": "#2c3445", "sidebar_sel_text": "#ffffff", "sidebar_disabled": "#5b6273",
+    "sidebar_sel_bg": "#3b6cf6", "sidebar_sel_text": "#ffffff",
+    "sidebar_disabled": "#5b6273",
 }
 
 
-def resolve(mode: str) -> str:
-    """'light'/'dark'/'system' -> concrete theme name."""
-    if mode in ("light", "dark"):
-        return mode
+def system_default() -> str:
+    """What the OS says, resolved once - there is no live 'System' mode."""
     try:
         if QApplication.styleHints().colorScheme() == Qt.ColorScheme.Dark:
             return "dark"
@@ -46,8 +47,13 @@ def resolve(mode: str) -> str:
     return "light"
 
 
-def colors(mode: str) -> dict:
-    return DARK if resolve(mode) == "dark" else LIGHT
+def current_mode() -> str:
+    from . import appstate
+    return appstate.get("ui_theme") or system_default()
+
+
+def colors(mode: str = "") -> dict:
+    return DARK if (mode or current_mode()) == "dark" else LIGHT
 
 
 def _palette(c: dict) -> QPalette:
@@ -75,23 +81,24 @@ def _palette(c: dict) -> QPalette:
 def _qss(c: dict) -> str:
     return f"""
 QWidget {{ font-size: 14px; }}
-#sidebar {{ background: {c['sidebar_bg']}; }}
-#sidebar QListWidget {{ background: {c['sidebar_bg']}; color: {c['sidebar_text']};
-                        border: none; outline: none; }}
-#sidebar QListWidget::item {{ padding: 12px 18px; }}
-#sidebar QListWidget::item:selected {{ background: {c['sidebar_sel_bg']};
-                                       color: {c['sidebar_sel_text']}; }}
-#sidebar QListWidget::item:disabled {{ color: {c['sidebar_disabled']}; }}
-#brand {{ color: {c['sidebar_sel_text']}; font-size: 18px; font-weight: 600;
-          padding: 18px 18px 6px 18px; }}
-#brandSub, #modeLabel {{ color: {c['sidebar_muted']}; padding: 0 18px 14px 18px; }}
-#modeLabel {{ padding: 4px 18px 2px 18px; font-size: 12px; }}
-#sidebar QComboBox {{ background: {c['button']}; color: {c['text']};
-                      border: 1px solid {c['border']}; border-radius: 4px;
-                      padding: 4px 8px; margin: 0 18px 12px 18px; }}
-#sidebar QComboBox QAbstractItemView {{ background: {c['panel']}; color: {c['text']};
-                                        selection-background-color: {c['sel_bg']};
-                                        selection-color: {c['sel_text']}; }}
+#topbar {{ background: {c['sidebar_bg']}; border-bottom: 1px solid {c['border']};
+           min-height: 44px; }}
+#topbar QTabBar {{ background: transparent; }}
+#topbar QTabBar::tab {{ background: transparent; color: {c['sidebar_text']};
+                        padding: 12px 18px; border: none; }}
+#topbar QTabBar::tab:selected {{ color: {c['accent']}; font-weight: 600;
+                                 border-bottom: 3px solid {c['accent']}; }}
+#topbar QTabBar::tab:hover:!selected {{ color: {c['text']};
+                                        border-bottom: 3px solid {c['border']}; }}
+#brand {{ color: {c['text']}; font-size: 16px; font-weight: 600;
+          padding: 0 10px 0 4px; }}
+#brandSub {{ color: {c['sidebar_muted']}; font-size: 12px; }}
+#topbar QComboBox {{ background: {c['panel']}; color: {c['text']};
+                     border: 1px solid {c['border']}; border-radius: 4px;
+                     padding: 4px 8px; }}
+#topbar QComboBox QAbstractItemView {{ background: {c['panel']}; color: {c['text']};
+                                       selection-background-color: {c['sel_bg']};
+                                       selection-color: {c['sel_text']}; }}
 #pageTitle {{ font-size: 22px; font-weight: 600; color: {c['text']}; }}
 #pageSub {{ color: {c['muted']}; margin-bottom: 8px; }}
 #log {{ font-family: "Cascadia Code", "JetBrains Mono", Consolas, "Courier New", monospace;
@@ -124,7 +131,8 @@ QPushButton#primary:disabled {{ background: {c['button']}; color: {c['disabled_t
                                 border: 1px solid {c['border']}; }}
 
 QGroupBox {{ font-weight: 600; margin-top: 12px; border: 1px solid {c['border']};
-             border-radius: 6px; padding: 18px 14px 14px 14px; color: {c['text']}; }}
+             border-radius: 6px; padding: 18px 14px 14px 14px; color: {c['text']};
+             background: {c['panel']}; }}
 QGroupBox::title {{ subcontrol-origin: margin; left: 10px; padding: 0 4px; color: {c['text']}; }}
 
 QPushButton:focus, QLineEdit:focus, QComboBox:focus, QPlainTextEdit:focus,
@@ -140,8 +148,8 @@ QLabel[accent="error"] {{ color: {c['error']}; }}
 """
 
 
-def apply(app: QApplication, mode: str) -> None:
-    """Apply the resolved theme; safe to call repeatedly (live-switches)."""
+def apply(app: QApplication, mode: str = "") -> None:
+    """Apply light or dark; safe to call repeatedly (live-switches)."""
     c = colors(mode)
     if "Fusion" in QStyleFactory.keys():
         app.setStyle("Fusion")            # honors the palette on every platform

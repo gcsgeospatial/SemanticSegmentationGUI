@@ -4,7 +4,6 @@ Local: convert -> pixi run (TT_* env)."""
 
 from __future__ import annotations
 
-import csv
 import json
 import os
 import shutil
@@ -12,165 +11,18 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-import numpy as np
-from PySide6.QtCore import Qt
 from PySide6.QtGui import QCursor
-from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDoubleSpinBox,
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox,
                                QFileDialog, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout,
                                QLabel, QLineEdit, QListWidget, QMenu,
-                               QPushButton, QRadioButton, QSpinBox, QTableWidget,
-                               QTableWidgetItem, QVBoxLayout, QWidget)
+                               QPushButton, QRadioButton, QSpinBox,
+                               QVBoxLayout, QWidget)
 
-from .. import (analysis, appstate, dataset, local_cli, modal_cli, panoptic,
-                plots, postproc, pretrain, ui)
+from .. import (appstate, dataset, local_cli, modal_cli, panoptic,
+                postproc, pretrain, ui)
 from ..backbones import ALS_GRID_M, ALS_TILE_M, BACKBONES
 from ..jobs import FuncWorker, JobRunner
 from ..logconsole import LogConsole
-
-
-class GtCompareDialog(QDialog):
-    """Compare a prediction to ground truth: pick both files, then map each
-    truth class to a prediction class (or ignore it). Only mapped truth
-    points are scored, so schema mismatches never poison the metrics."""
-
-    IGNORE = -1
-    _FLT = "Labeled clouds (*.npz *.las *.laz *.ply *.txt *.csv);;All files (*)"
-
-    def __init__(self, parent, class_names: list | None):
-        super().__init__(parent)
-        self.setWindowTitle("Compare to ground truth")
-        self._names = class_names or []
-        self.pred_path = self.gt_path = ""
-        self.pred_arr = self.gt_arr = None
-        self.gt_map: dict[int, int] = {}
-        self._combos: dict[int, QComboBox] = {}
-
-        lay = QVBoxLayout(self)
-        form = QFormLayout()
-        self.pred_edit = QLineEdit()
-        self.gt_edit = QLineEdit()
-        for label, edit, pick in (("Prediction", self.pred_edit, self._pick_pred),
-                                  ("Ground truth", self.gt_edit, self._pick_gt)):
-            edit.setReadOnly(True)
-            row = QHBoxLayout()
-            row.addWidget(edit, 1)
-            btn = QPushButton("Browse…")
-            btn.clicked.connect(pick)
-            row.addWidget(btn)
-            form.addRow(label, ui.wrap(row))
-        lay.addLayout(form)
-
-        self.table = QTableWidget(0, 3)
-        self.table.setHorizontalHeaderLabels(
-            ["Truth class", "Points", "Counts as prediction class"])
-        self.table.horizontalHeader().setStretchLastSection(True)
-        self.table.verticalHeader().setVisible(False)
-        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
-        lay.addWidget(self.table, 1)
-
-        self.status = QLabel("Pick a prediction and its ground truth; truth classes "
-                             "appear here for mapping. Unmapped classes are ignored, "
-                             "never counted against the model.")
-        self.status.setWordWrap(True)
-        lay.addWidget(self.status)
-
-        btns = QHBoxLayout()
-        btns.addStretch()
-        cancel = QPushButton("Cancel")
-        cancel.clicked.connect(self.reject)
-        btns.addWidget(cancel)
-        self.go_btn = QPushButton("Compare")
-        self.go_btn.setObjectName("primary")
-        self.go_btn.clicked.connect(self._go)
-        btns.addWidget(self.go_btn)
-        lay.addLayout(btns)
-        self.resize(600, 500)
-
-    def _name(self, c: int) -> str:
-        return (f"{c}: {self._names[c]}" if 0 <= c < len(self._names)
-                else f"class {c}")
-
-    def _load(self, path: str) -> np.ndarray | None:
-        QApplication.setOverrideCursor(QCursor(Qt.WaitCursor))
-        try:
-            return analysis.read_classes(Path(path))
-        except Exception as e:
-            self.status.setText(f"✗ {e}")
-            return None
-        finally:
-            QApplication.restoreOverrideCursor()
-
-    def _pick_pred(self):
-        p, _ = QFileDialog.getOpenFileName(self, "Prediction cloud",
-                                           appstate.get("last_view_dir", ""), self._FLT)
-        if not p:
-            return
-        arr = self._load(p)
-        if arr is None:
-            return
-        self.pred_path, self.pred_arr = p, arr
-        self.pred_edit.setText(p)
-        appstate.put("last_view_dir", str(Path(p).parent))
-        self._rebuild()
-
-    def _pick_gt(self):
-        p, _ = QFileDialog.getOpenFileName(self, "Ground truth for this scene",
-                                           appstate.get("truth_file", ""), self._FLT)
-        if not p:
-            return
-        arr = self._load(p)
-        if arr is None:
-            return
-        self.gt_path, self.gt_arr = p, arr
-        self.gt_edit.setText(p)
-        appstate.put("truth_file", p)
-        self._rebuild()
-
-    def _rebuild(self):
-        """Mapping table: one row per truth class, combo of prediction classes.
-        Default = same id where it exists in the prediction, saved map wins."""
-        self.table.setRowCount(0)
-        self._combos = {}
-        if self.gt_arr is None:
-            return
-        vals, counts = np.unique(self.gt_arr[self.gt_arr >= 0], return_counts=True)
-        pred_classes = ([] if self.pred_arr is None else
-                        [int(v) for v in np.unique(self.pred_arr) if v >= 0])
-        saved = appstate.get("gt_class_map") or {}
-        self.table.setRowCount(len(vals))
-        for r, (v, cnt) in enumerate(zip(vals, counts)):
-            v = int(v)
-            self.table.setItem(r, 0, QTableWidgetItem(self._name(v)))
-            self.table.setItem(r, 1, QTableWidgetItem(f"{int(cnt):,}"))
-            combo = QComboBox()
-            combo.addItem("— ignore —", self.IGNORE)
-            for pc in pred_classes:
-                combo.addItem(self._name(pc), pc)
-            want = saved.get(str(v), v if v in pred_classes else self.IGNORE)
-            combo.setCurrentIndex(max(combo.findData(int(want)), 0))
-            self.table.setCellWidget(r, 2, combo)
-            self._combos[v] = combo
-        if pred_classes:
-            self.status.setText("Review the mapping, then Compare.")
-
-    def _go(self):
-        if self.pred_arr is None or self.gt_arr is None:
-            self.status.setText("✗ Pick both a prediction and a ground truth file first.")
-            return
-        if len(self.pred_arr) != len(self.gt_arr):
-            self.status.setText(
-                f"✗ Point counts differ ({len(self.pred_arr):,} vs "
-                f"{len(self.gt_arr):,}) - these files don't match point-for-point. "
-                f"Pick the prediction exported from this exact scene.")
-            return
-        self.gt_map = {v: int(c.currentData()) for v, c in self._combos.items()
-                       if c.currentData() != self.IGNORE}
-        if not self.gt_map:
-            self.status.setText("✗ Every truth class is set to ignore - map at "
-                                "least one to a prediction class.")
-            return
-        appstate.put("gt_class_map", {str(k): v for k, v in self.gt_map.items()})
-        self.accept()
 
 
 class InferPage(QWidget):
@@ -202,7 +54,6 @@ class InferPage(QWidget):
         self._ens_idx = -1
         self._ens_dirs: list[Path] = []
         self._chain_dir: Path | None = None     # postproc/panoptic/export target
-        self._chain_scenes: Path | None = None  # staged scenes for the rule pass
         self._chain_names: list | None = None   # class names of the chain target
         self._chain_restore = False             # reprocess: reset even with no passes
         self._chain_originals = True            # input box matches the chain target
@@ -436,7 +287,7 @@ class InferPage(QWidget):
             "Toggle off classes that don't exist in these scenes. Their probability is "
             "zeroed after vote accumulation and the rest renormalized, so each point "
             "falls to its next-best class; exported confidence (and the low-confidence "
-            "gate above) are post-mask. Recorded in infer_run.json.")
+            "gate above) are post-mask. Recorded in job.json.")
         self._class_btns: list[QPushButton] = []
         self.class_mask_lbl = QLabel("")
         self.class_mask_lbl.setObjectName("pageSub")
@@ -627,13 +478,6 @@ class InferPage(QWidget):
         self.kill_btn.setVisible(False)
         self.kill_btn.clicked.connect(self._kill)
         run_row.addWidget(self.kill_btn)
-        self.compare_btn = QPushButton("Compare to ground truth…")
-        self.compare_btn.setToolTip("Pick a prediction + its ground truth, map truth "
-                                    "classes to prediction classes, and score only the "
-                                    "mapped points: accuracy, mIoU, macro-F1 and "
-                                    "per-class stats print to the log.")
-        self.compare_btn.clicked.connect(self._compare_gt)
-        run_row.addWidget(self.compare_btn)
         self.reprocess_btn = QPushButton("Post-process existing…")
         self.reprocess_btn.setToolTip(
             "Run the post-processing / instance clustering configured above "
@@ -1035,12 +879,8 @@ class InferPage(QWidget):
         self.run_combo.blockSignals(True)
         self.run_combo.clear()
         seen = set()
-        for h in reversed(appstate.get("run_history", [])):
-            if h["run_id"] not in seen:
-                seen.add(h["run_id"])
-                self.run_combo.addItem(f"{h['run_id']}  ({h['backbone']})", h)
         for root in appstate.run_roots(self.repo_root):
-            for rdir in plots.discover_runs(root):
+            for rdir in appstate.discover_runs(root):
                 if rdir.name in seen:
                     continue
                 m = _manifest_in(rdir)
@@ -1289,24 +1129,10 @@ class InferPage(QWidget):
         if not m:
             self._append(f"✗ No run.json for '{rid}' on any outputs volume. Set "
                          f"Architecture / grid / tile manually.")
-            self._forget_run(rid)
             return
         if self._combo_run_ref()[1] != rid:
             return
         self._apply_modal_manifest(m, rid)
-
-    def _forget_run(self, rid: str):
-        """Purge a history run that's gone from Modal; a pasted id that was
-        never in history is left alone."""
-        hist = appstate.get("run_history", [])
-        kept = [h for h in hist if h.get("run_id") != rid]
-        if len(kept) == len(hist):
-            return
-        appstate.put("run_history", kept)
-        if self._combo_run_ref()[1] == rid:
-            self.run_combo.clearEditText()
-        self.reload_runs()
-        self._append(f"  (dropped '{rid}' from the run list; stale history entry.)")
 
     def _apply_modal_manifest(self, m: dict, rid: str):
         """Apply + lock a manifest resolved from a Modal run id (no local path)."""
@@ -1547,7 +1373,8 @@ class InferPage(QWidget):
                              f"{m['weights']}")
                 return
         self._job_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self._begin_run(f"ensemble inference · {n} members · job {self._job_id}")
+        self._job_name = _job_name_for(input_dir)
+        self._begin_run(f"ensemble inference · {n} members · job {self._job_name}")
         self.run_btn.setEnabled(False)
         self._ens_running, self._ens_idx, self._ens_dirs = True, -1, []
         if not self._check_hag():
@@ -1570,8 +1397,8 @@ class InferPage(QWidget):
         self._start_local_infer(member=m)
 
     def _on_member_done(self):
-        """Keep the member's infer_run.json beside its predictions (the vote's
-        class clamp reads it), then next member or vote."""
+        """Keep the member's job.json beside its predictions (the vote's
+        class clamp reads its infer section), then next member or vote."""
         if not list(self._pred_dir.glob("*_pred.npz")):
             self._ens_running = False
             self.run_btn.setEnabled(True)
@@ -1579,30 +1406,40 @@ class InferPage(QWidget):
                          f"predictions in {self._pred_dir}. Check the log above.")
             self._end_run(f"✗ ensemble member {self._ens_idx + 1} wrote no predictions")
             return
-        src = Path(self._staged) / "infer_run.json"
+        src = Path(self._staged) / "job.json"
         if src.is_file():
             try:
-                shutil.copy2(src, self._pred_dir / "infer_run.json")
+                shutil.copy2(src, self._pred_dir / "job.json")
             except OSError as e:
-                self._append(f"[ensemble] (couldn't copy infer_run.json: {e})")
+                self._append(f"[ensemble] (couldn't copy job.json: {e})")
         self._ens_dirs.append(self._pred_dir)
         if self._ens_idx + 1 < len(self._ens_members):
             self._start_next_member()
             return
-        ens_dir = (appstate.workspace_dir() / "inference" / "ensemble"
-                   / f"predictions_{self._job_id}_ensemble")
+        # the vote lands in the job root itself; everything ensemble stays
+        # inside this one directory
+        ens_dir = Path(self._staged)
         self._append(f"\n[ensemble] voting over {len(self._ens_dirs)} member "
                      f"run(s) -> {ens_dir}…")
         self.voter.start(_vote_members, [str(d) for d in self._ens_dirs], str(ens_dir))
 
     def _on_voted(self, ens_dir):
-        self._report_predictions(Path(ens_dir))
+        """Fold the vote result into the *_input.npz (one file per input) and
+        drop the transient member outputs; they only exist to be voted over."""
+        ens_dir = Path(ens_dir)
+        try:
+            dataset.merge_predictions(ens_dir, ens_dir, progress=self._append)
+            shutil.rmtree(ens_dir / "members", ignore_errors=True)
+        except Exception as e:
+            self._append(f"⚠ couldn't fold the vote into *_input.npz ({e}); "
+                         f"member outputs kept in {ens_dir / 'members'}")
+        self._report_predictions(ens_dir)
 
     def _on_vote_error(self, tb: str):
         self._ens_running = False
         self.run_btn.setEnabled(True)
         self._append(f"\n✗ ensemble vote failed. The per-member predictions "
-                     f"remain in their predictions_{self._job_id}_m<k> folders.\n{tb}")
+                     f"remain in {Path(self._staged) / 'members'}.\n{tb}")
         self._end_run("✗ ensemble vote failed")
 
     def _run(self):
@@ -1664,7 +1501,8 @@ class InferPage(QWidget):
             return
 
         self._job_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self._begin_run(f"inference · {bkey} · job {self._job_id}")
+        self._job_name = _job_name_for(input_dir)
+        self._begin_run(f"inference · {bkey} · job {self._job_name}")
         self.run_btn.setEnabled(False)
         # runs enter history at train start and may lack final_model.pth, so check before paying (a downloaded run provably has weights)
         if modal and weights_run_id:
@@ -1807,20 +1645,16 @@ class InferPage(QWidget):
         return fields or None, geo or None, (geo_k if geo_k is not None else 100)
 
     def _infer_out_dir(self) -> Path:
-        """Local: converted scenes live inside the run's prediction folder
-        (workspace/inference/<run_tag>/predictions_<job>/scenes) - no separate
-        _infer staging area. Modal keeps the dataset/scratch staging spot for
-        the volume upload."""
-        if appstate.get_exec_mode() == "local":
-            base = appstate.workspace_dir() / "inference"
-            if self._ens_running:
-                return base / "ensemble" / f"predictions_{self._job_id}_ensemble"
-            return base / self._weights_run_tag() / f"predictions_{self._job_id}"
-        name = self._owning_dataset()
-        staged = appstate.known_datasets().get(name or "", {}).get("staged_dir", "")
-        if staged and os.path.isdir(staged):
-            return appstate.dataset_root(name) / "infer" / self._job_id
-        return appstate.scratch_infer_dir() / self._job_id
+        """One job dir for local and Modal alike: staged *_input.npz + job.json
+        with predictions merged in, named after the input; the timestamp job id
+        only appears on a name collision. Compute once per run (the collision
+        check depends on what's on disk)."""
+        base = appstate.workspace_dir() / "inference"
+        tag = "ensemble" if self._ens_running else self._weights_run_tag()
+        d = base / tag / f"predictions_{self._job_name}"
+        if d.exists() and any(d.iterdir()):
+            d = base / tag / f"predictions_{self._job_name}_{self._job_id}"
+        return d
 
     def _on_preflight(self, present):
         """Weights check: True=found, False=missing (block), None=couldn't list (proceed)."""
@@ -1893,11 +1727,9 @@ class InferPage(QWidget):
         elif self._stage == "upload_weights":
             self._start_modal_run()
         elif self._stage == "run":
-            self._dl_dest = (appstate.workspace_dir() / "inference"
-                             / self._weights_run_tag()
-                             / f"predictions_{self._job_id}")
+            self._dl_dest = Path(self._staged) / "_pull"
             self._dl_dest.mkdir(parents=True, exist_ok=True)
-            self._append(f"[4/4] Downloading predictions -> {self._dl_dest}…")
+            self._append(f"[4/4] Downloading predictions -> {self._staged}…")
             self._stage = "download"
             prog, args = modal_cli.volume_get(self._ds_vol,
                                               f"_infer/{self._job_id}/predictions",
@@ -1909,7 +1741,19 @@ class InferPage(QWidget):
             else:
                 self._report_predictions(self._pred_dir)
         elif self._stage == "download":
-            self._report_predictions(self._dl_dest / "predictions")
+            # fold the pulled standalone *_pred.npz into the staged
+            # *_input.npz - the job dir ends at one npz per input either way
+            try:
+                dataset.merge_predictions(self._staged,
+                                          self._dl_dest / "predictions",
+                                          progress=self._append)
+                shutil.rmtree(self._dl_dest, ignore_errors=True)
+            except Exception as e:
+                self._append(f"✗ merging pulled predictions failed: {e}; the "
+                             f"raw pull is kept in {self._dl_dest}")
+                self._end_run("✗ prediction merge failed")
+                return
+            self._report_predictions(Path(self._staged))
 
     def _report_predictions(self, pred_dir):
         """Verify predictions landed (a stage can exit 0 yet write nothing),
@@ -1932,7 +1776,6 @@ class InferPage(QWidget):
             return
         appstate.put("last_view_dir", str(pred_dir))
         self._chain_dir = pred_dir
-        self._chain_scenes = Path(self._staged) / "scenes" if self._staged else None
         self._chain_names = self._run_class_names
         self._chain_restore = False
         self._chain_originals = True
@@ -1955,10 +1798,8 @@ class InferPage(QWidget):
         on = [n for n, v in (("KNN", cfg["knn"]), ("sieve", cfg["sieve"]),
                              ("rules", cfg["rules"])) if v]
         self._append(f"\n[postproc] {' + '.join(on)} over {self._chain_dir}…")
-        scenes = (str(self._chain_scenes)
-                  if self._chain_scenes and self._chain_scenes.is_dir() else None)
         self.postprocessor.start(postproc.run_postproc, str(self._chain_dir),
-                                 scenes_dir=scenes, **cfg)
+                                 **cfg)
 
     def _on_postprocessed(self, result):
         self._append(f"✓ post-processing changed {result['changed']:,} labels "
@@ -2041,14 +1882,14 @@ class InferPage(QWidget):
             self._append("A run is already in progress.")
             return
         d = QFileDialog.getExistingDirectory(
-            self, "Predictions folder (contains *_pred.npz)",
+            self, "Predictions folder (contains inferred .npz files)",
             appstate.get("last_view_dir", str(appstate.workspace_dir())))
         if not d:
             return
         p = Path(d)
-        if not any(p.glob("*_pred.npz")):
-            self._append(f"✗ No *_pred.npz files in {p} - pick the predictions "
-                         "folder an inference run wrote.")
+        if not dataset.pred_files(p):
+            self._append(f"✗ No inferred .npz files in {p} - pick the folder "
+                         "an inference run wrote.")
             return
         names, src = panoptic.class_names_for(p)
         if names:
@@ -2059,32 +1900,13 @@ class InferPage(QWidget):
                          "geometry rules and instance clustering are disabled "
                          "for this folder; smoothing/sieve still run")
         self._chain_dir = p
-        self._chain_scenes = self._resolve_scenes_dir(p)
         self._chain_names = names
         self._chain_restore = True
         self._chain_originals = False
-        if self._chain_scenes is None:
-            self._append("[postproc] staged scenes folder not found for this "
-                         "job - the geometry rule pass will be skipped")
         appstate.put("last_view_dir", str(p))
         self.run_btn.setEnabled(False)
         self._begin_run(f"Post-process - {p.name}")
         self._start_postproc()
-
-    def _resolve_scenes_dir(self, pred_dir: Path) -> Path | None:
-        """The staged scenes folder for a predictions dir: beside it, in the
-        scratch infer root, or under a known dataset's infer jobs."""
-        job = panoptic.job_id_for(pred_dir)
-        cands = [pred_dir / "scenes", appstate.scratch_infer_dir() / job / "scenes"]
-        for name in appstate.known_datasets():
-            try:
-                cands.append(appstate.dataset_root(name) / "infer" / job / "scenes")
-            except (KeyError, OSError):
-                pass
-        for c in cands:
-            if c.is_dir() and any(c.glob("*.npz")):
-                return c
-        return None
 
     def _owning_dataset(self) -> str | None:
         """Dataset the active weights belong to (ensemble: the first member's)."""
@@ -2118,11 +1940,11 @@ class InferPage(QWidget):
         self._ens_running = False
         self.run_btn.setEnabled(True)
         if not written:
-            self._append("✗ Nothing exported (no *_pred.npz in the predictions folder).")
+            self._append("✗ Nothing exported (no inferred .npz in the predictions folder).")
             self._end_run("✗ nothing exported")
             return
-        self._append(f"\n✓ Done - {len(written)} prediction file(s) in {written[0].parent}.\n"
-                     f"  'Compare to ground truth…' for accuracy + mIoU.")
+        self._append(f"\n✓ Done - {len(written)} prediction file(s) in "
+                     f"{written[0].parent}.")
         self._end_run(f"✓ exported {len(written)} prediction file(s)")
 
     def _on_export_error(self, tb: str):
@@ -2154,10 +1976,14 @@ class InferPage(QWidget):
         """Local pixi inference via the TT_* env contract; `member` overrides
         the UI-derived backbone/weights/grid (ensemble)."""
         b = BACKBONES[member["backbone"]] if member else self._backbone()
-        suffix = f"_m{self._ens_idx + 1}" if member else ""
-        self._pred_dir = (appstate.workspace_dir() / "inference"
-                          / self._weights_run_tag(member)
-                          / f"predictions_{self._job_id}{suffix}")
+        # one dir per job: solo runs merge predictions into the staged
+        # *_input.npz in place; ensemble members write standalone *_pred.npz
+        # under members/ (transient - deleted after the vote folds in)
+        if member:
+            self._pred_dir = (Path(self._staged) / "members"
+                              / f"m{self._ens_idx + 1}_{member['backbone']}")
+        else:
+            self._pred_dir = Path(self._staged)
         self._pred_dir.mkdir(parents=True, exist_ok=True)
         if member:
             wpath = Path(member["weights"])
@@ -2215,65 +2041,6 @@ class InferPage(QWidget):
         self.run_btn.setEnabled(True)
         self._append(f"\n✗ Failed to start: {err}")
         self._end_run("✗ failed to start")
-
-    def _compare_gt(self):
-        """Class-mapping compare dialog, then score only mapped truth points
-        and print accuracy / mIoU / macro-F1 + per-class stats to the log."""
-        dlg = GtCompareDialog(self, self._run_class_names)
-        if dlg.exec() != QDialog.Accepted:
-            return
-        pred, gt = dlg.pred_path, dlg.gt_path
-        m = analysis.prediction_metrics(dlg.pred_arr, dlg.gt_arr, dlg.gt_map)
-        names = self._run_class_names or []
-        nm = lambda c: names[c] if 0 <= c < len(names) else f"class {c}"
-        scene = Path(pred).stem
-        for suffix in ("_pred", "_gt"):
-            scene = scene.replace(suffix, "")
-        lines = [f"\n── {scene} vs {Path(gt).name} ──",
-                 f"  accuracy {m['accuracy']:.4f}   mIoU {m['miou']:.4f}   "
-                 f"macro-F1 {m['macro_f1']:.4f}",
-                 f"  evaluated {m['evaluated']:,} pts over {len(m['per_class'])} "
-                 f"mapped classes"
-                 + (f"  (ignored {m['ignored']:,} unmapped pts)" if m["ignored"] else "")]
-        w = max(len(nm(c)) for c in m["per_class"])
-        lines.append(f"  {'class'.ljust(w)}    IoU     F1   prec  recall     points")
-        lines += [f"  {nm(c).ljust(w)}  {s['iou']:.3f}  {s['f1']:.3f}  "
-                  f"{s['precision']:.3f}   {s['recall']:.3f} {s['support']:>10,}"
-                  for c, s in sorted(m["per_class"].items())]
-        mpath = Path(pred).with_suffix(".metrics.json")
-        try:
-            with open(mpath, "w", encoding="utf-8") as f:
-                json.dump({"prediction": str(pred), "ground_truth": str(gt),
-                           "scene": scene, "class_names": names,
-                           "gt_class_map": {str(k): v for k, v in dlg.gt_map.items()},
-                           **m}, f, indent=2)
-            lines.append(f"  saved -> {mpath}")
-        except OSError as e:
-            lines.append(f"  (couldn't save metrics json: {e})")
-        row = {"when": datetime.now().strftime("%Y-%m-%d %H:%M"),
-               "prediction": str(pred), "ground_truth": str(gt), "scene": scene,
-               "accuracy": f"{m['accuracy']:.4f}", "miou": f"{m['miou']:.4f}",
-               "macro_f1": f"{m['macro_f1']:.4f}", "labeled": str(m["evaluated"])}
-        row.update({f"iou_{nm(c)}": f"{s['iou']:.4f}"
-                    for c, s in m["per_class"].items()})
-        cpath = appstate.workspace_dir() / "gt_metrics.csv"
-        try:
-            rows = []
-            if cpath.exists():
-                with open(cpath, newline="", encoding="utf-8") as f:
-                    rows = [r for r in csv.DictReader(f) if any(r.values())]
-            rows.append(row)
-            core = ["when", "prediction", "ground_truth", "scene",
-                    "accuracy", "miou", "macro_f1", "labeled"]
-            extra = sorted({k for r in rows for k in r if k} - set(core))
-            with open(cpath, "w", newline="", encoding="utf-8") as f:
-                w = csv.DictWriter(f, fieldnames=core + extra, restval="")
-                w.writeheader()
-                w.writerows(rows)
-            lines.append(f"  csv   -> {cpath}")
-        except (OSError, csv.Error) as e:
-            lines.append(f"  (couldn't update stats csv: {e})")
-        self._append("\n".join(lines))
 
     def _kill(self):
         """Hard-kill the live job: the subprocess tree plus any worker stage
@@ -2345,15 +2112,23 @@ def _vote_members(member_dirs: list, out_dir: str, progress=None):
     return Path(out_dir)
 
 
+def _job_name_for(input_path: str) -> str:
+    """Job dirs are named after the input, not a timestamp: tile.las ->
+    predictions_tile. Filesystem-hostile chars collapse to _."""
+    import re
+    p = Path(input_path)
+    raw = p.stem if p.is_file() else (p.name or p.parent.name)
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", raw) or "job"
+
+
 def _localize_paths(text: str, job_id: str, pred_dir, staged) -> str:
-    """Rewrite container bind-mount paths to the host folders they map to;
-    predictions first (the more specific mount), then the staging root."""
+    """Rewrite Modal container bind-mount paths to the host folders they map
+    to; predictions first (the more specific mount), then the staging root.
+    Local runs print real host paths and need no rewriting."""
     if pred_dir:
-        for p in (f"/datasets/_infer/{job_id}/predictions", f"_infer/{job_id}/predictions"):
-            text = text.replace(p, str(pred_dir))
+        text = text.replace(f"/datasets/_infer/{job_id}/predictions", str(pred_dir))
     if staged:
-        for p in (f"/datasets/_infer/{job_id}", f"_infer/{job_id}"):
-            text = text.replace(p, str(staged))
+        text = text.replace(f"/datasets/_infer/{job_id}", str(staged))
     return text
 
 
@@ -2367,9 +2142,9 @@ def _scene_channel_report(staged, features: list | None = None,
     ones already riding TT_ZERO_CHANNELS."""
     import numpy as np
     zeroed = set(zeroed)
-    scenes = sorted(Path(staged).glob("scenes/*.npz"))
+    scenes = sorted(Path(staged).glob("*_input.npz"))
     if not scenes:
-        return [f"⚠ no converted scenes under {staged} to check."], False
+        return [f"⚠ no converted *_input.npz scenes in {staged} to check."], False
     hard = [n for n in (features or [])
             if (n == "feat_hag" or n.startswith("feat_geo_")) and n not in zeroed]
     soft = [n for n in (features or [])

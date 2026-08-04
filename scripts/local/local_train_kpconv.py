@@ -44,7 +44,6 @@ VAL_EVERY     = 10
 PROXY_TILES   = 48
 PROXY_SAMPLING = "full"
 
-RESUME = False
 AUTO_RESUME = os.environ.get("AUTO_RESUME", "0") == "1"
 
 CLASS_WEIGHTING = True
@@ -285,7 +284,7 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
     train_list, val_list, test_list = ([], [], []) if INFER else ensure_prep()
 
     run_dir, resume_ckpt, start_epoch = tc.kp_resume_ladder(
-        INFER, EVAL_ONLY, RESUME or AUTO_RESUME, find_latest_checkpoint,
+        INFER, EVAL_ONLY, AUTO_RESUME, find_latest_checkpoint,
         infer_input, "kpconv_native", OPT_TYPE_STR, N_EPOCHS)
 
     train_tiles = sorted(glob.glob(f"{PREP_DIR}/train/*.npz"))
@@ -389,13 +388,16 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
         return [max(1, int(x)) for x in limits]
 
     def _load_or_calibrate_limits():
-        cache_p = f"{PREP_DIR}/neighbor_limits.json"
+        # limits live inside cache_meta.json (same lifecycle: one per prep
+        # cache); a legacy neighbor_limits.json still reads
         key = {**_cache_signature(), "kp_extent": KP_EXTENT,
                "untouched": CALIB_UNTOUCHED, "calib_max_pts": CALIB_MAX_PTS}
-        if os.path.exists(cache_p):
+        for cache_p, get in ((f"{PREP_DIR}/cache_meta.json",
+                              lambda d: d.get("neighbor_limits") or {}),
+                             (f"{PREP_DIR}/neighbor_limits.json", lambda d: d)):
             try:
                 with open(cache_p) as f:
-                    doc = json.load(f)
+                    doc = get(json.load(f))
                 if doc.get("key") == key:
                     print(f"  neighbor_limits (cached): {doc['limits']}", flush=True)
                     return [int(x) for x in doc["limits"]]
@@ -406,8 +408,7 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
         t0 = time.time()
         limits = calibrate_neighbors(train_tiles)
         print(f"  neighbor_limits: {limits}  ({time.time()-t0:.1f}s)", flush=True)
-        with open(cache_p, "w") as f:
-            json.dump({"key": key, "limits": limits}, f, indent=2)
+        tc.update_cache_meta(PREP_DIR, neighbor_limits={"key": key, "limits": limits})
         return limits
 
     if INFER:
@@ -522,10 +523,8 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
                         infer_apcotta=DG_INFER_APCOTTA)
         return
 
-    metrics_csv = tc.init_metrics_csv(run_dir)
-
-    val_csv = f"{run_dir}/val_metrics.csv"
-    tc.init_val_csv(val_csv, CLASS_NAMES)
+    metrics_csv = tc.init_metrics_csv(run_dir, CLASS_NAMES)
+    val_csv = metrics_csv          # val rows share the one metrics.csv
 
     val_items, test_items = tc.kp_eval_items(PREP_DIR, val_list, test_list)
     evaluate = tc.kp_make_evaluate(tc.kp_make_fwd_eval(make_kp_batch, _forward),

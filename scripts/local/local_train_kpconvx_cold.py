@@ -31,7 +31,6 @@ ACCUM         = 2
 CHECKPOINT_GAP = 10
 VAL_EVERY     = 10
 
-RESUME = False
 AUTO_RESUME = os.environ.get("AUTO_RESUME", "0") == "1"
 
 CLASS_WEIGHTING = True
@@ -180,7 +179,7 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
     train_list, val_list, test_list = ([], [], []) if INFER else ensure_prep()
 
     run_dir, resume_ckpt, start_epoch = tc.kp_resume_ladder(
-        INFER, EVAL_ONLY, RESUME or AUTO_RESUME, find_latest_checkpoint,
+        INFER, EVAL_ONLY, AUTO_RESUME, find_latest_checkpoint,
         infer_input, "kpconvx_cold_native", "AdamW", N_EPOCHS)
 
     build_feat = tc.kp_make_build_feat(DG_LOGDK_FEAT, DG_LOGDK_K, FEAT_SPEC)
@@ -195,7 +194,7 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
     VAL_FULL = VAL_RANK == "full"
     if not INFER:
         val_tiles = sorted(glob.glob(f"{PREP_DIR}/val/*.npz"))
-        tc.init_val_csv(f"{run_dir}/val_metrics.csv", CLASS_NAMES)
+        tc.init_metrics_csv(run_dir, CLASS_NAMES)
         best = tc.BestCheckpoint(run_dir, VAL_RANK)
     if not INFER and not EVAL_ONLY:
         proxy_tiles, proxy_rep, proxy_samples = tc.kp_curate_proxy(
@@ -205,7 +204,7 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
                               CLASS_NAMES, VAL_RANK):
             run_id, run_dir = tc.kp_make_run_dir("kpconvx_cold_native")
             resume_ckpt, start_epoch = None, 0
-            tc.init_val_csv(f"{run_dir}/val_metrics.csv", CLASS_NAMES)
+            tc.init_metrics_csv(run_dir, CLASS_NAMES)
             best = tc.BestCheckpoint(run_dir, VAL_RANK)
             tc.proxy_guard(run_dir, proxy_rep, tc.PROXY_PROTOCOL_TILES,
                            CLASS_NAMES, VAL_RANK)
@@ -379,9 +378,8 @@ def train_kpconvx(dataset: Optional[str] = None, mode: str = "train",
                         DG_INFER_ADABN, infer_apcotta=DG_INFER_APCOTTA)
         return
 
-    metrics_csv = tc.init_metrics_csv(run_dir)
-
-    val_csv = f"{run_dir}/val_metrics.csv"
+    metrics_csv = tc.init_metrics_csv(run_dir, CLASS_NAMES)
+    val_csv = metrics_csv          # val rows share the one metrics.csv
 
     val_items, test_items = tc.kp_eval_items(PREP_DIR, val_list, test_list)
     evaluate = tc.kp_make_evaluate(tc.kp_make_fwd_eval(make_kp_pack, _forward),

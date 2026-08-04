@@ -22,7 +22,7 @@ def dataset_dir(name):
 
 
 def infer_dir(job):
-    """Inference job dir (scenes/ + predictions); TT_INFER_DIR overrides."""
+    """Inference job dir (*_input.npz scenes + job.json); TT_INFER_DIR overrides."""
     return os.environ.get("TT_INFER_DIR") or f"{DATASETS_ROOT}/_infer/{job}"
 
 
@@ -240,6 +240,25 @@ def write_pred(path, xyz, pred, intensity=None, confidence=None, probs=None,
     np.savez(path, **d)
 
 
+def merge_pred_into_scene(scene_path, pred, confidence=None, probs=None):
+    """Fold predictions into the staged <stem>_input.npz so one file per
+    input holds channels + predictions (atomic replace, crash-safe)."""
+    import numpy as np
+    with np.load(scene_path) as z:
+        d = {k: z[k] for k in z.files}
+    # fresh predictions invalidate any previous postproc/clustering state
+    for stale in ("classification_orig", "confidence_orig", "instance", "probs"):
+        d.pop(stale, None)
+    d["classification"] = np.asarray(pred, np.int32)
+    if confidence is not None:
+        d["confidence"] = np.asarray(confidence, np.float32)
+    if probs is not None:
+        d["probs"] = np.asarray(probs, np.float16)
+    tmp = scene_path + ".tmp.npz"
+    np.savez(tmp, **d)
+    _replace_retry(tmp, scene_path)
+
+
 class DatasetExhausted(RuntimeError):
     """Deterministic 'no usable tiles' signal - must escape the broad
     train-loop excepts that swallow ordinary per-batch failures."""
@@ -304,7 +323,7 @@ VAL_FULL_NOTE = ("  val: full raw-scored eval over every val scene, same protoco
 
 
 def row_protocol(m):
-    """Which val_metrics.csv scale a metrics dict belongs to. proxy_val stamps
+    """Which val-row scale a metrics dict belongs to. proxy_val stamps
     m['protocol']; the raw-scored full evals don't."""
     return "proxy" if "protocol" in m else "full"
 
@@ -336,9 +355,10 @@ def best_val_miou(val_csv, protocol="proxy"):
 
 
 class BestCheckpoint:
-    """Track best val mIoU (seeded from val_metrics.csv); update(m) is True on
-    a new best and ignores metrics from the other protocol, so callers can hand
-    it every eval; finalize(save_last) saves last epoch only if val never ran."""
+    """Track best val mIoU (seeded from the merged metrics.csv, with a
+    legacy val_metrics.csv fallback); update(m) is True on a new best and
+    ignores metrics from the other protocol, so callers can hand it every
+    eval; finalize(save_last) saves last epoch only if val never ran."""
 
     def __init__(self, run_dir, protocol="proxy"):
         # every trainer builds one at train start, so this is the shared gate
@@ -350,8 +370,9 @@ class BestCheckpoint:
                 "zeroed channel would silently poison every training batch.")
         self.protocol = protocol
         self.final = os.path.join(run_dir, "final_model.pth")
-        self.best = best_val_miou(os.path.join(run_dir, "val_metrics.csv"),
-                                  protocol)
+        self.best = max(
+            best_val_miou(os.path.join(run_dir, "metrics.csv"), protocol),
+            best_val_miou(os.path.join(run_dir, "val_metrics.csv"), protocol))
 
     def update(self, m):
         if row_protocol(m) != self.protocol:
@@ -565,9 +586,25 @@ def _voxel_unique_cuda(code, return_inverse):
         return None
 
 
+def update_job_json(job_dir, section, doc):
+    """job.json is the single per-job manifest (staging/infer/postproc/
+    panoptic/report); each stage owns one section, atomically rewritten."""
+    path = os.path.join(job_dir, "job.json")
+    data = {}
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    data[section] = doc
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
+    return doc
+
+
 def write_infer_run(run_dir, config, scene_stats):
-    """infer_run.json: exact config + per-scene {scene, points, seconds};
-    rewritten after every scene so a crash keeps completed numbers."""
+    """job.json 'infer' section: exact config + per-scene {scene, points,
+    seconds}; rewritten after every scene so a crash keeps completed numbers."""
     doc = dict(config)
     doc["adabn"] = os.environ.get("DG_INFER_ADABN") == "1"
     doc["apcotta"] = os.environ.get("DG_INFER_APCOTTA") == "1"
@@ -580,9 +617,7 @@ def write_infer_run(run_dir, config, scene_stats):
     doc["scenes"] = scene_stats
     doc["total_points"] = int(sum(s["points"] for s in scene_stats))
     doc["total_seconds"] = round(sum(float(s["seconds"]) for s in scene_stats), 3)
-    with open(os.path.join(run_dir, "infer_run.json"), "w", encoding="utf-8") as f:
-        json.dump(doc, f, indent=2)
-    return doc
+    return update_job_json(run_dir, "infer", doc)
 
 
 def exclude_class_idx(class_names):
@@ -964,6 +999,26 @@ def split_scenes(ds_root):
     return train, val, test
 
 
+def update_cache_meta(prep_dir, **fields):
+    """Additive, atomic update of cache_meta.json (e.g. KPConv's calibrated
+    neighbor_limits ride here - same one-per-prep-cache lifecycle)."""
+    meta_path = f"{prep_dir}/cache_meta.json"
+    doc = {}
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path) as f:
+                doc = json.load(f)
+        except (OSError, ValueError):
+            doc = {}
+    doc.update(fields)
+    atomic_json_save(doc, meta_path)
+    return doc
+
+
+# cache_meta keys that are NOT part of the build signature
+_CACHE_META_EXTRAS = ("neighbor_limits",)
+
+
 def validate_cache(prep_dir, sig):
     """Refuse a prep cache built with different settings. True if the
     signature was newly written."""
@@ -971,6 +1026,7 @@ def validate_cache(prep_dir, sig):
     if os.path.exists(meta_path):
         with open(meta_path) as f:
             old = json.load(f)
+        old = {k: v for k, v in old.items() if k not in _CACHE_META_EXTRAS}
         if old != sig:
             diffs = {k: [old.get(k), sig.get(k)]
                      for k in sorted(set(old) | set(sig)) if old.get(k) != sig.get(k)}
@@ -979,8 +1035,7 @@ def validate_cache(prep_dir, sig):
                 f"(mismatched: {diffs}). Reusing it would silently mix incompatible "
                 f"data. Point PREP_DIR at a fresh path or delete the stale cache.")
         return False
-    with open(meta_path, "w") as f:
-        json.dump(sig, f, indent=2)
+    update_cache_meta(prep_dir, **sig)
     return True
 
 
@@ -1195,33 +1250,63 @@ def eval_metrics(t_inter, t_union, t_gt, correct, total, class_names, t_start,
     return m
 
 
-def init_val_csv(val_csv, class_names):
-    """Write the val_metrics.csv header if absent."""
-    if os.path.exists(val_csv):
-        return
-    cols = (["epoch", "val_acc", "val_miou"]
-            + [f"iou_{n}" for n in class_names] + ["protocol"])
-    with open(val_csv, "w", newline="", encoding="utf-8") as f:
-        csv.writer(f).writerow(cols)
+def metrics_cols(class_names):
+    """Union header of the ONE per-run metrics.csv: train rows fill the first
+    eight columns, val rows the rest (protocol last)."""
+    return (["epoch", "train_loss", "train_acc", "train_iou", "lr",
+             "sec_per_iter", "sec_per_epoch", "gpu_mem_mb",
+             "val_acc", "val_miou"] + [f"iou_{n}" for n in class_names]
+            + ["protocol"])
 
 
-def append_val_row(val_csv, ep, m, class_names):
-    """One val_metrics.csv row: epoch, acc, present-class mIoU, per-class IoUs,
-    protocol. Only rows matching the run's ranking protocol seed
-    BestCheckpoint - see row_protocol/ranking_protocol."""
-    ious = [m["per_class_iou"][n] for n in class_names]
-    with open(val_csv, "a", newline="", encoding="utf-8") as f:
-        csv.writer(f).writerow([ep, f"{m['overall_acc']:.4f}",
-                                f"{m['present_classes_mIoU']:.4f}"]
-                               + [f"{x:.4f}" for x in ious]
-                               + [row_protocol(m)])
+def append_val_row(metrics_csv, ep, m, class_names):
+    """One val row in the merged metrics.csv (train columns stay empty).
+    Only rows matching the run's ranking protocol seed BestCheckpoint - see
+    row_protocol/ranking_protocol."""
+    row = {"epoch": ep, "val_acc": f"{m['overall_acc']:.4f}",
+           "val_miou": f"{m['present_classes_mIoU']:.4f}",
+           "protocol": row_protocol(m)}
+    for n in class_names:
+        row[f"iou_{n}"] = f"{m['per_class_iou'][n]:.4f}"
+    with open(metrics_csv, "a", newline="", encoding="utf-8") as f:
+        csv.DictWriter(f, fieldnames=metrics_cols(class_names),
+                       extrasaction="ignore").writerow(row)
+
+
+def update_run_json(run_dir, **fields):
+    """Additive update of run.json - the manifest schema is frozen but allows
+    additive-optional keys (test_metrics, proxy_val, finished live here now
+    instead of their own sidecar files)."""
+    path = os.path.join(run_dir, "run.json")
+    doc = {}
+    if os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8-sig") as f:
+                doc = json.load(f)
+        except (OSError, ValueError):
+            doc = {}
+    doc.update(fields)
+    atomic_json_save(doc, path)
+    return doc
+
+
+def run_finished(run_dir):
+    """run.json 'finished' flag, with the legacy DONE sentinel as fallback."""
+    path = os.path.join(run_dir, "run.json")
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            if json.load(f).get("finished"):
+                return True
+    except (OSError, ValueError):
+        pass
+    return os.path.exists(os.path.join(run_dir, "DONE"))
 
 
 def _proxy_remedy(run_dir):
     """Both files must go together, and each costs something - say what."""
     return (f"Unset AUTO_RESUME to launch a fresh run, or delete BOTH "
-            f"{run_dir}/val_metrics.csv "
-            f"(this wipes the run's GUI plot history) and "
+            f"{run_dir}/metrics.csv "
+            f"(this wipes the run's metric history) and "
             f"{run_dir}/final_model.pth (the run is un-inferrable and "
             f"un-packageable until a later epoch re-crowns it), then relaunch. "
             f"Close the GUI inference page first - Windows holds the weights "
@@ -1245,23 +1330,29 @@ def proxy_guard(run_dir, report, protocol, class_names, ranking="proxy"):
             "inventory": [class_names[c] for c in report["inventory"]],
             "tiles_sha1": hashlib.sha1(
                 "\n".join(sorted(report["tiles"])).encode("utf-8")).hexdigest()[:16]})
-    path = f"{run_dir}/proxy_val.json"
     rows = other = 0
-    val_csv = f"{run_dir}/val_metrics.csv"
-    if os.path.exists(val_csv):
+    for val_csv in (f"{run_dir}/metrics.csv", f"{run_dir}/val_metrics.csv"):
+        if not os.path.exists(val_csv):
+            continue
         with open(val_csv, newline="", encoding="utf-8", errors="replace") as f:
-            raw = list(csv.reader(f))
-        for r in raw[1:]:
-            if not r:
-                continue
-            if r[-1] == ranking:
-                rows += 1
-            else:
-                other += 1
+            for r in csv.DictReader(f):
+                proto = r.get("protocol")
+                if not proto:
+                    continue          # train rows carry no protocol
+                if proto == ranking:
+                    rows += 1
+                else:
+                    other += 1
+    # the stamp lives in run.json now; a legacy proxy_val.json still reads
     old = None
-    if os.path.exists(path):
+    try:
+        with open(f"{run_dir}/run.json", encoding="utf-8-sig") as f:
+            old = json.load(f).get("proxy_val")
+    except (OSError, ValueError):
+        pass
+    if old is None and os.path.exists(f"{run_dir}/proxy_val.json"):
         try:
-            with open(path, encoding="utf-8") as f:
+            with open(f"{run_dir}/proxy_val.json", encoding="utf-8") as f:
                 old = json.load(f)
         except (OSError, ValueError):
             old = None
@@ -1269,7 +1360,7 @@ def proxy_guard(run_dir, report, protocol, class_names, ranking="proxy"):
     switched = (bool(other) and isinstance(old, dict)
                 and old.get("ranking", "proxy") != ranking)
     if not rows and not switched:
-        atomic_json_save(sig, path)
+        update_run_json(run_dir, proxy_val=sig)
         return True
     if old != sig:
         was = old.get("ranking", "proxy") if isinstance(old, dict) else None
@@ -1281,7 +1372,7 @@ def proxy_guard(run_dir, report, protocol, class_names, ranking="proxy"):
                 f"different scales, so the resumed run would chase a seed it can "
                 f"never match. Set PROXY_SAMPLING={back!r} to continue this run. "
                 f"{_proxy_remedy(run_dir)}")
-        bad = ("unreadable proxy_val.json" if not isinstance(old, dict) else
+        bad = ("unreadable proxy_val stamp" if not isinstance(old, dict) else
                {k: [old.get(k), sig[k]] for k in sig if old.get(k) != sig[k]})
         raise RuntimeError(
             f"{run_dir} holds {rows} proxy val row(s) ranked under a different "
@@ -1293,7 +1384,7 @@ def proxy_guard(run_dir, report, protocol, class_names, ranking="proxy"):
             f"{run_dir} holds {rows} {ranking} val row(s) but no final_model.pth: "
             f"the resume seed already sits above the crowned checkpoint, which "
             f"is gone, so the run would publish last-epoch weights instead. "
-            f"Delete {run_dir}/val_metrics.csv (this wipes the run's GUI plot "
+            f"Delete {run_dir}/metrics.csv (this wipes the run's metric "
             f"history) so the seed drops back to -1.0 and a later epoch re-crowns "
             f"the run, or unset AUTO_RESUME to launch a fresh run.")
     return True
@@ -1380,10 +1471,11 @@ def scene_arrays(z, n):
     return intensity, ret_num
 
 
-def run_infer_scenes(scenes, predict, pred_dir, run_dir, infer_cfg, cls_txt=False):
+def run_infer_scenes(scenes, predict, pred_dir, run_dir, infer_cfg):
     """--mode infer loop: predict(pc_path) -> (xyz, pred, intensity, conf,
-    probs), written as <name>_pred.npz (+ _pred_CLS.txt) with the crash-safe
-    per-scene infer_run.json rewrite."""
+    probs), merged into the staged *_input.npz when scenes and predictions
+    share a dir (else a standalone <name>_pred.npz), with the crash-safe
+    per-scene job.json rewrite."""
     import numpy as np
     # backstop for the GUI's probe-based pre-skip: any feat_* the run needs
     # that the scenes don't carry rides as zeros - missing data never aborts
@@ -1407,25 +1499,27 @@ def run_infer_scenes(scenes, predict, pred_dir, run_dir, infer_cfg, cls_txt=Fals
         name = os.path.splitext(os.path.basename(pc_path))[0]
         t0 = time.time()
         xyz, pred, inten, conf, probs = predict(pc_path)
-        try:
-            with np.load(pc_path) as z:
-                crs = str(z["crs_wkt"]) if "crs_wkt" in z.files else None
-                src = str(z["source_crs_wkt"]) if "source_crs_wkt" in z.files else None
-        except OSError:
-            crs = src = None
-        write_pred(f"{pred_dir}/{name}_pred.npz", xyz, pred, inten, conf, probs,
-                   crs_wkt=crs, source_crs_wkt=src)
-        if cls_txt:
-            np.savetxt(f"{pred_dir}/{name}_pred_CLS.txt", pred, fmt="%d")
+        # scenes and predictions in the same dir (the local one-file layout):
+        # fold predictions into the *_input.npz. A separate pred_dir (Modal
+        # remote: scenes and outputs live on different volumes) still gets a
+        # standalone *_pred.npz, merged locally after the pull.
+        if os.path.normpath(os.path.dirname(pc_path)) == os.path.normpath(pred_dir):
+            merge_pred_into_scene(pc_path, pred, conf, probs)
+        else:
+            try:
+                with np.load(pc_path) as z:
+                    crs = str(z["crs_wkt"]) if "crs_wkt" in z.files else None
+                    src = str(z["source_crs_wkt"]) if "source_crs_wkt" in z.files else None
+            except OSError:
+                crs = src = None
+            write_pred(f"{pred_dir}/{name}_pred.npz", xyz, pred, inten, conf, probs,
+                       crs_wkt=crs, source_crs_wkt=src)
         scene_stats.append({"scene": os.path.basename(pc_path),
                             "points": int(len(xyz)),
                             "seconds": round(time.time() - t0, 3)})
         write_infer_run(run_dir, infer_cfg, scene_stats)
         print(f"  [infer] {name}: {len(xyz):,} pts in {time.time()-t0:.1f}s", flush=True)
-    # exact wording matters: the GUI's _localize_paths rewrites this line
-    print(f"  [infer] done: predictions in "
-          f"_infer/{os.path.basename(os.path.dirname(pred_dir))}/predictions",
-          flush=True)
+    print(f"  [infer] done: predictions in {pred_dir}", flush=True)
 
 
 def kp_load_canonical(npz_path):
@@ -1888,7 +1982,7 @@ def kp_find_latest_checkpoint(opt_type, feature_modes, arch_hash=None,
         return int(os.path.basename(p)[2:5])
 
     for rd in sorted(glob.glob(f"{OUTPUTS_ROOT}/runs/*"), reverse=True):
-        if skip_done and os.path.exists(f"{rd}/DONE"):
+        if skip_done and run_finished(rd):
             continue
         ckpts = glob.glob(f"{rd}/checkpoints/ep*.pth")
         if not ckpts:
@@ -2238,15 +2332,51 @@ def kp_load_mode_weights(net, optim, resume_ckpt, start_epoch, eval_only,
     return start_epoch
 
 
-def init_metrics_csv(run_dir):
-    """metrics.csv with the shared per-epoch header (append-safe on resume)."""
+def _migrate_split_metrics(run_dir, cols):
+    """Fold a pre-merge run's split files (8-col metrics.csv +
+    val_metrics.csv) into the single union-header metrics.csv so old runs
+    stay resumable/readable; the val file is deleted after the fold."""
+    mcsv, vcsv = f"{run_dir}/metrics.csv", f"{run_dir}/val_metrics.csv"
+    m_rows, m_hdr = [], None
+    if os.path.exists(mcsv):
+        with open(mcsv, newline="", encoding="utf-8", errors="replace") as f:
+            rd = csv.DictReader(f)
+            m_hdr, m_rows = rd.fieldnames, list(rd)
+    v_rows = []
+    if os.path.exists(vcsv):
+        with open(vcsv, newline="", encoding="utf-8", errors="replace") as f:
+            v_rows = list(csv.DictReader(f))
+    if (m_hdr is None or m_hdr == cols) and not v_rows:
+        return
+
+    def key(r):
+        try:
+            return (float(r.get("epoch") or -1), bool(r.get("val_miou")))
+        except (TypeError, ValueError):
+            return (-1.0, False)
+
+    tmp = mcsv + ".tmp"
+    with open(tmp, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
+        w.writeheader()
+        for r in sorted(m_rows + v_rows, key=key):
+            w.writerow(r)
+    _replace_retry(tmp, mcsv)
+    if os.path.exists(vcsv):
+        os.remove(vcsv)
+    print("  [metrics] folded val_metrics.csv into metrics.csv (one file per run)",
+          flush=True)
+
+
+def init_metrics_csv(run_dir, class_names):
+    """The ONE metrics.csv per run - union header, train rows and val rows
+    side by side (append-safe on resume; pre-merge runs migrate in place)."""
     metrics_csv = f"{run_dir}/metrics.csv"
+    cols = metrics_cols(class_names)
+    _migrate_split_metrics(run_dir, cols)
     if not os.path.exists(metrics_csv):
         with open(metrics_csv, "w", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow([
-                "epoch", "train_loss", "train_acc", "train_iou", "lr",
-                "sec_per_iter", "sec_per_epoch", "gpu_mem_mb",
-            ])
+            csv.writer(f).writerow(cols)
     return metrics_csv
 
 
@@ -2268,7 +2398,8 @@ def kp_make_run_eval(net, forward, evaluate, make_batch, sample_tile,
                      val_full, eval_only, proxy_batches, proxy_tiles,
                      proxy_rep):
     """Shared KP eval driver: mid-training proxy/full val with best tracking,
-    plus the final PreciseBN + val/test pass that writes test_metrics.json.
+    plus the final PreciseBN + val/test pass that writes run.json's
+    test_metrics section.
     forward(batch) -> logits; proxy_batches() -> (batch, labels) generator."""
     import torch
 
@@ -2321,10 +2452,10 @@ def kp_make_run_eval(net, forward, evaluate, make_batch, sample_tile,
         mt = evaluate(test_items, f"test@ep{ep}")
         if swapped:
             net.load_state_dict(live_state)
-        with open(f"{run_dir}/test_metrics.json", "w", encoding="utf-8") as fj:
-            json.dump({"val": m, "test": mt,
-                       "val_scenes": [n for n, _ in val_list],
-                       "test_scenes": [n for n, _ in test_list]}, fj, indent=2)
+        update_run_json(run_dir, test_metrics={
+            "val": m, "test": mt,
+            "val_scenes": [n for n, _ in val_list],
+            "test_scenes": [n for n, _ in test_list]})
         net.train()
         return m
 
@@ -2335,7 +2466,7 @@ def kp_run_infer(run_dir, net, forward, kp_batch, build_feat, predict_points,
                  backbone, note_name, weights, infer_input, grid, chunk_xy,
                  grid_cli, chunk_cli, num_classes, class_names, feat_spec,
                  exc_idx, infer_adabn, neighbor_limits=None, infer_apcotta=False):
-    """Dataset-free inference over <run_dir>/scenes: optional AdaBN or APCoTTA
+    """Dataset-free inference over <run_dir>/*_input.npz: optional AdaBN or APCoTTA
     then per-scene predict via run_infer_scenes. neighbor_limits goes into the
     infer config only when given (kpconv restores its pyramid crop)."""
     import glob
@@ -2349,9 +2480,9 @@ def kp_run_infer(run_dir, net, forward, kp_batch, build_feat, predict_points,
         print(f"  [infer] note: {note_name} uses its trained geometry "
               f"(grid={grid}, chunk={chunk_xy}); --grid/--chunk-xy ignored.", flush=True)
     net.eval()
-    scenes = sorted(glob.glob(f"{run_dir}/scenes/*.npz"))
+    scenes = sorted(glob.glob(f"{run_dir}/*_input.npz"))
     if not scenes:
-        raise FileNotFoundError(f"No scenes under {run_dir}/scenes")
+        raise FileNotFoundError(f"No staged *_input.npz scenes in {run_dir}")
     pred_dir = os.environ.get("TT_PRED_DIR") or f"{run_dir}/predictions"
     infer_cfg = {"backbone": backbone, "mode": "infer",
                  "weights": weights,
@@ -2392,7 +2523,7 @@ def kp_run_infer(run_dir, net, forward, kp_batch, build_feat, predict_points,
                                            extras=extras)
         return raw, pred, intensity_n, conf, probs
 
-    run_infer_scenes(scenes, _predict, pred_dir, run_dir, infer_cfg, cls_txt=True)
+    run_infer_scenes(scenes, _predict, pred_dir, run_dir, infer_cfg)
 
 
 def kp_train_loop(net, optim, forward, seg_loss, make_batch, sample_tile,
@@ -2527,7 +2658,7 @@ def kp_train_loop(net, optim, forward, seg_loss, make_batch, sample_tile,
     if not eval_only:
         best.finalize(lambda p: atomic_torch_save(
             {"model": net.state_dict(), "epoch": ep}, p))
-        open(f"{run_dir}/DONE", "w").close()
+        update_run_json(run_dir, finished=True)
     print(f"  total wall-clock: {(time.time() - t_run)/3600:.2f} h")
 
 
@@ -2747,7 +2878,7 @@ def find_latest_unfinished_run(suffix, cfg=None):
     for rd in sorted(glob.glob(f"{OUTPUTS_ROOT}/runs/*"), reverse=True):
         if not rd.endswith(suffix):
             continue
-        if os.path.exists(f"{rd}/DONE"):
+        if run_finished(rd):
             continue
         if cfg is not None:
             try:
@@ -3174,7 +3305,7 @@ def ptv3_make_run_eval(backbone, head, evaluate, forward_logits, proxy_batches,
                        names, run_dir):
     """run_eval(ep, write_json=False): proxy/full val + best-checkpoint
     update; the final write_json call also test-evals the best weights and
-    writes test_metrics.json."""
+    writes run.json's test_metrics section."""
     import torch
 
     def run_eval(ep, write_json=False):
@@ -3204,10 +3335,10 @@ def ptv3_make_run_eval(backbone, head, evaluate, forward_logits, proxy_batches,
         mt = evaluate(test_items, f"test@ep{ep}")
         if swapped:
             backbone.load_state_dict(live_backbone); head.load_state_dict(live_head)
-        with open(f"{run_dir}/test_metrics.json", "w", encoding="utf-8") as fj:
-            json.dump({"val": m, "test": mt,
-                       "val_scenes": [n for n, _, _ in val_items],
-                       "test_scenes": [n for n, _, _ in test_items]}, fj, indent=2)
+        update_run_json(run_dir, test_metrics={
+            "val": m, "test": mt,
+            "val_scenes": [n for n, _, _ in val_items],
+            "test_scenes": [n for n, _, _ in test_items]})
         set_train_mode()
         return m
 
@@ -3324,7 +3455,7 @@ def ptv3_train_loop(backbone, head, optim, seg_loss, forward_logits,
     best.finalize(lambda p: save_best(ep))
     print(f"  total wall-clock {(time.time() - t_run)/3600:.2f} h")
 
-    open(f"{run_dir}/DONE", "w").close()
+    update_run_json(run_dir, finished=True)
     print(f"  run complete -> {run_id}", flush=True)
 
 

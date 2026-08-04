@@ -71,7 +71,6 @@ VAL_EVERY        = 10
 PROXY_TILES      = 48
 PROXY_SAMPLING   = "full"
 CHECKPOINT_GAP   = 3
-RESUME           = False
 AUTO_RESUME      = os.environ.get("AUTO_RESUME", "0") == "1"
 
 def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
@@ -288,9 +287,9 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
               f"final_model = best-val epoch {ckpt.get('epoch', '?')})", flush=True)
 
         run_dir = tc.infer_dir(infer_input)
-        scenes = sorted(glob.glob(f"{run_dir}/scenes/*.npz"))
+        scenes = sorted(glob.glob(f"{run_dir}/*_input.npz"))
         if not scenes:
-            raise FileNotFoundError(f"No scenes under {run_dir}/scenes")
+            raise FileNotFoundError(f"No staged *_input.npz scenes in {run_dir}")
 
         pred_dir = os.environ.get("TT_PRED_DIR") or f"{run_dir}/predictions"
         os.makedirs(pred_dir, exist_ok=True)
@@ -352,7 +351,7 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                "n_epochs": N_EPOCHS, "num_classes": NUM_CLASSES,
                "class_names": CLASS_NAMES}
     run_dir, run_id, resume_ckpt, start_epoch = tc.resume_ladder(
-        f"{dataset}_{BB_KEY}", _recipe, RESUME or AUTO_RESUME, proxy_rep,
+        f"{dataset}_{BB_KEY}", _recipe, AUTO_RESUME, proxy_rep,
         tc.PROXY_PROTOCOL_TILES, names, VAL_RANK, N_EPOCHS)
     if resume_ckpt is None:
         with open(f"{run_dir}/run.json", "w") as f:
@@ -464,15 +463,14 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
         AUG_COLOR, RARE_OVERSAMPLE, rare_cols, RARE_CENTER_PROB,
         DG_DENSITY_AUG, DG_COARSEN_MAX, DG_P_NATIVE)
 
-    metrics_csv = tc.init_metrics_csv(run_dir)
+    metrics_csv = tc.init_metrics_csv(run_dir, names)
 
     val_items, test_items = tc.ptv3_eval_items(ds_root, PREP_DIR, hold, test_tiles)
 
     evaluate = tc.ptv3_make_evaluate(_forward_logits, build_feat, FEAT_SPEC,
                                      GRID_SIZE, CHUNK_XY, NUM_CLASSES, names)
 
-    val_csv = f"{run_dir}/val_metrics.csv"
-    tc.init_val_csv(val_csv, names)
+    val_csv = metrics_csv          # val rows share the one metrics.csv
 
     best = tc.BestCheckpoint(run_dir, VAL_RANK)
     tc.proxy_guard(run_dir, proxy_rep, tc.PROXY_PROTOCOL_TILES, names, VAL_RANK)

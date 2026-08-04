@@ -50,7 +50,6 @@ PROXY_SAMPLING   = "full"
 PROXY_TILES      = 48
 PROXY_ANCHORS    = 3
 
-RESUME           = False
 AUTO_RESUME      = os.environ.get("AUTO_RESUME", "0") == "1"
 
 
@@ -565,9 +564,9 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
               f"final_model = best-val epoch {ckpt.get('epoch', '?')})", flush=True)
 
         run_dir = tc.infer_dir(infer_input)
-        scenes = sorted(glob.glob(f"{run_dir}/scenes/*.npz"))
+        scenes = sorted(glob.glob(f"{run_dir}/*_input.npz"))
         if not scenes:
-            raise FileNotFoundError(f"No scenes under {run_dir}/scenes")
+            raise FileNotFoundError(f"No staged *_input.npz scenes in {run_dir}")
 
         pred_dir = os.environ.get("TT_PRED_DIR") or f"{run_dir}/predictions"
         os.makedirs(pred_dir, exist_ok=True)
@@ -648,7 +647,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     _recipe = {"features": FEAT_SPEC, "n_epochs": N_EPOCHS,
                "num_classes": NUM_CLASSES, "class_names": CLASS_NAMES}
     run_dir, run_id, resume_ckpt, start_epoch = tc.resume_ladder(
-        f"{dataset}_randlanet_cold", _recipe, RESUME or AUTO_RESUME, proxy_rep,
+        f"{dataset}_randlanet_cold", _recipe, AUTO_RESUME, proxy_rep,
         tc.PROXY_PROTOCOL_SPHERES, CLASS_NAMES, VAL_RANK, N_EPOCHS)
     if resume_ckpt is None:
         with open(f"{run_dir}/run.json", "w") as f:
@@ -726,10 +725,8 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
               f"at epoch {start_epoch}", flush=True)
     sched = optim.lr_scheduler.ExponentialLR(opt, 0.95)
 
-    metrics_csv = tc.init_metrics_csv(run_dir)
-
-    val_csv = f"{run_dir}/val_metrics.csv"
-    tc.init_val_csv(val_csv, CLASS_NAMES)
+    metrics_csv = tc.init_metrics_csv(run_dir, CLASS_NAMES)
+    val_csv = metrics_csv          # val rows share the one metrics.csv
 
     def evaluate(ds, name2src, label):
         """Full-coverage eval scored on raw points: sphere-sweep the subsampled
@@ -890,10 +887,10 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         m_test = evaluate(test_ds, {n: p for n, p in test_list}, "test")
         if swapped:
             net.load_state_dict(live_state)
-        with open(f"{run_dir}/test_metrics.json", "w", encoding="utf-8") as fj:
-            json.dump({"val": m, "test": m_test,
-                       "val_scenes": [n for n, _ in val_list],
-                       "test_scenes": [n for n, _ in test_list]}, fj, indent=2)
+        tc.update_run_json(run_dir, test_metrics={
+            "val": m, "test": m_test,
+            "val_scenes": [n for n, _ in val_list],
+            "test_scenes": [n for n, _ in test_list]})
         net.train()
         return m
 
@@ -968,7 +965,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         {"model": net.state_dict(), "epoch": ep}, p))
     print(f"  total wall-clock {(time.time() - t_run)/3600:.2f} h")
 
-    open(f"{run_dir}/DONE", "w").close()
+    tc.update_run_json(run_dir, finished=True)
     print(f"  run complete -> {run_id}", flush=True)
 
 

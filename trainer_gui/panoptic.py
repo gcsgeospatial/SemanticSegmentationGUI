@@ -10,7 +10,6 @@ Local changes: fixed the constructor's k-shadowing bug, dropped tqdm.
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import numpy as np
@@ -159,50 +158,38 @@ class Alpine:
 
 # ---------------------------------------------------------------- GUI step
 
-def job_id_for(pred_dir: Path) -> str:
-    """predictions_<job>[_m<k>|_ensemble][/predictions] -> <job>."""
-    import re
-    pred_dir = Path(pred_dir)
-    name = pred_dir.parent.name if pred_dir.name == "predictions" else pred_dir.name
-    name = re.sub(r"(_m\d+|_ensemble)$", "", name)
-    return name[len("predictions_"):] if name.startswith("predictions_") else name
-
-
 def class_names_for(pred_dir: Path) -> tuple[list | None, str]:
-    """(class_names, source label): infer_run.json beside the npz (ensemble),
-    run.json a level up (downloaded runs), else the staged infer job's
-    infer_run.json (local runs). None when nothing names the classes."""
+    """(class_names, source label): the job.json beside the npz (its 'infer'
+    section), else run.json a level up (downloaded runs). None when nothing
+    names the classes."""
     from . import appstate
     pred_dir = Path(pred_dir)
-    for p in (pred_dir / "infer_run.json", pred_dir.parent / "run.json",
-              pred_dir.parent.parent / "run.json"):
+    m = appstate.read_json(pred_dir / "job.json")
+    if m and m.get("infer", {}).get("class_names"):
+        return list(m["infer"]["class_names"]), "job.json"
+    for p in (pred_dir.parent / "run.json", pred_dir.parent.parent / "run.json"):
         m = appstate.read_json(p)
         if m and m.get("class_names"):
             return list(m["class_names"]), p.name
-    roots = [appstate.scratch_infer_dir()]
-    for name in appstate.known_datasets():
-        try:
-            roots.append(appstate.dataset_root(name) / "infer")
-        except (KeyError, OSError):
-            pass
-    for r in roots:
-        m = appstate.read_json(r / job_id_for(pred_dir) / "infer_run.json")
-        if m and m.get("class_names"):
-            return list(m["class_names"]), "infer_run.json"
     return None, ""
 
 
 def run_panoptic(pred_dir, things: dict, k: int = 32, split: bool = True,
                  margin: float = 1.3, progress=None) -> dict:
-    """Cluster every *_pred.npz in pred_dir with ALPINE and write the result
+    """Cluster every inferred npz in pred_dir with ALPINE and write the result
     back as an additive 'instance' key (uint32, 0 = stuff, ids per scene).
     things = {model class index: (length_m, width_m)}. Atomic per-file rewrite
     so a crash never loses a prediction. Returns {files, instances}."""
+    from .dataset import pred_files, update_job_json
     say = progress or (lambda s: None)
-    files = sorted(Path(pred_dir).glob("*_pred.npz"))
+    files = []
+    for f in pred_files(pred_dir):
+        with np.load(f) as d:
+            if "classification" in d.files:
+                files.append(f)
     if not files:
-        raise RuntimeError(f"no *_pred.npz files in {pred_dir} - run Inference "
-                           "on this folder first, then come back")
+        raise RuntimeError(f"no inferred npz files in {pred_dir} - run "
+                           "Inference on this folder first, then come back")
     alp = Alpine(sorted(things), {c: [float(v[0]), float(v[1])] for c, v in things.items()},
                  k=k, split=split, margin=margin)
     total = 0
@@ -220,4 +207,8 @@ def run_panoptic(pred_dir, things: dict, k: int = 32, split: bool = True,
         from .postproc import replace_retry
         replace_retry(tmp, f)
         say(f"  {f.name}: {n_inst:,} instances over {len(xyz):,} pts")
+    update_job_json(pred_dir, "panoptic", {
+        "things": {str(c): list(v) for c, v in things.items()},
+        "k": k, "split": split, "margin": margin,
+        "files": len(files), "instances": total})
     return {"files": len(files), "instances": total}

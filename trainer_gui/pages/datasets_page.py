@@ -12,10 +12,10 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
                                QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel,
-                               QLineEdit, QListWidget, QListWidgetItem, QMenu, QMessageBox,
+                               QLineEdit, QListWidget, QListWidgetItem, QMessageBox,
                                QPushButton, QSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
-from .. import analysis, appstate, dataset, modal_cli, pretrain, theme, ui
+from .. import appstate, dataset, modal_cli, pretrain, theme, ui
 from ..dataset import LabelSpec, SplitConfig
 from ..jobs import FuncWorker, JobRunner
 from ..logconsole import LogConsole
@@ -73,8 +73,14 @@ class DatasetsPage(QWidget):
         self.upload_saved_btn = QPushButton("Upload selected to Modal")
         self.upload_saved_btn.clicked.connect(self._upload_saved)
         sd_col.addWidget(self.upload_saved_btn)
+        self.dup_btn = QPushButton("Duplicate && edit…")
+        self.dup_btn.setToolTip("Prefill the New-dataset form from this dataset "
+                                "(input, classes, split, features, HAG) so you can "
+                                "add a feature and rebuild without redoing choices.")
+        self.dup_btn.clicked.connect(self._duplicate_selected)
         self.delete_saved_btn = QPushButton("Delete selected")
         self.delete_saved_btn.clicked.connect(self._delete_saved)
+        sd_col.addWidget(self.dup_btn)
         sd_col.addWidget(self.delete_saved_btn)
         sd_row.addLayout(sd_col)
         self.stats_label = QLabel("")
@@ -248,19 +254,9 @@ class DatasetsPage(QWidget):
         self.scan_btn = QPushButton("Scan label values")
         self.scan_btn.clicked.connect(self._scan_labels)
         btn_row.addWidget(self.scan_btn)
-        self.analyze_btn = QPushButton("Analyze density")
-        self.analyze_btn.clicked.connect(self._analyze)
-        btn_row.addWidget(self.analyze_btn)
         self.combine_btn = QPushButton("Combine selected")
         self.combine_btn.clicked.connect(self._combine_selected)
         btn_row.addWidget(self.combine_btn)
-        self.copy_btn = QPushButton("Copy settings from…")
-        self.copy_btn.setToolTip("Repopulate class names, ignored values, split config and "
-                                 "feature selections from an existing dataset's "
-                                 "dataset_meta.json. Fields absent from the meta are left "
-                                 "untouched.")
-        self.copy_btn.clicked.connect(self._copy_settings_menu)
-        btn_row.addWidget(self.copy_btn)
         btn_row.addStretch()
         cl.addLayout(btn_row)
         self.class_table = QTableWidget(0, 5)
@@ -278,10 +274,6 @@ class DatasetsPage(QWidget):
         self.class_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.class_table.setMinimumHeight(160)
         cl.addWidget(self.class_table)
-        self.analyze_label = QLabel("")
-        self.analyze_label.setWordWrap(True)
-        theme.set_accent(self.analyze_label, "muted")
-        cl.addWidget(self.analyze_label)
         return box
 
     def _tiling_box(self) -> QWidget:
@@ -339,7 +331,7 @@ class DatasetsPage(QWidget):
 
     def _set_busy(self, on: bool):
         """One worker at a time; Stop lights up only while something runs."""
-        for b in (self.scan_btn, self.analyze_btn, self.tile_btn):
+        for b in (self.scan_btn, self.tile_btn):
             b.setEnabled(not on)
         self.stop_btn.setEnabled(on)
         if on:
@@ -352,7 +344,7 @@ class DatasetsPage(QWidget):
         if self.worker.running:
             return
         ready = bool(self._label_values) and self._scanned_for == self.input_edit.text().strip()
-        for w in (self.class_table, self.combine_btn, self.analyze_btn):
+        for w in (self.class_table, self.combine_btn):
             w.setEnabled(ready)
         self.tile_box.setEnabled(ready)
         self.scan_hint.setVisible(not ready)
@@ -485,15 +477,27 @@ class DatasetsPage(QWidget):
             mode=mode,
             strategy="provided" if self.split_provided_chk.isChecked() else "auto")
 
-    def _copy_settings_menu(self):
-        names = sorted(appstate.known_datasets())
-        if not names:
-            self._append("No saved datasets to copy settings from.")
+    def _duplicate_selected(self):
+        """Duplicate & edit: prefill the whole New-dataset form from the
+        selected dataset, name it <name>_v2, and let the user add features /
+        tweak before Build - no re-deriving choices from scratch."""
+        name = self._selected_known_name()
+        if name is None:
+            self._append("Select a saved dataset to duplicate first.")
             return
-        menu = QMenu(self)
-        for n in names:
-            menu.addAction(n, lambda n=n: self._copy_settings_from(n))
-        menu.exec(self.copy_btn.mapToGlobal(self.copy_btn.rect().bottomLeft()))
+        meta = appstate.read_json(
+            appstate.known_datasets().get(name, {}).get("meta_path", ""))
+        src = (meta or {}).get("source", {})
+        inputs = src.get("inputs") or []
+        if inputs:
+            self.input_edit.setText(inputs[0] if len(inputs) == 1
+                                    else str(Path(inputs[0]).parent))
+        base = re.sub(r"_v\d+$", "", name)
+        n = 2
+        while f"{base}_v{n}" in appstate.known_datasets():
+            n += 1
+        self.name_edit.setText(f"{base}_v{n}")
+        self._copy_settings_from(name)
 
     def _set_class_row(self, r: int, train: bool, values_text: str,
                        count_text: str, name: str, asprs=None):
@@ -637,32 +641,6 @@ class DatasetsPage(QWidget):
         self._update_scan_gate()
         self._append(f"Found {len(counts)} label values. Name them, uncheck any "
                      f"'unknown', then Build.")
-
-    def _analyze(self):
-        in_path = self.input_edit.text().strip()
-        if not os.path.exists(in_path):
-            self._append("Pick an input file or folder first.")
-            return
-        if not self._label_values:
-            self._append("Run 'Scan label values' first.")
-            return
-        self._set_busy(True)
-        self._append("Analyzing density…")
-
-        def job(progress):
-            files = dataset.expand_inputs(in_path)
-            progress(f"  scanning up to {analysis.MAX_FILES_PER_SPLIT} of {len(files)} file(s)")
-            return analysis.scan_folder(files)
-
-        self._done_cb = self._on_analyzed
-        self.worker.start(job)
-
-    def _on_analyzed(self, stats):
-        self._set_busy(False)
-        self.analyze_label.setText(
-            f"Density: {stats['mean_pts_per_m2']:.2f} pts/m²  ·  "
-            f"mean spacing {stats['mean_spacing_m']:.2f} m  ·  "
-            f"largest scene {stats['max_scene_points']:,} pts")
 
     def _combine_selected(self):
         """Collapse selected rows into one whose Source value lists every merged
@@ -1011,7 +989,7 @@ class DatasetsPage(QWidget):
 
     def _reload_known(self):
         """Rows are '<name>   <badge>'; the bare name rides in UserRole."""
-        c = theme.colors(appstate.get("ui_theme", "system"))
+        c = theme.colors()
         self.known_list.clear()
         for name, info in sorted(appstate.known_datasets().items()):
             staged = info.get("staged_dir", "")
@@ -1051,19 +1029,17 @@ class DatasetsPage(QWidget):
         meta_path = info.get("meta_path", "")
         meta = appstate.read_json(meta_path) if meta_path else None
         if meta is not None:
-            s = meta.get("stats", {})
-            spl = meta.get("splits", {})
-            n_tr = len(spl.get("train", {}).get("scenes", []))
-            n_va = len(spl.get("val", {}).get("scenes", []))
-            n_te = len(spl.get("test", {}).get("scenes", []))
-            hag = "  ·  HAG ✓" if meta.get("has_hag") else ""
-            fc = meta.get("source", {}).get("feature_channels") or []
-            extra = ("\nextra channels: " + ", ".join(c["name"] for c in fc)) if fc else ""
+            feats = [c for c, k in (("intensity", "has_intensity"),
+                                    ("return_number", "has_return_number"),
+                                    ("rgb", "has_rgb"), ("HAG", "has_hag"))
+                     if meta.get(k)]
+            feats += [c["name"] for c in
+                      meta.get("source", {}).get("feature_channels") or []]
             self.stats_label.setText(
                 f"{meta['name']}: {meta['num_classes']} classes "
-                f"({', '.join(meta['class_names'])})  ·  "
-                f"{s.get('mean_pts_per_m2', 0):.2f} pts/m²  ·  "
-                f"train {n_tr}, val {n_va}, test {n_te} scenes{hag}{extra}\n{status}")
+                f"({', '.join(meta['class_names'])})\n"
+                f"features: {', '.join(feats) if feats else 'xyz only'}\n"
+                f"{status}")
         else:
             self.stats_label.setText(f"{name}\n{status}")
 

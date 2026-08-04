@@ -25,8 +25,8 @@ Contracts (mirroring the local pixi path):
 
 - datasets: one shared volume named on the Datasets page (default
   `terminal-datasets`; env override `TT_DATASET_VOLUME`) mounted at `/datasets`,
-  one dataset per `/<name>` - the Datasets page uploads there; inference scenes
-  go to `/_infer/<job_id>`
+  one dataset per `/<name>` - the Datasets page uploads there; inference jobs
+  (flat `*_input.npz` + `job.json`) go to `/_infer/<job_id>`
 - outputs: per-backbone `<app>-outputs` volume mounted at `/outputs` (or one
   shared volume named on the Train page; env override `TT_OUTPUTS_VOLUME`);
   runs land at `runs/<id>` and the Inference page reads weights from there

@@ -152,17 +152,19 @@ def _scan(d):
     return out
 
 
-def _class_info(d):
-    """(num_classes, class_names) from a folder's infer_run.json, or None when
-    the folder has none (bare exported files) or it names no classes."""
-    p = os.path.join(d, "infer_run.json")
-    if not os.path.isfile(p):
-        return None
+def _infer_doc(d):
+    """The 'infer' section of a folder's job.json, or {} when absent."""
     try:
-        with open(p, encoding="utf-8") as f:
-            m = json.load(f)
+        with open(os.path.join(d, "job.json"), encoding="utf-8") as f:
+            return json.load(f).get("infer") or {}
     except (OSError, json.JSONDecodeError):
-        return None
+        return {}
+
+
+def _class_info(d):
+    """(num_classes, class_names) from a folder's job.json infer section, or
+    None when the folder has none (bare exported files) or it names no classes."""
+    m = _infer_doc(d)
     n, names = m.get("num_classes"), m.get("class_names") or []
     if n is None and not names:
         return None
@@ -170,27 +172,20 @@ def _class_info(d):
 
 
 def _member_name(d):
-    """Display name for an ensemble member dir: its infer_run.json backbone,
-    else the folder's basename."""
-    p = os.path.join(d, "infer_run.json")
-    try:
-        with open(p, encoding="utf-8") as f:
-            name = json.load(f).get("backbone")
-        if name:
-            return str(name)
-    except (OSError, json.JSONDecodeError):
-        pass
-    return os.path.basename(os.path.normpath(d))
+    """Display name for an ensemble member dir: its job.json backbone, else
+    the folder's basename."""
+    name = _infer_doc(d).get("backbone")
+    return str(name) if name else os.path.basename(os.path.normpath(d))
 
 
 def check_class_clamp(input_dirs, log=print):
-    """Refuse to mix models with different class sets. Dirs without an
-    infer_run.json (bare exported files) skip the check with a printed note."""
+    """Refuse to mix models with different class sets. Dirs without a
+    job.json (bare exported files) skip the check with a printed note."""
     infos = {}
     for d in input_dirs:
         info = _class_info(d)
         if info is None:
-            log(f"  note: no infer_run.json in {d}; class check skipped for it")
+            log(f"  note: no job.json in {d}; class check skipped for it")
         else:
             infos[d] = info
     if len({(n, tuple(names)) for n, names in infos.values()}) > 1:

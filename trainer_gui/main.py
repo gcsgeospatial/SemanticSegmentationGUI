@@ -1,4 +1,4 @@
-"""Training terminal - entry point + main window (sidebar nav over stacked pages)."""
+"""Training terminal - entry point + main window (top tab bar over stacked pages)."""
 
 from __future__ import annotations
 
@@ -10,13 +10,13 @@ from pathlib import Path
 from PySide6.QtCore import QByteArray, QEvent, QObject
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (QAbstractSpinBox, QApplication, QComboBox, QFileDialog, QHBoxLayout,
-                               QLabel, QListWidget, QListWidgetItem, QMessageBox, QStackedWidget,
+                               QLabel, QMessageBox, QStackedWidget, QTabBar,
                                QVBoxLayout, QWidget)
 
 # modal runs launch with cwd=REPO_ROOT so `modal run scripts/...` resolves
 REPO_ROOT = str(Path(__file__).resolve().parents[1])
 
-PAGES = ["Datasets", "Train", "Inference", "Plotting"]
+PAGES = ["Datasets", "Train", "Inference"]
 
 
 class _NoWheelEdit(QObject):
@@ -39,79 +39,71 @@ class MainWindow(QWidget):
         self.resize(1180, 800)
         self._restore_geometry()
 
-        row = QHBoxLayout(self)
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(0)
+        col = QVBoxLayout(self)
+        col.setContentsMargins(0, 0, 0, 0)
+        col.setSpacing(0)
 
-        side = QWidget()
-        side.setObjectName("sidebar")
-        side.setFixedWidth(220)
-        sl = QVBoxLayout(side)
-        sl.setContentsMargins(0, 0, 0, 0)
+        # one top bar on every page: brand · tabs · mode switch
+        top = QWidget()
+        top.setObjectName("topbar")
+        tl = QHBoxLayout(top)
+        tl.setContentsMargins(14, 0, 14, 0)
+        tl.setSpacing(10)
         brand = QLabel("Training Terminal")
         brand.setObjectName("brand")
-        sl.addWidget(brand)
+        tl.addWidget(brand)
+        self.nav = QTabBar()
+        self.nav.setExpanding(False)
+        for name in PAGES:
+            self.nav.addTab(name)
+        self.nav.currentChanged.connect(self._go)
+        tl.addWidget(self.nav)
+        tl.addStretch(1)
         self.tag = QLabel()
         self.tag.setObjectName("brandSub")
-        self.tag.setWordWrap(True)
-        sl.addWidget(self.tag)
+        tl.addWidget(self.tag)
 
         # Modal <-> Local switch; pages read appstate.get_exec_mode() at launch
         from . import appstate
-        mode_label = QLabel("Execution backend")
-        mode_label.setObjectName("modeLabel")
-        sl.addWidget(mode_label)
         self.mode_combo = QComboBox()
         self.mode_combo.addItem("Modal (cloud)", "modal")
         self.mode_combo.addItem("Local (pixi)", "local")
         self.mode_combo.setCurrentIndex(max(0, self.mode_combo.findData(appstate.get_exec_mode())))
         self.mode_combo.currentIndexChanged.connect(self._on_mode_change)
-        sl.addWidget(self.mode_combo)
+        tl.addWidget(self.mode_combo)
         self._apply_mode_tag(appstate.get_exec_mode())
 
-        theme_label = QLabel("Appearance")
-        theme_label.setObjectName("modeLabel")
-        sl.addWidget(theme_label)
+        from . import theme
         self.theme_combo = QComboBox()
-        self.theme_combo.addItem("System", "system")
         self.theme_combo.addItem("Light", "light")
         self.theme_combo.addItem("Dark", "dark")
         self.theme_combo.setCurrentIndex(
-            max(0, self.theme_combo.findData(appstate.get("ui_theme", "system"))))
+            max(0, self.theme_combo.findData(theme.current_mode())))
         self.theme_combo.currentIndexChanged.connect(self._on_theme_change)
-        sl.addWidget(self.theme_combo)
-
-        self.nav = QListWidget()
-        for name in PAGES:
-            self.nav.addItem(QListWidgetItem(name))
-        self.nav.currentRowChanged.connect(self._go)
-        sl.addWidget(self.nav, 1)
-        row.addWidget(side)
+        tl.addWidget(self.theme_combo)
+        col.addWidget(top)
 
         self.stack = QStackedWidget()
         content = QWidget()
         cl = QVBoxLayout(content)
-        cl.setContentsMargins(24, 18, 24, 18)
+        cl.setContentsMargins(24, 12, 24, 12)
         cl.addWidget(self.stack)
-        row.addWidget(content, 1)
+        col.addWidget(content, 1)
 
         from . import ui
         from .pages.datasets_page import DatasetsPage
         from .pages.infer_page import InferPage
-        from .pages.plotting_page import PlottingPage
         from .pages.train_page import TrainPage
 
         self.datasets_page = DatasetsPage(REPO_ROOT)
         self.train_page = TrainPage(REPO_ROOT)
-        self.plotting_page = PlottingPage(REPO_ROOT)
         self.infer_page = InferPage(REPO_ROOT)
-        for page in (self.datasets_page, self.train_page,
-                     self.infer_page, self.plotting_page):
+        for page in (self.datasets_page, self.train_page, self.infer_page):
             ui.polish_forms(page)
             self.stack.addWidget(ui.scroll_v(page))
 
         ui.set_navigator(self._navigate)
-        self.nav.setCurrentRow(0)
+        self._go(0)
 
     def _on_mode_change(self):
         from . import appstate
@@ -134,13 +126,12 @@ class MainWindow(QWidget):
 
     def _navigate(self, page_name: str):
         """ui.navigate target: switch pages."""
-        self.nav.setCurrentRow(PAGES.index(page_name))
+        self.nav.setCurrentIndex(PAGES.index(page_name))
 
     def _go(self, row: int):
         # name-keyed so inserting a page never silently shifts the refreshes
         refresh = {"Train": lambda: self.train_page.reload_datasets(),
-                   "Inference": lambda: self.infer_page.reload_runs(),
-                   "Plotting": lambda: self.plotting_page._rescan()}.get(PAGES[row])
+                   "Inference": lambda: self.infer_page.reload_runs()}.get(PAGES[row])
         if refresh:
             refresh()
         self.stack.setCurrentIndex(row)
@@ -212,13 +203,7 @@ def main() -> int:
     app.installEventFilter(_NoWheelEdit(app))
     app.setApplicationName("trainer_gui")
     app.setWindowIcon(_app_icon())
-    theme.apply(app, appstate.get("ui_theme", "system"))
-    try:   # live-follow the OS light/dark switch while in System mode
-        app.styleHints().colorSchemeChanged.connect(
-            lambda *_: (appstate.get("ui_theme", "system") == "system")
-            and theme.apply(app, appstate.get("ui_theme", "system")))
-    except (AttributeError, TypeError):
-        pass
+    theme.apply(app)
     _ensure_workspace()   # set the workspace BEFORE pages read it for their defaults
     win = MainWindow()
     win.show()

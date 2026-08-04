@@ -12,7 +12,6 @@ dependencies = [
     "numpy>=1.24",
     "scipy>=1.10",
     "laspy[lazrs]>=2.5",
-    "matplotlib>=3.8",
     "modal>=0.64",
     "pgeof>=0.3",
 ]

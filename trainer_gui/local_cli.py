@@ -76,21 +76,6 @@ def _nvidia_smi_gpus() -> "tuple[bool, str]":
     return True, f"{len(gpus)} GPU(s)"
 
 
-def local_vram_gb() -> float | None:
-    """Smallest visible GPU's total VRAM in GB, or None if undetectable.
-    Smallest, not largest: a run is capped by the weakest device it may land on."""
-    exe = shutil.which("nvidia-smi")
-    if exe is None:
-        return None
-    try:
-        p = subprocess.run([exe, "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
-                           capture_output=True, text=True, timeout=10)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    mibs = [int(ln.strip()) for ln in p.stdout.splitlines() if ln.strip().isdigit()]
-    return min(mibs) / 1024.0 if mibs else None
-
-
 def gpu_preflight() -> tuple[bool, str]:
     """(proceed, message) for GPU availability. The trainers are CUDA-only
     (every script calls .cuda(), no CPU path), so hard-block when nvidia-smi -L

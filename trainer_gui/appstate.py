@@ -45,11 +45,6 @@ def set_workspace(path: str) -> None:
     put("workspace", str(path))
 
 
-def dataset_root(name: str) -> Path:
-    """A dataset's on-disk root = its registered staged_dir (may be outside the workspace)."""
-    return Path(known_datasets()[name]["staged_dir"])
-
-
 def dataset_run_roots() -> list[Path]:
     """<dataset>/runs for every registered dataset still on disk."""
     roots = []
@@ -61,17 +56,12 @@ def dataset_run_roots() -> list[Path]:
 
 
 def run_roots(repo_root: str | None = None) -> list[Path]:
-    """Every place local runs live - the ONE discovery source for the Plotting
-    list and Inference run picker (each root walked one level deep)."""
+    """Every place local runs live - the ONE discovery source for the
+    Inference run picker (each root walked one level deep)."""
     roots = [*dataset_run_roots(), workspace_dir() / "inference", runs_dir()]
     if repo_root:
         roots.append(Path(repo_root) / "runs")
     return roots
-
-
-def scratch_infer_dir() -> Path:
-    """Where inference from a loose .pth (no linked dataset) lands."""
-    return workspace_dir() / "_scratch" / "infer"
 
 
 def runs_dir() -> Path:
@@ -135,8 +125,12 @@ def load_state() -> dict:
 
 
 def save_state(state: dict) -> None:
-    with open(_state_path(), "w", encoding="utf-8") as f:
+    # atomic: a crash mid-write must never take the whole app state with it
+    path = _state_path()
+    tmp = path.with_suffix(".json.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)
+    os.replace(tmp, path)
 
 
 def get(key: str, default: Any = None) -> Any:
@@ -211,21 +205,34 @@ def delete_dataset(name: str) -> tuple[str, str]:
             for child in root.iterdir():
                 if child.name not in _KEEP_ON_DELETE:
                     err = _rmtree_force(child) or err
-            _register_kept_runs(root)
         else:
             err = _rmtree_force(root)
     return (staged, err)
 
 
-def _register_kept_runs(root: Path) -> None:
-    """Keep a deleted dataset's runs/ visible via the Plotting page's extra roots."""
-    runs = root / "runs"
-    try:
-        has_runs = runs.is_dir() and any(runs.iterdir())
-    except OSError:
-        return
-    if has_runs:
-        extra = get("plot_extra_roots", [])
-        if str(runs) not in extra:
-            extra.append(str(runs))
-            put("plot_extra_roots", extra)
+def is_run_dir(d: Path) -> bool:
+    d = Path(d)
+    return d.is_dir() and any((d / fn).exists()
+                              for fn in ("run.json", "metrics.csv",
+                                         "val_metrics.csv"))
+
+
+def discover_runs(root: Path) -> list[Path]:
+    """Run dirs at `root` or one level below it (the layout downloads use:
+    <runs>/<backbone>/<run_id>/). Sorted newest-name-first, de-duplicated."""
+    root = Path(root)
+    if not root.exists():
+        return []
+    found: set[Path] = set()
+    if is_run_dir(root):
+        found.add(root)
+    for child in root.iterdir():
+        if not child.is_dir():
+            continue
+        if is_run_dir(child):
+            found.add(child)
+        else:
+            for grand in child.iterdir():
+                if is_run_dir(grand):
+                    found.add(grand)
+    return sorted(found, key=lambda p: p.name, reverse=True)
