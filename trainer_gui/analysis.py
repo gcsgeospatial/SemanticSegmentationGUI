@@ -23,7 +23,7 @@ def dg_config_to_env(cfg: dict) -> dict:
     return env
 
 
-# script defaults for the loss knobs (same in all trainers); a baseline run stays env-free
+# must match the loss-knob defaults in the trainer scripts
 LOSS_DEFAULTS = {"focal": False, "focal_gamma": 2.0, "class_weighting": True,
                  "weight_beta": 0.5, "rare_oversample": True}
 

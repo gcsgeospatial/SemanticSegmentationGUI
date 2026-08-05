@@ -199,7 +199,6 @@ class DatasetsPage(QWidget):
         self.hag_box.setToolTip("Bakes a per-point feat_hag channel into every scene. Pick "
                                 "the ground source and interpolation below. Select feat_hag "
                                 "in the Train page's feature list to feed it to any model.")
-        # ground SOURCE - orthogonal to interpolation (any source × any filter)
         self.hag_opts_w = ui.build_hag_options(
             self,
             ground_method_tip=(
@@ -485,8 +484,13 @@ class DatasetsPage(QWidget):
         if name is None:
             self._append("Select a saved dataset to duplicate first.")
             return
-        meta = appstate.read_json(
-            appstate.known_datasets().get(name, {}).get("meta_path", ""))
+        try:
+            meta = appstate.read_json(
+                appstate.known_datasets().get(name, {}).get("meta_path", ""))
+        except (OSError, ValueError) as e:
+            self._append(f"✗ dataset_meta.json for '{name}' is unreadable ({e}); "
+                         f"re-convert that dataset, then duplicate it again.")
+            return
         src = (meta or {}).get("source", {})
         inputs = src.get("inputs") or []
         if inputs:
@@ -523,9 +527,15 @@ class DatasetsPage(QWidget):
         """Repopulate classes, split and feature selections from a dataset's
         meta; fields missing from the meta are skipped silently."""
         meta_path = appstate.known_datasets().get(name, {}).get("meta_path", "")
-        meta = appstate.read_json(meta_path)
+        try:
+            meta = appstate.read_json(meta_path)
+        except (OSError, ValueError) as e:
+            self._append(f"✗ dataset_meta.json for '{name}' is unreadable ({e}); "
+                         f"re-convert that dataset, then try again.")
+            return
         if meta is None:
-            self._append(f"✗ Couldn't read dataset_meta.json for '{name}'.")
+            self._append(f"✗ No dataset_meta.json for '{name}' at '{meta_path}'; "
+                         f"re-convert that dataset, then try again.")
             return
         src = meta.get("source", {})
         copied = []
@@ -855,17 +865,23 @@ class DatasetsPage(QWidget):
             self._start_upload(self._staged_dir)
 
     @staticmethod
-    def _register_dataset(staged: Path) -> bool:
+    def _register_dataset(staged: Path) -> str:
         """Validate + remember a converted dataset folder. It must hold a readable
-        dataset_meta.json; False (nothing recorded) when it doesn't."""
-        if appstate.read_json(staged / "dataset_meta.json") is None:
-            return False
+        dataset_meta.json; returns "" on success, else why nothing was recorded."""
+        try:
+            meta = appstate.read_json(staged / "dataset_meta.json")
+        except (OSError, ValueError) as e:
+            return (f"{staged / 'dataset_meta.json'} is unreadable ({e}). Re-run "
+                    f"'Build dataset' on the source files to rewrite it.")
+        if meta is None:
+            return (f"{staged} has no dataset_meta.json. Pick the folder 'Build "
+                    f"dataset' wrote, or build it first.")
         appstate.remember_dataset(staged.name, {
             "staged_dir": str(staged),
             "meta_path": str(staged / "dataset_meta.json"),
             "uploaded": False,
         })
-        return True
+        return ""
 
     def _add_existing(self):
         """Register an already-converted dataset folder under Saved Datasets."""
@@ -875,11 +891,9 @@ class DatasetsPage(QWidget):
         if not picked:
             return
         staged = Path(picked)
-        if not self._register_dataset(staged):
-            QMessageBox.warning(
-                self, "Not a dataset",
-                f"{staged} has no readable dataset_meta.json. Build it with "
-                f"'Build dataset' first.")
+        err = self._register_dataset(staged)
+        if err:
+            QMessageBox.warning(self, "Not a dataset", err)
             return
         self._reload_known()
         self._append(f"✓ Added '{staged.name}' from {staged}.")
@@ -901,8 +915,9 @@ class DatasetsPage(QWidget):
             if not picked:
                 return
             staged = Path(picked)
-            if not self._register_dataset(staged):
-                self._append(f"✗ {staged} has no dataset_meta.json - not a dataset.")
+            err = self._register_dataset(staged)
+            if err:
+                self._append(f"✗ {err}")
                 return
         self._start_upload(staged)
 
@@ -1027,7 +1042,12 @@ class DatasetsPage(QWidget):
             if not on_disk:
                 status += "  ·  local copy missing (upload will ask where it is)"
         meta_path = info.get("meta_path", "")
-        meta = appstate.read_json(meta_path) if meta_path else None
+        try:
+            meta = appstate.read_json(meta_path) if meta_path else None
+        except (OSError, ValueError) as e:
+            meta = None
+            status = (f"dataset_meta.json is unreadable ({e}) - re-convert this "
+                      f"dataset before training on it")
         if meta is not None:
             feats = [c for c, k in (("intensity", "has_intensity"),
                                     ("return_number", "has_return_number"),

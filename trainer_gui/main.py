@@ -43,27 +43,21 @@ class MainWindow(QWidget):
         col.setContentsMargins(0, 0, 0, 0)
         col.setSpacing(0)
 
-        # one top bar on every page: brand · tabs · mode switch
         top = QWidget()
         top.setObjectName("topbar")
         tl = QHBoxLayout(top)
         tl.setContentsMargins(14, 0, 14, 0)
         tl.setSpacing(10)
-        brand = QLabel("Training Terminal")
-        brand.setObjectName("brand")
-        tl.addWidget(brand)
         self.nav = QTabBar()
         self.nav.setExpanding(False)
+        self.nav.setUsesScrollButtons(False)
         for name in PAGES:
             self.nav.addTab(name)
         self.nav.currentChanged.connect(self._go)
         tl.addWidget(self.nav)
         tl.addStretch(1)
-        self.tag = QLabel()
-        self.tag.setObjectName("brandSub")
-        tl.addWidget(self.tag)
 
-        # Modal <-> Local switch; pages read appstate.get_exec_mode() at launch
+        # pages read appstate.get_exec_mode() at launch
         from . import appstate
         self.mode_combo = QComboBox()
         self.mode_combo.addItem("Modal (cloud)", "modal")
@@ -71,7 +65,6 @@ class MainWindow(QWidget):
         self.mode_combo.setCurrentIndex(max(0, self.mode_combo.findData(appstate.get_exec_mode())))
         self.mode_combo.currentIndexChanged.connect(self._on_mode_change)
         tl.addWidget(self.mode_combo)
-        self._apply_mode_tag(appstate.get_exec_mode())
 
         from . import theme
         self.theme_combo = QComboBox()
@@ -109,14 +102,9 @@ class MainWindow(QWidget):
         from . import appstate
         mode = self.mode_combo.currentData()
         appstate.set_exec_mode(mode)
-        self._apply_mode_tag(mode)
         local = mode == "local"
         for page in (self.datasets_page, self.train_page, self.infer_page):
             page.apply_exec_mode(local)
-
-    def _apply_mode_tag(self, mode: str):
-        self.tag.setText("point-cloud training - local (pixi)" if mode == "local"
-                         else "point-cloud training on Modal")
 
     def _on_theme_change(self):
         from . import appstate, theme
@@ -207,6 +195,15 @@ def main() -> int:
     _ensure_workspace()   # set the workspace BEFORE pages read it for their defaults
     win = MainWindow()
     win.show()
+    bad = appstate.state_quarantine()
+    if bad:
+        QMessageBox.warning(
+            win, "Settings were corrupt",
+            f"state.json could not be read and was renamed to:\n{bad}\n\n"
+            "The app started with empty settings: saved datasets, the workspace "
+            "and preferences are gone.\n\n"
+            "Re-add each dataset folder on the Datasets page (Add existing…), "
+            "or copy values back out of the renamed file by hand.")
     _check_modal_cli(win)
     return app.exec()
 

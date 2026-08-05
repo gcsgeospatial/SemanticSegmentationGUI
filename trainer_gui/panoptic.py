@@ -63,7 +63,7 @@ class Alpine:
     def __init__(self, thing_indexes, thing_bboxes, k: int = 32,
                  split: bool = False, margin: float = 1.3):
         self.thing_indexes = thing_indexes
-        for ci, v in thing_bboxes.items():   # upstream used `k` here, clobbering the kwarg
+        for ci, v in thing_bboxes.items():
             if v[1] > v[0]:
                 thing_bboxes[ci] = [v[1], v[0]]
         self.thing_bboxes = thing_bboxes
@@ -163,12 +163,21 @@ def class_names_for(pred_dir: Path) -> tuple[list | None, str]:
     section), else run.json a level up (downloaded runs). None when nothing
     names the classes."""
     from . import appstate
+
+    def _read(p):
+        # a corrupt manifest is treated as "doesn't name the classes": the caller
+        # already handles that by falling back to numbered class labels
+        try:
+            return appstate.read_json(p)
+        except (OSError, ValueError):
+            return None
+
     pred_dir = Path(pred_dir)
-    m = appstate.read_json(pred_dir / "job.json")
+    m = _read(pred_dir / "job.json")
     if m and m.get("infer", {}).get("class_names"):
         return list(m["infer"]["class_names"]), "job.json"
     for p in (pred_dir.parent / "run.json", pred_dir.parent.parent / "run.json"):
-        m = appstate.read_json(p)
+        m = _read(p)
         if m and m.get("class_names"):
             return list(m["class_names"]), p.name
     return None, ""

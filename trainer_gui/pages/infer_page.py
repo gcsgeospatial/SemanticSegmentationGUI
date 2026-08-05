@@ -199,8 +199,6 @@ class InferPage(QWidget):
                                 "the ground source and interpolation below.")
         self.hag_chk.toggled.connect(lambda on: self.hag_opts_w.setVisible(on))
         iform.addRow("Height-Above-Ground", self.hag_chk)
-        # same source × interpolation axes as the Datasets page; default CSF
-        # because inference clouds are usually unlabeled
         self.hag_opts_w = ui.build_hag_options(
             self, filter_first=True, default_method="csf",
             ground_method_tip=(
@@ -265,8 +263,6 @@ class InferPage(QWidget):
         dg_row.addStretch()
         iform.addRow("Domain adaptation", ui.wrap(dg_row))
 
-        # per-channel source policy: calculated channels (feat_hag / feat_geo_*)
-        # recompute or zero; found channels bind to a probed input column or zero
         self.chan_grid_host = QWidget()
         cg = QGridLayout(self.chan_grid_host)
         cg.setContentsMargins(0, 0, 0, 0)
@@ -297,7 +293,6 @@ class InferPage(QWidget):
         iform.addRow("Classes (mask at launch)", ui.wrap(ccol))
         self._rebuild_class_list()
 
-        # export-only knobs: the .npz keeps raw predictions, so re-export never re-runs inference
         self.fmt_combo = QComboBox()
         for key in dataset.PRED_EXPORT_FORMATS:
             name = {"txt": "Text"}.get(key, key.upper())
@@ -345,12 +340,15 @@ class InferPage(QWidget):
         uc_row.addStretch()
         iform.addRow("Confidence", ui.wrap(uc_row))
 
-        # post-inference label cleanup: runs on the *_pred.npz after inference
-        # (and after the ensemble vote), before export; re-runnable any time
         self.pp_box = QGroupBox("Post-processing (after inference, before export)")
         self.pp_box.setCheckable(True)
         self.pp_box.setChecked(True)
-        pp = QFormLayout(self.pp_box)
+        pp_outer = QVBoxLayout(self.pp_box)
+        pp_outer.setContentsMargins(0, 0, 0, 0)
+        pp_content = QWidget()
+        pp_outer.addWidget(pp_content)
+        self.pp_box.toggled.connect(pp_content.setVisible)
+        pp = QFormLayout(pp_content)
         pp.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
         self.knn_chk = QCheckBox("KNN smoothing")
         self.knn_chk.setChecked(True)
@@ -431,8 +429,6 @@ class InferPage(QWidget):
         pp.addRow("Class roles", ui.wrap(rolerow))
         self._rebuild_role_combos()
 
-        # panoptic instances: ALPINE clustering folded in from the old tab -
-        # off by default, expands when the user goes down that path
         self.pan_box = QGroupBox("Instance clustering (ALPINE, training-free)")
         self.pan_box.setCheckable(True)
         self.pan_box.setChecked(False)
@@ -441,7 +437,13 @@ class InferPage(QWidget):
             "(ALPINE, arXiv 2503.13203) after post-processing; exports as an "
             "'instance_id' extra dimension (0 = stuff). PLY drops instances - "
             "pick las/laz/txt/csv.")
-        pv = QVBoxLayout(self.pan_box)
+        pan_outer = QVBoxLayout(self.pan_box)
+        pan_outer.setContentsMargins(0, 0, 0, 0)
+        pan_content = QWidget()
+        pan_outer.addWidget(pan_content)
+        self.pan_box.toggled.connect(pan_content.setVisible)
+        pan_content.setVisible(False)
+        pv = QVBoxLayout(pan_content)
         self.pan_grid = QGridLayout()
         self.pan_grid.setColumnStretch(0, 1)
         pv.addLayout(self.pan_grid)
@@ -526,7 +528,7 @@ class InferPage(QWidget):
         self.cfg_fetcher.output.connect(self._append)
         self.cfg_fetcher.done.connect(self._on_cfg_fetched)
         self.cfg_fetcher.error.connect(
-            lambda tb: self._append(f"✗ Run-config fetch failed:\n{tb}"))
+            lambda tb, msg="": self._append(f"✗ Run-config fetch failed:\n{msg or tb}"))
         self.runner.output.connect(self._on_output)
         self.runner.finished.connect(self._on_stage_done)
         self.runner.failed.connect(self._on_runner_failed)
@@ -550,7 +552,6 @@ class InferPage(QWidget):
             + ("Pick a run.json (or a local .pth), a folder of clouds, and run locally."
                if local else
                "Pick a run (or a local .pth), a folder of clouds, and run on Modal."))
-        # ensembles are local-only; on Modal the box simply doesn't exist
         if not local:
             self.ens_box.setChecked(False)
         self.wf.setRowVisible(self.ens_box, local)
@@ -883,7 +884,17 @@ class InferPage(QWidget):
             for rdir in appstate.discover_runs(root):
                 if rdir.name in seen:
                     continue
-                m = _manifest_in(rdir)
+                try:
+                    m = _manifest_in(rdir)
+                except (OSError, ValueError) as e:
+                    # keep the run pickable: vanishing from the list reads as "gone"
+                    seen.add(rdir.name)
+                    self.run_combo.addItem(f"{rdir.name}  (unreadable run.json)",
+                                           {"run_id": rdir.name, "backbone": None})
+                    self._append(f"⚠ {rdir / 'run.json'} is unreadable ({e}); its "
+                                 f"architecture and classes must be set by hand, or "
+                                 f"delete that file and re-download the run.")
+                    continue
                 if m is not None:
                     seen.add(rdir.name)
                     self.run_combo.addItem(f"{rdir.name}  ({m.get('backbone', '?')})",
@@ -912,7 +923,13 @@ class InferPage(QWidget):
         rid = str(h.get("run_id", ""))
         for rdir in (appstate.workspace_dir() / "inference" / rid,
                      appstate.runs_dir() / str(h.get("backbone", "")) / rid):
-            m = _manifest_in(rdir)
+            try:
+                m = _manifest_in(rdir)
+            except (OSError, ValueError) as e:
+                self._append(f"⚠ {rdir / 'run.json'} is unreadable ({e}); class "
+                             f"names stay as they are - set them by hand, or "
+                             f"re-download the run.")
+                continue
             if m is not None:
                 return self._names_from_manifest(m)
         return None
@@ -1107,7 +1124,13 @@ class InferPage(QWidget):
         cands = [appstate.workspace_dir() / "inference" / rid]
         cands += [bdir / rid for bdir in (rdirs.iterdir() if rdirs.exists() else [])]
         for d in cands:
-            m = _manifest_in(d)
+            try:
+                m = _manifest_in(d)
+            except (OSError, ValueError) as e:
+                self._append(f"⚠ {d / 'run.json'} is unreadable ({e}); fetching the "
+                             f"run config from Modal instead - delete that file to "
+                             f"stop this warning.")
+                continue
             if m is not None:
                 self._apply_modal_manifest(m, rid)
                 return
@@ -1416,8 +1439,6 @@ class InferPage(QWidget):
         if self._ens_idx + 1 < len(self._ens_members):
             self._start_next_member()
             return
-        # the vote lands in the job root itself; everything ensemble stays
-        # inside this one directory
         ens_dir = Path(self._staged)
         self._append(f"\n[ensemble] voting over {len(self._ens_dirs)} member "
                      f"run(s) -> {ens_dir}…")
@@ -1657,20 +1678,20 @@ class InferPage(QWidget):
         return d
 
     def _on_preflight(self, present):
-        """Weights check: True=found, False=missing (block), None=couldn't list (proceed)."""
-        if present is False:
+        """Weights check: True=found, False=the volume listed no final_model.pth."""
+        if not present:
             self._append(f"✗ Run '{self._pending_run_id}' has no final_model.pth on the "
                          f"outputs volume. Pick a completed run, or use 'Local .pth file'.")
             self.run_btn.setEnabled(True)
             self._end_run("✗ weights missing on Modal")
             return
-        if present is None:
-            self._append("[0/4] (couldn't verify weights on Modal - proceeding.)")
         self._start_conversion(self._pending_input)
 
-    def _on_preflight_error(self, tb: str):
-        self._append(f"[0/4] (weights check errored, proceeding anyway)\n{tb}")
-        self._start_conversion(self._pending_input)
+    def _on_preflight_error(self, tb: str, msg: str = ""):
+        self._append(f"✗ Couldn't check the weights for '{self._pending_run_id}' on "
+                     f"Modal, so nothing was run:\n{msg or tb}")
+        self.run_btn.setEnabled(True)
+        self._end_run("✗ weights check failed")
 
     def _on_converted(self, staged: Path):
         self._staged = staged
@@ -1858,9 +1879,18 @@ class InferPage(QWidget):
             # job, and a same-stem collision would rewrite the wrong source
             self._append("[export] source-dimension carry-over skipped - "
                          "original inputs for this folder are unknown")
+        try:
+            cmap = self._class_map()
+        except ValueError as e:
+            self._append(f"\n✗ Export aborted: {e}\nPredictions remain as raw .npz "
+                         f"in {self._chain_dir}.")
+            self._ens_running = False
+            self.run_btn.setEnabled(True)
+            self._end_run("✗ export blocked by a bad class map")
+            return
         self._append(f"\n[export] writing predictions as {fmt}…")
         self.exporter.start(dataset.export_predictions, self._chain_dir, fmt,
-                            class_map=self._class_map(), unclass_threshold=thr,
+                            class_map=cmap, unclass_threshold=thr,
                             originals=originals)
 
     def _on_chain_error(self, tb: str):
@@ -1917,14 +1947,23 @@ class InferPage(QWidget):
 
     def _dataset_meta(self, manifest: dict | None = None) -> dict | None:
         """The run's dataset_meta.json, or None. `manifest` overrides
-        self._manifest (_apply_manifest_fields runs before it's adopted)."""
+        self._manifest (_apply_manifest_fields runs before it's adopted).
+        An unreadable meta is reported here and then treated as absent, since
+        every caller only asks whether extra channel/class info exists."""
         name = manifest.get("dataset") if manifest else self._owning_dataset()
         mp = appstate.known_datasets().get(name or "", {}).get("meta_path", "")
-        return appstate.read_json(mp)
+        try:
+            return appstate.read_json(mp)
+        except (OSError, ValueError) as e:
+            self._append(f"⚠ dataset_meta.json for '{name}' is unreadable ({e}); "
+                         f"re-convert that dataset on the Datasets page to restore "
+                         f"its channel and class-code info.")
+            return None
 
     def _class_map(self) -> dict | None:
         """{model index: exported LAS code} per the Output codes choice;
-        None writes raw model indices."""
+        None writes raw model indices. Raises ValueError on a malformed meta -
+        raw indices in an ASPRS-coded file are silently misread downstream."""
         mode = self.codes_combo.currentData()
         classes = (self._dataset_meta() or {}).get("classes", [])
         cmap = dataset.class_map_for_export({"classes": classes}, mode,
@@ -2207,7 +2246,8 @@ def _scene_channel_report(staged, features: list | None = None,
 
 
 def _manifest_in(rdir: Path) -> dict | None:
-    """run.json in a run folder, or None."""
+    """run.json in a run folder; None when the folder has none. A run.json that
+    is there but corrupt raises - callers must not drop the run silently."""
     return appstate.read_json(Path(rdir) / "run.json")
 
 
@@ -2235,7 +2275,8 @@ def _entry_name(entry: dict) -> str:
 
 
 def _fetch_run_config(volumes: list, run_id: str, progress=None):
-    """runs/<run_id>/run.json from the first outputs volume that has it, or None.
+    """runs/<run_id>/run.json from the first outputs volume that has it; None
+    when every volume answered and none held it (a CLI failure raises).
     Runs in a FuncWorker thread (each try blocks on a `modal volume get`)."""
     for vol in volumes:
         if progress:
@@ -2247,9 +2288,8 @@ def _fetch_run_config(volumes: list, run_id: str, progress=None):
 
 
 def _check_weights_present(volume: str, run_id: str, progress=None):
-    """runs/<run_id>/final_model.pth on the outputs volume?
-    True=yes, False=missing (block), None=couldn't list. Runs in a FuncWorker thread."""
+    """runs/<run_id>/final_model.pth on the outputs volume? True=yes, False=the
+    run listed without it (or not at all). A failed listing raises ModalCliError
+    rather than waving a paid GPU run through. Runs in a FuncWorker thread."""
     entries = modal_cli.list_volume_entries(volume, f"/runs/{run_id}")
-    if not entries:
-        return None
     return any(_entry_name(e) == "final_model.pth" for e in entries)

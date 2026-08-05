@@ -21,7 +21,7 @@ from ..backbones import BACKBONES, GPU_CHOICES, PARAM_TIPS
 from ..jobs import FuncWorker, JobRunner, LogParser
 from ..logconsole import LogConsole
 
-# Channels each arch CAN consume - a capability filter; standard channels are pre-checked as a reversible default (default_feature_checks), geo/hag extras stay opt-in.
+# channels each arch CAN consume - a capability filter, not the pre-check defaults
 _FEAT_STANDARD = {
     "randlanet":    ["intensity", "return_number"],
     "kpconvx_cold": ["intensity", "return_number"],
@@ -395,7 +395,12 @@ class TrainPage(QWidget):
         info = appstate.known_datasets().get(name, {})
         meta_path = info.get("meta_path", "")
         if meta_path:
-            self._meta = appstate.read_json(meta_path)
+            try:
+                self._meta = appstate.read_json(meta_path)
+            except (OSError, ValueError) as e:
+                self._append(f"✗ dataset_meta.json for '{name}' is unreadable "
+                             f"({e}); re-convert that dataset on the Datasets "
+                             f"page before training on it.")
         if not name:
             self._set_ds_status("")
             self._ds_ready = False
@@ -853,7 +858,6 @@ class TrainPage(QWidget):
         self._out_root = out_root
         self.runner.start(prog, args, cwd=self.repo_root, extra_env=run_env)
         self._set_run_live(True)
-        # local timeout = graceful stop at the nearest checkpoint, not a kill
         self._timeout_timer.start(self.timeout_spin.value() * 3600 * 1000)
 
     def _preflight_modal_run(self, p):
@@ -875,7 +879,6 @@ class TrainPage(QWidget):
         appstate.set_modal_outputs_volume(ov)
         self._pending = p
         name = p["dataset"]
-        # the volume the dataset was uploaded to wins over the current setting
         vol = (appstate.known_datasets().get(name, {}).get("volume")
                or appstate.modal_datasets_volume())
         p["volume"] = vol
@@ -887,6 +890,7 @@ class TrainPage(QWidget):
         p, self._pending = self._pending, None
         if p is None:
             return
+        # empty only ever means "modal answered and the path holds nothing"
         if not entries:
             self._append(f"✗ Dataset '{p['dataset']}' isn't on the "
                          f"'{p['volume']}' volume. Upload it from the "
@@ -895,13 +899,13 @@ class TrainPage(QWidget):
             return
         self._start_modal_run(p)
 
-    def _on_modal_preflight_error(self, tb: str):
+    def _on_modal_preflight_error(self, tb: str, msg: str = ""):
         p, self._pending = self._pending, None
         if p is None:
             return
-        self._append("[modal] (couldn't verify the dataset on the volume; "
-                     "proceeding anyway.)")
-        self._start_modal_run(p)
+        self._append(f"✗ Couldn't check '{p['dataset']}' on the '{p['volume']}' "
+                     f"volume, so the run was not launched:\n{msg or tb}")
+        self.launch_btn.setEnabled(True)
 
     def _start_modal_run(self, p):
         b, flags = p["backbone"], p["flags"]
@@ -1025,8 +1029,12 @@ class TrainPage(QWidget):
         if self._out_root:
             try:
                 (Path(self._out_root) / "STOP").unlink()
-            except OSError:
+            except FileNotFoundError:
                 pass
+            except OSError as e:
+                # left in place it stops the NEXT run at its first epoch check
+                self._append(f"⚠ couldn't clear the STOP file ({e}); delete "
+                             f"{Path(self._out_root) / 'STOP'} before the next run")
             self._out_root = None
 
     def _on_output(self, text: str):

@@ -22,8 +22,7 @@ EPOCH_RE = re.compile(
 VAL_RE = re.compile(
     r"\[(?:val|eval)@ep(\d+)\]\s+acc=([\d.]+)\s+"
     r"mIoU\(\d+-way\)=([\d.]+)\s+mIoU\(present \d+\)=([\d.]+)")
-# the id lines every trainer actually prints: "run complete -> <id>" at the end
-# (train_common + randlanet's copy), "RESUMING/EVAL-ONLY on <id> ..." at start
+# exact trainer wording: "run complete -> <id>" at end, "RESUMING/EVAL-ONLY on <id>" at start
 RUN_DIR_RE = re.compile(r"(?:run complete -> |RESUMING |EVAL-ONLY on )(\S+)")
 
 

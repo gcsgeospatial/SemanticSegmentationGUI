@@ -90,9 +90,6 @@ QWidget {{ font-size: 14px; }}
                                  border-bottom: 3px solid {c['accent']}; }}
 #topbar QTabBar::tab:hover:!selected {{ color: {c['text']};
                                         border-bottom: 3px solid {c['border']}; }}
-#brand {{ color: {c['text']}; font-size: 16px; font-weight: 600;
-          padding: 0 10px 0 4px; }}
-#brandSub {{ color: {c['sidebar_muted']}; font-size: 12px; }}
 #topbar QComboBox {{ background: {c['panel']}; color: {c['text']};
                      border: 1px solid {c['border']}; border-radius: 4px;
                      padding: 4px 8px; }}
@@ -152,7 +149,7 @@ def apply(app: QApplication, mode: str = "") -> None:
     """Apply light or dark; safe to call repeatedly (live-switches)."""
     c = colors(mode)
     if "Fusion" in QStyleFactory.keys():
-        app.setStyle("Fusion")            # honors the palette on every platform
+        app.setStyle("Fusion")
     app.setPalette(_palette(c))
     app.setStyleSheet(_qss(c))
 

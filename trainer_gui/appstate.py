@@ -108,11 +108,13 @@ def set_modal_outputs_volume(name: str) -> None:
 
 
 def read_json(path) -> dict | None:
-    """Parse a JSON file; None when it's missing, unreadable or invalid."""
+    """Parse a JSON file; None ONLY when it isn't there. Unreadable or malformed
+    raises (OSError / json.JSONDecodeError) - a caller that wants to treat those
+    as absent must catch and say so itself."""
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
-    except (OSError, json.JSONDecodeError):
+    except FileNotFoundError:
         return None
 
 
@@ -120,8 +122,35 @@ def _state_path() -> Path:
     return app_dir() / "state.json"
 
 
+_quarantined = ""
+
+
+def state_quarantine() -> str:
+    """Path a corrupt state.json was renamed to this session ("" = none); the
+    GUI reports it at startup, since the app came up with empty settings."""
+    return _quarantined
+
+
 def load_state() -> dict:
-    return read_json(_state_path()) or {}
+    global _quarantined
+    path = _state_path()
+    try:
+        return read_json(path) or {}
+    except (OSError, ValueError) as bad_state:
+        # never return {} in place: put() would write it back over the registry
+        n = 1
+        while (path.parent / f"{path.name}.bad-{n}").exists():
+            n += 1
+        dest = path.parent / f"{path.name}.bad-{n}"
+        try:
+            os.replace(path, dest)
+        except OSError as e:
+            raise RuntimeError(
+                f"{path} is unreadable ({bad_state}) and cannot be renamed out of "
+                f"the way ({e}). Close whatever is holding it, or delete it by "
+                f"hand, then relaunch.") from e
+        _quarantined = str(dest)
+        return {}
 
 
 def save_state(state: dict) -> None:
@@ -161,7 +190,6 @@ def forget_dataset(name: str) -> None:
     put("datasets", ds)
 
 
-# record-keeping subdirs kept when a dataset is deleted
 _KEEP_ON_DELETE = ("runs", "infer")
 
 

@@ -37,7 +37,6 @@ def npz_to_las(path):
     if "crs_wkt" in z.files:
         proc_wkt = str(z["crs_wkt"])
         src_wkt = str(z["source_crs_wkt"]) if "source_crs_wkt" in z.files else None
-        # restore_to_source is the single source of truth for the inverse reprojection
         sys.path.insert(0, _REPO_ROOT)
         from trainer_gui.readers import restore_to_source
         xyz = restore_to_source(xyz, proc_wkt, src_wkt)

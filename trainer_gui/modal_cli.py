@@ -4,9 +4,24 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
+
+
+class ModalCliError(RuntimeError):
+    """A `modal` invocation failed. Carries the command and modal's own output
+    so callers report the real cause instead of guessing at an empty result."""
+
+    def __init__(self, cmd: str, detail: str):
+        self.cmd = cmd
+        self.detail = detail.strip()
+        super().__init__(f"`{cmd}` failed: {self.detail or 'no output from modal'}")
+
+
+# modal's wording for "that path/volume isn't there" - genuine emptiness, not failure
+_MISSING = re.compile(r"not found|no such file|does not exist|doesn't exist", re.I)
 
 
 def modal_exe() -> str:
@@ -51,42 +66,70 @@ def run_script(script: str, flags: dict, detach: bool = False,
 
 # ---- thin synchronous helpers (background threads only - they block) ----
 
-def fetch_run_manifest(volume: str, run_id: str, timeout: int = 60) -> dict | None:
-    """Blocking: read runs/<run_id>/run.json off an outputs volume; None if
-    absent/unreadable."""
+def _run_modal(prog: str, args: list, timeout: int):
+    """subprocess.run for a modal command; OSError/timeout become ModalCliError.
+    Forces UTF-8: modal's ✓/box chars crash under Windows cp1252."""
+    cmd = " ".join([prog] + args)
     env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
+    try:
+        return cmd, subprocess.run([prog] + args, capture_output=True, text=True,
+                                   timeout=timeout, encoding="utf-8",
+                                   errors="replace", env=env)
+    except OSError as e:
+        raise ModalCliError(cmd, f"could not start the modal CLI ({e}). Install it "
+                                 f"with `pip install modal`, run `modal setup`, "
+                                 f"then try again.") from e
+    except subprocess.TimeoutExpired as e:
+        raise ModalCliError(cmd, f"no answer after {timeout}s. Check your network "
+                                 f"and `modal profile current`, then try again.") from e
+
+
+def fetch_run_manifest(volume: str, run_id: str, timeout: int = 60) -> dict | None:
+    """Blocking: read runs/<run_id>/run.json off an outputs volume. None ONLY
+    when modal answered and there is no such file; raises ModalCliError when the
+    CLI itself failed."""
     with tempfile.TemporaryDirectory() as td:
         prog, args = volume_get(volume, f"runs/{run_id}/run.json", td)
-        try:
-            out = subprocess.run([prog] + args, capture_output=True, text=True,
-                                 timeout=timeout, encoding="utf-8",
-                                 errors="replace", env=env)
-        except (OSError, subprocess.TimeoutExpired):
-            return None
+        cmd, out = _run_modal(prog, args, timeout)
         dest = os.path.join(td, "run.json")
-        if out.returncode == 0 and os.path.isfile(dest):
-            try:
-                with open(dest, encoding="utf-8") as f:
-                    return json.load(f)
-            except (OSError, json.JSONDecodeError):
+        if out.returncode != 0:
+            detail = (out.stderr or out.stdout or "")
+            if _MISSING.search(detail):
                 return None
-    return None
+            raise ModalCliError(cmd, f"{detail}\nFix the error above (usually a "
+                                     f"wrong volume name '{volume}' or an expired "
+                                     f"login - re-run `modal setup`), then retry.")
+        if not os.path.isfile(dest):
+            return None
+        try:
+            with open(dest, encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            raise ModalCliError(cmd, f"runs/{run_id}/run.json on '{volume}' is not "
+                                     f"readable JSON ({e}). Re-run the training job "
+                                     f"or pick another run.") from e
 
 
 def list_volume_entries(volume: str, remote_path: str = "/", timeout: int = 60) -> list[dict]:
-    """Blocking `modal volume ls --json`; returns [] if the path doesn't exist."""
+    """Blocking `modal volume ls --json`. [] means modal answered and the path is
+    empty or absent; a CLI failure raises ModalCliError."""
     prog, args = volume_ls(volume, remote_path)
-    # force UTF-8: modal's ✓/box chars crash under Windows cp1252
-    env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
-    try:
-        out = subprocess.run([prog] + args, capture_output=True, text=True,
-                             timeout=timeout, encoding="utf-8", errors="replace", env=env)
-    except (OSError, subprocess.TimeoutExpired):
-        return []
+    cmd, out = _run_modal(prog, args, timeout)
     if out.returncode != 0:
-        return []
+        detail = (out.stderr or out.stdout or "")
+        if _MISSING.search(detail):
+            return []
+        raise ModalCliError(cmd, f"{detail}\nFix the error above (usually a wrong "
+                                 f"volume name '{volume}' or an expired login - "
+                                 f"re-run `modal setup`), then retry.")
     try:
         data = json.loads(out.stdout)
-    except json.JSONDecodeError:
-        return []
-    return data if isinstance(data, list) else []
+    except json.JSONDecodeError as e:
+        raise ModalCliError(cmd, f"unparseable --json output ({e}). Upgrade the "
+                                 f"Modal CLI with `pip install -U modal`, then "
+                                 f"retry.") from e
+    if not isinstance(data, list):
+        raise ModalCliError(cmd, f"--json returned {type(data).__name__}, not a "
+                                 f"list. Upgrade the Modal CLI with `pip install "
+                                 f"-U modal`, then retry.")
+    return data

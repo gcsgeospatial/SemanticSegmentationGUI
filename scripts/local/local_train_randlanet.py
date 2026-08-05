@@ -381,6 +381,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
             os.makedirs(f"{PREP_DIR}/{split}", exist_ok=True)
         train_list, val_list, test_list = tc.split_scenes(ds_root)
         any_new = tc.validate_cache(PREP_DIR, _cache_signature())
+        tc.validate_scenes(PREP_DIR, ds_root)
         for split, items in (("train", train_list), ("val", val_list),
                              ("test", test_list)):
             print(f"  [{split}] {len(items)} scenes", flush=True)
@@ -522,7 +523,6 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
         if not os.path.exists(wpath):
             raise FileNotFoundError(f"weights not found: {wpath}")
         ckpt = tc.load_ckpt_safe(wpath, map_location=device)
-        # accept wrapped ('model'/'model_state_dict'/'state_dict') and bare state dicts
         sd = (ckpt.get("model", ckpt.get("model_state_dict",
                                          ckpt.get("state_dict", ckpt)))
               if isinstance(ckpt, dict) else ckpt)
@@ -564,7 +564,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
               f"final_model = best-val epoch {ckpt.get('epoch', '?')})", flush=True)
 
         run_dir = tc.infer_dir(infer_input)
-        scenes = sorted(glob.glob(f"{run_dir}/*_input.npz"))
+        scenes = tc.infer_scenes(run_dir)
         if not scenes:
             raise FileNotFoundError(f"No staged *_input.npz scenes in {run_dir}")
 
@@ -626,6 +626,7 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     print(f"  RandLA-Net  {dataset}  "
           f"({tc.gpu_name()}, {N_EPOCHS} ep, batch {BATCH_SIZE})")
     print("=" * 70)
+    tc.preflight_env()
     tc.clear_stop()
     train_list, val_list, test_list = ensure_prep()
     train_files = sorted(glob.glob(f"{PREP_DIR}/train/*.npz"))
@@ -726,7 +727,8 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
     sched = optim.lr_scheduler.ExponentialLR(opt, 0.95)
 
     metrics_csv = tc.init_metrics_csv(run_dir, CLASS_NAMES)
-    val_csv = metrics_csv          # val rows share the one metrics.csv
+    val_csv = metrics_csv
+    _eval_exclude_idx = tc.exclude_class_idx(CLASS_NAMES)
 
     def evaluate(ds, name2src, label):
         """Full-coverage eval scored on raw points: sphere-sweep the subsampled
@@ -767,7 +769,9 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                         if len(pend_items) == VAL_BATCH:
                             flush()
                     flush()
-                pred = votes.argmax(1)
+                # same class mask the infer path applies, so an eval-only
+                # re-score measures the predictor that actually ships
+                pred = tc.apply_class_mask(votes, _eval_exclude_idx).argmax(1)
                 name = os.path.splitext(os.path.basename(ds.files[i]))[0]
                 raw_src = name2src.get(name)
                 got = votes.sum(1) > 0
@@ -859,10 +863,8 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                      NUM_CLASSES, CLASS_NAMES, f"eval@ep{ep}",
                      cfg.val_steps, tc.PROXY_PROTOCOL_SPHERES, inventory=inv))
             net.train()
-            # weights before the csv row: a kill between them must not seed a phantom best that final_model.pth can never match
-            if best.update(m):
-                tc.atomic_torch_save({"model": net.state_dict(), "epoch": ep},
-                                     best.final)
+            best.update(m, lambda p, extra: tc.atomic_torch_save(
+                {"model": net.state_dict(), "epoch": ep, **extra}, p))
             tc.append_val_row(val_csv, ep, m, CLASS_NAMES)
             return m
         def _bn_batches(n=32):
@@ -954,7 +956,8 @@ def train_randlanet(dataset: Optional[str] = None, sub_grid: Optional[float] = N
                                   "optim": opt.state_dict(), "epoch": ep},
                                  f"{run_dir}/checkpoints/ep{ep:03d}.pth")
         stop = tc.stop_requested(ep)
-        if (ep + 1) % VAL_EVERY == 0 and ep != N_EPOCHS - 1 and not stop:
+        # the last epoch DOES validate: the final eval never crowns
+        if (ep + 1) % VAL_EVERY == 0 and not stop:
             run_eval(ep)
         if stop:
             break

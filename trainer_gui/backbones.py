@@ -13,12 +13,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-# modal ALS practice: 0.25 m is the modal published grid (DALES, FRACTAL,
-# Vaihingen, H3D); 50 m the modal patch. Both are starting points, not optima.
 ALS_GRID_M = 0.25
 ALS_TILE_M = 50.0
-# KPConv family only: 100 x grid, i.e. the paper's in_radius = 50 x dl as a side.
-# Wider wastes memory past the deepest layer's reach and makes the point cap thin.
 KP_TILE_M = 25.0
 
 
@@ -79,7 +75,7 @@ def _common(epochs_default: int, batch_default: int, steps_default: int = 500,
     return specs
 
 
-# hover help for the per-model parameter rows, keyed by ParamSpec.flag
+# keys must match ParamSpec.flag
 PARAM_TIPS = {
     "grid": "Voxel size (m) the cloud is thinned to. Smaller keeps more detail but costs memory.",
     "sub-grid": "Voxel size (m) the cloud is thinned to. Smaller keeps more detail but costs memory.",
@@ -95,7 +91,6 @@ BACKBONES: dict[str, Backbone] = {b.key: b for b in [
     Backbone(
         key="ptv3", label="PTv3", script="scripts/modal/modal_train_ptv3.py",
         app_name="ptv3",
-        # 24 GB floor: fp32 non-flash attention leaves 16 GB no margin
         rec_gpu="A100",
         params=[ParamSpec("grid", "Grid size (m)", "float", ALS_GRID_M, 0.02, 3.0,
                           step=0.05, decimals=2)]
@@ -118,7 +113,6 @@ BACKBONES: dict[str, Backbone] = {b.key: b for b in [
                           step=0.05, decimals=2)]
                + _common(150, 4, steps_default=300, tile_m=KP_TILE_M),
     ),
-    # original KPConv: deformable blocks are heavier, hence min_vram 40 / batch 3
     Backbone(
         key="kpconv", label="KPConv", script="scripts/modal/modal_train_kpconv.py",
         app_name="kpconv",
@@ -127,7 +121,7 @@ BACKBONES: dict[str, Backbone] = {b.key: b for b in [
                           step=0.05, decimals=2)]
                + _common(150, 3, steps_default=300, tile_m=KP_TILE_M),
     ),
-    # Pointcept-SSL encoders (Concerto/Sonata/Utonia): one shared trainer, CC-BY-NC weights; "freeze encoder" = upstream linear-probe protocol
+    # Concerto/Sonata/Utonia upstream weights are CC-BY-NC
     Backbone(
         key="concerto", label="Concerto", script="scripts/modal/modal_train_concerto.py",
         app_name="concerto",

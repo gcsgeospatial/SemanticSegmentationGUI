@@ -280,6 +280,7 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
           f"{torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'none'}")
 
     if not INFER:
+        tc.preflight_env()
         tc.clear_stop()
     train_list, val_list, test_list = ([], [], []) if INFER else ensure_prep()
 
@@ -401,8 +402,15 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
                 if doc.get("key") == key:
                     print(f"  neighbor_limits (cached): {doc['limits']}", flush=True)
                     return [int(x) for x in doc["limits"]]
-            except Exception:
-                pass
+            except FileNotFoundError:
+                continue          # no cache yet: try the legacy file, then calibrate
+            except (OSError, ValueError, KeyError, TypeError) as e:
+                # a mismatched key is normal (recalibrate); a CORRUPT cache is
+                # not - recalibrating from it would silently give a resumed run
+                # a different neighbour pyramid than it trained with
+                raise RuntimeError(
+                    f"{cache_p} is unreadable ({e}). Delete it to recalibrate "
+                    f"deliberately, then launch again.") from e
         print(f"  calibrating neighbor_limits on up to {CALIB_TILES} tiles "
               f"(one-off per prep cache)…", flush=True)
         t0 = time.time()
@@ -524,7 +532,7 @@ def train_kpconv(dataset: Optional[str] = None, mode: str = "train",
         return
 
     metrics_csv = tc.init_metrics_csv(run_dir, CLASS_NAMES)
-    val_csv = metrics_csv          # val rows share the one metrics.csv
+    val_csv = metrics_csv
 
     val_items, test_items = tc.kp_eval_items(PREP_DIR, val_list, test_list)
     evaluate = tc.kp_make_evaluate(tc.kp_make_fwd_eval(make_kp_batch, _forward),

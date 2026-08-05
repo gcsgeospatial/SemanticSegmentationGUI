@@ -115,10 +115,9 @@ GRID_HAG_GAP_WARN_M = 50.0
 # CSF decimation cell: only a cell's lowest point can be ground, so CSF runs on the min-Z-per-cell envelope; must stay well under the cloth resolution (~1-2 m)
 CSF_DECIM_CELL_M = 0.5
 
-# SMRF window + cut net are complements (swept synthetically 2026-07: w=100 alone
-# leaves 45% of a 120 m roof as ground, w=100+cut=50 leaves 0% up to 200 m roofs).
-# Net lines are spaced `cut` apart with values from an opening of ~4*cut diameter,
-# so roofs past ~200 m defeat the net; the height guard strips those
+# SMRF window + cut net are complements: net lines are spaced `cut` apart with values
+# from an opening of ~4*cut diameter, so roofs past ~200 m defeat the net; the height
+# guard strips those
 SMRF_WINDOW_M = 100.0
 SMRF_CUT_M = 50.0
 

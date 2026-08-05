@@ -394,7 +394,7 @@ def _convert_one(cloud: Cloud, raw: np.ndarray | None, value_to_index: dict[int,
     without it blocks runs that require the channel. missing_fields='skip'
     (inference): a requested field the file lacks is skipped and reported in
     stats['skipped_fields'] instead of raising - the trainer feeds zeros."""
-    # xyz stays float64: UTM-scale coords quantize to 0.5 m in float32, and trainers origin-shift to a local frame before their own casts
+    # xyz stays float64: UTM-scale coords quantize to 0.5 m in float32
     crs_warning = _crs_report(cloud.crs_wkt, cloud.source_crs_wkt, cloud.xyz, out_path.stem)
     out: dict[str, np.ndarray] = {"xyz": cloud.xyz.astype(np.float64)}
     # crs_wkt = processing CRS of the stored coords; source_crs_wkt present = a transform occurred (the round-trip signal), both ferry scene npz -> pred npz
@@ -667,8 +667,9 @@ def _plan_and_convert(input_files: list[Path], val_files: list[Path] | None,
     if pool_dir.is_dir():
         try:
             pool_dir.rmdir()
-        except OSError:
-            pass
+        except OSError as e:
+            say(f"  ! {pool_dir} could not be removed ({e}); it still holds "
+                f"converted scenes that never reached their split folder")
     return stats
 
 
@@ -698,7 +699,6 @@ def convert_dataset(name: str, inputs, spec: LabelSpec | None,
     split = split or SplitConfig()
     name = sanitize_name(name)
     out_root = staging_root / name
-    # stale scenes from an earlier build would silently leak between splits
     if out_root.is_dir() and any(out_root.iterdir()):
         raise FileExistsError(
             f"Dataset '{name}' already exists at {out_root}. Rebuilding on top of it "
@@ -994,12 +994,34 @@ def infer_stem(path) -> str:
 def pred_files(pred_dir) -> list[Path]:
     """Prediction-bearing npz files in a job dir: merged *_input.npz (the
     one-file layout) plus standalone *_pred.npz (ensemble members, Modal
-    pulls); when both exist for a stem the merged file wins."""
+    pulls); when both exist for a stem the merged file wins. The job.json
+    staging manifest is consulted first (manifests over globs); glob covers
+    manifest-less dirs."""
+    pred_dir = Path(pred_dir)
+    try:
+        job = appstate_read(pred_dir / "job.json") or {}
+    except (OSError, ValueError):
+        job = {}   # corrupt manifest: fall back to the glob rather than hide npz
+    names = job.get("staging", {}).get("scenes") or []
+    listed = [pred_dir / n for n in names]
+    inputs = (listed if listed and all(q.is_file() for q in listed)
+              else sorted(pred_dir.glob("*_input.npz")))
     by_stem: dict[str, Path] = {}
-    for pat in ("*_input.npz", "*_pred.npz"):
-        for p in sorted(Path(pred_dir).glob(pat)):
-            by_stem.setdefault(infer_stem(p), p)
+    for q in inputs:
+        by_stem.setdefault(infer_stem(q), q)
+    for q in sorted(pred_dir.glob("*_pred.npz")):
+        by_stem.setdefault(infer_stem(q), q)
     return sorted(by_stem.values())
+
+
+def appstate_read(path):
+    """appstate.read_json's contract without the import (dataset.py stays
+    GUI-framework-free for the shipped runtime): None only when the file isn't
+    there; unreadable or malformed raises."""
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
 
 
 def merge_predictions(job_dir, pred_src_dir, progress=None) -> int:
@@ -1063,51 +1085,70 @@ def asprs_code_for(name: str) -> int | None:
     return None
 
 
+def _cls_int(c, key: str) -> int:
+    """One int field of a dataset-meta classes entry ('source_value' honours the
+    source_values list). ValueError naming the entry when it's unusable."""
+    if not isinstance(c, dict):
+        v = c
+    elif key == "source_value":
+        src = c.get("source_values") or [c.get("source_value")]
+        v = src[0] if src else None
+    else:
+        v = c.get(key)
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        raise ValueError(f"dataset meta class entry {c!r} has no usable '{key}' "
+                         f"(got {v!r}); fix that entry in dataset_meta.json, or "
+                         f"set Output codes to 'raw model indices', then export "
+                         f"again.") from None
+
+
 def export_class_map(meta_classes, mode: str) -> dict | None:
     """{model index: exported LAS code} from a dataset meta's classes list.
     mode 'asprs': the class's stored asprs_value, else a name match, else its
     source value (collisions fall into the 64+ user band). mode 'source': the
-    training data's source values. mode 'raw' (or unusable meta): None."""
+    training data's source values. Returns None ONLY for mode 'raw' (and for an
+    empty classes list); a malformed entry raises ValueError naming it, because
+    falling back to raw indices writes them into a file GIS reads as ASPRS."""
     if mode == "raw" or not meta_classes:
         return None
-    try:
-        if mode == "source":
-            return {int(c["index"]): int((c.get("source_values") or
-                                          [c["source_value"]])[0])
-                    for c in meta_classes}
-        cs = sorted(meta_classes, key=lambda c: int(c["index"]))
-        cmap = {int(c["index"]): (int(c["asprs_value"])
-                                  if c.get("asprs_value") is not None
-                                  else asprs_code_for(c.get("name", "")))
-                for c in cs}
-        taken = {v for v in cmap.values() if v is not None}
-        nxt = ASPRS_USER_BASE
-        for c in cs:
-            i = int(c["index"])
-            if cmap[i] is not None:
-                continue
-            src = c.get("source_values") or [c.get("source_value")]
-            v = int(src[0]) if src and src[0] is not None else None
-            if v is None or v in taken:
-                v = max(nxt, ASPRS_USER_BASE)
-                while v in taken:
-                    v += 1
-                nxt = v + 1
-            cmap[i] = v
-            taken.add(v)
-        return cmap
-    except (ValueError, KeyError, TypeError, IndexError):
-        return None
+    cs = sorted(meta_classes, key=lambda c: _cls_int(c, "index"))
+    if mode == "source":
+        return {_cls_int(c, "index"): _cls_int(c, "source_value") for c in cs}
+    cmap = {_cls_int(c, "index"): (_cls_int(c, "asprs_value")
+                                   if c.get("asprs_value") is not None
+                                   else asprs_code_for(c.get("name", "")))
+            for c in cs}
+    taken = {v for v in cmap.values() if v is not None}
+    nxt = ASPRS_USER_BASE
+    for c in cs:
+        i = _cls_int(c, "index")
+        if cmap[i] is not None:
+            continue
+        src = c.get("source_values") or [c.get("source_value")]
+        # no source value at all is legal here - it just falls into the user band
+        v = _cls_int(c, "source_value") if src and src[0] is not None else None
+        if v is None or v in taken:
+            v = max(nxt, ASPRS_USER_BASE)
+            while v in taken:
+                v += 1
+            nxt = v + 1
+        cmap[i] = v
+        taken.add(v)
+    return cmap
 
 
 def class_map_for_export(meta: dict | None, mode: str, say, subject: str) -> dict | None:
     """export_class_map over a dataset meta, logging the raw-indices fallback via
-    `say`; `subject` names the weights/run in the log line."""
-    cmap = export_class_map((meta or {}).get("classes", []), mode)
-    if mode != "raw" and not cmap:
+    `say`; `subject` names the weights/run in the log line. Only a meta with no
+    classes falls back - a malformed one raises (see export_class_map)."""
+    classes = (meta or {}).get("classes", [])
+    if mode != "raw" and not classes:
         say(f"[export] no dataset meta for {subject}; exported codes are raw "
-            f"model indices.")
-    return cmap
+            f"model indices. Register that dataset on the Datasets page "
+            f"(Add existing…) to export real class codes.")
+    return export_class_map(classes, mode)
 
 
 def _rewrite_original(orig: Path, dst: Path, cls, confidence=None, member=None,
@@ -1250,7 +1291,7 @@ def export_predictions(pred_dir, fmt: str, progress=None, class_map=None,
                 say(f"  ⚠ {Path(orig).name}: can't carry source dimensions "
                     f"({e}); writing xyz + classification only.")
         if not carried:
-            _write_pred(dst, xyz, cls, fmt, confidence=conf, crs_wkt=crs_wkt,
+            _write_pred(dst, xyz, cls, fmt, say=say, confidence=conf, crs_wkt=crs_wkt,
                         source_crs_wkt=source_wkt, member=member, instance=instance,
                         extra_dims=extra_dims)
         written.append(dst)
@@ -1322,7 +1363,7 @@ def prediction_report(pred_dir, class_names=None, unclass_threshold=None,
 
 def _write_pred(dst: Path, xyz: np.ndarray, cls: np.ndarray, fmt: str,
                 confidence=None, crs_wkt=None, source_crs_wkt=None, member=None,
-                instance=None, extra_dims=None):
+                instance=None, extra_dims=None, say=print):
     """One classified cloud -> dst, with xyz inverse-transformed back to the source
     frame via the shared keystone restore (raises the D2 legacy block). The embedded
     las/laz WKT VLR is the SOURCE CRS so deliverables overlay the input clouds.
@@ -1346,8 +1387,10 @@ def _write_pred(dst: Path, xyz: np.ndarray, cls: np.ndarray, fmt: str,
             try:
                 from pyproj import CRS
                 h.add_crs(CRS.from_wkt(geo_wkt))
-            except Exception:
-                pass
+            except Exception as e:
+                # written unreferenced, it silently fails to overlay the input
+                say(f"  ! {dst.name}: could not embed the CRS ({e}); the file "
+                    f"is written WITHOUT georeferencing")
         h.offsets = xyz.min(0)
         h.scales = [0.001] * 3
         las = laspy.LasData(h)

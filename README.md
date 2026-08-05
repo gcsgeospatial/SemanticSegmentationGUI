@@ -1,89 +1,92 @@
 # Training Terminal
 
-Desktop GUI (PySide6) for training and running point-cloud semantic-segmentation
-models: bring a folder of point clouds, build a dataset, train a model, run
-inference. Three pages: **Datasets → Train → Inference**.
+A desktop app for point-cloud semantic segmentation: turn your classified
+point clouds into a dataset, train a model on it, and classify new clouds
+with the result — three tabs, no code.
 
-Two execution backends, switched in the sidebar: **Local (pixi)** and
-**Modal (cloud)**. Both run the same `scripts/local/` trainers (the Modal
-shells subprocess them on a cloud GPU; see `scripts/modal/README.md`).
+Runs on your own NVIDIA GPU, or on [Modal](https://modal.com) cloud GPUs with
+the switch in the top bar.
 
-## Run it
+## Install & run
 
-```powershell
+```
 cd trainer_gui
-pixi install     # one-time
-pixi run gui     # launch
+pixi install
+pixi run gui
 ```
 
-pip alternative (Python 3.10+): `pip install -e .` then `trainer-gui`.
+[pixi](https://pixi.sh) handles everything on Windows and Linux. On first
+launch you pick a workspace folder — all datasets, training runs, and
+inference results live there.
 
-## How it runs training/inference
+## 1 · Datasets
 
-The GUI never trains in-process. Locally it runs each trainer inside a
-per-model pixi environment (`envs/pixi.toml`, locked in `envs/pixi.lock` -
-one env per backbone, CUDA/torch + pinned model sources as `trainer-src-*`
-conda packages from a public prefix.dev channel). Host dirs pass via env vars
-(the `train_common` contract; unset = the fixed container paths Modal uses):
+Point at classified clouds (`las/laz`, `ply`, `txt/csv/xyz/pts`, `pcd`,
+`npy/npz`). The app finds your label field, lists every class value it sees,
+and lets you rename, merge, or exclude classes. Pick a validation/test
+fraction and Build — the split is carved once, recorded, and never changes
+under you. Coordinates are reprojected to meters automatically and restored
+on export.
 
-| Env var | Holds |
+Optional per-point channels you can bake in:
+
+- **Height Above Ground** — ground found from your ground class, or detected
+  with [CSF (cloth simulation)](https://github.com/jianboqi/CSF) or
+  [SMRF](https://pdal.io/en/latest/stages/filters.smrf.html) via
+  [PDAL](https://pdal.io), or a fast lowest-point proxy; interpolated by
+  grid, nearest-neighbor, or Delaunay.
+- **Geometric features** (planarity, linearity, scattering, verticality…) —
+  computed with [pgeof](https://github.com/drprojects/point_geometric_features)
+  at the optimal neighborhood size.
+
+**Duplicate & edit** clones an existing dataset's whole setup into the form
+so you can add a channel and rebuild without redoing your choices.
+
+## 2 · Train
+
+Pick the dataset and a model; sensible per-model defaults are pre-filled and
+everything is editable. Logs stream live; you can stop gracefully at the
+nearest checkpoint. A finished run is one folder holding the weights, its
+manifest, and its metric history — that folder is all inference needs.
+
+| Model | What it is |
 |---|---|
-| `TT_DATASETS_ROOT` | staging root with the canonical datasets |
-| `TT_OUTPUTS_ROOT` | `runs/<id>/` weights + training artifacts |
-| `TT_DATASET_DIR` / `TT_INFER_DIR` / `TT_PRED_DIR` | per-run overrides |
-| `TT_TRAIN_STRIDE` | train-tile stride as a fraction of chunk_xy (default 0.75) |
+| [PTv3](https://github.com/Pointcept/PointTransformerV3) | Point Transformer V3 ([paper](https://arxiv.org/abs/2312.10035)) |
+| [RandLA-Net](https://github.com/QingyongHu/RandLA-Net) | lightweight large-scale net ([paper](https://arxiv.org/abs/1911.11236)) |
+| [KPConv](https://github.com/HuguesTHOMAS/KPConv-PyTorch) | kernel point convolution ([paper](https://arxiv.org/abs/1904.08889)) |
+| [KPConvX-L](https://github.com/apple/ml-kpconvx) | modernized KPConv with kernel attention |
+| Concerto / [Sonata](https://github.com/facebookresearch/sonata) / Utonia | fine-tuned self-supervised [Pointcept](https://github.com/Pointcept/Pointcept)-family encoders — **weights are CC-BY-NC 4.0 (non-commercial)** |
 
-No pixi on PATH (or not a CUDA host) → the GUI prints the exact command
-instead of running it.
+Optional training extras: class balancing, focal/Lovász loss options, rare-class
+oversampling, and density-generalization augmentation for inferring at a
+different point density than you trained on.
 
-## Models
+## 3 · Inference
 
-| Model | key | Local script |
-|---|---|---|
-| PTv3 | `ptv3` | `scripts/local/local_train_ptv3.py` |
-| RandLA-Net | `randlanet` | `scripts/local/local_train_randlanet.py` |
-| KPConvX-L | `kpconvx_cold` | `scripts/local/local_train_kpconvx_cold.py` |
-| KPConv | `kpconv` | `scripts/local/local_train_kpconv.py` |
-| Concerto (pretrained encoder) | `concerto` | `scripts/local/local_train_concerto.py` |
-| Sonata (pretrained encoder) | `sonata` | `scripts/local/local_train_sonata.py` |
-| Utonia (pretrained encoder) | `utonia` | `scripts/local/local_train_utonia.py` |
+Pick weights (a run, an installed model package, or a bare `.pth`), pick an
+input file or folder, Run. Everything for a job lands in one folder: one
+`.npz` per input (the converted channels *and* the predictions in the same
+file — open it in any viewer to explore both) plus a `job.json` record and
+your exported result.
 
-`concerto`/`sonata`/`utonia` fine-tune Pointcept self-supervised encoders
-(shared trainer; the latter two are thin wrappers). Their HuggingFace weights
-are **CC-BY-NC 4.0 (non-commercial)**.
+- **Export**: classified `las/laz` (source coordinates and every original
+  dimension carried over), or `txt/csv/ply`; a confidence threshold can send
+  unsure points to *unclassified*; optional per-point uncertainty fields.
+- **Accuracy boosters**: test-time augmentation views, overlapped tile
+  voting, and test-time adaptation (AdaBN, [paper](https://arxiv.org/abs/1603.04779),
+  and APCoTTA) on the BatchNorm architectures (RandLA-Net / KPConv / KPConvX).
+- **Cleanup passes** (re-runnable any time without re-inference): KNN
+  probability smoothing (in the spirit of
+  [RangeNet++](https://github.com/PRBonn/rangenet_lib)), small-island
+  removal, and confidence-gated height/planarity rules for the classic
+  ground/vegetation/building confusions.
+- **Instances**: cluster chosen classes into individual objects with
+  [ALPINE](https://github.com/valeoai/Alpine) ([paper](https://arxiv.org/abs/2503.13203)) —
+  training-free, exported as an `instance_id` field.
+- **Ensemble**: run 2–3 trained models over one input and majority-vote —
+  typically ~+2 mIoU over the best single model.
 
-**HeightAboveGround** is a feature channel (`feat_hag`), not a model variant:
-bake it at dataset build or inference staging (ground source: labeled class /
-CSF / SMRF / Z-min proxy; grid, NN, or Delaunay interpolation). Runs trained
-with it record it in `run.json "features"`; inference recomputes it from the
-input clouds.
+## Licensing
 
-## The three pages
-
-- **Datasets** builds `<staging>/<name>/` - scan label values into named
-  classes, optional HAG, one recorded train/val/test split
-  (`dataset_meta.json` + `train|val|test/<scene>.npz`; trainers read the
-  folders verbatim and never re-split).
-- **Train** picks dataset + model, pre-fills per-model parameters, launches
-  the pixi run and streams logs. A finished run dir holds the weights,
-  `run.json` (the single manifest inference needs - config, class names,
-  final test metrics, finished flag), and `metrics.csv` (per-epoch train +
-  val rows).
-- **Inference** takes weights (a training run, an installed
-  `trainer-weights-*` package, or a bare `.pth`) and an input file/folder.
-  Each input converts to `<stem>_input.npz` in the job dir and predictions
-  merge into that same file - one npz per input plus one `job.json`
-  manifest. Optional cleanup passes (KNN smoothing, sieve, geometry rules),
-  ALPINE instance clustering, and export to las/laz/ply/txt/csv. An
-  **Ensemble** group runs 2-3 models over one staged job and majority-votes
-  the result (`scripts/local/ensemble_vote.py` works standalone too).
-
-## Repo layout
-
-```
-trainer_gui/     the PySide6 app - pages/, local_cli.py, ...
-scripts/local/   the real trainers/inferencers (plain argparse; run standalone)
-scripts/modal/   thin cloud shells (see its README.md)
-scripts/helper/  train_common.py (shared training/manifest logic)
-envs/            pixi.toml + pixi.lock - one training env per backbone
-```
+MIT for the app. Models keep their upstream licenses (see the table);
+the Pointcept-encoder weights are non-commercial.

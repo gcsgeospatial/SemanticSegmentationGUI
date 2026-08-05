@@ -115,7 +115,7 @@ def write_out(path, xyz, cls, intensity, confidence, agree, crs_wkt=None,
             d["intensity"] = intensity
         if crs_wkt:
             d["crs_wkt"] = np.asarray(str(crs_wkt))
-        if source_crs_wkt:                       # round-trip signal rides along
+        if source_crs_wkt:
             d["source_crs_wkt"] = np.asarray(str(source_crs_wkt))
         np.savez(path, **d)
         return
@@ -230,7 +230,6 @@ def ensemble(input_dirs, out_dir, log=print):
             dom = dominant_member(voted, probs=np.stack(probs))
         else:
             noprobs = [d for d, p in zip(input_dirs, probs) if p is None]
-            # the two branches genuinely disagree - say which one ran
             log(f"  {stem}: weighted hard vote (no probs in {noprobs})")
             w = np.stack([c if c is not None else np.ones(len(ref_lab), np.float32)
                           for c in confs])
@@ -238,7 +237,7 @@ def ensemble(input_dirs, out_dir, log=print):
             dom = dominant_member(voted, labels=stacked, weights=w)
         agree = agreement(stacked, voted)
         crs = src_crs = None
-        if ref_path.endswith(".npz"):    # ferry the reference member's CRS pair along
+        if ref_path.endswith(".npz"):
             with np.load(ref_path) as zr:
                 crs = str(zr["crs_wkt"]) if "crs_wkt" in zr.files else None
                 src_crs = str(zr["source_crs_wkt"]) if "source_crs_wkt" in zr.files else None

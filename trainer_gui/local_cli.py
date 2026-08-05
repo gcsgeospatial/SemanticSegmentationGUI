@@ -13,8 +13,7 @@ from pathlib import Path
 
 from . import appstate
 
-# local_cli lives in trainer_gui/ inside the repo; the envs workspace sits
-# beside it. Editable installs run from the checkout, so this always resolves.
+# repo checkout root; envs/ sits beside trainer_gui/
 _REPO = Path(__file__).resolve().parents[1]
 
 

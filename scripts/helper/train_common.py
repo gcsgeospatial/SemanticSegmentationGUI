@@ -32,9 +32,8 @@ def resolve_weights_path(weights):
 
 
 # ---- density-domain-generalization primitives ------------------------------
-# Occupancy o = rho*g^2; o < 1 breaks density invariance, and coarsening is
-# one-way (thin dense, never densify sparse).
-# DG_* env overrides are set by the GUI panel (or directly), never CLI args.
+# Coarsening is one-way (thin dense, never densify sparse). DG_* env
+# overrides are set by the GUI panel (or directly), never CLI args.
 
 def env_bool(name, default):
     v = os.environ.get(name)
@@ -56,7 +55,6 @@ def env_str(name, default):
     return v if v not in (None, "") else default
 
 
-# D1 - density/grid jitter: per-tile effective grid g_eff >= g0.
 def effective_grid(g0, coarsen_max=2.5, p_native=0.5, rng=None):
     """g0 with prob p_native, else log-uniform in [g0, g0*coarsen_max]
     (coarsen_max = 1/(g0*sqrt(rho_min)) reaches output density rho_min)."""
@@ -67,7 +65,6 @@ def effective_grid(g0, coarsen_max=2.5, p_native=0.5, rng=None):
     return float(g0) * float(np.exp(rng.uniform(0.0, np.log(coarsen_max))))
 
 
-# D0/D0b - canonicalize to a grid: first point per g-cell.
 def voxel_first_idx(xyz, g):
     """Indices of the first point per g-voxel; slice every per-point companion
     array by them too."""
@@ -77,7 +74,6 @@ def voxel_first_idx(xyz, g):
     return np.sort(idx)
 
 
-# D3b - local-density input channel: log d_k ~ -0.5 log rho (pair with D1).
 def local_density_logdk(xyz, k=8):
     """Per-point log distance to the k-th nearest neighbour (natural log).
     Larger = sparser. Returns float32 array, shape (N,)."""
@@ -93,7 +89,6 @@ def local_density_logdk(xyz, k=8):
     return np.log(np.maximum(dk, 1e-6)).astype(np.float32)
 
 
-# D2b - AdaBN: re-estimate BN running stats on the unlabeled target.
 def adabn_recalibrate(model, batches, forward, momentum=None, reset=True):
     """Refresh BN running mean/var over target `batches` via forward(model, b).
     momentum None = cumulative (PreciseBN); float = exponential, and reset zeroes
@@ -136,9 +131,6 @@ def adabn_recalibrate(model, batches, forward, momentum=None, reset=True):
     return model
 
 
-# D2c - APCoTTA (arXiv:2505.09971) reduced to the offline one-shot job shape:
-# AdaBN stats refresh + entropy-filtered entropy minimization on BN affine
-# params + stochastic restore toward source weights (their RPI).
 def apcotta_adapt(model, batches, logits_fn, lr=1e-3, ent_frac=0.4,
                   restore_p=0.01):
     """Adapt over target `batches` via logits_fn(model, batch) -> (N, C).
@@ -342,7 +334,7 @@ def best_val_miou(val_csv, protocol="proxy"):
     final_model.pth forever."""
     if not os.path.exists(val_csv):
         return -1.0
-    best = -1.0
+    best, skipped = -1.0, 0
     with open(val_csv, newline="", encoding="utf-8", errors="replace") as f:
         for row in csv.DictReader(f):
             if row.get("protocol") != protocol:
@@ -350,42 +342,72 @@ def best_val_miou(val_csv, protocol="proxy"):
             try:
                 best = max(best, float(row["val_miou"]))
             except (KeyError, TypeError, ValueError):
-                pass
+                skipped += 1
+    if skipped:
+        # silently dropping rows here seeds the crown too low, so a worse
+        # epoch can later overwrite a better final_model.pth
+        print(f"  [best] {skipped} unreadable val row(s) in {val_csv} were "
+              f"ignored when seeding the best score", flush=True)
     return best
 
 
 class BestCheckpoint:
-    """Track best val mIoU (seeded from the merged metrics.csv, with a
-    legacy val_metrics.csv fallback); update(m) is True on a new best and
-    ignores metrics from the other protocol, so callers can hand it every
-    eval; finalize(save_last) saves last epoch only if val never ran."""
+    """Track best val mIoU across restarts. update(m, save) crowns a new best
+    and writes it; metrics from the other protocol are ignored, so callers can
+    hand it every eval. finalize(save_last) saves last epoch only if val never
+    ran."""
 
     def __init__(self, run_dir, protocol="proxy"):
-        # every trainer builds one at train start, so this is the shared gate
-        # keeping the inference-only channel kill out of training batches
-        if zero_channels():
-            raise RuntimeError(
-                "TT_ZERO_CHANNELS is an inference-only control (set by the Infer "
-                "page's Input channels table); unset it before training - a "
-                "zeroed channel would silently poison every training batch.")
         self.protocol = protocol
         self.final = os.path.join(run_dir, "final_model.pth")
         self.best = max(
             best_val_miou(os.path.join(run_dir, "metrics.csv"), protocol),
-            best_val_miou(os.path.join(run_dir, "val_metrics.csv"), protocol))
+            self._crowned_miou())
 
-    def update(self, m):
+    def _crowned_miou(self):
+        """The score stamped inside an existing final_model.pth. Seeding from
+        the file as well as the csv is what stops a kill between the save and
+        the csv row from letting a later, WORSE epoch overwrite the crown."""
+        if not os.path.exists(self.final):
+            return -1.0
+        try:
+            ck = load_ckpt_safe(self.final)
+        except RuntimeError as e:
+            # unreadable crown: fall back to the csv seed rather than block a
+            # resume, but say so - this run may overwrite that file
+            print(f"  [best] {self.final} is unreadable ({e}); seeding from "
+                  f"metrics.csv only", flush=True)
+            return -1.0
+        if ck.get("crown_protocol") != self.protocol:
+            return -1.0        # crowned on the other val scale; not comparable
+        return float(ck.get("val_miou", -1.0))
+
+    def update(self, m, save):
+        """save(path, extra) writes the checkpoint with `extra` merged in."""
         if row_protocol(m) != self.protocol:
             return False
         miou = m["present_classes_mIoU"]
-        if miou > self.best:
-            self.best = miou
-            return True
-        return False
+        if miou <= self.best:
+            return False
+        self.best = miou
+        save(self.final, {"val_miou": float(miou), "crown_protocol": self.protocol})
+        return True
 
     def finalize(self, save_last):
         if not os.path.exists(self.final):
             save_last(self.final)
+
+
+def preflight_env():
+    """Startup guard for env that must never reach a TRAINING run. Called by
+    every trainer before prep, so a poisoned setting can't bake zeroed
+    channels into the tile cache under a clean signature."""
+    if zero_channels():
+        raise RuntimeError(
+            "TT_ZERO_CHANNELS is an inference-only control (set by the Infer "
+            "page's Input channels table); unset it before training - a "
+            "zeroed channel would silently poison every training batch and "
+            "the prep cache built from it.")
 
 
 STOP_SENTINEL = f"{OUTPUTS_ROOT}/STOP"
@@ -397,8 +419,14 @@ def clear_stop():
     try:
         os.remove(STOP_SENTINEL)
         print("  [stop] removed stale STOP sentinel", flush=True)
-    except OSError:
+    except FileNotFoundError:
         pass
+    except OSError as e:
+        # a sentinel we couldn't delete stops THIS run at its first epoch check
+        raise RuntimeError(
+            f"{STOP_SENTINEL} exists and cannot be removed ({e}). Delete it by "
+            f"hand, then launch again - left in place it stops this run "
+            f"immediately.") from e
 
 
 def stop_requested(ep):
@@ -408,8 +436,13 @@ def stop_requested(ep):
         return False
     try:
         os.remove(STOP_SENTINEL)
-    except OSError:
+    except FileNotFoundError:
         pass
+    except OSError as e:
+        # not consumed = the next run on this /outputs stops at epoch 0
+        print(f"  [stop] WARNING: could not consume {STOP_SENTINEL} ({e}); "
+              f"delete it before the next run or that run stops immediately",
+              flush=True)
     print(f"  [stop] STOP sentinel found. Stopping after epoch {ep}; "
           f"running the final evaluation…", flush=True)
     return True
@@ -586,6 +619,36 @@ def _voxel_unique_cuda(code, return_inverse):
         return None
 
 
+def scene_stem(path):
+    """<stem>_input.npz -> <stem>. Twin of trainer_gui.dataset.infer_stem: the
+    trainer runs in the model env with no trainer_gui package, so the filename
+    convention has to be spelled on both sides - keep them identical."""
+    import re
+    return re.sub(r"_(input|pred)$", "",
+                  os.path.splitext(os.path.basename(path))[0])
+
+
+def infer_scenes(run_dir):
+    """Staged scenes for an infer job: the job.json staging manifest first
+    (manifests over globs - writers record what they created), glob fallback
+    for manifest-less dirs."""
+    import glob
+    names = []
+    try:
+        with open(os.path.join(run_dir, "job.json"), encoding="utf-8") as f:
+            names = (json.load(f).get("staging") or {}).get("scenes") or []
+    except FileNotFoundError:
+        pass                      # hand-built job dir: the glob below covers it
+    except (OSError, ValueError) as e:
+        raise RuntimeError(
+            f"{run_dir}/job.json is unreadable ({e}). Delete it to fall back to "
+            f"a directory scan, or re-stage the job.") from e
+    listed = [os.path.join(run_dir, n) for n in names]
+    if listed and all(os.path.isfile(p) for p in listed):
+        return sorted(listed)
+    return sorted(glob.glob(f"{run_dir}/*_input.npz"))
+
+
 def update_job_json(job_dir, section, doc):
     """job.json is the single per-job manifest (staging/infer/postproc/
     panoptic/report); each stage owns one section, atomically rewritten."""
@@ -748,11 +811,14 @@ def drop_corrupt_tile(path):
     """Remove a truncated cached tile and its scene's .done so the next prep
     re-tiles it (Modal preemption mid-commit can persist half-written npz)."""
     import re
-    print(f"  corrupt cached tile dropped: {path}", flush=True)
     try:
         os.remove(path)
-    except OSError:
-        pass
+        print(f"  corrupt cached tile dropped: {path}", flush=True)
+    except OSError as e:
+        # the caller reports "N corrupt tile(s) removed"; say so when it isn't
+        # true, or the next run re-reads the same broken file
+        print(f"  corrupt cached tile {path} could NOT be removed ({e}); "
+              f"delete it by hand before the next run", flush=True)
     m = re.match(r"(.+)_x-?\d+_y-?\d+\.npz$", os.path.basename(path))
     if m:
         try:
@@ -999,6 +1065,63 @@ def split_scenes(ds_root):
     return train, val, test
 
 
+def scenes_fingerprint(ds_root):
+    """{split: [[name, size], ...]} for the dataset's three split folders.
+    ponytail: name+size, not a content hash - it survives copying a dataset to
+    another machine and still catches an added/removed/rebuilt scene, which is
+    every case that actually occurs; hash bytes only if a same-size edit ever
+    has to be caught."""
+    return {split: [[n, os.path.getsize(p)] for n, p in items]
+            for split, items in zip(("train", "val", "test"),
+                                    split_scenes(ds_root))}
+
+
+def validate_scenes(prep_dir, ds_root):
+    """Guard the cache against DATASET changes, not just setting changes: the
+    tile lists are globbed from prep/, so a scene added, removed or moved
+    between splits would otherwise keep training from stale tiles forever.
+    A cache with no inventory recorded predates this check and is adopted."""
+    cur = scenes_fingerprint(ds_root)
+    meta = read_cache_meta(prep_dir)
+    was = meta.get("scenes")
+    if was is None:
+        update_cache_meta(prep_dir, scenes=cur)
+        return
+    if was == cur:
+        return
+    moved = []
+    for split in ("train", "val", "test"):
+        old = {n for n, _ in was.get(split, [])}
+        new = {n for n, _ in cur.get(split, [])}
+        for n in sorted(new - old):
+            moved.append(f"+{split}/{n}")
+        for n in sorted(old - new):
+            moved.append(f"-{split}/{n}")
+        for n, sz in cur.get(split, []):
+            if n in old and [n, sz] not in was.get(split, []):
+                moved.append(f"~{split}/{n}")
+    raise RuntimeError(
+        f"The dataset's scenes changed since this prep cache was built "
+        f"({', '.join(moved[:8])}{' …' if len(moved) > 8 else ''}). "
+        f"Delete {prep_dir} and launch again to re-tile.")
+
+
+def read_cache_meta(prep_dir):
+    """cache_meta.json as a dict; {} when absent. A present-but-corrupt meta
+    is an error - silently treating it as absent is how a stale cache gets
+    adopted under a fresh signature."""
+    path = os.path.join(prep_dir, "cache_meta.json")
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError) as e:
+        raise RuntimeError(
+            f"{path} is unreadable ({e}). Delete {prep_dir} and launch again "
+            f"to re-tile.") from e
+
+
 def update_cache_meta(prep_dir, **fields):
     """Additive, atomic update of cache_meta.json (e.g. KPConv's calibrated
     neighbor_limits ride here - same one-per-prep-cache lifecycle)."""
@@ -1016,24 +1139,23 @@ def update_cache_meta(prep_dir, **fields):
 
 
 # cache_meta keys that are NOT part of the build signature
-_CACHE_META_EXTRAS = ("neighbor_limits",)
+# written into cache_meta.json but NOT part of the settings signature
+_CACHE_META_EXTRAS = ("neighbor_limits", "scenes")
 
 
 def validate_cache(prep_dir, sig):
     """Refuse a prep cache built with different settings. True if the
     signature was newly written."""
-    meta_path = f"{prep_dir}/cache_meta.json"
-    if os.path.exists(meta_path):
-        with open(meta_path) as f:
-            old = json.load(f)
-        old = {k: v for k, v in old.items() if k not in _CACHE_META_EXTRAS}
+    if os.path.exists(f"{prep_dir}/cache_meta.json"):
+        old = {k: v for k, v in read_cache_meta(prep_dir).items()
+               if k not in _CACHE_META_EXTRAS}
         if old != sig:
             diffs = {k: [old.get(k), sig.get(k)]
                      for k in sorted(set(old) | set(sig)) if old.get(k) != sig.get(k)}
             raise RuntimeError(
                 f"Preprocess cache at {prep_dir} was built with DIFFERENT settings "
                 f"(mismatched: {diffs}). Reusing it would silently mix incompatible "
-                f"data. Point PREP_DIR at a fresh path or delete the stale cache.")
+                f"data. Delete {prep_dir} and launch again to re-tile.")
         return False
     update_cache_meta(prep_dir, **sig)
     return True
@@ -1295,11 +1417,14 @@ def run_finished(run_dir):
     path = os.path.join(run_dir, "run.json")
     try:
         with open(path, encoding="utf-8-sig") as f:
-            if json.load(f).get("finished"):
-                return True
-    except (OSError, ValueError):
-        pass
-    return os.path.exists(os.path.join(run_dir, "DONE"))
+            return bool(json.load(f).get("finished"))
+    except FileNotFoundError:
+        return False
+    except (OSError, ValueError) as e:
+        raise RuntimeError(
+            f"{path} is unreadable ({e}); a run whose manifest can't be read "
+            f"can't be resumed or published. Delete the run dir, or restore "
+            f"run.json from a backup.") from e
 
 
 def _proxy_remedy(run_dir):
@@ -1343,19 +1468,16 @@ def proxy_guard(run_dir, report, protocol, class_names, ranking="proxy"):
                     rows += 1
                 else:
                     other += 1
-    # the stamp lives in run.json now; a legacy proxy_val.json still reads
     old = None
     try:
         with open(f"{run_dir}/run.json", encoding="utf-8-sig") as f:
             old = json.load(f).get("proxy_val")
-    except (OSError, ValueError):
-        pass
-    if old is None and os.path.exists(f"{run_dir}/proxy_val.json"):
-        try:
-            with open(f"{run_dir}/proxy_val.json", encoding="utf-8") as f:
-                old = json.load(f)
-        except (OSError, ValueError):
-            old = None
+    except FileNotFoundError:
+        pass                       # fresh run dir: nothing stamped yet
+    except (OSError, ValueError) as e:
+        raise RuntimeError(
+            f"{run_dir}/run.json is unreadable ({e}); the proxy-set guard "
+            f"cannot verify this resume. Delete the run dir and start fresh.") from e
     # rows on the other scale under a signature that NAMES that scale = a mid-run switch
     switched = (bool(other) and isinstance(old, dict)
                 and old.get("ranking", "proxy") != ranking)
@@ -1477,8 +1599,8 @@ def run_infer_scenes(scenes, predict, pred_dir, run_dir, infer_cfg):
     share a dir (else a standalone <name>_pred.npz), with the crash-safe
     per-scene job.json rewrite."""
     import numpy as np
-    # backstop for the GUI's probe-based pre-skip: any feat_* the run needs
-    # that the scenes don't carry rides as zeros - missing data never aborts
+    # feat_* the run needs but the scenes don't carry ride as zeros - missing
+    # data never aborts
     need = [n for n in (infer_cfg.get("features") or []) if n.startswith("feat_")]
     if need and scenes:
         # union across ALL scenes: a mixed folder must never abort mid-run
@@ -1491,18 +1613,18 @@ def run_infer_scenes(scenes, predict, pred_dir, run_dir, infer_cfg):
             print(f"  [channels] not in the converted scenes -> fed as zeros: "
                   f"{', '.join(sorted(missing))}", flush=True)
     zc = zero_channels()
-    if zc:   # permanent provenance: these predictions ran without these inputs
+    if zc:
         infer_cfg = {**infer_cfg, "zeroed_channels": sorted(zc)}
     print(f"  [infer] labeling {len(scenes)} scene(s) -> {pred_dir}", flush=True)
     scene_stats = []
     for pc_path in scenes:
-        name = os.path.splitext(os.path.basename(pc_path))[0]
+        # scenes are staged as <stem>_input.npz; the standalone pred must come
+        # back as <stem>_pred.npz or merge_predictions/the Modal pull miss it
+        name = scene_stem(pc_path)
         t0 = time.time()
         xyz, pred, inten, conf, probs = predict(pc_path)
-        # scenes and predictions in the same dir (the local one-file layout):
-        # fold predictions into the *_input.npz. A separate pred_dir (Modal
-        # remote: scenes and outputs live on different volumes) still gets a
-        # standalone *_pred.npz, merged locally after the pull.
+        # separate pred_dir (Modal remote): standalone *_pred.npz, merged
+        # locally after the pull
         if os.path.normpath(os.path.dirname(pc_path)) == os.path.normpath(pred_dir):
             merge_pred_into_scene(pc_path, pred, conf, probs)
         else:
@@ -1880,6 +2002,7 @@ def kp_ensure_prep(prep_dir, ds_root, sig, tile_fn):
         os.makedirs(f"{prep_dir}/{split}", exist_ok=True)
     train_list, val_list, test_list = split_scenes(ds_root)
     any_new = [validate_cache(prep_dir, sig)]
+    validate_scenes(prep_dir, ds_root)
 
     def tile_remaining(items, out_dir, split):
         for name, pc_path in items:
@@ -2027,10 +2150,23 @@ def kp_make_evaluate(forward, build_feat, grid, chunk_xy, num_classes,
     """KP voted eval scored on the ORIGINAL raw points: center-weighted
     softmax votes per voxel, argmax, NN-propagate to raw, score vs raw GT.
     forward([(cxyz, feat)]) -> per-tile (N, C) logits list; scene_items are
-    (name, pc_path, split_dir) triples."""
+    (name, pc_path, split_dir) triples.
+
+    Honors the same EXCLUDE_CLASSES and rigid DG_INFER_TTA_RIGID views the
+    infer path uses, so an eval-only re-score measures the predictor that
+    actually ships. Both default to off, so a training run is unchanged."""
     import glob
     import numpy as np
     import torch
+
+    exclude_idx = exclude_class_idx(class_names)
+    # rigid views only: flips/rotations leave every feature channel invariant,
+    # so tile features need no rebuild. Scale views would change the density
+    # features, which eval can't recompute from the cached tile.
+    views = infer_tta_views(0, env_str("DG_INFER_TTA_RIGID", ""))
+    if env_int("DG_INFER_TTA", 0) and len(views) == 1:
+        print("  [eval] scale TTA views are an infer-only booster; this score "
+              "uses 1 view (set DG_INFER_TTA_RIGID for voted eval)", flush=True)
 
     def evaluate(scene_items, label):
         bs0 = bs = max(1, int(os.environ.get("EVAL_BATCH", "4")))
@@ -2088,12 +2224,22 @@ def kp_make_evaluate(forward, build_feat, grid, chunk_xy, num_classes,
 
                 def flush():
                     nonlocal n_skipped_tiles
-                    for (xyz, _, _), lg in zip(group, forward_group(group)):
-                        if lg is None:
+                    # one pass per view; with the default single view this is
+                    # the same single forward_group call as before
+                    per_view = [forward_group([(x, view(c), f)
+                                               for x, c, f in group])
+                                for view in views]
+                    for i, (xyz, _, _) in enumerate(group):
+                        lgs = [pv[i] for pv in per_view]
+                        if any(lg is None for lg in lgs):
                             n_skipped_tiles += 1
                             continue
-                        e = np.exp(lg - lg.max(1, keepdims=True))
-                        prob = e / e.sum(1, keepdims=True)
+                        prob = None
+                        for lg in lgs:
+                            e = np.exp(lg - lg.max(1, keepdims=True))
+                            p = e / e.sum(1, keepdims=True)
+                            prob = p if prob is None else prob + p
+                        prob = apply_class_mask(prob / len(lgs), exclude_idx)
                         cxy = (xyz[:, :2].min(0) + xyz[:, :2].max(0)) / 2
                         d = np.abs(xyz[:, :2] - cxy).max(1)
                         wgt = np.clip(1.0 - d / (chunk_xy / 2.0), 0.05, 1.0) ** 2
@@ -2412,9 +2558,8 @@ def kp_make_run_eval(net, forward, evaluate, make_batch, sample_tile,
                            len(proxy_tiles), PROXY_PROTOCOL_TILES,
                            inventory=proxy_rep["inventory"]))
             net.train()
-            if best.update(m):
-                atomic_torch_save({"model": net.state_dict(), "epoch": ep},
-                                  best.final)
+            best.update(m, lambda p, extra: atomic_torch_save(
+                {"model": net.state_dict(), "epoch": ep, **extra}, p))
             append_val_row(val_csv, ep, m, class_names)
             return m
         if not eval_only:
@@ -2480,7 +2625,7 @@ def kp_run_infer(run_dir, net, forward, kp_batch, build_feat, predict_points,
         print(f"  [infer] note: {note_name} uses its trained geometry "
               f"(grid={grid}, chunk={chunk_xy}); --grid/--chunk-xy ignored.", flush=True)
     net.eval()
-    scenes = sorted(glob.glob(f"{run_dir}/*_input.npz"))
+    scenes = infer_scenes(run_dir)
     if not scenes:
         raise FileNotFoundError(f"No staged *_input.npz scenes in {run_dir}")
     pred_dir = os.environ.get("TT_PRED_DIR") or f"{run_dir}/predictions"
@@ -2645,7 +2790,9 @@ def kp_train_loop(net, optim, forward, seg_loss, make_batch, sample_tile,
                                "optim": optim.state_dict(), "epoch": ep},
                               f"{run_dir}/checkpoints/ep{ep:03d}.pth")
         stop = stop_requested(ep)
-        if (ep + 1) % val_every == 0 and ep != n_epochs - 1 and not stop:
+        # the last epoch DOES validate: the final eval never crowns, so skipping
+        # it left n_epochs <= val_every runs with no crown at all
+        if (ep + 1) % val_every == 0 and not stop:
             run_eval(ep)
         if stop:
             break
@@ -2770,12 +2917,15 @@ def ptv3_ensure_prep(prep_dir, ds_root, chunk_xy, stride, load_canonical):
     os.makedirs(f"{prep_dir}/test",  exist_ok=True)
     print(f"  ensuring preprocessed cache -> {prep_dir}", flush=True)
     # signature stamp: PREP_DIR doesn't encode the class layout, so a rebuilt dataset would silently reuse old-index tiles
-    meta = {}
     try:
-        with open(f"{ds_root}/dataset_meta.json") as f:
+        with open(f"{ds_root}/dataset_meta.json", encoding="utf-8-sig") as f:
             meta = json.load(f)
-    except (OSError, ValueError):
-        pass
+    except (OSError, ValueError) as e:
+        # a {} here signs the cache with all-Nones, which matches every other
+        # all-None signature - exactly the stale-tile reuse this stamp prevents
+        raise RuntimeError(
+            f"{ds_root}/dataset_meta.json is unreadable ({e}). Rebuild the "
+            f"dataset on the Datasets page, then launch again.") from e
     sp = meta.get("split", {}) if isinstance(meta.get("split"), dict) else {}
     validate_cache(prep_dir, {"pipeline": "ptv3",
                               "chunk_xy": chunk_xy,
@@ -2785,6 +2935,7 @@ def ptv3_ensure_prep(prep_dir, ds_root, chunk_xy, stride, load_canonical):
                               "class_names": meta.get("class_names"),
                               "split_seed": sp.get("seed"),
                               "split_mode": sp.get("mode")})
+    validate_scenes(prep_dir, ds_root)
     any_new = [False]
     def already_tiled(out_dir, scene):
         return bool(glob.glob(f"{out_dir}/{scene}_x*.npz"))
@@ -2928,6 +3079,17 @@ def resume_ladder(suffix, recipe, want_resume, proxy_rep, protocol,
     return run_dir, run_id, resume_ckpt, start_epoch
 
 
+def _ptv3_eval_masking(class_names):
+    """EXCLUDE_CLASSES for the ptv3 eval path. Rigid TTA views are NOT applied
+    here: these tiles are voxelized and the vote is scattered back through the
+    voxel `inverse` map, so a rotated view would have to re-voxelize - scoring
+    a view against the wrong inverse map silently corrupts the metric."""
+    if env_str("DG_INFER_TTA_RIGID", "") or env_int("DG_INFER_TTA", 0):
+        print("  [eval] TTA views are not applied to this backbone's eval "
+              "(voxelized tiles); this score is 1 view", flush=True)
+    return exclude_class_idx(class_names)
+
+
 def ptv3_make_evaluate(forward, build_feat, feat_spec, grid, chunk_xy,
                        num_classes, class_names):
     """PTv3-family voted eval scored on the ORIGINAL raw points (KP protocol).
@@ -2938,6 +3100,7 @@ def ptv3_make_evaluate(forward, build_feat, feat_spec, grid, chunk_xy,
     import torch
 
     dev = "cuda" if torch.cuda.is_available() else "cpu"
+    exclude_idx = _ptv3_eval_masking(class_names)
 
     def evaluate(scene_items, label):
         bs0 = bs = max(1, int(os.environ.get("EVAL_BATCH", "4")))
@@ -3024,7 +3187,8 @@ def ptv3_make_evaluate(forward, build_feat, feat_spec, grid, chunk_xy,
                             n_skipped_tiles += 1
                             continue
                         e = np.exp(lg - lg.max(1, keepdims=True))
-                        prob = (e / e.sum(1, keepdims=True))[inverse]
+                        prob = apply_class_mask(
+                            (e / e.sum(1, keepdims=True))[inverse], exclude_idx)
                         cxy = (xyz[:, :2].min(0) + xyz[:, :2].max(0)) / 2
                         d = np.abs(xyz[:, :2] - cxy).max(1)
                         wgt = np.clip(1.0 - d / (chunk_xy / 2.0), 0.05, 1.0) ** 2
@@ -3316,14 +3480,12 @@ def ptv3_make_run_eval(backbone, head, evaluate, forward_logits, proxy_batches,
                            names, f"val@ep{ep}", len(proxy_tiles),
                            PROXY_PROTOCOL_TILES,
                            inventory=proxy_rep["inventory"]))
-            # weights before the csv row: a kill between them must not seed a best final_model.pth can never match
-            if best.update(m):
-                save_best(ep)
+            best.update(m, lambda p, extra: save_best(ep, extra))
             append_val_row(val_csv, ep, m, names)
             set_train_mode()
             return m
         m = evaluate(val_items, f"val@ep{ep}")
-        # deliberately no best.update: the last epoch is never a crown candidate, matching the AdaBN trainers
+        # deliberately no best.update: the last epoch is never a crown candidate
         append_val_row(val_csv, ep, m, names)
         swapped = os.path.exists(best.final)
         if swapped:
@@ -3442,7 +3604,9 @@ def ptv3_train_loop(backbone, head, optim, seg_loss, forward_logits,
                 except OSError:
                     pass
         stop = stop_requested(ep)
-        if (ep + 1) % val_every == 0 and ep != n_epochs - 1 and not stop:
+        # the last epoch DOES validate: the final eval never crowns, so skipping
+        # it left n_epochs <= val_every runs with no crown at all
+        if (ep + 1) % val_every == 0 and not stop:
             run_eval(ep)
         if stop:
             break

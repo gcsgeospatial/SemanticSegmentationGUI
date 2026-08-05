@@ -228,7 +228,6 @@ class LogConsole(QWidget):
         return bar.value() >= bar.maximum() - self._edit.fontMetrics().height()
 
     def _autoscroll(self, was_at_bottom: bool) -> None:
-        # same tail-follow heuristic as ui.append_log, gated by the pin toggle
         if self._pin_btn.isChecked() and was_at_bottom:
             bar = self._edit.verticalScrollBar()
             bar.setValue(bar.maximum())
@@ -276,7 +275,6 @@ class LogConsole(QWidget):
                     text = text[m.end():]
                     if not text:
                         continue
-            # severity verdict beats per-char ANSI: one glance = one meaning
             cur.insertText(text, self._fmt(sev_color or ansi or CONSOLE_TEXT))
 
     def _re_render(self) -> None:

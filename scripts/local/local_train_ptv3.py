@@ -287,7 +287,7 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
               f"final_model = best-val epoch {ckpt.get('epoch', '?')})", flush=True)
 
         run_dir = tc.infer_dir(infer_input)
-        scenes = sorted(glob.glob(f"{run_dir}/*_input.npz"))
+        scenes = tc.infer_scenes(run_dir)
         if not scenes:
             raise FileNotFoundError(f"No staged *_input.npz scenes in {run_dir}")
 
@@ -321,6 +321,7 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
     print("=" * 70)
     print(f"  CUDA: {torch.cuda.is_available()}  "
           f"{torch.cuda.get_device_name(0) if torch.cuda.is_available() else ''}")
+    tc.preflight_env()
     tc.clear_stop()
     tc.ptv3_ensure_prep(PREP_DIR, ds_root, CHUNK_XY, STRIDE, load_canonical)
 
@@ -470,7 +471,7 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
     evaluate = tc.ptv3_make_evaluate(_forward_logits, build_feat, FEAT_SPEC,
                                      GRID_SIZE, CHUNK_XY, NUM_CLASSES, names)
 
-    val_csv = metrics_csv          # val rows share the one metrics.csv
+    val_csv = metrics_csv
 
     best = tc.BestCheckpoint(run_dir, VAL_RANK)
     tc.proxy_guard(run_dir, proxy_rep, tc.PROXY_PROTOCOL_TILES, names, VAL_RANK)
@@ -480,9 +481,9 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
                                            to_ptv3_batch, _viable, proxy_rep,
                                            CHUNK_XY, PREP_DIR)
 
-    def _save_best(ep):
+    def _save_best(ep, extra=None):
         state = {"backbone": backbone.state_dict(),
-                 "head": head.state_dict(), "epoch": ep}
+                 "head": head.state_dict(), "epoch": ep, **(extra or {})}
         if pretrained:
             state["config"] = model_cfg
         tc.atomic_torch_save(state, best.final)
