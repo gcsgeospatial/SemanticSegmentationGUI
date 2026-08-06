@@ -587,10 +587,23 @@ class TrainPage(QWidget):
                                   "rare labels get amplified); ↓ β = closer to "
                                   "unweighted.")
         self.loss_cw.toggled.connect(self.loss_beta.setEnabled)
+        self.loss_smooth = QDoubleSpinBox()
+        self.loss_smooth.setRange(-0.01, 0.3)
+        self.loss_smooth.setSingleStep(0.05)
+        self.loss_smooth.setValue(-0.01)
+        self.loss_smooth.setSpecialValueText("backbone default")
+        self.loss_smooth.setToolTip(
+            "Label smoothing for the CE loss. Backbone defaults: 0.0 "
+            "(PTv3 family), 0.2 (KPConv family).\n"
+            "↑ = softer targets, better-calibrated confidences (helps "
+            "low-confidence / OOD gating at inference); ↓ = sharper, more "
+            "confident predictions. 0.1 is a common calibration setting.")
         r2 = QHBoxLayout()
         r2.addWidget(self.loss_cw)
         r2.addWidget(QLabel("strength β"))
         r2.addWidget(self.loss_beta)
+        r2.addWidget(QLabel("label smoothing"))
+        r2.addWidget(self.loss_smooth)
         r2.addStretch(1)
         lay.addLayout(r2)
 
@@ -609,10 +622,12 @@ class TrainPage(QWidget):
     def _loss_collect(self) -> dict:
         if not self.adv_box.isChecked():
             return {}
+        smooth = round(self.loss_smooth.value(), 2)
         return {"focal": self.loss_focal.isChecked(),
                 "focal_gamma": round(self.loss_gamma.value(), 2),
                 "class_weighting": self.loss_cw.isChecked(),
                 "weight_beta": round(self.loss_beta.value(), 2),
+                "label_smoothing": None if smooth < 0 else smooth,
                 "rare_oversample": self.loss_rare.isChecked()}
 
     def _dg_rows(self, lay):
@@ -1128,6 +1143,8 @@ class TrainPage(QWidget):
                 self.loss_gamma.setValue(float(loss.get("focal_gamma", 2.0)))
                 self.loss_cw.setChecked(bool(loss.get("class_weighting", True)))
                 self.loss_beta.setValue(float(loss.get("weight_beta", 0.5)))
+                sm = loss.get("label_smoothing")
+                self.loss_smooth.setValue(-0.01 if sm is None else float(sm))
                 self.loss_rare.setChecked(bool(loss.get("rare_oversample", True)))
             except (TypeError, ValueError):
                 pass

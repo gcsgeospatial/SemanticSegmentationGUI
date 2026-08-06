@@ -424,6 +424,20 @@ Consumers: the GUI's Inference page lists anything installed under
 `share/trainer-weights/`, and the `sem` CLI installs these packages as its
 products.
 
+Before packaging a ptv3-family run, optionally fit its OOD stats so `sem`
+users get the feature-distance unknown gate:
+
+```
+python scripts/local/local_train_<backbone>.py --mode fit_ood \
+    --weights runs/<id>/final_model.pth --dataset <dataset>
+```
+
+This writes `ood_gmm.npz` (per-class feature Gaussians plus suggested
+thresholds) next to the weights; the packager picks it up when present and
+notes when it is missing. The label smoothing knob in the train page
+("backbone default" leaves each trainer's own value) improves how well
+these gates separate unknowns, so prefer 0.1 on runs meant for shipping.
+
 ---
 
 ## 8. Validating a change

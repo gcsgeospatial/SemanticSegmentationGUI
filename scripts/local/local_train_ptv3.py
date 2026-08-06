@@ -91,11 +91,11 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
     import train_common as tc
     (DG_DENSITY_AUG, DG_COARSEN_MAX, DG_P_NATIVE, DG_LOGDK_FEAT, DG_LOGDK_K,
      DG_INFER_TTA, USE_FOCAL, FOCAL_GAMMA, CLASS_WEIGHTING, WEIGHT_BETA,
-     RARE_OVERSAMPLE, VAL_EVERY,
+     LABEL_SMOOTH, RARE_OVERSAMPLE, VAL_EVERY,
      FEAT_CHANNELS, PROXY_SAMPLING) = tc.env_overrides(globals(), [
         "DG_DENSITY_AUG", "DG_COARSEN_MAX", "DG_P_NATIVE", "DG_LOGDK_FEAT",
         "DG_LOGDK_K", "DG_INFER_TTA", "USE_FOCAL", "FOCAL_GAMMA",
-        "CLASS_WEIGHTING", "WEIGHT_BETA", "RARE_OVERSAMPLE",
+        "CLASS_WEIGHTING", "WEIGHT_BETA", "LABEL_SMOOTH", "RARE_OVERSAMPLE",
         "VAL_EVERY", "FEAT_CHANNELS", "PROXY_SAMPLING"])
 
     # wrappers overwrite the PKG globals per call - read them here, not at import
@@ -133,9 +133,12 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
             color_src = "rgb"
         elif "intensity" in FEAT_SPEC and ds_meta.get("has_intensity"):
             color_src = "intensity"
-        PREP_DIR = (f"{ds_root}/prep/{'pcssl' if pretrained else 'ptv3'}_{color_src}"
+
+        def _prep_dir():
+            return (f"{ds_root}/prep/{'pcssl' if pretrained else 'ptv3'}_{color_src}"
                     f"{tc.feat_spec_tag(FEAT_SPEC, FEAT_DEFAULT)}_chunk{int(CHUNK_XY)}_loc"
                     f"{tc.train_stride_tag()}")
+        PREP_DIR = _prep_dir()
 
     def _in_ch(spec):
         # a pretrained stem expects a trailing 3-wide (zeroed) normal slot
@@ -168,6 +171,15 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
             return head(_upcast_feat(backbone(batch)))
         point = backbone(batch)
         return head(point["feat"] if isinstance(point, dict) else point.feat)
+
+    def _forward_feat(batch):
+        """(logits, penultimate features) - the OOD fit/scoring hook."""
+        if pretrained:
+            f = _upcast_feat(backbone(batch))
+        else:
+            point = backbone(batch)
+            f = point["feat"] if isinstance(point, dict) else point.feat
+        return head(f), f
 
     def build_feat(cxyz, rgbf, extras=None, drop=()):
         return tc.ptv3_build_feat(FEAT_SPEC, cxyz, rgbf, extras, drop,
@@ -310,6 +322,52 @@ def train_ptv3(dataset: Optional[str] = None, grid: Optional[float] = None,
             _forward_logits, load_canonical, build_feat, FEAT_SPEC, GRID_SIZE,
             CHUNK_XY, DG_INFER_TTA, num_classes, exclude_idx=exc_idx)
         tc.run_infer_scenes(scenes, predict_scene, pred_dir, run_dir, infer_cfg)
+        return
+
+    if mode == "fit_ood":
+        # per-class feature Gaussians -> ood_gmm.npz beside the weights; the
+        # inference runtime scores against them when the file ships with the
+        # weights package
+        if not weights:
+            raise ValueError("--mode fit_ood requires --weights (and --dataset)")
+        wpath = tc.resolve_weights_path(weights)
+        if not os.path.exists(wpath):
+            raise FileNotFoundError(f"weights not found: {wpath}")
+        ckpt = tc.load_ckpt_safe(wpath, map_location="cpu")
+        bsd, hsd = ckpt["backbone"], ckpt["head"]
+        num_classes = int(hsd["weight"].shape[0])
+        meta = tc.infer_meta(wpath) or {}
+        if meta.get("grid") is not None:
+            GRID_SIZE = float(meta["grid"])
+        color_src = meta.get("color_source") or color_src
+        FEAT_DEFAULT = ["x", "y", "z", "rgb" if color_src == "rgb" else "intensity"]
+        mf = meta.get("features")
+        FEAT_SPEC = (tc.parse_feat_spec(",".join(mf), FEAT_DEFAULT) if mf
+                     else list(FEAT_DEFAULT))
+        IN_CH = _in_ch(FEAT_SPEC)
+        if pretrained and "config" not in ckpt:
+            raise ValueError(f"{weights} has no embedded model config "
+                             f"(not a local_train_{BB_KEY}.py checkpoint?)")
+        backbone, head, model_cfg, stem_pre = build_model(
+            num_classes, from_config=ckpt.get("config"))
+        backbone.load_state_dict(bsd)
+        head.load_state_dict(hsd)
+        backbone.eval(); head.eval()
+        PREP_DIR = _prep_dir()   # FEAT_SPEC now mirrors the weights' run.json
+        tc.ptv3_ensure_prep(PREP_DIR, ds_root, CHUNK_XY, STRIDE, load_canonical)
+        train_tiles = sorted(glob.glob(f"{PREP_DIR}/train/*.npz"))
+        if not train_tiles:
+            raise FileNotFoundError(f"no train tiles in {PREP_DIR}")
+        out = tc.ptv3_fit_ood(train_tiles, _forward_feat, load_canonical,
+                              build_feat, FEAT_SPEC, GRID_SIZE, num_classes)
+        dst = os.path.join(os.path.dirname(wpath), "ood_gmm.npz")
+        np.savez(dst, **out)
+        print(f"  [fit_ood] wrote {dst} (dims={int(out['dims'])}; train min-dist "
+              f"p90={out['p90']:.3f} p95={out['p95']:.3f} p99={out['p99']:.3f})",
+              flush=True)
+        print("  [fit_ood] gate suggestion: sem infer --unclass-gmm "
+              f"{out['p99']:.2f} (p99); relax toward p95 if too permissive",
+              flush=True)
         return
 
     print("=" * 70)

@@ -3442,6 +3442,80 @@ def ptv3_make_predict_scene(forward_logits, load_canonical, build_feat,
     return _predict_scene
 
 
+def ptv3_fit_ood(train_tiles, forward_feat, load_canonical, build_feat,
+                 feat_spec, grid, num_classes, reservoir=100_000):
+    """Per-class diagonal Gaussians over the frozen model's penultimate
+    features, one pass over the train tiles. Distances are per-dim means so
+    thresholds stay O(1) regardless of feature width. Returns the ood_gmm.npz
+    payload: mean/var [C, D], dims, and train min-distance percentiles.
+    Absent classes get a far-away mean so scoring needs no mask."""
+    # ponytail: single diagonal Gaussian per class; k-component GMM on
+    # PCA-reduced feats if this proves too blunt
+    import numpy as np
+    import torch
+    cnt = s = ss = None
+    rng = np.random.RandomState(0)
+    res = []
+    per_tile = max(1024, reservoir // max(len(train_tiles), 1))
+    with torch.no_grad():
+        for i, t in enumerate(train_tiles):
+            xyz, rgb, lab = load_canonical(t)
+            z0 = np.load(t)
+            ex0 = feat_extras(z0, feat_spec, os.path.basename(t))
+            w = (xyz - xyz.mean(0)).astype(np.float32)
+            keys = np.floor(w / grid).astype(np.int64)
+            first, inverse = voxel_unique(keys, return_inverse=True)
+            vlab = lab[first]
+            keep = vlab >= 0
+            if not keep.any():
+                continue
+            rgbf = rgb.astype(np.float32) / 255.0
+            feat = build_feat(w[first], rgbf[first],
+                              {n: v[first] for n, v in ex0.items()})
+            gc = keys[first] - keys[first].min(0)
+            _, f = forward_feat({
+                "coord": torch.from_numpy(w[first]).cuda(),
+                "grid_coord": torch.from_numpy(np.ascontiguousarray(gc)).long().cuda(),
+                "feat": torch.from_numpy(feat).cuda(),
+                "offset": torch.tensor([len(first)], dtype=torch.long).cuda()})
+            f = f.float().cpu().numpy()[keep]
+            vl = vlab[keep]
+            if cnt is None:
+                D = f.shape[1]
+                cnt = np.zeros(num_classes)
+                s = np.zeros((num_classes, D))
+                ss = np.zeros((num_classes, D))
+            for c in np.unique(vl):
+                m = vl == c
+                cnt[c] += int(m.sum())
+                s[c] += f[m].sum(0)
+                ss[c] += (f[m] ** 2).sum(0)
+            take = rng.choice(len(f), size=min(per_tile, len(f)), replace=False)
+            res.append(f[take])
+            if (i + 1) % 25 == 0 or i + 1 == len(train_tiles):
+                print(f"  [fit_ood] {i + 1}/{len(train_tiles)} tiles", flush=True)
+    if cnt is None:
+        raise RuntimeError("fit_ood saw no labeled voxels in the train tiles")
+    present = cnt > 0
+    mean = np.zeros_like(s)
+    var = np.ones_like(ss)
+    mean[present] = s[present] / cnt[present, None]
+    var[present] = np.maximum(
+        ss[present] / cnt[present, None] - mean[present] ** 2, 1e-6)
+    mean[~present] = 1e9   # never the min distance
+    R = np.concatenate(res).astype(np.float32)
+    d = None
+    for c in range(num_classes):
+        dc = (((R - mean[c]) ** 2) / var[c]).mean(-1)
+        d = dc if d is None else np.minimum(d, dc)
+    p90, p95, p99 = (float(np.percentile(d, q)) for q in (90, 95, 99))
+    print(f"  [fit_ood] classes present: {present.sum()}/{num_classes}; "
+          f"reservoir {len(R):,} voxels", flush=True)
+    return {"mean": mean.astype(np.float32), "var": var.astype(np.float32),
+            "dims": np.int64(mean.shape[1]), "grid": np.float32(grid),
+            "p90": np.float32(p90), "p95": np.float32(p95), "p99": np.float32(p99)}
+
+
 def ptv3_proxy_batches(proxy_tiles, batch_size, to_batch, viable, proxy_rep,
                        chunk_xy, prep_dir):
     """Zero-arg generator over the proxy-val tiles; a tile the batcher drops
@@ -3692,6 +3766,7 @@ _ENV_KNOBS = {
     "FOCAL_GAMMA":      ("LOSS_FOCAL_GAMMA",     "env_float"),
     "CLASS_WEIGHTING":  ("LOSS_CLASS_WEIGHTING", "env_bool"),
     "WEIGHT_BETA":      ("LOSS_WEIGHT_BETA",     "env_float"),
+    "LABEL_SMOOTH":     ("LOSS_LABEL_SMOOTH",    "env_float"),
     "RARE_OVERSAMPLE":  ("RARE_OVERSAMPLE",      "env_bool"),
     "PROXY_SAMPLING":   ("PROXY_SAMPLING",       "env_str"),
     "KP_AGGREGATION":   ("KP_AGGREGATION",       "env_str"),

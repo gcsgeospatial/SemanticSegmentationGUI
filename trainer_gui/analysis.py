@@ -42,6 +42,9 @@ def loss_config_to_env(cfg: dict) -> dict:
         env["LOSS_CLASS_WEIGHTING"] = b(cfg.get("class_weighting"))
     if float(cfg.get("weight_beta", 0.5)) != LOSS_DEFAULTS["weight_beta"]:
         env["LOSS_WEIGHT_BETA"] = str(float(cfg["weight_beta"]))
+    # None = keep the backbone's own default (they differ: ptv3 0.0, kpconv 0.2)
+    if cfg.get("label_smoothing") is not None:
+        env["LOSS_LABEL_SMOOTH"] = str(float(cfg["label_smoothing"]))
     if cfg.get("rare_oversample", True) != LOSS_DEFAULTS["rare_oversample"]:
         env["RARE_OVERSAMPLE"] = b(cfg.get("rare_oversample"))
     return env
